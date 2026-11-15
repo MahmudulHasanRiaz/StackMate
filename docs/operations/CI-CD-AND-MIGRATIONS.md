@@ -2,28 +2,32 @@
 
 ## 0. Status — read this first
 
-**CI has now run on GitHub Actions.** Run #7 (commit `f0c2dab`,
-2026-11-15 15:58 +06) **FAILED** at the last step
-(`pnpm run smoke:check`): `scripts/smoke-check.mjs` imports
-`apps/api/src/app.ts` directly, which needs Node type stripping —
-Node 22.14.0 (`.nvmrc` at the time) throws
-`ERR_UNKNOWN_FILE_EXTENSION`. Every earlier step passed (validate,
-migration check, lint, typecheck, unit tests, Postgres integration
-tests, build, wrangler `--dry-run`). Fix pushed as commit `9660b15`:
-`.nvmrc` 22.14.0 → **24.22.1** (the Node version all local
-verification used; Node 24 is the current LTS). The re-run result had
-**not** been observed yet at the time of writing — do not claim CI is
-green until a run is seen passing. `deploy-production.yml` has never
-run (manual-only, and production setup in §5 is not complete).
+**CI is green** (run #20, commit `16b5b59`, 2026-11-15 ~16:29 +06,
+1m 8s — all steps passed; runs #11–#20 all passed). The first
+smoke-check failure (run #7, Node 22.14.0 cannot import `.ts`) was
+fixed by `.nvmrc` → 24.22.1 (commit `9660b15`).
+`deploy-production.yml` has never run (manual-only, and production
+setup in §5 is not complete).
 
-**Staging infrastructure now exists** (created 2026-11-15 via the
-owner's browser, commerciansbd account): Neon `staging` branch
-`br-plain-voice-b3vx916o`, Hyperdrive `stackmate-no-cache`
-(`30a29917780c4aff91b9a198b63eb387`) + `stackmate-cached`
-(`3ae1e99fbd6d4fcea9a0cb35de71ae4c`), R2 bucket
-`stackmate-private-assets`. See §3.5 for the staging deploy path and
-§5.6 for the remaining owner-side setup. Staging has **not** been
-deployed yet.
+**Staging deploy is by direct Cloudflare Git connection, not by
+Actions.** A dedicated `staging` branch (created from feat head
+`16b5b59`, 2026-11-15) is tracked by Worker
+`stackmate-api-staging` at
+`https://stackmate-api-staging.ad-dawah.workers.dev` (production
+branch = `staging`, auto-deploy on push; build command `pnpm
+install --frozen-lockfile && pnpm run db:migrate:deploy && pnpm run
+build`, deploy command `npx wrangler deploy --env staging --config
+apps/api/wrangler.jsonc`, Node 24.22.1, `DATABASE_MIGRATION_URL`
+build secret = direct staging Neon URL). `deploy-staging.yml` is
+kept as the manual Actions alternative; it is not on `main`, so the
+Actions UI shows "Workflow does not exist" — that is expected, not
+an error. GitHub `staging` environment secrets were verified present
+2026-11-15 16:44 (`STAGING_DIRECT_DATABASE_URL`,
+`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`). The first staging
+build is triggered by a push to the `staging` branch; Worker runtime
+secrets + `STACKMATE_STAGING_API_URL` (§5.6) are set after the
+Worker URL is known, then a redeploy is triggered. Staging has
+**not** served live traffic yet.
 
 Verified locally 2026-11-15 (not on GitHub Actions): `pnpm run
 validate:repo`, `pnpm run db:check` (63 Drizzle tables vs 4 migrations:
@@ -128,7 +132,23 @@ Auth cookies stay same-origin. For **production**, how the deployed
 admin reaches the deployed API (same-domain routing, proxy, or an
 absolute URL) is still undecided; do not invent it here.
 
-### 3.5 Staging deployment — `.github/workflows/deploy-staging.yml`
+### 3.5 Staging deployment — direct Cloudflare Git connection (current path)
+
+The staging Worker is connected directly to the GitHub repo in the
+Cloudflare dashboard (no PAT, no Actions trigger): repository
+`MahmudulHasanRiaz/StackMate`, dedicated branch `staging` (created
+from feat head `16b5b59`; `main` untouched), production branch =
+`staging`, auto-deploy on push. Build command: `pnpm install
+--frozen-lockfile && pnpm run db:migrate:deploy && pnpm run build`
+(migrations run before the app builds, against the direct staging
+Neon URL from the `DATABASE_MIGRATION_URL` build secret).
+Deploy command: `npx wrangler deploy --env staging --config
+apps/api/wrangler.jsonc`. Worker URL:
+`https://stackmate-api-staging.ad-dawah.workers.dev`.
+
+`.github/workflows/deploy-staging.yml` below is the manual Actions
+alternative (kept for a future API-triggered run); it is not the
+current path.
 
 **Manual only** (`workflow_dispatch`, no push trigger). Three jobs, in
 strict order; the staging-touching jobs reference
@@ -277,10 +297,16 @@ owner-side (dashboard / GitHub Settings) setup:
    - `STACKMATE_STAGING_API_URL` — deployed staging API base URL,
      e.g. `https://stackmate-api-staging.<subdomain>.workers.dev`
      (no trailing slash). Used by the live smoke checks.
-6. **First staging deploy**: Actions → **Deploy Staging** → Run
-   workflow → type `staging` in the `confirm` input → approve the
-   `staging` environment prompt. Then set the Worker URL secrets
-   (§5.6 steps 1–2) and re-run. Verify: migrations 0000–0004
-   applied to the staging branch, Worker deploy succeeded, and
-   both live smoke checks passed. The deploy is complete only
-   then.
+6. **First staging deploy (current path — direct Cloudflare Git
+   connection)**: push to the `staging` branch; Cloudflare
+   auto-builds (migrations → build → deploy). Then set the Worker
+   URL secrets (§5.6 steps 1–2 — the Worker URL is
+   `https://stackmate-api-staging.ad-dawah.workers.dev`) and trigger
+   a redeploy from the Cloudflare dashboard. Verify: migrations
+   0000–0004 applied to the staging branch, Worker deploy succeeded,
+   and both live smoke checks passed (`/api/v1/health` and `/`). The
+   deploy is complete only then. (The Actions alternative:
+   Actions → **Deploy Staging** → Run workflow → type `staging` in
+   the `confirm` input → approve the `staging` environment prompt —
+   but the workflow file is not on `main`, so it can only be
+   triggered via API dispatch for ref `staging`, not from the UI.)
