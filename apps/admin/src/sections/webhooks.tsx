@@ -1,13 +1,13 @@
 /**
  * Webhooks & Outbox (design spec §4.1/§4.2).
  *
- * Routes (registered in router.tsx by the parent after delivery):
+ * Routes (registered in router.tsx):
  *   /webhooks, /webhooks/$webhookId
  *
- * The `as never` casts on the router hooks below keep this file
- * typechecking until those routes are registered; at runtime TanStack
- * Router resolves the literal route ids once the routes exist. Remove
- * the casts when the routes are registered.
+ * Search is read with `useSearch({ strict: false })`: the route id is
+ * "/_main/webhooks" (the operational shell is a pathless `_main`
+ * layout route), so a plain-path `from: "/webhooks"` throws
+ * "Invariant failed" at render (jsdom repro 2026-11-15).
  *
  * Endpoints used (all `integrations.manage`):
  *   GET  /api/v1/admin/webhooks
@@ -67,8 +67,12 @@ import type { IntegratedSite } from "./integrations";
 /* ------------------------------------------------------------------ */
 /* Route helpers (see header note)                                     */
 /* ------------------------------------------------------------------ */
-function useRouteSearch(from: string) {
-  return useSearch({ from: from as never }) as unknown as Record<string, unknown>;
+function useRouteSearch() {
+  // No `from`: the route id is "/_main/webhooks" (pathless `_main`
+  // layout parent), so a plain-path `from: "/webhooks"` throws
+  // "Invariant failed" at render (jsdom repro 2026-11-15). Read the
+  // current route's search like the other list sections.
+  return useSearch({ strict: false }) as unknown as Record<string, unknown>;
 }
 
 function useRouteNavigate() {
@@ -178,7 +182,7 @@ function TestResultBanner({
 /* List: /webhooks                                                     */
 /* ------------------------------------------------------------------ */
 export function WebhooksSection() {
-  const rawSearch = useRouteSearch("/webhooks");
+  const rawSearch = useRouteSearch();
   const search = parseListSearch(rawSearch);
   const navigate = useRouteNavigate();
   const [registerOpen, setRegisterOpen] = useState(false);

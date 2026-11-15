@@ -1,13 +1,13 @@
 /**
  * Tracking / Meta CAPI — tracking events list (design spec §4.1).
  *
- * Route (registered in router.tsx by the parent after delivery):
+ * Route (registered in router.tsx):
  *   /tracking
  *
- * The `as never` casts on the router hooks below keep this file
- * typechecking until that route is registered; at runtime TanStack
- * Router resolves the literal route id once the route exists. Remove
- * the casts when the route is registered.
+ * Search is read with `useSearch({ strict: false })`: the route id is
+ * "/_main/tracking" (the operational shell is a pathless `_main`
+ * layout route), so a plain-path `from: "/tracking"` throws
+ * "Invariant failed" at render (jsdom repro 2026-11-15).
  *
  * Endpoint used (`tracking.manage`):
  *   GET /api/v1/admin/tracking/events
@@ -46,8 +46,12 @@ import type { IntegratedSite } from "./integrations";
 /* ------------------------------------------------------------------ */
 /* Route helpers (see header note)                                     */
 /* ------------------------------------------------------------------ */
-function useRouteSearch(from: string) {
-  return useSearch({ from: from as never }) as unknown as Record<string, unknown>;
+function useRouteSearch() {
+  // No `from`: the route id is "/_main/tracking" (pathless `_main`
+  // layout parent), so a plain-path `from: "/tracking"` throws
+  // "Invariant failed" at render (jsdom repro 2026-11-15). Read the
+  // current route's search like the other list sections.
+  return useSearch({ strict: false }) as unknown as Record<string, unknown>;
 }
 
 function useRouteNavigate() {
@@ -90,7 +94,7 @@ const STATUS_FILTERS = [
 type StatusFilter = (typeof STATUS_FILTERS)[number];
 
 export function TrackingSection() {
-  const rawSearch = useRouteSearch("/tracking");
+  const rawSearch = useRouteSearch();
   const search = parseListSearch(rawSearch);
   const navigate = useRouteNavigate();
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");

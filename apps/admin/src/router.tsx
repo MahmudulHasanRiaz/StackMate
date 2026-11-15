@@ -3,9 +3,12 @@
  *
  * Two layout routes — never both mounted at once:
  *  - _main: the operational shell (15 sections, grouped sidebar).
- *  - _settings: the DEDICATED Settings shell. Entering /settings
- *    unmounts the main menu (it collapses/hides) and opens the Settings
- *    area expanded with its own sub-menu. Leaving restores the main menu.
+ *  - /settings: the DEDICATED Settings shell (path route, no `id` —
+ *    TanStack Router forbids a route having both `id` and `path`;
+ *    2026-11-15 this threw at bundle load and blanked the whole SPA).
+ *    Entering /settings unmounts the main menu (it collapses/hides)
+ *    and opens the Settings area expanded with its own sub-menu.
+ *    Leaving restores the main menu.
  *
  * Every operational section is a route component under src/sections/
  * (one createRoute per section, list + detail where the API supports it).
@@ -295,7 +298,6 @@ const auditLogsRoute = makeListRoute("/audit-logs", AuditLogsSection);
 
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
-  id: "_settings",
   path: "/settings",
   component: SettingsShell,
 });
@@ -307,7 +309,7 @@ const settingsIndexRoute = createRoute({
 });
 
 function SettingsCategoryRoute() {
-  const { category } = useParams({ from: "/_settings/$category" });
+  const { category } = useParams({ from: "/settings/$category" });
   return <SettingsCategoryPage category={category} />;
 }
 
