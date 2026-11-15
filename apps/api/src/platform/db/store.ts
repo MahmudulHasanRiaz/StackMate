@@ -1,0 +1,811 @@
+/**
+ * Transactional Domain Store & Unit of Work.
+ * Supports ACID transactions with serialized row-level lock semantics (`withTransaction`),
+ * automatic rollback on error, idempotency record enforcement, and Hyperdrive session tracking.
+ *
+ * TEST-ONLY: StackMateDataStore is the IN-MEMORY implementation of the store
+ * contract. It must NEVER be instantiated in production paths — production
+ * must use DrizzleStore (apps/api/src/platform/db/drizzle-store.ts), the
+ * PostgreSQL-backed subclass with the same public surface. This class is
+ * kept for unit tests and for local development without a database.
+ * Production wiring (app.ts) is responsible for constructing DrizzleStore
+ * from the Hyperdrive connection string and the real R2 bucket binding.
+ */
+import { randomUUID } from "node:crypto";
+import type { R2BucketBinding } from "../../env.ts";
+import {
+  SEED_CURRENCIES,
+  SEED_PAYMENT_PROVIDERS,
+  SEED_PERMISSIONS,
+  SEED_ROLES,
+} from "../../../../../db/seeds/seed-reference.ts";
+import {
+  type Ed25519KeyMaterial,
+  generateEd25519KeyMaterial,
+  sha256Hex,
+} from "../crypto/index.ts";
+import { InMemoryR2Bucket } from "../storage/r2.ts";
+import { AppError } from "../../shared/errors.ts";
+
+export interface UserRecord {
+  id: string;
+  name: string;
+  email: string;
+  email_verified: boolean;
+  password_hash: string;
+  status: "active" | "suspended";
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SessionRecord {
+  id: string;
+  token: string;
+  user_id: string;
+  ip_address: string | null;
+  user_agent: string | null;
+  expires_at: string;
+  created_at: string;
+}
+
+export interface RoleRecord {
+  id: string;
+  key: string;
+  name: string;
+  description: string;
+  is_system: boolean;
+  permission_keys: string[];
+  created_at: string;
+}
+
+export interface UploadedAssetRecord {
+  id: string;
+  object_key: string;
+  bucket_name: string;
+  original_filename: string;
+  content_type: string;
+  byte_size: number;
+  checksum_sha256: string;
+  visibility: "private" | "public";
+  uploaded_by_user_id: string | null;
+  owner_customer_id: string | null;
+  created_at: string;
+}
+
+export interface ProductRecord {
+  id: string;
+  code: string;
+  slug: string;
+  name: string;
+  description: string | null;
+  product_type: string;
+  fulfillment_type: string;
+  distribution_channels: string[];
+  default_activation_limit: number;
+  offline_grace_hours: number;
+  status: "draft" | "active" | "archived";
+  website_url: string | null;
+  documentation_url: string | null;
+  created_by_user_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProductFeatureRecord {
+  id: string;
+  product_id: string;
+  feature_key: string;
+  name: string;
+  description: string | null;
+  value_type: "boolean" | "limit" | "quota" | "metered";
+  unit: string | null;
+  default_value: unknown;
+  status: "active" | "archived";
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProductPackageRecord {
+  id: string;
+  product_id: string;
+  package_key: string;
+  name: string;
+  description: string | null;
+  status: "draft" | "active" | "archived";
+  current_version_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PackageVersionFeatureGrant {
+  id: string;
+  package_version_id: string;
+  product_id: string;
+  product_feature_id: string;
+  feature_key_snapshot: string;
+  value_type_snapshot: "boolean" | "limit" | "quota" | "metered";
+  entitlement_value: unknown;
+  unit_snapshot: string | null;
+}
+
+export interface PackageVersionRecord {
+  id: string;
+  package_id: string;
+  product_id: string;
+  version_number: number;
+  status: "draft" | "published" | "retired";
+  change_summary: string | null;
+  features: PackageVersionFeatureGrant[];
+  published_at: string | null;
+  created_at: string;
+}
+
+export interface PackagePriceRecord {
+  id: string;
+  package_version_id: string;
+  price_key: string;
+  price_kind: "free" | "one_time" | "recurring" | "lifetime";
+  amount_minor: number;
+  currency_code: string;
+  interval_unit: "day" | "week" | "month" | "year" | null;
+  interval_count: number | null;
+  trial_days: number;
+  setup_fee_minor: number;
+  status: "active" | "inactive" | "retired";
+  used_in_orders: boolean;
+  created_at: string;
+}
+
+export interface CustomerRecord {
+  id: string;
+  customer_number: string;
+  customer_type: "person" | "business";
+  name: string;
+  email: string | null;
+  normalized_email: string | null;
+  phone: string | null;
+  normalized_phone: string | null;
+  company_name: string | null;
+  country_code: string;
+  status: "active" | "inactive" | "blocked";
+  registration_source: string;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface OrderItemSnapshotRecord {
+  id: string;
+  order_item_id: string;
+  source_type: "package_version" | "custom_offer" | "complimentary" | "manual_adjustment";
+  source_package_version_id: string | null;
+  schema_version: number;
+  snapshot_hash: string;
+  items: Array<{
+    feature_key_snapshot: string;
+    value_type_snapshot: "boolean" | "limit" | "quota" | "metered";
+    entitlement_value: unknown;
+    unit_snapshot: string | null;
+  }>;
+  created_at: string;
+}
+
+export interface OrderItemRecord {
+  id: string;
+  order_id: string;
+  product_id: string;
+  package_id: string | null;
+  package_version_id: string | null;
+  package_price_id: string | null;
+  item_kind: "package" | "custom" | "one_time_product" | "other";
+  fulfillment_type_snapshot: string;
+  product_name_snapshot: string;
+  package_name_snapshot: string | null;
+  package_version_snapshot: number | null;
+  price_kind_snapshot: "free" | "one_time" | "recurring" | "lifetime";
+  interval_unit_snapshot: "day" | "week" | "month" | "year" | null;
+  interval_count_snapshot: number | null;
+  activation_limit_snapshot: number;
+  quantity: number;
+  unit_amount_minor: number;
+  line_subtotal_minor: number;
+  line_discount_minor: number;
+  line_tax_minor: number;
+  line_total_minor: number;
+  currency_code: string;
+  entitlement_snapshot: OrderItemSnapshotRecord;
+  created_at: string;
+}
+
+export interface OrderRecord {
+  id: string;
+  order_number: string;
+  public_reference: string;
+  customer_id: string;
+  source: "admin" | "website" | "api" | "import";
+  integrated_site_id: string | null;
+  status: "draft" | "awaiting_payment" | "processing" | "completed" | "cancelled" | "failed";
+  payment_status: "unpaid" | "pending_verification" | "paid" | "partially_refunded" | "refunded";
+  currency_code: string;
+  subtotal_minor: number;
+  discount_minor: number;
+  tax_minor: number;
+  total_minor: number;
+  customer_note: string | null;
+  internal_note: string | null;
+  items: OrderItemRecord[];
+  attribution: Record<string, string | undefined> | null;
+  created_by_user_id: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  cancelled_at: string | null;
+}
+
+export interface InvoiceRecord {
+  id: string;
+  invoice_number: string;
+  customer_id: string;
+  order_id: string | null;
+  subscription_id: string | null;
+  invoice_type: "initial" | "renewal" | "adjustment" | "credit_note";
+  status: "draft" | "open" | "paid" | "void" | "uncollectible" | "partially_paid";
+  currency_code: string;
+  subtotal_minor: number;
+  discount_minor: number;
+  tax_minor: number;
+  total_minor: number;
+  amount_paid_minor: number;
+  amount_due_minor: number;
+  issued_at: string;
+  paid_at: string | null;
+  items: Array<{
+    id: string;
+    description_snapshot: string;
+    quantity: number;
+    unit_amount_minor: number;
+    line_amount_minor: number;
+    currency_code: string;
+  }>;
+  created_at: string;
+}
+
+export interface PaymentProviderRecord {
+  id: string;
+  provider_key: string;
+  display_name: string;
+  provider_type: "manual_mfs" | "manual_bank" | "automated";
+  adapter_key: string;
+  status: "enabled" | "disabled";
+}
+
+export interface PaymentMethodRecord {
+  id: string;
+  provider_id: string;
+  method_key: string;
+  display_name: string;
+  method_kind: "mfs_account" | "bank_account" | "automated_checkout";
+  account_type: "personal" | "merchant" | "agent" | null;
+  account_label: string | null;
+  instructions: string | null;
+  configuration: {
+    account_number: string;
+    account_holder_name?: string;
+    bank_name?: string;
+    branch_name?: string;
+    routing_number?: string;
+    transaction_id_requirement: "required" | "optional" | "disabled";
+  };
+  transfer_rails: Array<"npsb" | "beftn" | "rtgs">;
+  is_enabled: boolean;
+  sort_order: number;
+  created_at: string;
+}
+
+export interface PaymentSubmissionRecord {
+  id: string;
+  order_id: string;
+  customer_id: string;
+  payment_method_id: string;
+  amount_minor: number;
+  currency_code: string;
+  sender_name: string | null;
+  sender_phone: string | null;
+  sender_bank_name: string | null;
+  sender_account_reference: string | null;
+  transfer_rail_key: string | null;
+  transaction_reference: string | null;
+  normalized_transaction_reference: string | null;
+  payment_date: string | null; // ISO YYYY-MM-DD
+  proof_asset_id: string | null;
+  duplicate_risk_Warning: boolean;
+  status: "submitted" | "under_review" | "approved" | "rejected" | "cancelled";
+  customer_note: string | null;
+  submitted_at: string;
+  reviewed_at: string | null;
+  reviewed_by_user_id: string | null;
+}
+
+export interface PaymentTransactionRecord {
+  id: string;
+  order_id: string;
+  payment_method_id: string | null;
+  payment_submission_id: string | null;
+  provider_id: string;
+  provider_transaction_id: string | null;
+  amount_minor: number;
+  currency_code: string;
+  status: "succeeded" | "pending" | "failed" | "partially_refunded" | "refunded";
+  paid_at: string;
+  verified_by_user_id: string | null;
+  verification_source: "manual_staff" | "provider_webhook" | "provider_query" | "import";
+  created_at: string;
+}
+
+export interface PaymentVerificationLogRecord {
+  id: string;
+  payment_submission_id: string;
+  actor_user_id: string;
+  decision: "approved" | "rejected" | "requested_information" | "reopened";
+  reason_code: string | null;
+  customer_message: string | null;
+  notes: string | null;
+  created_at: string;
+}
+
+export interface SubscriptionPeriodRecord {
+  id: string;
+  subscription_id: string;
+  period_number: number;
+  period_start: string;
+  period_end: string;
+  status: "pending" | "active" | "completed" | "void" | "failed";
+  renewal_order_id: string | null;
+  invoice_id: string | null;
+  payment_transaction_id: string | null;
+  activated_at: string | null;
+  created_at: string;
+}
+
+export interface SubscriptionRecord {
+  id: string;
+  subscription_number: string;
+  customer_id: string;
+  product_id: string;
+  source_order_item_id: string | null;
+  source_package_version_id: string | null;
+  status: "trialing" | "pending" | "active" | "past_due" | "paused" | "cancelled" | "expired";
+  billing_kind: "one_time" | "recurring" | "lifetime" | "custom";
+  interval_unit: "day" | "week" | "month" | "year" | null;
+  interval_count: number | null;
+  currency_code: string;
+  unit_amount_minor: number;
+  current_period_start: string | null;
+  current_period_end: string | null;
+  next_renewal_at: string | null;
+  cancel_at_period_end: boolean;
+  cancelled_at: string | null;
+  periods: SubscriptionPeriodRecord[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface LicenseEntitlementSnapshotRecord {
+  id: string;
+  license_id: string;
+  version_number: number;
+  source_type: "order_item" | "subscription_period" | "manual_grant" | "admin_adjustment";
+  effective_at: string;
+  reason: string | null;
+  snapshot_hash: string;
+  items: Array<{
+    feature_key_snapshot: string;
+    value_type_snapshot: "boolean" | "limit" | "quota" | "metered";
+    entitlement_value: unknown;
+    unit_snapshot: string | null;
+  }>;
+  created_by_user_id: string | null;
+  created_at: string;
+}
+
+export interface LicenseActivationRecord {
+  id: string;
+  license_id: string;
+  installation_id_hash: string;
+  domain_normalized: string | null;
+  environment: "production" | "staging" | "development" | "other";
+  status: "active" | "deactivated" | "blocked";
+  activated_at: string;
+  last_seen_at: string;
+  deactivated_at: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface LicenseRecord {
+  id: string;
+  license_number: string;
+  product_id: string;
+  customer_id: string;
+  source_order_item_id: string | null;
+  subscription_id: string | null;
+  license_key_hash: string;
+  license_key_hint: string;
+  issued_raw_key_once?: string; // Available only in issuance transaction response, never persisted in DB table
+  status: "pending" | "active" | "expired" | "suspended" | "revoked";
+  activation_limit: number;
+  valid_from: string;
+  expires_at: string | null;
+  grace_until: string | null;
+  current_entitlement_snapshot_id: string;
+  snapshots: LicenseEntitlementSnapshotRecord[];
+  activations: LicenseActivationRecord[];
+  issued_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface IntegratedSiteRecord {
+  id: string;
+  site_key: string;
+  name: string;
+  environment: "production" | "staging" | "development";
+  status: "pending_verification" | "active" | "suspended" | "revoked";
+  api_version: string;
+  allowed_capabilities: string[];
+  product_ids: string[];
+  domains: Array<{
+    id: string;
+    domain: string;
+    verification_method: "dns_txt" | "http_file" | "manual_review";
+    verification_challenge: string;
+    verification_status: "pending" | "verified" | "failed";
+    verified_at: string | null;
+    is_primary: boolean;
+  }>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SiteCredentialRecord {
+  id: string;
+  integrated_site_id: string;
+  key_id: string;
+  credential_type: "public_key" | "bearer_secret" | "hmac_shared_secret" | "public_signing_key";
+  secret_hash: string | null;
+  secret_ciphertext: string | null;
+  encryption_key_version: string | null;
+  scopes: string[];
+  status: "active" | "rotated" | "revoked" | "expired";
+  created_at: string;
+  revoked_at: string | null;
+  last_used_at: string | null;
+}
+
+export interface TrackingConfigRecord {
+  id: string;
+  integrated_site_id: string;
+  provider: "meta";
+  pixel_id: string;
+  access_token_ciphertext: string;
+  encryption_key_version: string;
+  test_event_code: string | null;
+  enabled_events: string[];
+  status: "enabled" | "disabled";
+  created_at: string;
+  updated_at: string;
+  rotated_at: string | null;
+}
+
+export interface TrackingEventRecord {
+  id: string;
+  integrated_site_id: string;
+  event_name: string;
+  event_id: string;
+  event_time: string;
+  event_source_url: string | null;
+  order_id: string | null;
+  consent_state: "granted" | "denied";
+  consent_policy_version: string;
+  sanitized_payload: Record<string, unknown>;
+  status: "received" | "queued" | "processed" | "rejected";
+  delivery_attempts: number;
+  delivered_at: string | null;
+  created_at: string;
+}
+
+export interface WebhookEndpointRecord {
+  id: string;
+  integrated_site_id: string | null;
+  url: string;
+  description: string;
+  subscribed_events: string[];
+  status: "active" | "disabled" | "revoked";
+  secret_key_id: string;
+  secret_ciphertext: string;
+  key_version: string;
+  created_at: string;
+}
+
+export interface OutboxEventRecord {
+  id: string;
+  event_key: string;
+  aggregate_type: string;
+  aggregate_id: string;
+  event_type: string;
+  payload: Record<string, unknown>;
+  status: "pending" | "processing" | "delivered" | "dead_letter";
+  attempt_count: number;
+  available_at: string;
+  locked_until: string | null;
+  locked_by: string | null;
+  last_error_code: string | null;
+  created_at: string;
+  processed_at: string | null;
+}
+
+export interface IdempotencyRecord {
+  id: string;
+  scope_key: string;
+  idempotency_key: string;
+  request_hash: string;
+  status: "processing" | "completed" | "failed";
+  response_status: number;
+  response_body: unknown;
+  expires_at: string;
+  created_at: string;
+}
+
+export interface AuditLogRecord {
+  id: string;
+  actor_type: "staff" | "system" | "integration";
+  actor_user_id: string | null;
+  integrated_site_id: string | null;
+  action: string;
+  resource_type: string;
+  resource_id: string;
+  outcome: "success" | "denied" | "failed";
+  request_id: string;
+  changes: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface DatabaseState {
+  users: UserRecord[];
+  sessions: SessionRecord[];
+  roles: RoleRecord[];
+  user_roles: Array<{ user_id: string; role_id: string; assigned_at: string }>;
+  uploaded_assets: UploadedAssetRecord[];
+  products: ProductRecord[];
+  product_features: ProductFeatureRecord[];
+  product_packages: ProductPackageRecord[];
+  package_versions: PackageVersionRecord[];
+  package_prices: PackagePriceRecord[];
+  customers: CustomerRecord[];
+  orders: OrderRecord[];
+  invoices: InvoiceRecord[];
+  payment_providers: PaymentProviderRecord[];
+  payment_methods: PaymentMethodRecord[];
+  payment_submissions: PaymentSubmissionRecord[];
+  payment_transactions: PaymentTransactionRecord[];
+  payment_verification_logs: PaymentVerificationLogRecord[];
+  subscriptions: SubscriptionRecord[];
+  licenses: LicenseRecord[];
+  integrated_sites: IntegratedSiteRecord[];
+  site_credentials: SiteCredentialRecord[];
+  request_nonces: Array<{ credential_id: string; nonce: string; expires_at: string }>;
+  tracking_configurations: TrackingConfigRecord[];
+  tracking_events: TrackingEventRecord[];
+  webhook_endpoints: WebhookEndpointRecord[];
+  webhook_deliveries: Array<{
+    id: string;
+    webhook_endpoint_id: string;
+    event_id: string;
+    delivery_id: string;
+    status: "pending" | "delivered" | "retrying" | "failed";
+    attempt_count: number;
+    last_http_status: number | null;
+    delivered_at: string | null;
+  }>;
+  outbox_events: OutboxEventRecord[];
+  idempotency_records: IdempotencyRecord[];
+  audit_logs: AuditLogRecord[];
+  sequence_counters: {
+    customer: number;
+    order: number;
+    invoice: number;
+    subscription: number;
+    license: number;
+  };
+}
+
+export class StackMateDataStore {
+  public state: DatabaseState;
+  /**
+   * Object-storage bucket for private payment evidence. Typed as the
+   * R2BucketBinding interface (not the in-memory implementation) so a real
+   * Cloudflare R2 binding can be substituted by DrizzleStore in production.
+   * The base class still constructs an InMemoryR2Bucket by default — see
+   * DrizzleStore.usesInMemoryBucket / requireRealBucket().
+   */
+  public r2Bucket: R2BucketBinding;
+  public readonly signingKeys: Map<string, Ed25519KeyMaterial>;
+  public activeSigningKeyId: string;
+  private txMutex: Promise<void> = Promise.resolve();
+  public queryMetrics = {
+    uncachedQueries: 0,
+    cachedQueries: 0,
+    transactionsCommitted: 0,
+    transactionsRolledBack: 0,
+  };
+
+  constructor(initialSigningKeyId = "sm-ed25519-2026-11") {
+    this.r2Bucket = new InMemoryR2Bucket();
+    this.signingKeys = new Map();
+    const keyMat = generateEd25519KeyMaterial(initialSigningKeyId);
+    this.signingKeys.set(initialSigningKeyId, keyMat);
+    this.activeSigningKeyId = initialSigningKeyId;
+
+    this.state = {
+      users: [],
+      sessions: [],
+      roles: SEED_ROLES.map((r) => ({
+        id: r.id,
+        key: r.key,
+        name: r.name,
+        description: r.description,
+        is_system: r.is_system,
+        permission_keys: [...r.permissions],
+        created_at: new Date().toISOString(),
+      })),
+      user_roles: [],
+      uploaded_assets: [],
+      products: [],
+      product_features: [],
+      product_packages: [],
+      package_versions: [],
+      package_prices: [],
+      customers: [],
+      orders: [],
+      invoices: [],
+      payment_providers: SEED_PAYMENT_PROVIDERS.map((p) => ({ ...p })),
+      payment_methods: [],
+      payment_submissions: [],
+      payment_transactions: [],
+      payment_verification_logs: [],
+      subscriptions: [],
+      licenses: [],
+      integrated_sites: [],
+      site_credentials: [],
+      request_nonces: [],
+      tracking_configurations: [],
+      tracking_events: [],
+      webhook_endpoints: [],
+      webhook_deliveries: [],
+      outbox_events: [],
+      idempotency_records: [],
+      audit_logs: [],
+      sequence_counters: {
+        customer: 1000,
+        order: 10000,
+        invoice: 20000,
+        subscription: 30000,
+        license: 40000,
+      },
+    };
+  }
+
+  public get allPermissions() {
+    return SEED_PERMISSIONS;
+  }
+
+  public get allCurrencies() {
+    return SEED_CURRENCIES;
+  }
+
+  public getActiveSigningKey(): Ed25519KeyMaterial {
+    const k = this.signingKeys.get(this.activeSigningKeyId);
+    if (!k) throw new Error("Active Ed25519 signing key not found.");
+    return k;
+  }
+
+  public rotateSigningKey(newKeyId: string): Ed25519KeyMaterial {
+    if (this.signingKeys.has(newKeyId)) {
+      throw new AppError("CONFLICT", `Signing key ID '${newKeyId}' already exists.`, 409);
+    }
+    const nextKey = generateEd25519KeyMaterial(newKeyId);
+    this.signingKeys.set(newKeyId, nextKey);
+    this.activeSigningKeyId = newKeyId;
+    return nextKey;
+  }
+
+  /**
+   * Executes an atomic, serialized transaction with snapshot rollback on error.
+   * Simulates PostgreSQL transaction isolation & row-level `SELECT ... FOR UPDATE` locking.
+   */
+  public async withTransaction<T>(fn: (state: DatabaseState) => Promise<T> | T): Promise<T> {
+    let releaseLock!: () => void;
+    const prevMutex = this.txMutex;
+    this.txMutex = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+
+    await prevMutex;
+    this.queryMetrics.uncachedQueries += 1;
+    const snapshotJson = JSON.stringify(this.state);
+    try {
+      const result = await fn(this.state);
+      this.queryMetrics.transactionsCommitted += 1;
+      return result;
+    } catch (error) {
+      this.state = JSON.parse(snapshotJson) as DatabaseState;
+      this.queryMetrics.transactionsRolledBack += 1;
+      throw error;
+    } finally {
+      releaseLock();
+    }
+  }
+
+  /**
+   * Executes a deterministic idempotent command (Database Design §18.5, API Spec §20).
+   */
+  public async executeIdempotent<T>(
+    scopeKey: string,
+    idempotencyKey: string,
+    requestPayload: unknown,
+    statusCode: number,
+    fn: (state: DatabaseState) => Promise<T> | T
+  ): Promise<{ status: number; body: T; replayed: boolean }> {
+    const trimmedKey = idempotencyKey.trim();
+    if (trimmedKey.length < 8 || trimmedKey.length > 128) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        "Idempotency-Key header must be between 8 and 128 characters.",
+        400
+      );
+    }
+    const requestHash = sha256Hex(JSON.stringify(requestPayload ?? {}));
+
+    return this.withTransaction(async (state) => {
+      const existing = state.idempotency_records.find(
+        (r) => r.scope_key === scopeKey && r.idempotency_key === trimmedKey
+      );
+      if (existing) {
+        if (existing.request_hash !== requestHash) {
+          throw new AppError(
+            "IDEMPOTENCY_KEY_REUSED",
+            "Idempotency-Key was already used with a different request payload.",
+            409
+          );
+        }
+        if (existing.status === "processing") {
+          throw new AppError(
+            "IDEMPOTENCY_IN_PROGRESS",
+            "A request with this Idempotency-Key is currently processing.",
+            409
+          );
+        }
+        return {
+          status: existing.response_status,
+          body: existing.response_body as T,
+          replayed: true,
+        };
+      }
+
+      const body = await fn(state);
+      state.idempotency_records.push({
+        id: randomUUID(),
+        scope_key: scopeKey,
+        idempotency_key: trimmedKey,
+        request_hash: requestHash,
+        status: "completed",
+        response_status: statusCode,
+        response_body: body,
+        expires_at: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
+        created_at: new Date().toISOString(),
+      });
+
+      return { status: statusCode, body, replayed: false };
+    });
+  }
+}

@@ -1,0 +1,40 @@
+# ADR-0005: Cloudflare Hyperdrive, PostgreSQL Driver Selection, and Query Caching Strategy
+
+- **Status:** Accepted
+- **Date:** 15 November 2026
+- **Decision owners:** StackMate product and engineering
+- **Related specifications:** PRD §2.3, §2.4; TAD §7.3, §17.3; Database Design §21; Security & Threat Model §4.1, §4.4
+
+## Context
+
+StackMate runs its backend API on Cloudflare Workers with Neon PostgreSQL as the primary database and Drizzle ORM as the query and schema layer. The product owner has mandated using **Cloudflare Hyperdrive from day one** for connection pooling and supported query caching between Cloudflare Workers and Neon PostgreSQL.
+
+At the same time:
+1. Cloudflare Workers prohibit sharing open TCP sockets (`pg.Pool` / `pg.Client`) across distinct incoming requests at module scope ([Better Auth Cloudflare Guide](https://better-auth.com/docs/guides/cloudflare)).
+2. Official Cloudflare Hyperdrive documentation explicitly warns that pairing Drizzle ORM with `postgres.js` over Hyperdrive is not supported and mandates using `node-postgres` (`pg` `> 8.16.3`) with the `nodejs_compat` compatibility flag ([Cloudflare Hyperdrive Drizzle ORM Docs](https://developers.cloudflare.com/hyperdrive/examples/connect-to-postgres/postgres-drivers-and-libraries/drizzle-orm/)).
+3. Hyperdrive caches eligible read-only (`SELECT`) queries by default (`max_age = 60s`, `stale_while_revalidate = 15s`) and **does not purge or invalidate cached read results on writes** ([Cloudflare Hyperdrive Query Caching Docs](https://developers.cloudflare.com/hyperdrive/concepts/query-caching/)). Serving authentication sessions, RBAC permissions, order status, payment verification queues, or license activations from a cached Hyperdrive binding would introduce severe security and financial consistency bugs.
+
+## Decision
+
+1. **Driver & ORM Selection:** Use `drizzle-orm/node-postgres` with `pg` (`>= 8.16.3`, pinned at `^8.20.0`) and `"compatibility_flags": ["nodejs_compat"]`, `"compatibility_date": "2026-11-15"` in `apps/api/wrangler.jsonc`.
+2. **Dual Hyperdrive Bindings (Cache-Disabled Default + Cached Read Binding):**
+   - `HYPERDRIVE_NO_CACHE`: Configured with `--caching-disabled`. Used as the **authoritative default connection** for all authentication, session lookup, RBAC permission resolution, admin mutations and reads-after-write, order creation, manual payment submission and approval, subscription periods, license activation/validation, idempotency checks, and transactional outbox processing.
+   - `HYPERDRIVE_CACHED`: Configured with Hyperdrive query caching enabled (`max_age = 60s`, `stale_while_revalidate = 15s`). Used **exclusively** for explicitly opt-in, staleness-tolerant read queries (such as public product catalog listings `/api/v1/public/sites/:siteKey/products` and historical dashboard aggregate summaries). If `HYPERDRIVE_CACHED` is not bound in an environment, the database factory safely falls back to `HYPERDRIVE_NO_CACHE`.
+3. **Request-Scoped Connection Lifecycle:**
+   - Never instantiate a global `Client` or `Pool` at module scope in the Worker.
+   - Inside each request context, `createRequestDatabaseContext(env, ctx)` lazily creates a request-scoped `pg.Client` (or single-connection pool) connected to `env.HYPERDRIVE_NO_CACHE.connectionString` (and optionally `env.HYPERDRIVE_CACHED.connectionString` when a cacheable public read is requested), and registers `ctx.waitUntil(client.end())` after request completion so connections are cleanly returned to Hyperdrive's edge transaction pool.
+4. **Interactive Transactions & Row Locking:**
+   - Multi-statement business operations (`ApprovePayment`, `RejectPayment`, `CreateOrder`, `ActivateLicense`, `RenewSubscription`, `ClaimOutboxBatch`) run inside `db.transaction(async (tx) => { ... })` on the `HYPERDRIVE_NO_CACHE` client.
+   - Because Hyperdrive operates in transaction pooling mode, all statements between `BEGIN` and `COMMIT`/`ROLLBACK` (including `SELECT ... FOR UPDATE` and `FOR UPDATE SKIP LOCKED`) execute on the same pinned backend PostgreSQL connection.
+   - Never perform external HTTP calls (Meta CAPI, outbound webhooks, email APIs, R2 uploads) inside a `db.transaction()` block.
+5. **Migration Connection Separation:**
+   - Database migrations (`pnpm run db:migrate:deploy`) run in CI/CD before `wrangler deploy` using a direct Neon PostgreSQL connection string (`DATABASE_MIGRATION_URL`, with `pg_try_advisory_lock`) rather than through Hyperdrive's transaction pooler.
+6. **Plan Limits & Operational Headroom:**
+   - Per [Cloudflare Hyperdrive Pricing Docs](https://developers.cloudflare.com/hyperdrive/platform/pricing/), the Workers Free plan limits Hyperdrive to **100,000 queries/day** (counting both cached and uncached queries and mutations, resetting at `00:00 UTC`), whereas the Workers Paid plan includes **Unlimited** Hyperdrive queries at no extra cost.
+   - Because two Hyperdrive configurations (`HYPERDRIVE_NO_CACHE` and `HYPERDRIVE_CACHED`) each maintain their own connection pool against Neon, configure origin pool sizes so their combined `max_size` stays comfortably below Neon's `max_connections` limit, leaving headroom for migrations and administrative access.
+
+## Consequences
+
+- Zero cross-request I/O violations in Cloudflare Workers.
+- Immediate read-after-write consistency for all security, auth, financial, and licensing operations via `HYPERDRIVE_NO_CACHE`.
+- Sub-millisecond edge query caching for high-traffic public catalog reads on external landing pages via `HYPERDRIVE_CACHED`.
