@@ -3,5 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "description": "Centralized product, licensing, subscription and commerce platform",
-  "scripts": {}
+  "scripts": {
+    "validate:repo": "node scripts/validate-repo.mjs"
+  }
 }

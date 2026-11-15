@@ -1,13 +1,8 @@
 # Architecture Decision Records
 
-Record accepted technical decisions here. Use one file per decision, for example ADR-0001-neon-connection-strategy.md.
+Accepted and proposed architecture decisions are recorded here.
 
-Each ADR should include:
-- Status: proposed, accepted, superseded, or rejected.
-- Context and constraints.
-- Options considered.
-- Decision and rationale.
-- Consequences and trade-offs.
-- Evidence, tests, and links to affected specifications.
-
-Do not use an ADR to silently change product behavior; product changes require product-owner approval.
+- [ADR-0001: Date, Time, and Display Format](ADR-0001-date-time-and-display-format.md)
+- [ADR-0002: CI/CD and Database Migration Safety](ADR-0002-ci-cd-and-database-migrations.md)
+- [ADR-0003: Digital Services Marketplace Extensibility](ADR-0003-digital-services-marketplace-extensibility.md)
+- [ADR template](ADR-TEMPLATE.md)
