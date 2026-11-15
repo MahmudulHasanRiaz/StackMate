@@ -19,13 +19,15 @@ See docs/README.md for links.
 
 ## Stage 0 checklist
 
-- [ ] Root README and agent instructions.
-- [ ] pnpm workspace and package manager configuration.
-- [ ] Admin/API/contracts skeleton.
-- [ ] Database schema/migration directory and Drizzle configuration.
-- [ ] Environment template and gitignore.
+- [x] Root README and agent instructions.
+- [x] Initial pnpm workspace and root TypeScript baseline.
+- [x] Admin/API/contracts directory placeholders.
+- [x] Database workspace placeholder.
+- [x] Environment template and gitignore.
+- [ ] Runnable admin/API source skeleton and package manifests.
+- [ ] Drizzle configuration after database connectivity spike.
 - [ ] CI checks.
-- [ ] Clean install and build evidence.
+- [ ] Clean install, typecheck, lint, tests, and build evidence.
 
 ## Technical spikes
 
