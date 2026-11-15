@@ -229,3 +229,29 @@ export const CreatePackagePriceSchema = v
     }
     return true;
   }, "Price interval configuration does not match price_kind rules (Database Design §10.4).");
+
+/**
+ * Feature key and value_type are deliberately NOT updatable (API Spec §9.2):
+ * a feature used by a published package or license snapshot must not be
+ * silently renamed or retyped.
+ */
+export const UpdateProductFeatureSchema = v.object({
+  name: v.string().trim().min(2).max(160).optional(),
+  description: v.string().trim().max(2000).nullable().optional(),
+  unit: v.string().trim().max(50).nullable().optional(),
+  default_value: v.unknown().optional(),
+});
+
+export const UpdateProductPackageSchema = v.object({
+  name: v.string().trim().min(2).max(160).optional(),
+  description: v.string().trim().max(2000).nullable().optional(),
+});
+
+export const UpdatePackagePriceSchema = v.object({
+  amount_minor: v.number().int().nonnegative().optional(),
+  currency_code: v.string().trim().min(3).max(3).optional(),
+  interval_unit: v.enum(INTERVAL_UNITS).nullable().optional(),
+  interval_count: v.number().int().positive().nullable().optional(),
+  trial_days: v.number().int().nonnegative().optional(),
+  setup_fee_minor: v.number().int().nonnegative().optional(),
+});

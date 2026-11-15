@@ -87,3 +87,63 @@ export const RegisterWebhookEndpointSchema = v.object({
   description: v.string().trim().min(2).max(160),
   subscribed_events: v.array(v.string().trim().min(3).max(80), { min: 1 }),
 });
+
+export const SITE_CAPABILITIES = [
+  "catalog.read",
+  "checkout.create",
+  "orders.read:own",
+  "orders.cancel:own",
+  "tracking.events.write",
+  "webhooks.test",
+] as const;
+
+export const UpdateIntegratedSiteSchema = v.object({
+  name: v.string().trim().min(2).max(160).optional(),
+  environment: v.enum(SITE_ENVIRONMENTS).optional(),
+  api_version: v.string().trim().min(1).max(30).optional(),
+  allowed_capabilities: v.array(v.enum(SITE_CAPABILITIES)).optional(),
+});
+
+export const DOMAIN_VERIFICATION_METHODS = ["dns_txt", "http_file", "manual_review"] as const;
+
+export const RegisterSiteDomainSchema = v.object({
+  domain: v.string().trim().min(3).max(253),
+  verification_method: v.enum(DOMAIN_VERIFICATION_METHODS).default("dns_txt"),
+  is_primary: v.boolean().default(false),
+});
+
+export const VerifySiteDomainSchema = v.object({
+  method: v.enum(DOMAIN_VERIFICATION_METHODS),
+  reviewer_note: v.string().trim().min(2).max(1000).optional(),
+});
+
+export const CreateRoleSchema = v.object({
+  key: v
+    .string()
+    .trim()
+    .toLowerCase()
+    .min(2)
+    .max(60)
+    .regex(/^[a-z][a-z0-9_]*$/, "Role key must start with a lowercase letter and use snake_case."),
+  name: v.string().trim().min(2).max(160),
+  description: v.string().trim().max(500).optional(),
+  permissions: v.array(v.string().trim().min(2).max(80)).default([]),
+});
+
+export const UpdateRoleSchema = v.object({
+  name: v.string().trim().min(2).max(160).optional(),
+  description: v.string().trim().max(500).nullable().optional(),
+  permissions: v.array(v.string().trim().min(2).max(80)).optional(),
+});
+
+export const CreateStaffInvitationSchema = v.object({
+  name: v.string().trim().min(2).max(200),
+  email: v.string().trim().email(),
+  role_keys: v.array(v.string().trim().min(2).max(80), { min: 1 }),
+});
+
+export const AcceptStaffInvitationSchema = v.object({
+  token: v.string().trim().min(32).max(200),
+  name: v.string().trim().min(2).max(200),
+  password: v.string().min(10).max(200),
+});

@@ -35,6 +35,7 @@
  */
 import { describe, it, beforeAll, afterAll } from "vitest";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -108,6 +109,8 @@ describe.skipIf(!DATABASE_URL)("Business workflows (Postgres)", () => {
   let grantLicenseKey = "";
   let renewalOrderId = "";
   let renewalReference = "";
+  let b1CancelKeyId = ""; // Batch 1: credential minted with orders.cancel:own
+  let b1CancelSecret = "";
 
   type ApiOpts = {
     method?: string;
@@ -1536,6 +1539,870 @@ describe.skipIf(!DATABASE_URL)("Business workflows (Postgres)", () => {
     assert.equal(
       await countWhere("payment_submissions", "order_id = $1", [adminOrderId]),
       0
+    );
+  }, 30_000);
+
+  // -------------------------------------------------------------------------
+  // Batch 1 — Admin completion (API). Tests 21-29 cover the endpoints added
+  // for the admin panel: customer update + per-customer collections,
+  // order/invoice lifecycle, payment provider/method writes + staff-recorded
+  // claims, subscription/license detail + activation deactivate, site
+  // lifecycle/products/credentials/domains, webhook test + outbox replay,
+  // public/server detail + cancel, feature/package/price writes, roles and
+  // the invitation 503 guard (see test 29 note).
+  // -------------------------------------------------------------------------
+
+  it("21. Batch 1 customers: PATCH update + per-customer collections; read-only cannot write", async () => {
+    const patched = await apiRequest(`/api/v1/admin/customers/${customerId}`, {
+      method: "PATCH",
+      cookie: superCookie,
+      body: { name: "Tanvir Rahman (Updated)", phone: "+8801812345678" },
+    });
+    assert.equal(patched.status, 200, JSON.stringify(patched.body));
+    assert.equal(patched.body.data.name, "Tanvir Rahman (Updated)");
+    assert.equal(
+      (await one("SELECT name FROM customers WHERE id = $1", [customerId])).name,
+      "Tanvir Rahman (Updated)"
+    );
+    const forbidden = await apiRequest(`/api/v1/admin/customers/${customerId}`, {
+      method: "PATCH",
+      cookie: readOnlyCookie,
+      body: { name: "Nope" },
+    });
+    assert.equal(forbidden.status, 403, JSON.stringify(forbidden.body));
+
+    const orders = await apiRequest(`/api/v1/admin/customers/${customerId}/orders`, {
+      cookie: superCookie,
+    });
+    assert.equal(orders.status, 200, JSON.stringify(orders.body));
+    assert.ok(orders.body.data.items.length >= 1, "admin customer must have orders");
+    const subs = await apiRequest(
+      `/api/v1/admin/customers/${workflowCustomerId}/subscriptions`,
+      { cookie: superCookie }
+    );
+    assert.equal(subs.status, 200, JSON.stringify(subs.body));
+    assert.ok(subs.body.data.items.length >= 1, "checkout customer must have subscriptions");
+    const lics = await apiRequest(`/api/v1/admin/customers/${workflowCustomerId}/licenses`, {
+      cookie: superCookie,
+    });
+    assert.equal(lics.status, 200, JSON.stringify(lics.body));
+    assert.ok(lics.body.data.items.length >= 1, "checkout customer must have licenses");
+    assert.ok(!("license_key_hash" in lics.body.data.items[0]));
+    const ghost = await apiRequest(
+      "/api/v1/admin/customers/00000000-0000-4000-8000-000000000000/orders",
+      { cookie: superCookie }
+    );
+    assert.equal(ghost.status, 404, JSON.stringify(ghost.body));
+  }, 30_000);
+
+  it("22. Batch 1 orders/invoices: invoice 409 while live, void then create, complete guard, cancel", async () => {
+    const created = await apiRequest("/api/v1/admin/orders", {
+      method: "POST",
+      cookie: superCookie,
+      body: {
+        customer_id: customerId,
+        product_id: productId,
+        item_kind: "package",
+        package_version_id: versionId,
+        package_price_id: priceId,
+        quantity: 1,
+      },
+    });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const orderId = created.body.data.order.id as string;
+
+    // A second invoice while the initial one is live -> 409.
+    const dup = await apiRequest(`/api/v1/admin/orders/${orderId}/invoices`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {},
+    });
+    assert.equal(dup.status, 409, JSON.stringify(dup.body));
+
+    const list = await apiRequest(`/api/v1/admin/orders/${orderId}/invoices`, {
+      cookie: superCookie,
+    });
+    assert.equal(list.status, 200, JSON.stringify(list.body));
+    assert.equal(list.body.data.items.length, 1, "exactly the initial invoice");
+    const invoiceId = list.body.data.items[0].id as string;
+    const detail = await apiRequest(`/api/v1/admin/invoices/${invoiceId}`, {
+      cookie: superCookie,
+    });
+    assert.equal(detail.status, 200, JSON.stringify(detail.body));
+    assert.equal(detail.body.data.order.id, orderId);
+
+    // Void the open initial invoice, then a new one can be created.
+    const voided = await apiRequest(`/api/v1/admin/invoices/${invoiceId}/void`, {
+      method: "POST",
+      cookie: superCookie,
+      body: { reason: "B1 test void" },
+    });
+    assert.equal(voided.status, 200, JSON.stringify(voided.body));
+    assert.equal(voided.body.data.status, "void");
+    const created2 = await apiRequest(`/api/v1/admin/orders/${orderId}/invoices`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {},
+    });
+    assert.equal(created2.status, 201, JSON.stringify(created2.body));
+
+    // Complete is blocked while the order is unpaid.
+    const complete = await apiRequest(`/api/v1/admin/orders/${orderId}/complete`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {},
+    });
+    assert.equal(complete.status, 409, JSON.stringify(complete.body));
+
+    // Cancel works on an unpaid order and enqueues order.cancelled.
+    const cancelled = await apiRequest(`/api/v1/admin/orders/${orderId}/cancel`, {
+      method: "POST",
+      cookie: superCookie,
+      body: { reason: "B1 test cancel" },
+    });
+    assert.equal(cancelled.status, 200, JSON.stringify(cancelled.body));
+    assert.equal(cancelled.body.data.status, "cancelled");
+    assert.equal(
+      (await one("SELECT status FROM orders WHERE id = $1", [orderId])).status,
+      "cancelled"
+    );
+    assert.ok(
+      (await countWhere("outbox_events", "event_type = $1 AND aggregate_id = $2", [
+        "order.cancelled",
+        orderId,
+      ])) >= 1
+    );
+    const again = await apiRequest(`/api/v1/admin/orders/${orderId}/cancel`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {},
+    });
+    assert.equal(again.status, 409, JSON.stringify(again.body));
+  }, 30_000);
+
+  it("23. Batch 1 payment providers/methods + staff-recorded claim", async () => {
+    const prov = await apiRequest("/api/v1/admin/payment-providers", {
+      method: "POST",
+      cookie: superCookie,
+      body: {
+        provider_key: "nagad-manual-b1",
+        display_name: "Nagad Manual B1",
+        provider_type: "manual_mfs",
+        adapter_key: "nagad_manual",
+      },
+    });
+    assert.equal(prov.status, 201, JSON.stringify(prov.body));
+    const providerId = prov.body.data.id as string;
+    const patchedProv = await apiRequest(`/api/v1/admin/payment-providers/${providerId}`, {
+      method: "PATCH",
+      cookie: superCookie,
+      body: { display_name: "Nagad Manual B1 (Renamed)" },
+    });
+    assert.equal(patchedProv.status, 200, JSON.stringify(patchedProv.body));
+    assert.equal(patchedProv.body.data.display_name, "Nagad Manual B1 (Renamed)");
+
+    const methodId = (
+      await one("SELECT id FROM payment_methods WHERE method_key = $1", [
+        "bkash-merchant-main",
+      ])
+    ).id as string;
+    const mDetail = await apiRequest(`/api/v1/admin/payment-methods/${methodId}`, {
+      cookie: superCookie,
+    });
+    assert.equal(mDetail.status, 200, JSON.stringify(mDetail.body));
+    const mPatched = await apiRequest(`/api/v1/admin/payment-methods/${methodId}`, {
+      method: "PATCH",
+      cookie: superCookie,
+      body: { display_name: "bKash Merchant Payment (B1)" },
+    });
+    assert.equal(mPatched.status, 200, JSON.stringify(mPatched.body));
+    const disabled = await apiRequest(`/api/v1/admin/payment-methods/${methodId}/disable`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {},
+    });
+    assert.equal(disabled.status, 200, JSON.stringify(disabled.body));
+    assert.equal(disabled.body.data.is_enabled, false);
+    const enabled = await apiRequest(`/api/v1/admin/payment-methods/${methodId}/enable`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {},
+    });
+    assert.equal(enabled.status, 200, JSON.stringify(enabled.body));
+    assert.equal(enabled.body.data.is_enabled, true);
+
+    // Submission detail + verification history (approved submission, tests 6/7).
+    const sDetail = await apiRequest(`/api/v1/admin/payment-submissions/${submissionId}`, {
+      cookie: superCookie,
+    });
+    assert.equal(sDetail.status, 200, JSON.stringify(sDetail.body));
+    assert.equal(sDetail.body.data.status, "approved");
+    const sHistory = await apiRequest(
+      `/api/v1/admin/payment-submissions/${submissionId}/history`,
+      { cookie: superCookie }
+    );
+    assert.equal(sHistory.status, 200, JSON.stringify(sHistory.body));
+    assert.ok(sHistory.body.data.items.length >= 1);
+
+    // Staff-recorded claim on a fresh unpaid order: lands pending_verification,
+    // never paid.
+    const created = await apiRequest("/api/v1/admin/orders", {
+      method: "POST",
+      cookie: superCookie,
+      body: {
+        customer_id: customerId,
+        product_id: productId,
+        item_kind: "package",
+        package_version_id: versionId,
+        package_price_id: priceId,
+        quantity: 1,
+      },
+    });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const orderId = created.body.data.order.id as string;
+    const claim = await apiRequest(`/api/v1/admin/orders/${orderId}/payment-submissions`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {
+        payment_method_id: methodId,
+        amount_minor: 499900,
+        currency_code: "BDT",
+        sender_phone: "01711223344",
+        transaction_id: "BKA-BIZ-B1-001",
+        payment_date_display: "15/11/2026",
+      },
+    });
+    assert.equal(claim.status, 201, JSON.stringify(claim.body));
+    assert.equal(
+      (await one("SELECT payment_status FROM orders WHERE id = $1", [orderId]))
+        .payment_status,
+      "pending_verification"
+    );
+    assert.ok(
+      (await countWhere("outbox_events", "event_type = $1 AND aggregate_id = $2", [
+        "payment.submitted",
+        claim.body.data.payment_submission.id,
+      ])) >= 1
+    );
+  }, 30_000);
+
+  it("24. Batch 1 subscriptions/licenses detail + activation deactivate", async () => {
+    const sub = await apiRequest(`/api/v1/admin/subscriptions/${subscriptionId}`, {
+      cookie: superCookie,
+    });
+    assert.equal(sub.status, 200, JSON.stringify(sub.body));
+    assert.equal(sub.body.data.id, subscriptionId);
+    assert.ok(Array.isArray(sub.body.data.renewal_invoices));
+
+    // NOTE: grantLicenseId (test 14) cannot be used here — test 15 revoked
+    // it, and revocation deactivates every live activation. licenseId (the
+    // subscription license, tests 9-11) still has 3 active activations.
+    const lic = await apiRequest(`/api/v1/admin/licenses/${licenseId}`, {
+      cookie: superCookie,
+    });
+    assert.equal(lic.status, 200, JSON.stringify(lic.body));
+    assert.ok(!("license_key_hash" in lic.body.data), "detail must never expose the key hash");
+    assert.ok(Array.isArray(lic.body.data.entitlement_snapshots));
+    const acts = await apiRequest(`/api/v1/admin/licenses/${licenseId}/activations`, {
+      cookie: superCookie,
+    });
+    assert.equal(acts.status, 200, JSON.stringify(acts.body));
+    assert.ok(acts.body.data.items.length >= 1);
+    const activeAct = acts.body.data.items.find((a: any) => a.status === "active");
+    assert.ok(activeAct, "expected at least one active activation");
+    const deactivated = await apiRequest(
+      `/api/v1/admin/licenses/${licenseId}/activations/${activeAct.id}/deactivate`,
+      { method: "POST", cookie: superCookie, body: { reason: "B1 test deactivate" } }
+    );
+    assert.equal(deactivated.status, 200, JSON.stringify(deactivated.body));
+    assert.equal(deactivated.body.data.activation.status, "deactivated");
+    assert.equal(
+      (await one("SELECT status FROM license_activations WHERE id = $1", [activeAct.id]))
+        .status,
+      "deactivated"
+    );
+    const again = await apiRequest(
+      `/api/v1/admin/licenses/${licenseId}/activations/${activeAct.id}/deactivate`,
+      { method: "POST", cookie: superCookie, body: {} }
+    );
+    assert.equal(again.status, 409, JSON.stringify(again.body));
+  }, 30_000);
+
+  it("25. Batch 1 sites: detail, patch, product assign/remove, credentials, domains (never auto-verified)", async () => {
+    const detail = await apiRequest(`/api/v1/admin/integrated-sites/${siteId}`, {
+      cookie: superCookie,
+    });
+    assert.equal(detail.status, 200, JSON.stringify(detail.body));
+    assert.ok(Array.isArray(detail.body.data.domains));
+    const patched = await apiRequest(`/api/v1/admin/integrated-sites/${siteId}`, {
+      method: "PATCH",
+      cookie: superCookie,
+      body: { name: "BizMate Official Website (B1)" },
+    });
+    assert.equal(patched.status, 200, JSON.stringify(patched.body));
+    assert.equal(patched.body.data.name, "BizMate Official Website (B1)");
+
+    // Second product: assign, duplicate-assign 409, remove.
+    const prod2 = await apiRequest("/api/v1/admin/products", {
+      method: "POST",
+      cookie: superCookie,
+      body: {
+        code: "BIZMATE2",
+        slug: "biz-mate-addon",
+        name: "BizMate Add-on",
+        product_type: "wordpress_plugin",
+        fulfillment_type: "software_license",
+        default_activation_limit: 1,
+        offline_grace_hours: 24,
+      },
+    });
+    assert.equal(prod2.status, 201, JSON.stringify(prod2.body));
+    const prod2Id = prod2.body.data.id as string;
+    const assigned = await apiRequest(`/api/v1/admin/integrated-sites/${siteId}/products`, {
+      method: "POST",
+      cookie: superCookie,
+      body: { product_id: prod2Id },
+    });
+    assert.equal(assigned.status, 200, JSON.stringify(assigned.body));
+    assert.ok(assigned.body.data.product_ids.includes(prod2Id));
+    const dupAssign = await apiRequest(`/api/v1/admin/integrated-sites/${siteId}/products`, {
+      method: "POST",
+      cookie: superCookie,
+      body: { product_id: prod2Id },
+    });
+    assert.equal(dupAssign.status, 409, JSON.stringify(dupAssign.body));
+    const removed = await apiRequest(
+      `/api/v1/admin/integrated-sites/${siteId}/products/${prod2Id}`,
+      { method: "DELETE", cookie: superCookie }
+    );
+    assert.equal(removed.status, 200, JSON.stringify(removed.body));
+    assert.ok(!removed.body.data.product_ids.includes(prod2Id));
+
+    // Credential with the cancel scope (used by the server-cancel test 27).
+    const cred = await apiRequest(`/api/v1/admin/integrated-sites/${siteId}/credentials`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {
+        credential_type: "hmac_shared_secret",
+        scopes: ["catalog.read", "orders.cancel:own"],
+      },
+    });
+    assert.equal(cred.status, 201, JSON.stringify(cred.body));
+    assert.ok(cred.body.data.credential.key_id);
+    assert.ok(cred.body.data.raw_secret_once, "raw secret is returned exactly once");
+    b1CancelKeyId = cred.body.data.credential.key_id as string;
+    b1CancelSecret = cred.body.data.raw_secret_once as string;
+    const creds = await apiRequest(`/api/v1/admin/integrated-sites/${siteId}/credentials`, {
+      cookie: superCookie,
+    });
+    assert.equal(creds.status, 200, JSON.stringify(creds.body));
+    assert.ok(creds.body.data.items.length >= 2);
+    assert.ok(!("secret_ciphertext" in creds.body.data.items[0]));
+
+    // Domains: register -> pending (never auto-verified).
+    const domain = await apiRequest(`/api/v1/admin/integrated-sites/${siteId}/domains`, {
+      method: "POST",
+      cookie: superCookie,
+      body: { domain: "shop.bizstore.bd", verification_method: "dns_txt" },
+    });
+    assert.equal(domain.status, 201, JSON.stringify(domain.body));
+    const newDomain = domain.body.data.domains.find((d: any) => d.domain === "shop.bizstore.bd");
+    assert.ok(newDomain, "new domain missing from site domains");
+    assert.equal(newDomain.verification_status, "pending");
+    assert.ok(
+      newDomain.verification_challenge.startsWith("stackmate-site-verification=")
+    );
+    // Automated verification is not implemented yet -> 409.
+    const autoVerify = await apiRequest(
+      `/api/v1/admin/integrated-sites/${siteId}/domains/${newDomain.id}/verify`,
+      { method: "POST", cookie: superCookie, body: { method: "dns_txt" } }
+    );
+    assert.equal(autoVerify.status, 409, JSON.stringify(autoVerify.body));
+    // Manual review with a note verifies it.
+    const manual = await apiRequest(
+      `/api/v1/admin/integrated-sites/${siteId}/domains/${newDomain.id}/verify`,
+      {
+        method: "POST",
+        cookie: superCookie,
+        body: { method: "manual_review", reviewer_note: "B1 test: DNS TXT checked by hand." },
+      }
+    );
+    assert.equal(manual.status, 200, JSON.stringify(manual.body));
+    assert.equal(
+      manual.body.data.domains.find((d: any) => d.domain === "shop.bizstore.bd")
+        .verification_status,
+      "verified"
+    );
+    // Challenge regeneration resets to pending.
+    const challenge = await apiRequest(
+      `/api/v1/admin/integrated-sites/${siteId}/domains/${newDomain.id}/verification-challenge`,
+      { method: "POST", cookie: superCookie, body: {} }
+    );
+    assert.equal(challenge.status, 200, JSON.stringify(challenge.body));
+    assert.equal(
+      challenge.body.data.domains.find((d: any) => d.domain === "shop.bizstore.bd")
+        .verification_status,
+      "pending"
+    );
+    // Delete the extra domain (the primary remains).
+    const deleted = await apiRequest(
+      `/api/v1/admin/integrated-sites/${siteId}/domains/${newDomain.id}`,
+      { method: "DELETE", cookie: superCookie }
+    );
+    assert.equal(deleted.status, 200, JSON.stringify(deleted.body));
+    assert.ok(!deleted.body.data.domains.some((d: any) => d.domain === "shop.bizstore.bd"));
+
+    // Suspend + revoke on a disposable second site (never the main site).
+    const site2 = await apiRequest("/api/v1/admin/integrated-sites", {
+      method: "POST",
+      cookie: superCookie,
+      body: {
+        name: "B1 Disposable Site",
+        environment: "staging",
+        primary_domain: "b1-disposable.example",
+        product_ids: [productId],
+        allowed_capabilities: ["catalog.read"],
+      },
+    });
+    assert.equal(site2.status, 201, JSON.stringify(site2.body));
+    const site2Id = site2.body.data.site.id as string;
+    const suspended = await apiRequest(
+      `/api/v1/admin/integrated-sites/${site2Id}/suspend`,
+      { method: "POST", cookie: superCookie, body: {} }
+    );
+    assert.equal(suspended.status, 200, JSON.stringify(suspended.body));
+    assert.equal(suspended.body.data.status, "suspended");
+    const suspendAgain = await apiRequest(
+      `/api/v1/admin/integrated-sites/${site2Id}/suspend`,
+      { method: "POST", cookie: superCookie, body: {} }
+    );
+    assert.equal(suspendAgain.status, 409, JSON.stringify(suspendAgain.body));
+    const revoked = await apiRequest(`/api/v1/admin/integrated-sites/${site2Id}/revoke`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {},
+    });
+    assert.equal(revoked.status, 200, JSON.stringify(revoked.body));
+    assert.equal(revoked.body.data.status, "revoked");
+    const revokeAgain = await apiRequest(`/api/v1/admin/integrated-sites/${site2Id}/revoke`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {},
+    });
+    assert.equal(revokeAgain.status, 409, JSON.stringify(revokeAgain.body));
+  }, 30_000);
+
+  it("26. Batch 1 webhooks: test delivery records a failed delivery; outbox list + replay of dead-letter", async () => {
+    const created = await apiRequest("/api/v1/admin/webhooks", {
+      method: "POST",
+      cookie: superCookie,
+      body: {
+        // 192.0.2.1 is TEST-NET-1 (RFC 5737 documentation range): it passes
+        // the SSRF validator (not private/loopback/link-local) but is
+        // guaranteed unroutable, so delivery fails — which is the point:
+        // a failed delivery must be recorded, not crash the endpoint.
+        // (Loopback targets are blocked by SSRF policy, so 127.0.0.1
+        // cannot be used here.)
+        url: "https://192.0.2.1/b1-hook",
+        description: "B1 test endpoint (unreachable)",
+        subscribed_events: ["order.cancelled"],
+      },
+    });
+    assert.equal(created.status, 201, JSON.stringify(created.body));
+    const webhookId = created.body.data.endpoint.id as string;
+
+    // Test delivery to an unreachable address: 200 envelope, delivered:false.
+    const tested = await apiRequest(`/api/v1/admin/webhooks/${webhookId}/test`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {},
+    });
+    assert.equal(tested.status, 200, JSON.stringify(tested.body));
+    assert.equal(tested.body.data.delivered, false);
+    assert.ok(tested.body.data.error, "unreachable target must produce an error string");
+    const deliveries = await apiRequest(`/api/v1/admin/webhooks/${webhookId}/deliveries`, {
+      cookie: superCookie,
+    });
+    assert.equal(deliveries.status, 200, JSON.stringify(deliveries.body));
+    assert.equal(deliveries.body.data.items.length, 1);
+    assert.equal(deliveries.body.data.items[0].status, "failed");
+
+    const outbox = await apiRequest("/api/v1/admin/outbox-events?status=pending", {
+      cookie: superCookie,
+    });
+    assert.equal(outbox.status, 200, JSON.stringify(outbox.body));
+    assert.ok(Array.isArray(outbox.body.data.items));
+    // Replaying a pending event is a duplicate risk -> 409.
+    const pendingEvent = outbox.body.data.items[0];
+    if (pendingEvent) {
+      const replayPending = await apiRequest(
+        `/api/v1/admin/outbox-events/${pendingEvent.id}/replay`,
+        { method: "POST", cookie: superCookie, body: {} }
+      );
+      assert.equal(replayPending.status, 409, JSON.stringify(replayPending.body));
+    }
+    // A dead-lettered event replays to pending with a fresh attempt budget.
+    const deadId = randomUUID();
+    await adminClient.query(
+      `INSERT INTO outbox_events (id, event_key, event_type, aggregate_type, aggregate_id, status, attempt_count, available_at, payload)
+       VALUES ($1, $2, 'webhook.test', 'webhook_endpoint', $3, 'dead_letter', 3, NOW(), '{}'::jsonb)`,
+      [deadId, `b1-dead-letter-${deadId}`, webhookId]
+    );
+    const replayed = await apiRequest(`/api/v1/admin/outbox-events/${deadId}/replay`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {},
+    });
+    assert.equal(replayed.status, 200, JSON.stringify(replayed.body));
+    assert.equal(replayed.body.data.status, "pending");
+    assert.equal(replayed.body.data.attempt_count, 0);
+  }, 30_000);
+
+  it("27. Batch 1 public/server: product + package detail, signed packages list, signed order cancel", async () => {
+    const prodDetail = await apiRequest(
+      `/api/v1/public/sites/${siteKey}/products/biz-mate-plugin`,
+      { headers: { "X-StackMate-Site-Key": siteKey } }
+    );
+    assert.equal(prodDetail.status, 200, JSON.stringify(prodDetail.body));
+    assert.equal(prodDetail.body.data.slug, "biz-mate-plugin");
+    assert.ok(Array.isArray(prodDetail.body.data.packages));
+
+    const currentVersionId = (
+      await one("SELECT current_version_id FROM product_packages WHERE product_id = $1", [
+        productId,
+      ])
+    ).current_version_id as string;
+    const pkgDetail = await apiRequest(
+      `/api/v1/public/sites/${siteKey}/packages/${currentVersionId}`,
+      { headers: { "X-StackMate-Site-Key": siteKey } }
+    );
+    assert.equal(pkgDetail.status, 200, JSON.stringify(pkgDetail.body));
+    assert.equal(pkgDetail.body.data.package_version_id, currentVersionId);
+    assert.ok(pkgDetail.body.data.prices.length >= 1);
+    const wrong = await apiRequest(
+      `/api/v1/public/sites/${siteKey}/products/biz-mate-plugin`,
+      { headers: { "X-StackMate-Site-Key": "sm_site_wrongkey0000000000000000" } }
+    );
+    assert.equal(wrong.status, 403, JSON.stringify(wrong.body));
+
+    // Signed server packages list (catalog.read, original credential).
+    const s2sPath = `/api/v1/integrations/sites/${siteKey}/products/biz-mate-plugin/packages`;
+    const ts = Math.floor(Date.now() / 1000);
+    const nonce = `nonce-biz-b1-${Date.now()}`;
+    const signed = signCanonicalServerRequest(
+      {
+        keyId: hmacKeyId,
+        timestampUnixSeconds: ts,
+        nonce,
+        method: "GET",
+        host: "localhost:8787",
+        rawPathAndQuery: s2sPath,
+        rawBody: "",
+      },
+      hmacSharedSecret
+    );
+    const s2s = await apiRequest(s2sPath, {
+      headers: {
+        "X-StackMate-Key-Id": hmacKeyId,
+        "X-StackMate-Timestamp": String(ts),
+        "X-StackMate-Nonce": nonce,
+        "X-StackMate-Content-SHA256": signed.contentSha256Header,
+        "X-StackMate-Signature": signed.signatureHeader,
+      },
+    });
+    assert.equal(s2s.status, 200, JSON.stringify(s2s.body));
+    assert.ok(s2s.body.data.items.length >= 1);
+
+    // Signed order cancel: the paid public order is guarded -> 409.
+    const cancelPaidPath = `/api/v1/integrations/sites/${siteKey}/orders/${publicReference}/cancel`;
+    const ts2 = Math.floor(Date.now() / 1000);
+    const nonce2 = `nonce-biz-b1c-${Date.now()}`;
+    const signed2 = signCanonicalServerRequest(
+      {
+        keyId: b1CancelKeyId,
+        timestampUnixSeconds: ts2,
+        nonce: nonce2,
+        method: "POST",
+        host: "localhost:8787",
+        rawPathAndQuery: cancelPaidPath,
+        rawBody: JSON.stringify({ reason: "B1 cancel paid" }),
+      },
+      b1CancelSecret
+    );
+    const cancelPaid = await apiRequest(cancelPaidPath, {
+      method: "POST",
+      headers: {
+        "X-StackMate-Key-Id": b1CancelKeyId,
+        "X-StackMate-Timestamp": String(ts2),
+        "X-StackMate-Nonce": nonce2,
+        "X-StackMate-Content-SHA256": signed2.contentSha256Header,
+        "X-StackMate-Signature": signed2.signatureHeader,
+      },
+      body: { reason: "B1 cancel paid" },
+    });
+    assert.equal(cancelPaid.status, 409, JSON.stringify(cancelPaid.body));
+
+    // Fresh unpaid checkout order, then cancel it via the server route.
+    const freshCheckout = await apiRequest(`/api/v1/public/sites/${siteKey}/checkout/orders`, {
+      method: "POST",
+      headers: { "X-StackMate-Site-Key": siteKey, "Idempotency-Key": "idem-biz-b1-cancel-order" },
+      body: {
+        items: [
+          {
+            product_slug: "biz-mate-plugin",
+            package_version_id: currentVersionId,
+            price_id: priceId,
+            quantity: 1,
+          },
+        ],
+        customer: { name: "B1 Cancel", email: "b1-cancel@example.com" },
+      },
+    });
+    assert.equal(freshCheckout.status, 201, JSON.stringify(freshCheckout.body));
+    const freshRef = freshCheckout.body.data.order.public_reference as string;
+    const cancelPath = `/api/v1/integrations/sites/${siteKey}/orders/${freshRef}/cancel`;
+    const ts3 = Math.floor(Date.now() / 1000);
+    const nonce3 = `nonce-biz-b1c2-${Date.now()}`;
+    const signed3 = signCanonicalServerRequest(
+      {
+        keyId: b1CancelKeyId,
+        timestampUnixSeconds: ts3,
+        nonce: nonce3,
+        method: "POST",
+        host: "localhost:8787",
+        rawPathAndQuery: cancelPath,
+        rawBody: JSON.stringify({ reason: "B1 cancel fresh" }),
+      },
+      b1CancelSecret
+    );
+    const cancelled = await apiRequest(cancelPath, {
+      method: "POST",
+      headers: {
+        "X-StackMate-Key-Id": b1CancelKeyId,
+        "X-StackMate-Timestamp": String(ts3),
+        "X-StackMate-Nonce": nonce3,
+        "X-StackMate-Content-SHA256": signed3.contentSha256Header,
+        "X-StackMate-Signature": signed3.signatureHeader,
+      },
+      body: { reason: "B1 cancel fresh" },
+    });
+    assert.equal(cancelled.status, 200, JSON.stringify(cancelled.body));
+    assert.equal(cancelled.body.data.status, "cancelled");
+    assert.equal(
+      (await one("SELECT status FROM orders WHERE public_reference = $1", [freshRef])).status,
+      "cancelled"
+    );
+
+    // Revoke the cancel-scope credential now that it served its purpose.
+    const credRow = await one("SELECT id FROM site_credentials WHERE key_id = $1", [
+      b1CancelKeyId,
+    ]);
+    const revoked = await apiRequest(
+      `/api/v1/admin/integrated-sites/${siteId}/credentials/${credRow.id}/revoke`,
+      { method: "POST", cookie: superCookie, body: {} }
+    );
+    assert.equal(revoked.status, 200, JSON.stringify(revoked.body));
+    assert.equal(revoked.body.data.status, "revoked");
+  }, 30_000);
+
+  it("28. Batch 1 features/packages/prices: update, archive, retire", async () => {
+    const feat = await apiRequest(`/api/v1/admin/products/${productId}/features`, {
+      method: "POST",
+      cookie: superCookie,
+      body: { feature_key: "b1_extra", name: "B1 Extra", value_type: "boolean" },
+    });
+    assert.equal(feat.status, 201, JSON.stringify(feat.body));
+    const featId = feat.body.data.id as string;
+    const fDetail = await apiRequest(
+      `/api/v1/admin/products/${productId}/features/${featId}`,
+      { cookie: superCookie }
+    );
+    assert.equal(fDetail.status, 200, JSON.stringify(fDetail.body));
+    const fPatched = await apiRequest(
+      `/api/v1/admin/products/${productId}/features/${featId}`,
+      { method: "PATCH", cookie: superCookie, body: { name: "B1 Extra Renamed" } }
+    );
+    assert.equal(fPatched.status, 200, JSON.stringify(fPatched.body));
+    assert.equal(
+      (await one("SELECT name FROM product_features WHERE id = $1", [featId])).name,
+      "B1 Extra Renamed"
+    );
+    const archived = await apiRequest(
+      `/api/v1/admin/products/${productId}/features/${featId}/archive`,
+      { method: "POST", cookie: superCookie, body: {} }
+    );
+    assert.equal(archived.status, 200, JSON.stringify(archived.body));
+    assert.equal(archived.body.data.status, "archived");
+    // Archiving a feature referenced by the published version -> 409.
+    const archPub = await apiRequest(
+      `/api/v1/admin/products/${productId}/features/${featureId}/archive`,
+      { method: "POST", cookie: superCookie, body: {} }
+    );
+    assert.equal(archPub.status, 409, JSON.stringify(archPub.body));
+
+    const packageId = (
+      await one("SELECT id FROM product_packages WHERE product_id = $1", [productId])
+    ).id as string;
+    const pDetail = await apiRequest(`/api/v1/admin/packages/${packageId}`, {
+      cookie: superCookie,
+    });
+    assert.equal(pDetail.status, 200, JSON.stringify(pDetail.body));
+    const pPatched = await apiRequest(`/api/v1/admin/packages/${packageId}`, {
+      method: "PATCH",
+      cookie: superCookie,
+      body: { name: "Agency Plan (B1)" },
+    });
+    assert.equal(pPatched.status, 200, JSON.stringify(pPatched.body));
+
+    // Price: create -> get -> patch -> disable; the order-used price cannot be patched.
+    const price2 = await apiRequest(`/api/v1/admin/package-versions/${versionId}/prices`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {
+        price_key: "bdt-monthly-b1",
+        price_kind: "recurring",
+        amount_minor: 49900,
+        currency_code: "BDT",
+        interval_unit: "month",
+        interval_count: 1,
+      },
+    });
+    assert.equal(price2.status, 201, JSON.stringify(price2.body));
+    const price2Id = price2.body.data.id as string;
+    const prDetail = await apiRequest(`/api/v1/admin/prices/${price2Id}`, {
+      cookie: superCookie,
+    });
+    assert.equal(prDetail.status, 200, JSON.stringify(prDetail.body));
+    const prPatched = await apiRequest(`/api/v1/admin/prices/${price2Id}`, {
+      method: "PATCH",
+      cookie: superCookie,
+      body: { amount_minor: 54900 },
+    });
+    assert.equal(prPatched.status, 200, JSON.stringify(prPatched.body));
+    assert.equal(
+      Number((await one("SELECT amount_minor FROM package_prices WHERE id = $1", [price2Id])).amount_minor),
+      54900
+    );
+    const prDisabled = await apiRequest(`/api/v1/admin/prices/${price2Id}/disable`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {},
+    });
+    assert.equal(prDisabled.status, 200, JSON.stringify(prDisabled.body));
+    assert.equal(prDisabled.body.data.status, "inactive");
+    const usedPatch = await apiRequest(`/api/v1/admin/prices/${priceId}`, {
+      method: "PATCH",
+      cookie: superCookie,
+      body: { amount_minor: 1 },
+    });
+    assert.equal(usedPatch.status, 409, JSON.stringify(usedPatch.body));
+
+    // Version: create v2 -> publish -> retire (package back to draft).
+    const v2 = await apiRequest(`/api/v1/admin/packages/${packageId}/versions`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {
+        features: [
+          {
+            product_feature_id: featureId,
+            entitlement_value: { value_type: "boolean", value: true },
+          },
+        ],
+        change_summary: "B1 v2",
+      },
+    });
+    assert.equal(v2.status, 201, JSON.stringify(v2.body));
+    const v2Id = v2.body.data.id as string;
+    const pubV2 = await apiRequest(`/api/v1/admin/package-versions/${v2Id}/publish`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {},
+    });
+    assert.equal(pubV2.status, 200, JSON.stringify(pubV2.body));
+    const retired = await apiRequest(`/api/v1/admin/package-versions/${v2Id}/retire`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {},
+    });
+    assert.equal(retired.status, 200, JSON.stringify(retired.body));
+    assert.equal(
+      (await one("SELECT status FROM product_packages WHERE id = $1", [packageId])).status,
+      "draft"
+    );
+    assert.equal(
+      (await one("SELECT current_version_id FROM product_packages WHERE id = $1", [packageId]))
+        .current_version_id,
+      null
+    );
+    const again = await apiRequest(`/api/v1/admin/package-versions/${v2Id}/retire`, {
+      method: "POST",
+      cookie: superCookie,
+      body: {},
+    });
+    assert.equal(again.status, 409, JSON.stringify(again.body));
+  }, 30_000);
+
+  it("29. Batch 1 roles + invitations: role CRUD works; invitations persist via DrizzleStore wiring (migration 0005)", async () => {
+    const role = await apiRequest("/api/v1/admin/roles", {
+      method: "POST",
+      cookie: superCookie,
+      body: {
+        key: "support_agent_b1",
+        name: "Support Agent B1",
+        permissions: ["customers.read", "orders.read"],
+      },
+    });
+    assert.equal(role.status, 201, JSON.stringify(role.body));
+    const roleId = role.body.data.id as string;
+    const patched = await apiRequest(`/api/v1/admin/roles/${roleId}`, {
+      method: "PATCH",
+      cookie: superCookie,
+      body: { name: "Support Agent B1 (Renamed)" },
+    });
+    assert.equal(patched.status, 200, JSON.stringify(patched.body));
+    assert.equal(patched.body.data.name, "Support Agent B1 (Renamed)");
+    // The super_admin role is unmodifiable.
+    const superRole = (await one("SELECT id FROM roles WHERE key = $1", ["super_admin"]))
+      .id as string;
+    const superPatch = await apiRequest(`/api/v1/admin/roles/${superRole}`, {
+      method: "PATCH",
+      cookie: superCookie,
+      body: { name: "Nope" },
+    });
+    assert.equal(superPatch.status, 403, JSON.stringify(superPatch.body));
+
+    // Invitations: the DrizzleStore wiring for staff_invitations landed
+    // with the batch1 invitations patch (migration 0005), so creating an
+    // invitation must now succeed (201) AND persist — the row must survive
+    // a fresh request (state reload) and show up in the invitations list.
+    // The pre-wiring 503 fail-closed behavior is covered by the in-memory
+    // suite (apps/api/test/staff-invitations.test.ts), which probes the
+    // supportsStaffInvitations flag on an unwired store.
+    const invite = await apiRequest("/api/v1/admin/users/invitations", {
+      method: "POST",
+      cookie: superCookie,
+      body: {
+        email: "invite-b1@stackmate.local",
+        name: "B1 Invitee",
+        role_keys: ["support_agent_b1"],
+      },
+    });
+    assert.equal(invite.status, 201, JSON.stringify(invite.body));
+    assert.equal(invite.body.data.invitation.email, "invite-b1@stackmate.local");
+    assert.equal(invite.body.data.invitation.status, "pending");
+    assert.equal(typeof invite.body.data.token_once, "string");
+    assert.ok(invite.body.data.token_once.length > 0);
+    assert.equal(await count("SELECT COUNT(*) AS count FROM staff_invitations"), 1);
+    const listed = await apiRequest("/api/v1/admin/users/invitations", {
+      method: "GET",
+      cookie: superCookie,
+    });
+    assert.equal(listed.status, 200, JSON.stringify(listed.body));
+    assert.ok(
+      (listed.body.data.items as Array<{ email: string }>).some(
+        (row) => row.email === "invite-b1@stackmate.local"
+      ),
+      JSON.stringify(listed.body)
     );
   }, 30_000);
 });

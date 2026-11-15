@@ -60,6 +60,22 @@ export interface RoleRecord {
   created_at: string;
 }
 
+export interface StaffInvitationRecord {
+  id: string;
+  email: string;
+  name: string;
+  role_keys: string[];
+  token_hash: string;
+  status: "pending" | "accepted" | "revoked" | "expired";
+  expires_at: string;
+  invited_by_user_id: string | null;
+  accepted_user_id: string | null;
+  accepted_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface UploadedAssetRecord {
   id: string;
   object_key: string;
@@ -576,6 +592,7 @@ export interface DatabaseState {
   users: UserRecord[];
   sessions: SessionRecord[];
   roles: RoleRecord[];
+  staff_invitations: StaffInvitationRecord[];
   user_roles: Array<{ user_id: string; role_id: string; assigned_at: string }>;
   uploaded_assets: UploadedAssetRecord[];
   products: ProductRecord[];
@@ -661,6 +678,7 @@ export class StackMateDataStore {
         created_at: new Date().toISOString(),
       })),
       user_roles: [],
+      staff_invitations: [],
       uploaded_assets: [],
       products: [],
       product_features: [],

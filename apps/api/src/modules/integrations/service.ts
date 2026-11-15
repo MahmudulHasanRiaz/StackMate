@@ -10,6 +10,9 @@ import {
   CreateSiteCredentialSchema,
   normalizeInstallationDomain,
   RegisterIntegratedSiteSchema,
+  RegisterSiteDomainSchema,
+  UpdateIntegratedSiteSchema,
+  VerifySiteDomainSchema,
 } from "../../../../../packages/contracts/src/index.ts";
 import {
   decryptSecretAtRest,
@@ -320,5 +323,469 @@ export async function authenticateSignedServerRequest(
     cred.last_used_at = nowIso;
 
     return { site, credential: cred };
+  });
+}
+
+export async function updateIntegratedSiteByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  siteId: string,
+  rawInput: unknown,
+  requestId: string
+): Promise<IntegratedSiteRecord> {
+  assertStaffPermission(actor, "integrations.manage");
+  const input = UpdateIntegratedSiteSchema.parse(rawInput);
+  return store.withTransaction((state) => {
+    const site = state.integrated_sites.find((s) => s.id === siteId);
+    if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
+    if (input.name !== undefined) site.name = input.name;
+    if (input.environment !== undefined) site.environment = input.environment;
+    if (input.api_version !== undefined) site.api_version = input.api_version;
+    if (input.allowed_capabilities !== undefined)
+      site.allowed_capabilities = [...input.allowed_capabilities];
+    site.updated_at = new Date().toISOString();
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "integrations.site.updated",
+      resource_type: "integrated_site",
+      resource_id: site.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: input as Record<string, unknown>,
+    });
+    return site;
+  });
+}
+
+export async function suspendIntegratedSiteByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  siteId: string,
+  requestId: string
+): Promise<IntegratedSiteRecord> {
+  assertStaffPermission(actor, "integrations.manage");
+  return store.withTransaction((state) => {
+    const site = state.integrated_sites.find((s) => s.id === siteId);
+    if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
+    if (site.status === "suspended") {
+      throw new AppError("CONFLICT", "Integrated site is already suspended.", 409);
+    }
+    if (site.status === "revoked") {
+      throw new AppError("CONFLICT", "A revoked site cannot be suspended.", 409);
+    }
+    const prev = site.status;
+    site.status = "suspended";
+    site.updated_at = new Date().toISOString();
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "integrations.site.suspended",
+      resource_type: "integrated_site",
+      resource_id: site.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { from_status: prev, to_status: "suspended" },
+    });
+    return site;
+  });
+}
+
+export async function revokeIntegratedSiteByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  siteId: string,
+  requestId: string
+): Promise<IntegratedSiteRecord> {
+  assertStaffPermission(actor, "integrations.manage");
+  return store.withTransaction((state) => {
+    const site = state.integrated_sites.find((s) => s.id === siteId);
+    if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
+    if (site.status === "revoked") {
+      throw new AppError("CONFLICT", "Integrated site is already revoked.", 409);
+    }
+    const prev = site.status;
+    const nowIso = new Date().toISOString();
+    site.status = "revoked";
+    site.updated_at = nowIso;
+    // Revoking a site revokes its server credentials too — a revoked
+    // site must not be able to authenticate any further request.
+    for (const cred of state.site_credentials.filter(
+      (c) => c.integrated_site_id === site.id && c.status === "active"
+    )) {
+      cred.status = "revoked";
+      cred.revoked_at = nowIso;
+    }
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "integrations.site.revoked",
+      resource_type: "integrated_site",
+      resource_id: site.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { from_status: prev, to_status: "revoked" },
+    });
+    return site;
+  });
+}
+
+export async function assignProductToSiteByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  siteId: string,
+  productId: string,
+  requestId: string
+): Promise<IntegratedSiteRecord> {
+  assertStaffPermission(actor, "integrations.manage");
+  return store.withTransaction((state) => {
+    const site = state.integrated_sites.find((s) => s.id === siteId);
+    if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
+    const product = state.products.find((p) => p.id === productId);
+    if (!product) throw new AppError("NOT_FOUND", "Product not found.", 404);
+    if (site.product_ids.includes(productId)) {
+      throw new AppError(
+        "CONFLICT",
+        `Product '${product.code}' is already assigned to this site.`,
+        409
+      );
+    }
+    site.product_ids.push(productId);
+    site.updated_at = new Date().toISOString();
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "integrations.site.product_assigned",
+      resource_type: "integrated_site",
+      resource_id: site.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { product_id: productId, product_code: product.code },
+    });
+    return site;
+  });
+}
+
+export async function removeProductFromSiteByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  siteId: string,
+  productId: string,
+  requestId: string
+): Promise<IntegratedSiteRecord> {
+  assertStaffPermission(actor, "integrations.manage");
+  return store.withTransaction((state) => {
+    const site = state.integrated_sites.find((s) => s.id === siteId);
+    if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
+    if (!site.product_ids.includes(productId)) {
+      throw new AppError("NOT_FOUND", "Product is not assigned to this site.", 404);
+    }
+    site.product_ids = site.product_ids.filter((id) => id !== productId);
+    site.updated_at = new Date().toISOString();
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "integrations.site.product_removed",
+      resource_type: "integrated_site",
+      resource_id: site.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { product_id: productId },
+    });
+    return site;
+  });
+}
+
+export async function createSiteCredentialByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  siteId: string,
+  rawInput: unknown,
+  config: { encryptionKey: string; keyVersion: string; requestId: string }
+): Promise<{
+  credential: Omit<SiteCredentialRecord, "secret_ciphertext" | "secret_hash">;
+  raw_secret_once: string | null;
+}> {
+  assertStaffPermission(actor, "integrations.rotate_credentials");
+  const input = CreateSiteCredentialSchema.parse(rawInput);
+  return store.withTransaction((state) => {
+    const site = state.integrated_sites.find((s) => s.id === siteId);
+    if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
+    if (site.status === "revoked") {
+      throw new AppError("CONFLICT", "Cannot create credentials for a revoked site.", 409);
+    }
+    // Public-key credentials need key material the create schema does
+    // not carry — only secret-based types can be minted here.
+    if (
+      input.credential_type === "public_key" ||
+      input.credential_type === "public_signing_key"
+    ) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        "Public-key credentials require key material upload, which is not supported by this endpoint. Use hmac_shared_secret or bearer_secret.",
+        422
+      );
+    }
+
+    const credId = randomUUID();
+    const keyId = randomOpaqueToken(
+      site.environment === "production" ? "sk_live" : "sk_test",
+      12
+    );
+    const rawSecret = randomOpaqueToken("smsec", 32);
+    const ciphertext = encryptSecretAtRest(
+      rawSecret,
+      config.encryptionKey,
+      config.keyVersion,
+      `site_credentials:${credId}`
+    );
+    const nowIso = new Date().toISOString();
+    const credential: SiteCredentialRecord = {
+      id: credId,
+      integrated_site_id: siteId,
+      key_id: keyId,
+      credential_type: input.credential_type,
+      secret_hash: sha256Hex(rawSecret),
+      secret_ciphertext: ciphertext,
+      encryption_key_version: config.keyVersion,
+      scopes: [...input.scopes],
+      status: "active",
+      created_at: nowIso,
+      revoked_at: null,
+      last_used_at: null,
+    };
+    state.site_credentials.push(credential);
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "integrations.credential.created",
+      resource_type: "site_credential",
+      resource_id: credential.id,
+      outcome: "success",
+      request_id: config.requestId,
+      changes: { site_id: siteId, credential_type: credential.credential_type, key_id: keyId },
+    });
+    const { secret_ciphertext: _c, secret_hash: _h, ...safeCredential } = credential;
+    return { credential: safeCredential, raw_secret_once: rawSecret };
+  });
+}
+
+export async function revokeSiteCredentialByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  siteId: string,
+  credentialId: string,
+  requestId: string
+): Promise<Omit<SiteCredentialRecord, "secret_ciphertext" | "secret_hash">> {
+  assertStaffPermission(actor, "integrations.rotate_credentials");
+  return store.withTransaction((state) => {
+    const cred = state.site_credentials.find(
+      (c) => c.id === credentialId && c.integrated_site_id === siteId
+    );
+    if (!cred) throw new AppError("NOT_FOUND", "Site credential not found.", 404);
+    if (cred.status === "revoked") {
+      throw new AppError("CONFLICT", "Credential is already revoked.", 409);
+    }
+    if (cred.status === "rotated") {
+      throw new AppError("CONFLICT", "Credential was already rotated away.", 409);
+    }
+    cred.status = "revoked";
+    cred.revoked_at = new Date().toISOString();
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "integrations.credential.revoked",
+      resource_type: "site_credential",
+      resource_id: cred.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { key_id: cred.key_id },
+    });
+    const { secret_ciphertext: _c, secret_hash: _h, ...safeCredential } = cred;
+    return safeCredential;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Site domains (API Spec §13.2). Registration NEVER auto-verifies: a new
+// domain starts as "pending" with a fresh DNS TXT challenge. Real DNS/HTTP
+// verification is Batch 2; until then only an explicit, audited manual
+// review can mark a domain verified.
+// ---------------------------------------------------------------------------
+
+export async function registerSiteDomainByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  siteId: string,
+  rawInput: unknown,
+  requestId: string
+): Promise<IntegratedSiteRecord> {
+  assertStaffPermission(actor, "integrations.manage");
+  const input = RegisterSiteDomainSchema.parse(rawInput);
+  let normalized: string;
+  try {
+    normalized = normalizeInstallationDomain(input.domain);
+  } catch {
+    throw new AppError("VALIDATION_ERROR", `Invalid domain '${input.domain}'.`, 422);
+  }
+  return store.withTransaction((state) => {
+    const site = state.integrated_sites.find((s) => s.id === siteId);
+    if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
+    if (state.integrated_sites.some((s) => s.domains.some((d) => d.domain === normalized))) {
+      throw new AppError(
+        "CONFLICT",
+        `Domain '${normalized}' is already registered to an integrated site.`,
+        409
+      );
+    }
+    const nowIso = new Date().toISOString();
+    if (input.is_primary) {
+      for (const d of site.domains) d.is_primary = false;
+    }
+    site.domains.push({
+      id: randomUUID(),
+      domain: normalized,
+      verification_method: input.verification_method,
+      verification_challenge: `stackmate-site-verification=${randomOpaqueToken("verify", 16)}`,
+      verification_status: "pending",
+      verified_at: null,
+      is_primary: input.is_primary,
+    });
+    site.updated_at = nowIso;
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "integrations.domain.registered",
+      resource_type: "integrated_site",
+      resource_id: site.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { domain: normalized, verification_method: input.verification_method },
+    });
+    return site;
+  });
+}
+
+export async function generateDomainVerificationChallengeByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  siteId: string,
+  domainId: string,
+  requestId: string
+): Promise<IntegratedSiteRecord> {
+  assertStaffPermission(actor, "integrations.manage");
+  return store.withTransaction((state) => {
+    const site = state.integrated_sites.find((s) => s.id === siteId);
+    if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
+    const domain = site.domains.find((d) => d.id === domainId);
+    if (!domain) throw new AppError("NOT_FOUND", "Domain not found.", 404);
+    domain.verification_challenge = `stackmate-site-verification=${randomOpaqueToken("verify", 16)}`;
+    domain.verification_status = "pending";
+    domain.verified_at = null;
+    site.updated_at = new Date().toISOString();
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "integrations.domain.challenge_generated",
+      resource_type: "integrated_site",
+      resource_id: site.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { domain: domain.domain },
+    });
+    return site;
+  });
+}
+
+export async function verifySiteDomainByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  siteId: string,
+  domainId: string,
+  rawInput: unknown,
+  requestId: string
+): Promise<IntegratedSiteRecord> {
+  assertStaffPermission(actor, "integrations.manage");
+  const input = VerifySiteDomainSchema.parse(rawInput);
+  // Automated DNS/HTTP verification is Batch 2 — it does not exist yet,
+  // and a fake "verified" would repeat the original defect. Only an
+  // explicit manual review (with a recorded note) can verify a domain now.
+  if (input.method !== "manual_review") {
+    throw new AppError(
+      "CONFLICT",
+      `Automated ${input.method} verification is not implemented yet (Batch 2). Use method "manual_review" with a reviewer_note to record a manual review.`,
+      409
+    );
+  }
+  if (!input.reviewer_note) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "Manual domain verification requires a reviewer_note.",
+      422
+    );
+  }
+  return store.withTransaction((state) => {
+    const site = state.integrated_sites.find((s) => s.id === siteId);
+    if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
+    const domain = site.domains.find((d) => d.id === domainId);
+    if (!domain) throw new AppError("NOT_FOUND", "Domain not found.", 404);
+    if (domain.verification_status === "verified") {
+      throw new AppError("CONFLICT", "Domain is already verified.", 409);
+    }
+    const nowIso = new Date().toISOString();
+    domain.verification_status = "verified";
+    domain.verified_at = nowIso;
+    site.updated_at = nowIso;
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "integrations.domain.verified_manually",
+      resource_type: "integrated_site",
+      resource_id: site.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { domain: domain.domain, reviewer_note: input.reviewer_note },
+    });
+    return site;
+  });
+}
+
+export async function deleteSiteDomainByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  siteId: string,
+  domainId: string,
+  requestId: string
+): Promise<IntegratedSiteRecord> {
+  assertStaffPermission(actor, "integrations.manage");
+  return store.withTransaction((state) => {
+    const site = state.integrated_sites.find((s) => s.id === siteId);
+    if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
+    const domain = site.domains.find((d) => d.id === domainId);
+    if (!domain) throw new AppError("NOT_FOUND", "Domain not found.", 404);
+    if (site.domains.length === 1) {
+      throw new AppError(
+        "CONFLICT",
+        "A site must keep at least one domain. Register a replacement domain first.",
+        409
+      );
+    }
+    const wasPrimary = domain.is_primary;
+    site.domains = site.domains.filter((d) => d.id !== domainId);
+    if (wasPrimary && site.domains.length > 0) {
+      site.domains[0]!.is_primary = true;
+    }
+    site.updated_at = new Date().toISOString();
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "integrations.domain.deleted",
+      resource_type: "integrated_site",
+      resource_id: site.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { domain: domain.domain },
+    });
+    return site;
   });
 }

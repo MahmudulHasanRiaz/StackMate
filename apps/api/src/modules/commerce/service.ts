@@ -621,3 +621,239 @@ export async function createOrderByAdmin(
     return { order, invoice };
   });
 }
+
+/**
+ * Shared order-cancellation core (API Spec §10.2, §21.2). Used by the
+ * staff admin endpoint and by the server-to-server cancel endpoint
+ * (§15, scope orders.cancel:own) — the caller has already proven its own
+ * authorization; this function enforces the state machine only.
+ */
+export function cancelOrderInTx(
+  state: DatabaseState,
+  order: OrderRecord,
+  opts: {
+    actorType: "staff" | "integration";
+    actorUserId?: string | null;
+    integratedSiteId?: string | null;
+    reason: string;
+    requestId: string;
+  }
+): OrderRecord {
+  if (order.status === "cancelled") {
+    throw new AppError("CONFLICT", "Order is already cancelled.", 409);
+  }
+  if (order.status === "completed") {
+    throw new AppError("CONFLICT", "Completed orders cannot be cancelled.", 409);
+  }
+  if (order.status === "failed") {
+    throw new AppError("CONFLICT", "Failed orders cannot be cancelled.", 409);
+  }
+  if (order.payment_status === "paid") {
+    throw new AppError(
+      "CONFLICT",
+      "Paid orders cannot be cancelled. Issue a refund through the financial workflow instead.",
+      409
+    );
+  }
+  const pendingReview = state.payment_submissions.some(
+    (s) =>
+      s.order_id === order.id && (s.status === "submitted" || s.status === "under_review")
+  );
+  if (pendingReview) {
+    throw new AppError(
+      "CONFLICT",
+      "A payment submission for this order is still under verification. Approve or reject it first.",
+      409
+    );
+  }
+
+  const nowIso = new Date().toISOString();
+  const prevStatus = order.status;
+  order.status = "cancelled";
+  order.cancelled_at = nowIso;
+  order.updated_at = nowIso;
+
+  state.outbox_events.push({
+    id: randomUUID(),
+    event_key: `order.cancelled:${order.id}`,
+    aggregate_type: "order",
+    aggregate_id: order.id,
+    event_type: "order.cancelled",
+    payload: {
+      order_reference: order.public_reference,
+      order_number: order.order_number,
+      status: "cancelled",
+    },
+    status: "pending",
+    attempt_count: 0,
+    available_at: nowIso,
+    locked_until: null,
+    locked_by: null,
+    last_error_code: null,
+    created_at: nowIso,
+    processed_at: null,
+  });
+
+  appendAuditLog(state, {
+    actor_type: opts.actorType,
+    actor_user_id: opts.actorUserId ?? null,
+    integrated_site_id: opts.integratedSiteId ?? null,
+    action: "commerce.order.cancelled",
+    resource_type: "order",
+    resource_id: order.id,
+    outcome: "success",
+    request_id: opts.requestId,
+    changes: { from_status: prevStatus, to_status: "cancelled", reason: opts.reason },
+  });
+  return order;
+}
+
+export async function cancelOrderByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  orderId: string,
+  rawInput: unknown,
+  requestId: string
+): Promise<OrderRecord> {
+  assertStaffPermission(actor, "orders.manage");
+  const reason =
+    typeof (rawInput as { reason?: unknown } | null)?.reason === "string" &&
+    ((rawInput as { reason: string }).reason.trim().length ?? 0) > 0
+      ? (rawInput as { reason: string }).reason.trim()
+      : "Cancelled by staff";
+  return store.withTransaction((state) => {
+    const order = state.orders.find((o) => o.id === orderId);
+    if (!order) throw new AppError("NOT_FOUND", "Order not found.", 404);
+    return cancelOrderInTx(state, order, {
+      actorType: "staff",
+      actorUserId: actor.user.id,
+      reason,
+      requestId,
+    });
+  });
+}
+
+export async function completeOrderByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  orderId: string,
+  requestId: string
+): Promise<OrderRecord> {
+  assertStaffPermission(actor, "orders.manage");
+  return store.withTransaction((state) => {
+    const order = state.orders.find((o) => o.id === orderId);
+    if (!order) throw new AppError("NOT_FOUND", "Order not found.", 404);
+    if (order.status === "completed") {
+      throw new AppError("CONFLICT", "Order is already completed.", 409);
+    }
+    if (order.status === "cancelled" || order.status === "failed") {
+      throw new AppError(
+        "CONFLICT",
+        `A ${order.status} order cannot be completed.`,
+        409
+      );
+    }
+    // API Spec §10.2: completion must never bypass payment verification.
+    if (order.payment_status !== "paid") {
+      throw new AppError(
+        "CONFLICT",
+        `Order cannot be completed while payment_status is '${order.payment_status}'. Verify the payment first.`,
+        409
+      );
+    }
+    const prevStatus = order.status;
+    const nowIso = new Date().toISOString();
+    order.status = "completed";
+    order.completed_at = nowIso;
+    order.updated_at = nowIso;
+
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "commerce.order.completed",
+      resource_type: "order",
+      resource_id: order.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { from_status: prevStatus, to_status: "completed" },
+    });
+    return order;
+  });
+}
+
+export async function createInvoiceForOrderByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  orderId: string,
+  requestId: string
+): Promise<InvoiceRecord> {
+  assertStaffPermission(actor, "orders.manage");
+  return store.withTransaction((state) => {
+    const order = state.orders.find((o) => o.id === orderId);
+    if (!order) throw new AppError("NOT_FOUND", "Order not found.", 404);
+    const existingInitial = state.invoices.find(
+      (i) => i.order_id === order.id && i.invoice_type === "initial" && i.status !== "void"
+    );
+    if (existingInitial) {
+      throw new AppError(
+        "CONFLICT",
+        `Order already has a live initial invoice '${existingInitial.invoice_number}'.`,
+        409
+      );
+    }
+    const invoice = generateInvoiceForOrderInTx(state, order, "initial");
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "commerce.invoice.created",
+      resource_type: "invoice",
+      resource_id: invoice.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { order_id: order.id, invoice_number: invoice.invoice_number },
+    });
+    return invoice;
+  });
+}
+
+export async function voidInvoiceByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  invoiceId: string,
+  rawInput: unknown,
+  requestId: string
+): Promise<InvoiceRecord> {
+  assertStaffPermission(actor, "orders.manage");
+  const reason =
+    typeof (rawInput as { reason?: unknown } | null)?.reason === "string" &&
+    ((rawInput as { reason: string }).reason.trim().length ?? 0) > 0
+      ? (rawInput as { reason: string }).reason.trim()
+      : "Voided by staff";
+  return store.withTransaction((state) => {
+    const invoice = state.invoices.find((i) => i.id === invoiceId);
+    if (!invoice) throw new AppError("NOT_FOUND", "Invoice not found.", 404);
+    if (invoice.status === "void") {
+      throw new AppError("CONFLICT", "Invoice is already void.", 409);
+    }
+    if (invoice.status === "paid") {
+      throw new AppError(
+        "CONFLICT",
+        "A paid invoice cannot be voided. Issue a credit note through the financial workflow instead.",
+        409
+      );
+    }
+    const prevStatus = invoice.status;
+    invoice.status = "void";
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "commerce.invoice.voided",
+      resource_type: "invoice",
+      resource_id: invoice.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { from_status: prevStatus, to_status: "void", reason },
+    });
+    return invoice;
+  });
+}

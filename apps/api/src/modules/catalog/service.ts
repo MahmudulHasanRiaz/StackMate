@@ -4,6 +4,9 @@ import {
   CreateProductFeatureSchema,
   CreateProductPackageSchema,
   CreateProductSchema,
+  UpdatePackagePriceSchema,
+  UpdateProductFeatureSchema,
+  UpdateProductPackageSchema,
   UpdateProductSchema,
   validateFeatureEntitlementValue,
 } from "../../../../../packages/contracts/src/index.ts";
@@ -496,6 +499,272 @@ export async function createPackagePrice(
         amount_minor: price.amount_minor,
         currency_code: price.currency_code,
       },
+    });
+    return price;
+  });
+}
+
+export async function updateProductFeatureByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  productId: string,
+  featureId: string,
+  rawInput: unknown,
+  requestId: string
+): Promise<ProductFeatureRecord> {
+  assertStaffPermission(actor, "features.manage");
+  const input = UpdateProductFeatureSchema.parse(rawInput);
+  return store.withTransaction((state) => {
+    const feature = state.product_features.find(
+      (f) => f.id === featureId && f.product_id === productId
+    );
+    if (!feature) throw new AppError("NOT_FOUND", "Product feature not found.", 404);
+
+    if (input.default_value !== undefined) {
+      try {
+        feature.default_value = validateFeatureEntitlementValue(
+          feature.value_type,
+          input.default_value
+        );
+      } catch (err) {
+        throw new AppError("VALIDATION_ERROR", (err as Error).message, 422);
+      }
+    }
+    if (input.name !== undefined) feature.name = input.name;
+    if (input.description !== undefined) feature.description = input.description;
+    if (input.unit !== undefined) feature.unit = input.unit;
+    feature.updated_at = new Date().toISOString();
+
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "catalog.feature.updated",
+      resource_type: "product_feature",
+      resource_id: feature.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: input as Record<string, unknown>,
+    });
+    return feature;
+  });
+}
+
+export async function archiveProductFeatureByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  productId: string,
+  featureId: string,
+  requestId: string
+): Promise<ProductFeatureRecord> {
+  assertStaffPermission(actor, "features.manage");
+  return store.withTransaction((state) => {
+    const feature = state.product_features.find(
+      (f) => f.id === featureId && f.product_id === productId
+    );
+    if (!feature) throw new AppError("NOT_FOUND", "Product feature not found.", 404);
+    if (feature.status === "archived") {
+      throw new AppError("CONFLICT", "Feature is already archived.", 409);
+    }
+    // A feature referenced by a published package version must keep
+    // working for existing grants — refuse to archive it while published.
+    const usedByPublished = state.package_versions.some(
+      (v) =>
+        v.status === "published" &&
+        v.features.some((g) => g.product_feature_id === feature.id)
+    );
+    if (usedByPublished) {
+      throw new AppError(
+        "CONFLICT",
+        "Feature is referenced by a published package version and cannot be archived. Retire the published version first.",
+        409
+      );
+    }
+    feature.status = "archived";
+    feature.updated_at = new Date().toISOString();
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "catalog.feature.archived",
+      resource_type: "product_feature",
+      resource_id: feature.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { feature_key: feature.feature_key },
+    });
+    return feature;
+  });
+}
+
+export async function updateProductPackageByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  packageId: string,
+  rawInput: unknown,
+  requestId: string
+): Promise<ProductPackageRecord> {
+  assertStaffPermission(actor, "packages.manage");
+  const input = UpdateProductPackageSchema.parse(rawInput);
+  return store.withTransaction((state) => {
+    const pkg = state.product_packages.find((p) => p.id === packageId);
+    if (!pkg) throw new AppError("NOT_FOUND", "Package not found.", 404);
+    if (input.name !== undefined) pkg.name = input.name;
+    if (input.description !== undefined) pkg.description = input.description;
+    pkg.updated_at = new Date().toISOString();
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "catalog.package.updated",
+      resource_type: "product_package",
+      resource_id: pkg.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: input as Record<string, unknown>,
+    });
+    return pkg;
+  });
+}
+
+export async function retirePackageVersionByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  versionId: string,
+  requestId: string
+): Promise<PackageVersionRecord> {
+  assertStaffPermission(actor, "packages.publish");
+  return store.withTransaction((state) => {
+    const version = state.package_versions.find((v) => v.id === versionId);
+    if (!version) throw new AppError("NOT_FOUND", "Package version not found.", 404);
+    if (version.status === "retired") {
+      throw new AppError("CONFLICT", "Package version is already retired.", 409);
+    }
+    if (version.status === "draft") {
+      throw new AppError(
+        "CONFLICT",
+        "Only a published version can be retired. Draft versions are never sold.",
+        409
+      );
+    }
+    const pkg = state.product_packages.find((p) => p.id === version.package_id);
+    if (!pkg) throw new AppError("NOT_FOUND", "Parent package not found.", 404);
+
+    version.status = "retired";
+    // The retired version stops being the purchasable current version.
+    if (pkg.current_version_id === version.id) {
+      pkg.current_version_id = null;
+      pkg.status = "draft";
+      pkg.updated_at = new Date().toISOString();
+    }
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "catalog.package_version.retired",
+      resource_type: "package_version",
+      resource_id: version.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { package_id: pkg.id, version_number: version.version_number },
+    });
+    return version;
+  });
+}
+
+export async function updatePackagePriceByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  priceId: string,
+  rawInput: unknown,
+  requestId: string
+): Promise<PackagePriceRecord> {
+  assertStaffPermission(actor, "packages.manage");
+  const input = UpdatePackagePriceSchema.parse(rawInput);
+  return store.withTransaction((state) => {
+    const price = state.package_prices.find((p) => p.id === priceId);
+    if (!price) throw new AppError("NOT_FOUND", "Package price not found.", 404);
+    // API Spec §9.4: a price already used in orders is immutable —
+    // create a replacement price instead of editing history.
+    if (price.used_in_orders) {
+      throw new AppError(
+        "CONFLICT",
+        "Price has already been used in orders and cannot be edited. Create a replacement price instead.",
+        409
+      );
+    }
+    // Interval configuration must stay consistent with the (immutable) price_kind.
+    const nextIntervalUnit =
+      input.interval_unit !== undefined ? input.interval_unit : price.interval_unit;
+    const nextIntervalCount =
+      input.interval_count !== undefined ? input.interval_count : price.interval_count;
+    if (price.price_kind === "recurring") {
+      if (!nextIntervalUnit || !nextIntervalCount) {
+        throw new AppError(
+          "VALIDATION_ERROR",
+          "Recurring prices require interval_unit and interval_count.",
+          422
+        );
+      }
+    } else {
+      if (nextIntervalUnit || nextIntervalCount) {
+        throw new AppError(
+          "VALIDATION_ERROR",
+          `A ${price.price_kind} price must not carry interval_unit/interval_count.`,
+          422
+        );
+      }
+    }
+    if (price.price_kind === "free") {
+      const nextAmount = input.amount_minor ?? price.amount_minor;
+      const nextSetup = input.setup_fee_minor ?? price.setup_fee_minor;
+      if (nextAmount !== 0 || nextSetup !== 0) {
+        throw new AppError("VALIDATION_ERROR", "Free prices must stay at zero amount.", 422);
+      }
+    }
+    if (input.amount_minor !== undefined) price.amount_minor = input.amount_minor;
+    if (input.currency_code !== undefined) price.currency_code = input.currency_code.toUpperCase();
+    if (input.interval_unit !== undefined) price.interval_unit = input.interval_unit;
+    if (input.interval_count !== undefined) price.interval_count = input.interval_count;
+    if (input.trial_days !== undefined) price.trial_days = input.trial_days;
+    if (input.setup_fee_minor !== undefined) price.setup_fee_minor = input.setup_fee_minor;
+
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "catalog.price.updated",
+      resource_type: "package_price",
+      resource_id: price.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: input as Record<string, unknown>,
+    });
+    return price;
+  });
+}
+
+export async function disablePackagePriceByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  priceId: string,
+  requestId: string
+): Promise<PackagePriceRecord> {
+  assertStaffPermission(actor, "packages.manage");
+  return store.withTransaction((state) => {
+    const price = state.package_prices.find((p) => p.id === priceId);
+    if (!price) throw new AppError("NOT_FOUND", "Package price not found.", 404);
+    if (price.status === "inactive") {
+      throw new AppError("CONFLICT", "Price is already disabled.", 409);
+    }
+    // The price status vocabulary is active | inactive | retired
+    // (migration 0000 CHECK); "inactive" is the disabled state — the
+    // public catalogue only exposes status === "active" prices.
+    price.status = "inactive";
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "catalog.price.disabled",
+      resource_type: "package_price",
+      resource_id: price.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { price_key: price.price_key },
     });
     return price;
   });
