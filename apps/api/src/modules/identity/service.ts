@@ -1,7 +1,86 @@
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import { and, eq } from "drizzle-orm";
+import type { NodePgDatabase } from "drizzle-orm/node-postgres";
+import { hashPassword as hashPasswordBetterAuth } from "better-auth/crypto";
+import type * as schema from "../../../../../db/schema/index.ts";
+import {
+  accounts as baAccounts,
+  sessions as baSessions,
+  users as baUsers,
+} from "../../../../../db/schema/auth.ts";
 import type { DatabaseState, StackMateDataStore, UserRecord } from "../../platform/db/store.ts";
 import { AppError } from "../../shared/errors.ts";
 import { appendAuditLog } from "../audit/service.ts";
+import type { createBetterAuth } from "./better-auth.ts";
+
+/** A real Better Auth instance (see modules/identity/better-auth.ts). */
+export type BetterAuthInstance = ReturnType<typeof createBetterAuth>;
+
+/**
+ * UNIFIED AUTHENTICATION (2026-11-15, Fix 2).
+ *
+ * Better Auth is the single authentication authority. Staff identity is a
+ * Better Auth user (Drizzle `users` table) linked to the StackMate staff
+ * record (`store.state.users`) by EMAIL, which is unique in both tables.
+ * Roles, permissions and suspension state live ONLY in the StackMate staff
+ * record; Better Auth knows nothing about roles. Every authenticated
+ * request re-checks the staff record, so a suspended user fails validation
+ * even with a live Better Auth session.
+ *
+ * Session validation has two entry points, both reading the SAME Better
+ * Auth session record (Drizzle `sessions` table):
+ *  1. Cookie — the browser's signed `better-auth.session_token` cookie is
+ *     passed verbatim to `auth.api.getSession`, which verifies the
+ *     signature and looks the session up server-side. (Better Auth 1.7.23
+ *     has NO bearer-token session retrieval; its getSession reads only
+ *     the signed cookie — verified against dist/api/routes/session.mjs.)
+ *  2. Bearer / legacy `stackmate_session` cookie — the raw session token
+ *     is looked up directly in the `sessions` table and checked for
+ *     expiry. This is the same record the cookie path validates, not a
+ *     second session system; it exists so API clients and the test suite
+ *     can present the token returned by sign-in.
+ *
+ * TEST-ONLY SEAM (read this before claiming full unification): the
+ * in-memory StackMateDataStore has no Postgres behind it, so Better Auth
+ * cannot run against it. When a store has no `drizzleDb`, the functions
+ * below fall back to the legacy in-memory session mechanism
+ * (`signInStaffSessionTestAdapter` / `state.sessions` lookup). That path
+ * is reachable ONLY in tests: production/staging wiring always builds a
+ * DrizzleStore and fails closed without Hyperdrive, so no production
+ * request can ever take the legacy branch. Do not remove the seam
+ * without a Postgres-backed test adapter.
+ *
+ * PASSWORDS — TWO HASHES, ONE PASSWORD (read this before "simplifying"
+ * anything): the StackMate staff record and the Better Auth identity are
+ * the SAME `users` row (email UNIQUE), but the two systems hash passwords
+ * differently and neither can verify the other's hash:
+ *  - StackMate staff hash: `scrypt:<salt hex>:<derived hex>` (node
+ *    scryptSync, r=8) in `users.password_hash` — verified by
+ *    verifyPasswordScrypt below (test-adapter sign-in + lazy migration).
+ *  - Better Auth hash: `<salt hex>:<derived hex>` (scrypt N=16384, r=16,
+ *    p=1, dkLen=64, via `better-auth/crypto`) in the credential
+ *    `accounts` row — verified by Better Auth's own signInEmail.
+ * Provisioning therefore creates ONLY the credential `accounts` row for
+ * the existing user id (never a second user row, never signUpEmail,
+ * which would violate the email UNIQUE constraint). Both hashes are
+ * (re)created from the plaintext password whenever it is set or
+ * changed, so they stay in sync; the legacy hash is never used to
+ * authorize a production request.
+ */
+export function storeSupportsBetterAuth(store: StackMateDataStore): boolean {
+  return (store as unknown as { drizzleDb?: unknown }).drizzleDb !== undefined;
+}
+
+function drizzleDbOf(store: StackMateDataStore): NodePgDatabase<typeof schema> {
+  return (store as unknown as { drizzleDb: NodePgDatabase<typeof schema> }).drizzleDb;
+}
+
+async function reloadStateIfPossible(store: StackMateDataStore): Promise<void> {
+  const maybe = store as unknown as { loadState?: () => Promise<unknown> };
+  if (typeof maybe.loadState === "function") {
+    await maybe.loadState();
+  }
+}
 
 export interface StaffPrincipal {
   user: {
@@ -182,7 +261,256 @@ export async function createStaffUserByAdmin(
   });
 }
 
+/**
+ * Provision (or confirm) the Better Auth identity for a staff member.
+ * Server-side only — the public sign-up endpoint is blocked in app.ts.
+ * Returns the Better Auth user id, or null when the identity already
+ * exists. Throws on any other failure; callers that provision
+ * best-effort (bootstrap / staff creation) catch and rely on lazy
+ * migration at first sign-in instead.
+ */
+/**
+ * Provision (or confirm) the Better Auth credential for a staff member
+ * who already has a `users` row. Server-side only — the public sign-up
+ * endpoint is blocked in app.ts, and signUpEmail must NEVER be used
+ * here: it would insert a second `users` row and violate the email
+ * UNIQUE constraint. Instead this inserts exactly one credential
+ * `accounts` row (providerId 'credential') holding Better Auth's own
+ * password hash for the existing user id. Idempotent: returns
+ * `{ provisioned: false }` when the credential already exists.
+ */
+export async function ensureBetterAuthIdentity(
+  store: StackMateDataStore,
+  input: { userId: string; email: string; password: string }
+): Promise<{ provisioned: boolean }> {
+  if (await betterAuthCredentialExists(store, input.userId)) {
+    return { provisioned: false };
+  }
+  const baHash = await hashPasswordBetterAuth(input.password);
+  const now = new Date();
+  await drizzleDbOf(store)
+    .insert(baAccounts)
+    .values({
+      id: randomUUID(),
+      // Better Auth's sign-in lookup requires accountId === user.id
+      // (dist/api/routes/sign-in.mjs: credentialAccount matches
+      // providerId 'credential' AND accountId === userRecord.user.id).
+      // Using the email here silently breaks every sign-in.
+      accountId: input.userId,
+      providerId: "credential",
+      userId: input.userId,
+      password: baHash,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .onConflictDoNothing();
+  // A concurrent provision may have won the race; re-check rather than
+  // assuming this insert landed.
+  return { provisioned: await betterAuthCredentialExists(store, input.userId) };
+}
+
+async function betterAuthCredentialExists(
+  store: StackMateDataStore,
+  userId: string
+): Promise<boolean> {
+  const rows = await drizzleDbOf(store)
+    .select({ id: baAccounts.id })
+    .from(baAccounts)
+    .where(
+      and(eq(baAccounts.userId, userId), eq(baAccounts.providerId, "credential"))
+    )
+    .limit(1);
+  return rows.length > 0;
+}
+
+async function findBetterAuthSessionByToken(
+  store: StackMateDataStore,
+  token: string
+): Promise<{ id: string; userId: string; expiresAt: Date } | null> {
+  const rows = await drizzleDbOf(store)
+    .select({ id: baSessions.id, userId: baSessions.userId, expiresAt: baSessions.expiresAt })
+    .from(baSessions)
+    .where(eq(baSessions.token, token))
+    .limit(1);
+  const row = rows[0];
+  if (!row) return null;
+  return { id: row.id, userId: row.userId, expiresAt: row.expiresAt };
+}
+
+async function findBetterAuthUserEmail(
+  store: StackMateDataStore,
+  userId: string
+): Promise<string | null> {
+  const rows = await drizzleDbOf(store)
+    .select({ email: baUsers.email })
+    .from(baUsers)
+    .where(eq(baUsers.id, userId))
+    .limit(1);
+  return rows[0]?.email ?? null;
+}
+
+function buildPrincipal(state: DatabaseState, user: UserRecord): StaffPrincipal {
+  const { roles, permissions } = resolveEffectivePermissions(state, user.id);
+  return {
+    user: { id: user.id, name: user.name, email: user.email, status: user.status },
+    session_id: "",
+    roles,
+    permissions,
+  };
+}
+
+/**
+ * Staff sign-in through Better Auth (production path) or the legacy
+ * in-memory mechanism (test adapter only — see the module header).
+ *
+ * Better Auth flow: the staff record must already exist (bootstrap or
+ * admin creation); the password is verified by Better Auth against its
+ * own credential account. If no Better Auth identity exists yet for a
+ * staff member (accounts created before unification, or eager
+ * provisioning failed), the stored scrypt hash is verified once and the
+ * identity is provisioned lazily — the same email is never duplicated,
+ * and a wrong password never provisions anything.
+ *
+ * Returns the Better Auth session token, its expiry, the staff
+ * principal, and the Set-Cookie values Better Auth issued (the signed
+ * session cookie the browser must store). `set_cookie` is empty on the
+ * test-adapter path, where app.ts sets the legacy cookie instead.
+ */
 export async function signInStaffSession(
+  store: StackMateDataStore,
+  input: {
+    email: string;
+    password: string;
+    ipAddress?: string | null;
+    userAgent?: string | null;
+    requestId: string;
+  },
+  auth?: BetterAuthInstance | null
+): Promise<{
+  session_token: string;
+  expires_at: string;
+  principal: StaffPrincipal;
+  set_cookie: string[];
+}> {
+  if (auth && storeSupportsBetterAuth(store)) {
+    return signInStaffSessionViaBetterAuth(store, input, auth);
+  }
+  return signInStaffSessionTestAdapter(store, input);
+}
+
+async function signInStaffSessionViaBetterAuth(
+  store: StackMateDataStore,
+  input: {
+    email: string;
+    password: string;
+    ipAddress?: string | null;
+    userAgent?: string | null;
+    requestId: string;
+  },
+  auth: BetterAuthInstance
+): Promise<{
+  session_token: string;
+  expires_at: string;
+  principal: StaffPrincipal;
+  set_cookie: string[];
+}> {
+  const emailNormalized = input.email.trim().toLowerCase();
+  await reloadStateIfPossible(store);
+  const user = store.state.users.find((u) => u.email === emailNormalized);
+  const deny = async (reason: string): Promise<never> => {
+    await store
+      .withTransaction((state) => {
+        appendAuditLog(state, {
+          actor_type: "staff",
+          actor_user_id: user?.id ?? null,
+          action: "identity.auth.sign_in_failed",
+          resource_type: "session",
+          resource_id: emailNormalized,
+          outcome: "denied",
+          request_id: input.requestId,
+          changes: { reason },
+        });
+      })
+      .catch(() => {});
+    throw new AppError("UNAUTHORIZED", "Invalid email or password.", 401);
+  };
+  if (!user) await deny("unknown_email");
+  if (user!.status !== "active") {
+    throw new AppError("FORBIDDEN", "Staff account is suspended.", 403);
+  }
+
+  // better-call's generated types do not expose the `asResponse` option
+  // the runtime dispatch supports (dist/api/dispatch.mjs: `input.asResponse
+  // ?? isRequestLike(...)`); the cast below is that documented runtime
+  // behaviour, verified by the probe in better-auth-unified.test.ts.
+  const callSignIn = () =>
+    (auth.api.signInEmail as unknown as (opts: unknown) => Promise<unknown>)({
+      body: { email: emailNormalized, password: input.password },
+      headers: new Headers(),
+      asResponse: true,
+    });
+  // NOTE: with `asResponse: true`, better-call RETURNS error responses
+  // instead of throwing (dist/api/dispatch.mjs), so a failed sign-in
+  // arrives here as a non-OK Response, not an exception. Both shapes
+  // must funnel into the lazy-migration attempt below.
+  let response = (await callSignIn().catch(() => null)) as Response | null;
+  if (!response || !response.ok) {
+    // No Better Auth credential yet? Migrate the legacy scrypt hash once.
+    // A wrong password must never provision a credential.
+    const hasCredential = await betterAuthCredentialExists(store, user!.id).catch(
+      () => true
+    );
+    if (!hasCredential && verifyPasswordScrypt(input.password, user!.password_hash)) {
+      await ensureBetterAuthIdentity(store, {
+        userId: user!.id,
+        email: emailNormalized,
+        password: input.password,
+      });
+      response = (await callSignIn().catch(() => null)) as Response | null;
+    }
+    if (!response || !response.ok) {
+      await deny(hasCredential ? "bad_password" : "bad_password_no_identity");
+    }
+  }
+  const setCookie: string[] =
+    typeof (response! as Response).headers.getSetCookie === "function"
+      ? (response! as Response).headers.getSetCookie()
+      : [];
+  const body = (await response!.json()) as {
+    token?: unknown;
+    user?: { id?: unknown };
+  };
+  const token = typeof body.token === "string" ? body.token : "";
+  if (!token) {
+    throw new AppError("INTERNAL_ERROR", "Better Auth sign-in returned no session token.", 500);
+  }
+  const sessionRow = await findBetterAuthSessionByToken(store, token).catch(() => null);
+  const expiresAt = sessionRow
+    ? sessionRow.expiresAt.toISOString()
+    : new Date(Date.now() + 12 * 3600 * 1000).toISOString();
+
+  const principal = buildPrincipal(store.state, user!);
+  if (sessionRow) principal.session_id = sessionRow.id;
+  await store.withTransaction((state) => {
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: user!.id,
+      action: "identity.auth.signed_in",
+      resource_type: "session",
+      resource_id: token.slice(0, 12),
+      outcome: "success",
+      request_id: input.requestId,
+    });
+  });
+  return { session_token: token, expires_at: expiresAt, principal, set_cookie: setCookie };
+}
+
+/**
+ * TEST-ADAPTER-ONLY sign-in (in-memory store, no Postgres, no Better
+ * Auth). Unreachable in production/staging wiring. Kept so the
+ * in-memory e2e suite can run without a database.
+ */
+async function signInStaffSessionTestAdapter(
   store: StackMateDataStore,
   input: {
     email: string;
@@ -195,6 +523,7 @@ export async function signInStaffSession(
   session_token: string;
   expires_at: string;
   principal: StaffPrincipal;
+  set_cookie: string[];
 }> {
   return store.withTransaction((state) => {
     const emailNormalized = input.email.trim().toLowerCase();
@@ -228,18 +557,8 @@ export async function signInStaffSession(
       created_at: new Date().toISOString(),
     });
 
-    const { roles, permissions } = resolveEffectivePermissions(state, user.id);
-    const principal: StaffPrincipal = {
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        status: user.status,
-      },
-      session_id: sessionId,
-      roles,
-      permissions,
-    };
+    const principal = buildPrincipal(state, user);
+    principal.session_id = sessionId;
 
     appendAuditLog(state, {
       actor_type: "staff",
@@ -255,37 +574,242 @@ export async function signInStaffSession(
       session_token: sessionToken,
       expires_at: expiresAt,
       principal,
+      set_cookie: [],
     };
   });
 }
 
-export function resolveStaffPrincipalFromToken(
+/**
+ * Resolve the staff principal for one request from Better Auth state.
+ * Cookie path: the signed `better-auth.session_token` cookie is validated
+ * by Better Auth itself (`auth.api.getSession`). Bearer / legacy-cookie
+ * path: the raw token is looked up in the Better Auth `sessions` table.
+ * In both cases the staff record is re-read and must be `active` — a
+ * suspended user fails here even with a live Better Auth session.
+ * Returns null when there is no valid session. The test adapter (no
+ * Better Auth) resolves against its in-memory `sessions` state instead.
+ */
+export async function resolveStaffPrincipal(
   store: StackMateDataStore,
-  rawToken: string | undefined | null,
-  nowMs = Date.now()
-): StaffPrincipal | null {
-  if (!rawToken) return null;
-  store.queryMetrics.uncachedQueries += 1;
-  const session = store.state.sessions.find((s) => s.token === rawToken.trim());
-  if (!session) return null;
-  if (new Date(session.expires_at).getTime() <= nowMs) {
-    return null;
+  input: {
+    auth?: BetterAuthInstance | null;
+    cookieHeader?: string | null;
+    bearerToken?: string | null;
+    nowMs?: number;
   }
+): Promise<StaffPrincipal | null> {
+  const nowMs = input.nowMs ?? Date.now();
+  const auth = input.auth ?? null;
+
+  if (auth && storeSupportsBetterAuth(store) && input.cookieHeader) {
+    const cookieName = "better-auth.session_token";
+    if (input.cookieHeader.includes(`${cookieName}=`)) {
+      try {
+        const session = (await auth.api.getSession({
+          headers: new Headers({ cookie: input.cookieHeader }),
+        })) as { session?: { id?: string; expiresAt?: string | Date }; user?: { email?: string } } | null;
+        if (session?.user?.email) {
+          await reloadStateIfPossible(store);
+          const user = store.state.users.find(
+            (u) => u.email === session.user!.email!.trim().toLowerCase()
+          );
+          if (user && user.status === "active") {
+            const principal = buildPrincipal(store.state, user);
+            principal.session_id = session.session?.id ?? "";
+            return principal;
+          }
+          return null;
+        }
+      } catch {
+        return null;
+      }
+    }
+  }
+
+  const rawToken = input.bearerToken?.trim() || extractStackmateSessionCookie(input.cookieHeader);
+  if (!rawToken) return null;
+
+  if (auth && storeSupportsBetterAuth(store)) {
+    const row = await findBetterAuthSessionByToken(store, rawToken).catch(() => null);
+    if (!row || row.expiresAt.getTime() <= nowMs) return null;
+    const email = await findBetterAuthUserEmail(store, row.userId).catch(() => null);
+    if (!email) return null;
+    await reloadStateIfPossible(store);
+    const user = store.state.users.find((u) => u.email === email.trim().toLowerCase());
+    if (!user || user.status !== "active") return null;
+    const principal = buildPrincipal(store.state, user);
+    principal.session_id = row.id;
+    return principal;
+  }
+
+  // Test adapter only (see module header).
+  store.queryMetrics.uncachedQueries += 1;
+  const session = store.state.sessions.find((s) => s.token === rawToken);
+  if (!session) return null;
+  if (new Date(session.expires_at).getTime() <= nowMs) return null;
   const user = store.state.users.find((u) => u.id === session.user_id);
   if (!user || user.status !== "active") return null;
+  const principal = buildPrincipal(store.state, user);
+  principal.session_id = session.id;
+  return principal;
+}
 
-  const { roles, permissions } = resolveEffectivePermissions(store.state, user.id);
-  return {
-    user: {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      status: user.status,
-    },
-    session_id: session.id,
-    roles,
-    permissions,
-  };
+function extractStackmateSessionCookie(cookieHeader: string | null | undefined): string | null {
+  if (!cookieHeader) return null;
+  for (const part of cookieHeader.split(";")) {
+    const [rawName, ...rest] = part.trim().split("=");
+    if (rawName === "stackmate_session" || rawName === "__Host-stackmate_session") {
+      return rest.join("=").trim() || null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Sign out: revoke the Better Auth session behind the presented cookie
+ * (via Better Auth's own sign-out, which also clears the cookie) and/or
+ * the bearer/legacy token (by deleting its session row — for a
+ * DrizzleStore the row is mirrored in `state.sessions`, so the same
+ * withTransaction filter that used to revoke legacy sessions revokes
+ * Better Auth sessions too). Returns Set-Cookie values to forward.
+ */
+export async function signOutStaffSession(
+  store: StackMateDataStore,
+  input: {
+    auth?: BetterAuthInstance | null;
+    cookieHeader?: string | null;
+    bearerToken?: string | null;
+  }
+): Promise<{ signed_out: true; set_cookie: string[] }> {
+  const auth = input.auth ?? null;
+  let setCookie: string[] = [];
+  if (auth && storeSupportsBetterAuth(store) && input.cookieHeader?.includes("better-auth.session_token=")) {
+    try {
+      const res = (await (auth.api.signOut as unknown as (opts: unknown) => Promise<unknown>)({
+        headers: new Headers({ cookie: input.cookieHeader }),
+        asResponse: true,
+      })) as Response;
+      if (res instanceof Response && typeof res.headers.getSetCookie === "function") {
+        setCookie = res.headers.getSetCookie();
+      }
+    } catch {
+      // Fall through to the row delete below; a missing session is not an error.
+    }
+  }
+  const rawToken = input.bearerToken?.trim() || extractStackmateSessionCookie(input.cookieHeader);
+  if (rawToken) {
+    await store.withTransaction((state) => {
+      state.sessions = state.sessions.filter((s) => s.token !== rawToken);
+    });
+  }
+  return { signed_out: true, set_cookie: setCookie };
+}
+
+/**
+ * Change the signed-in staff member's password through Better Auth and
+ * revoke all OTHER sessions (Better Auth `revokeOtherSessions`). The
+ * current session stays valid. On the test adapter (no Better Auth) the
+ * stored scrypt hash is rotated and other legacy sessions are revoked.
+ */
+export async function changeStaffPassword(
+  store: StackMateDataStore,
+  principal: StaffPrincipal,
+  input: {
+    auth?: BetterAuthInstance | null;
+    cookieHeader?: string | null;
+    currentPassword: string;
+    newPassword: string;
+    requestId: string;
+  }
+): Promise<{ changed: true; revoked_other_sessions: number | null }> {
+  if (input.newPassword.length < 10) {
+    throw new AppError("VALIDATION_ERROR", "New password must be at least 10 characters.", 422);
+  }
+  const auth = input.auth ?? null;
+  if (auth && storeSupportsBetterAuth(store)) {
+    // Without `asResponse`, better-call THROWS Better Auth's APIError on
+    // a wrong current password; map it to the StackMate 401 instead of
+    // letting it surface as a 500.
+    try {
+      const res = (await (auth.api.changePassword as unknown as (opts: unknown) => Promise<unknown>)({
+        body: {
+          currentPassword: input.currentPassword,
+          newPassword: input.newPassword,
+          // Do NOT pass revokeOtherSessions: true here. Verified against
+          // the installed better-auth 1.7.23 source
+          // (dist/api/routes/update-user.mjs): with that flag the endpoint
+          // calls deleteUserSessions(userId), which deletes ALL sessions
+          // INCLUDING the one making the request. Revoking only the other
+          // sessions is done by the dedicated endpoint below.
+          revokeOtherSessions: false,
+        },
+        headers: new Headers({ cookie: input.cookieHeader ?? "" }),
+      })) as { user?: unknown };
+      if (!res || typeof res !== "object") {
+        throw new AppError("UNAUTHORIZED", "Current password is incorrect.", 401);
+      }
+      // Revoke every session except the one that made this request
+      // (dist/api/routes/session.mjs: revokeOtherSessions filters out
+      // ctx.context.session.session.token). Identified via the same
+      // signed session cookie.
+      await (auth.api.revokeOtherSessions as unknown as (opts: unknown) => Promise<unknown>)({
+        headers: new Headers({ cookie: input.cookieHeader ?? "" }),
+      });
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      throw new AppError("UNAUTHORIZED", "Current password is incorrect.", 401);
+    }
+    // Keep the legacy staff hash in sync: Better Auth updated only its
+    // own credential hash above. The staff hash is never used to
+    // authorize a production request, but leaving the old password
+    // verifiable anywhere would be a landmine.
+    await store.withTransaction((state) => {
+      const user = state.users.find((u) => u.id === principal.user.id);
+      if (user) {
+        user.password_hash = hashPasswordScrypt(input.newPassword);
+        user.updated_at = new Date().toISOString();
+      }
+      appendAuditLog(state, {
+        actor_type: "staff",
+        actor_user_id: principal.user.id,
+        action: "identity.auth.password_changed",
+        resource_type: "user",
+        resource_id: principal.user.id,
+        outcome: "success",
+        request_id: input.requestId,
+      });
+    });
+    // Better Auth's change-password endpoint does not report how many
+    // sessions it revoked, so the count is honestly null here (the
+    // revocation itself is verified by the unified-auth test: the other
+    // session stops working). The test-adapter branch below returns a
+    // real count.
+    return { changed: true, revoked_other_sessions: null };
+  }
+  // Test adapter only (see module header).
+  return store.withTransaction((state) => {
+    const user = state.users.find((u) => u.id === principal.user.id);
+    if (!user) throw new AppError("NOT_FOUND", "Staff user not found.", 404);
+    if (!verifyPasswordScrypt(input.currentPassword, user.password_hash)) {
+      throw new AppError("UNAUTHORIZED", "Current password is incorrect.", 401);
+    }
+    user.password_hash = hashPasswordScrypt(input.newPassword);
+    user.updated_at = new Date().toISOString();
+    const before = state.sessions.length;
+    state.sessions = state.sessions.filter(
+      (s) => s.user_id !== user.id || s.id === principal.session_id
+    );
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: user.id,
+      action: "identity.auth.password_changed",
+      resource_type: "user",
+      resource_id: user.id,
+      outcome: "success",
+      request_id: input.requestId,
+    });
+    return { changed: true as const, revoked_other_sessions: before - state.sessions.length };
+  });
 }
 
 export async function updateStaffUserRoles(
@@ -320,7 +844,12 @@ export async function updateStaffUserRoles(
       });
     }
 
-    // Security & Threat Model §4.1: Revoke active sessions immediately after role changes
+    // Security & Threat Model §4.1: Revoke active sessions immediately after role changes.
+    // This also revokes Better Auth sessions: for a DrizzleStore,
+    // `state.sessions` mirrors the Better Auth `sessions` table, so
+    // removing a row here deletes the row via diff-persist and the
+    // session stops validating on the next request (verified by
+    // better-auth-unified.test.ts).
     const beforeCount = state.sessions.length;
     state.sessions = state.sessions.filter((s) => s.user_id !== targetUserId);
     const revokedCount = beforeCount - state.sessions.length;

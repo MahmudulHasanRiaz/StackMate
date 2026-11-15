@@ -193,6 +193,46 @@ export function generateEd25519KeyMaterial(keyId: string): Ed25519KeyMaterial {
   };
 }
 
+/**
+ * Export a key material's private key as a compact private-JWK JSON string
+ * (kty OKP, crv Ed25519, x + d). This is the plaintext DrizzleStore
+ * encrypts into signing_keys.encrypted_private_jwk — never log it, never
+ * return it from an API.
+ */
+export function exportPrivateJwkJson(material: Ed25519KeyMaterial): string {
+  const privateKey = createPrivateKey(material.privateKeyPem);
+  const jwk = privateKey.export({ format: "jwk" }) as Record<string, unknown>;
+  return JSON.stringify(jwk);
+}
+
+/**
+ * Read the `kid` from a compact JWS header WITHOUT verifying the
+ * signature — the caller must then verify with that kid's public key.
+ * Throws LICENSE_INVALID on a malformed token or a missing kid.
+ */
+export function readEntitlementJwsKid(jwsToken: string): string {
+  const parts = jwsToken.split(".");
+  if (parts.length !== 3) {
+    throw new AppError("LICENSE_INVALID", "Malformed JWS entitlement token.", 401);
+  }
+  let header: { kid?: unknown };
+  try {
+    header = JSON.parse(
+      Buffer.from(parts[0]!, "base64url").toString("utf8")
+    ) as { kid?: unknown };
+  } catch {
+    throw new AppError("LICENSE_INVALID", "Malformed JWS entitlement token header.", 401);
+  }
+  if (typeof header.kid !== "string" || header.kid.trim().length === 0) {
+    throw new AppError(
+      "LICENSE_INVALID",
+      "Entitlement JWS header has no kid; cannot select a verification key.",
+      401
+    );
+  }
+  return header.kid;
+}
+
 export function signEntitlementJws(
   claims: EntitlementTokenClaims,
   keyMaterial: Ed25519KeyMaterial

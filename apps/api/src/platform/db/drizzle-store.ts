@@ -47,27 +47,35 @@
  *    larger than 160 chars throws a clear "apply migration 0002" error.
  *    Apply db/migrations/0002_sequence_counters.sql in production.
  *
- * 4. Signing keys are NOT durably persisted. `signing_key_metadata` holds
- *    only PUBLIC key metadata; the private key material comes from the
- *    LICENSE_SIGNING_PRIVATE_JWK env var (or the `signingPrivateJwk`
- *    create() option) and is imported with
- *    importEd25519KeyMaterialFromPrivateJwk() below. If no JWK is
- *    available, a key is generated PER PROCESS with
- *    generateEd25519KeyMaterial() — exactly like the base class — which
- *    means license verification keys CHANGE ON EVERY WORKER
- *    RESTART/ISOLATE and previously issued entitlement JWSs stop
- *    verifying. Durable key persistence (a signing_keys table holding
- *    encrypted private material, or KMS) is a KNOWN OPEN TODO.
- *    `rotateSigningKey()` is inherited unchanged: it rotates the
- *    in-memory key only and writes NO metadata row. The active key id is
- *    resolved as: create() option `signingKeyId` → the `status='active'`
- *    row of signing_key_metadata (if any) → "sm-ed25519-2026-11".
- *    NOTE FOR THE WIRING AGENT: apps/api/src/index.ts currently passes
- *    only connectionString/r2Bucket/signingKeyId to create() — it does
- *    NOT forward LICENSE_SIGNING_PRIVATE_JWK. Until it does (via the
- *    `signingPrivateJwk` / `signingPublicJwk` options), production runs
- *    on per-process keys. In Workers, `process.env` is not populated
- *    with bindings, so the process.env fallback only helps local dev.
+ * 4. Signing keys ARE durably persisted (Fix 1, migration 0004). The
+ *    signing_keys table is the source of truth: one row per key version,
+ *    private JWK encrypted with AES-256-GCM under ENCRYPTION_KEY_V1 and
+ *    bound to AAD "signing_key:<key_id>" (see signingKeyAadContext),
+ *    public JWK stored in clear. Exactly one row is 'active' (partial
+ *    unique index); retired keys stay verifiable, revoked keys are never
+ *    loaded and their tokens stop verifying. Boot: load the active row
+ *    (+ every retired row) from the DB; if no active row exists, import
+ *    the LICENSE_SIGNING_PRIVATE_JWK env/option JWK once (bootstrap-only)
+ *    or generate ONE key and persist it immediately — inside one
+ *    advisory-locked transaction, so concurrent boots converge on a
+ *    single active row. The constructor's per-process key is discarded
+ *    here, and getActiveSigningKey() refuses to serve until the durable
+ *    load succeeds. signing_key_metadata (migration 0000) is kept as a
+ *    public metadata mirror, synced in the same transaction on
+ *    bootstrap / rotation / revocation; it never holds private material.
+ *    ENCRYPTION_KEY_V1 comes from the `encryptionSecret` create() option
+ *    (preferred) or process.env (local dev only — Workers do not populate
+ *    process.env); with no secret the store fails closed unless the
+ *    runtime is positively local/test (APP_ENV local|test, NODE_ENV test,
+ *    or vitest), where the env.ts dev fallback applies. If a stored key
+ *    cannot be decrypted (wrong or lost master secret), boot fails
+ *    closed: rotation to a fresh key is the only recovery and old tokens
+ *    become unverifiable — see
+ *    docs/operations/KEY-ROTATION-AND-SECURITY-RUNBOOK.md.
+ *    apps/api/src/index.ts forwards encryptionSecret (env.ENCRYPTION_KEY_V1)
+ *    and appEnv (env.APP_ENV) from the resolved Worker env, so a deployed
+ *    Worker decrypts with the real secret; the local/test dev fallback
+ *    applies only when no secret is supplied at all (see resolveEncryptionSecret).
  *
  * 5. R2 bucket is fail-visible, not fail-closed, at this layer. If
  *    create() is called without `r2Bucket`, the inherited in-memory
@@ -106,9 +114,13 @@ import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import * as schema from "@stackmate/db/schema";
 import type { R2BucketBinding } from "../../env.ts";
 import {
+  decryptSecretAtRest,
+  encryptSecretAtRest,
+  exportPrivateJwkJson,
   generateEd25519KeyMaterial,
   type Ed25519KeyMaterial,
 } from "../crypto/index.ts";
+import { AppError } from "../../shared/errors.ts";
 import {
   StackMateDataStore,
   type AuditLogRecord,
@@ -149,6 +161,36 @@ import {
 
 export const DEFAULT_SIGNING_KEY_ID = "sm-ed25519-2026-11";
 
+/**
+ * AAD context for a signing key's encrypted private JWK. The context is a
+ * FIXED string per key id — `signing_key:<key_id>` — so a ciphertext
+ * copied to a different key row (or a different purpose) cannot decrypt:
+ * encryptSecretAtRest/decryptSecretAtRest build the real GCM AAD as
+ * `v1:<aadContext>`, i.e. `v1:signing_key:<key_id>` here. The key id is
+ * part of the AAD rather than the plaintext, so re-keying a row under a
+ * new id requires re-encryption, not a silent copy.
+ */
+export function signingKeyAadContext(keyId: string): string {
+  return `signing_key:${keyId}`;
+}
+
+/**
+ * Dev-only fallback master secret for envelope encryption, byte-identical
+ * to the local-dev default in env.ts (resolveRuntimeConfig). It is NOT a
+ * real secret: DrizzleStore uses it only when the runtime is positively
+ * local/test and no ENCRYPTION_KEY_V1 was supplied (see
+ * resolveEncryptionSecret). Any other runtime without a secret fails
+ * closed instead of silently encrypting production keys with a public
+ * default.
+ */
+const DEV_FALLBACK_ENCRYPTION_SECRET =
+  "local-dev-aes-256-gcm-master-key-32-bytes-seed!!";
+
+/** Fresh bootstrap/rotation key id for the current month, e.g. sm-ed25519-2026-11. */
+function deriveMonthlySigningKeyId(now = new Date()): string {
+  return `sm-ed25519-${now.toISOString().slice(0, 7)}`;
+}
+
 /** Advisory lock key serializing writers across store instances/processes. */
 const WRITER_ADVISORY_LOCK_KEY = 727271;
 
@@ -173,6 +215,23 @@ export interface DrizzleStoreCreateOptions {
    */
   signingPrivateJwk?: string | undefined;
   signingPublicJwk?: string | undefined;
+  /**
+   * Master secret for AES-256-GCM envelope encryption of private signing
+   * keys (ENCRYPTION_KEY_V1). Prefer passing this from the wiring layer
+   * (env.ENCRYPTION_KEY_V1); if omitted, create() falls back to
+   * process.env.ENCRYPTION_KEY_V1 (local dev only — Workers do not
+   * populate process.env with bindings) and then, only on a positively
+   * local/test runtime, to the dev fallback (see resolveEncryptionSecret).
+   * apps/api/src/index.ts forwards encryptionSecret + appEnv from the
+   * resolved Worker env, so a deployed Worker never relies on the fallback.
+   */
+  encryptionSecret?: string | undefined;
+  /**
+   * Runtime environment name. Used ONLY to decide whether a missing
+   * encryption secret may fall back to the dev default; defaults to
+   * process.env.APP_ENV when omitted.
+   */
+  appEnv?: "local" | "test" | "staging" | "production" | undefined;
 }
 
 /**
@@ -405,6 +464,7 @@ interface StoreCapabilities {
   trackingEventsDelivery: boolean;
   idempotencyResponseBody: boolean;
   licensesIntegrationProfileNullable: boolean;
+  signingKeys: boolean;
 }
 
 const NO_MIGRATION_0002: StoreCapabilities = {
@@ -419,6 +479,7 @@ const NO_MIGRATION_0002: StoreCapabilities = {
   trackingEventsDelivery: false,
   idempotencyResponseBody: false,
   licensesIntegrationProfileNullable: false,
+  signingKeys: false,
 };
 
 /**
@@ -494,7 +555,8 @@ async function detectCapabilities(client: Client): Promise<StoreCapabilities> {
           OR (table_name = 'subscriptions' AND column_name = 'unit_amount_minor')
           OR (table_name = 'tracking_events' AND column_name IN ('delivery_attempts', 'delivered_at'))
           OR (table_name = 'idempotency_records' AND column_name = 'response_body')
-          OR (table_name = 'licenses' AND column_name = 'integration_profile_id'))`
+          OR (table_name = 'licenses' AND column_name = 'integration_profile_id')
+          OR (table_name = 'signing_keys'))`
   );
   const present = new Set(
     rows.map((r) => `${String(r["table_name"])}.${String(r["column_name"])}`)
@@ -520,6 +582,7 @@ async function detectCapabilities(client: Client): Promise<StoreCapabilities> {
       present.has("tracking_events.delivered_at"),
     idempotencyResponseBody: present.has("idempotency_records.response_body"),
     licensesIntegrationProfileNullable: licensesRow?.["is_nullable"] === "YES",
+    signingKeys: present.has("signing_keys.key_id"),
   };
 }
 
@@ -563,6 +626,17 @@ export class DrizzleStore extends StackMateDataStore {
   /** Serializes ALL database access on the shared client (see header 1). */
   private txQueue: Promise<void> = Promise.resolve();
   private capabilities: StoreCapabilities = NO_MIGRATION_0002;
+  /**
+   * Master secret resolved at create() (see resolveEncryptionSecret).
+   * Kept only so rotation can encrypt the new key; never logged.
+   */
+  private encryptionSecret: string | null = null;
+  /**
+   * True once the active key was loaded from signing_keys. The
+   * getActiveSigningKey() override refuses to serve a key before this,
+   * so a store can never sign with the constructor's per-process key.
+   */
+  private signingKeysDurable = false;
 
   private constructor(pgClient: Client, drizzleDb: NodePgDatabase<typeof schema>) {
     super(DEFAULT_SIGNING_KEY_ID);
@@ -611,54 +685,500 @@ export class DrizzleStore extends StackMateDataStore {
   }
 
   /**
-   * Resolve the active signing key id + material (header note 4).
-   * Priority for the id: create() option → active signing_key_metadata row
-   * → default. Priority for the private material: create() option →
-   * process.env (local dev only) → per-process generation (documented
-   * limitation: keys change on every restart/isolate).
+   * Resolve the master secret for signing-key envelope encryption.
+   * Priority: create() option `encryptionSecret` → process.env
+   * ENCRYPTION_KEY_V1 (local dev only — Workers do not populate
+   * process.env with bindings). With no secret at all, the store fails
+   * closed UNLESS the runtime is positively local/test (APP_ENV
+   * 'local'/'test', NODE_ENV 'test', or under vitest), where the env.ts
+   * dev fallback applies. This is deliberately stricter than env.ts,
+   * which defaults an unset APP_ENV to 'local': DrizzleStore cannot see
+   * Worker bindings, so an unwired Worker (no appEnv, no test signal)
+   * must fail closed rather than silently encrypt production keys with
+   * a public default. Wiring must pass encryptionSecret + appEnv
+   * (see the NOTE in the create() options).
+   */
+  private resolveEncryptionSecret(opts: DrizzleStoreCreateOptions): string {
+    const supplied = opts.encryptionSecret?.trim() ?? "";
+    const fromEnv = process.env.ENCRYPTION_KEY_V1?.trim() ?? "";
+    const secret = supplied.length > 0 ? supplied : fromEnv;
+    if (secret.length > 0) return secret;
+    const appEnv = opts.appEnv ?? process.env.APP_ENV;
+    const isProdLike = appEnv === "staging" || appEnv === "production";
+    const isKnownNonProd =
+      appEnv === "local" ||
+      appEnv === "test" ||
+      process.env.NODE_ENV === "test" ||
+      process.env.VITEST === "true";
+    if (isProdLike || !isKnownNonProd) {
+      throw new Error(
+        "DrizzleStore: ENCRYPTION_KEY_V1 is missing and no encryptionSecret was passed to DrizzleStore.create(). " +
+          "License signing keys cannot be decrypted or persisted without it. " +
+          "In staging/production set the ENCRYPTION_KEY_V1 secret (wiring: pass encryptionSecret: env.ENCRYPTION_KEY_V1 and appEnv: env.APP_ENV to DrizzleStore.create()). " +
+          "The local/test dev fallback applies only when APP_ENV is 'local'/'test' (or under vitest / NODE_ENV=test)."
+      );
+    }
+    return DEV_FALLBACK_ENCRYPTION_SECRET;
+  }
+
+  /**
+   * Durably resolve the signing keys (header note 4).
+   *
+   * Source of truth is the signing_keys table, never process memory:
+   *  1. If an 'active' row exists, load it — plus every 'retired' row,
+   *     so old tokens keep verifying across restarts. Revoked rows are
+   *     never loaded (their tokens must stop verifying).
+   *  2. If no active row exists and an env/option private JWK was
+   *     supplied, import it ONCE (bootstrap-only) under the configured
+   *     key id and persist it encrypted.
+   *  3. If no active row exists and no JWK was supplied, generate ONE
+   *     key, encrypt it, and persist it immediately.
+   * The whole bootstrap runs inside one advisory-locked transaction, so
+   * two processes booting at once converge on a single active row
+   * (unique key_id + ON CONFLICT DO NOTHING, then re-read). The
+   * constructor's per-process key is discarded here — it is never used.
+   * Throws a clear error when migration 0004 is missing, when
+   * ENCRYPTION_KEY_V1 is missing/undecryptable, or when the stored
+   * private material cannot be decrypted.
    */
   private async resolveSigningKey(
     opts: DrizzleStoreCreateOptions
   ): Promise<void> {
-    let keyId = opts.signingKeyId;
-    if (keyId === undefined) {
+    const secret = this.resolveEncryptionSecret(opts);
+    this.encryptionSecret = secret;
+    if (!this.capabilities.signingKeys) {
+      throw new Error(
+        "DrizzleStore: signing_keys table is missing. Apply migration 0004 (db/migrations/0004_signing_keys.sql) before starting the API — license signing keys are durable-only and a per-process key is no longer generated."
+      );
+    }
+    const client = this.pgClient;
+    await client.query("BEGIN");
+    try {
+      await client.query("SELECT pg_advisory_xact_lock($1)", [WRITER_ADVISORY_LOCK_KEY]);
+      const activeRows = await queryRows(
+        client,
+        `SELECT key_id FROM signing_keys WHERE status = 'active'`
+      );
+      if (activeRows.length > 1) {
+        throw new Error(
+          `DrizzleStore: signing_keys has ${activeRows.length} active keys (expected exactly one). The single-active partial unique index from migration 0004 should prevent this — inspect the table before restarting.`
+        );
+      }
+      if (activeRows.length === 0) {
+        await this.bootstrapSigningKey(client, opts, secret);
+      }
       const rows = await queryRows(
-        this.pgClient,
+        client,
+        `SELECT key_id, public_jwk, encrypted_private_jwk, status
+           FROM signing_keys WHERE status <> 'revoked'
+          ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END, key_id ASC`
+      );
+      // Decrypt inside the transaction: a corrupt/undecryptable row rolls
+      // the bootstrap back and boot fails closed with a clear error.
+      const loaded = new Map<string, Ed25519KeyMaterial>();
+      let activeKeyId: string | null = null;
+      for (const row of rows) {
+        const material = this.decryptSigningKeyRow(row, secret);
+        loaded.set(material.keyId, material);
+        if (str(row, "status") === "active") activeKeyId = material.keyId;
+      }
+      if (activeKeyId === null) {
+        throw new Error(
+          "DrizzleStore: signing_keys has no active key after bootstrap. The bootstrap insert did not produce an active row (the configured key id may already exist as a retired/revoked row) — inspect signing_keys before restarting."
+        );
+      }
+      await client.query("COMMIT");
+      // Only now replace the constructor's per-process key: nothing
+      // outside this method can ever observe a non-durable key.
+      this.signingKeys.clear();
+      for (const [keyId, material] of loaded) this.signingKeys.set(keyId, material);
+      this.activeSigningKeyId = activeKeyId;
+      this.signingKeysDurable = true;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    }
+  }
+
+  /**
+   * First-boot key creation, inside the caller's advisory-locked
+   * transaction. Key id priority: create() option `signingKeyId` → the
+   * active signing_key_metadata row (legacy hint) → the current month
+   * (sm-ed25519-YYYY-MM). Private material priority: env/option JWK
+   * (imported once, bootstrap-only) → generate one key. The row is
+   * inserted ON CONFLICT DO NOTHING so a concurrent boot that won the
+   * same key id converges instead of erroring; the caller's re-read
+   * then loads whichever active row exists.
+   */
+  private async bootstrapSigningKey(
+    client: Client,
+    opts: DrizzleStoreCreateOptions,
+    secret: string
+  ): Promise<void> {
+    let keyId = opts.signingKeyId?.trim() ?? "";
+    if (keyId.length === 0) {
+      const metaRows = await queryRows(
+        client,
         `SELECT key_id FROM signing_key_metadata
           WHERE status = 'active'
           ORDER BY activated_at DESC NULLS LAST, created_at DESC
           LIMIT 1`
       );
-      const found = rows[0] === undefined ? null : str(rows[0], "key_id");
-      keyId = found ?? DEFAULT_SIGNING_KEY_ID;
+      keyId =
+        (metaRows[0] === undefined ? null : str(metaRows[0], "key_id")) ??
+        deriveMonthlySigningKeyId();
     }
     const privateJwkRaw =
       opts.signingPrivateJwk ?? process.env.LICENSE_SIGNING_PRIVATE_JWK;
     const publicJwkRaw =
       opts.signingPublicJwk ?? process.env.LICENSE_SIGNING_PUBLIC_JWK;
+    let material: Ed25519KeyMaterial;
+    let privateJwkJson: string;
     if (privateJwkRaw !== undefined && privateJwkRaw.trim().length > 0) {
-      const material = importEd25519KeyMaterialFromPrivateJwk(
+      material = importEd25519KeyMaterialFromPrivateJwk(
         privateJwkRaw,
         keyId,
         publicJwkRaw
       );
-      this.signingKeys.set(keyId, material);
-      if (keyId !== DEFAULT_SIGNING_KEY_ID) {
-        this.signingKeys.delete(DEFAULT_SIGNING_KEY_ID);
-      }
-      this.activeSigningKeyId = keyId;
+      privateJwkJson = JSON.stringify(
+        JSON.parse(privateJwkRaw) as Record<string, unknown>
+      );
+    } else {
+      material = generateEd25519KeyMaterial(keyId);
+      privateJwkJson = exportPrivateJwkJson(material);
+    }
+    const encrypted = encryptSecretAtRest(
+      privateJwkJson,
+      secret,
+      "v1",
+      signingKeyAadContext(keyId)
+    );
+    const inserted = await client.query(
+      `INSERT INTO signing_keys
+         (id, key_id, public_jwk, encrypted_private_jwk, status,
+          created_at, activated_at, supersedes_key_id, rotation_reason)
+       VALUES ($1, $2, $3::jsonb, $4, 'active', now(), now(), NULL, NULL)
+       ON CONFLICT (key_id) DO NOTHING`,
+      [randomUUID(), keyId, JSON.stringify(material.publicKeyJwk), encrypted]
+    );
+    if (inserted.rowCount === 0) {
+      // Same key_id already exists (concurrent boot won it, or it is a
+      // retired/revoked row). The caller's re-read decides: an active
+      // row means the race converged; otherwise boot fails closed.
       return;
     }
-    if (keyId !== DEFAULT_SIGNING_KEY_ID) {
-      // No durable private key available: per-process key under the
-      // metadata-resolved id. Verification keys change on restart.
-      const material = generateEd25519KeyMaterial(keyId);
-      this.signingKeys.set(keyId, material);
-      this.signingKeys.delete(DEFAULT_SIGNING_KEY_ID);
-      this.activeSigningKeyId = keyId;
+    await this.syncSigningKeyMetadata(client, {
+      keyId,
+      publicJwk: material.publicKeyJwk,
+      status: "active",
+      retiredAt: null,
+    });
+  }
+
+  /**
+   * Decrypt one signing_keys row into key material. The stored public
+   * JWK is passed to the importer as a cross-check: import fails loudly
+   * if it does not match the private key. An undecryptable row is a
+   * fail-closed boot error, never a silent fallback to a fresh key —
+   * silently replacing the key would invalidate every token ever signed
+   * with it.
+   */
+  private decryptSigningKeyRow(row: Row, secret: string): Ed25519KeyMaterial {
+    const keyId = reqStr(row, "key_id", "signing_keys");
+    const encrypted = reqStr(row, "encrypted_private_jwk", "signing_keys");
+    let privateJwkJson: string;
+    try {
+      privateJwkJson = decryptSecretAtRest(
+        encrypted,
+        secret,
+        signingKeyAadContext(keyId)
+      );
+    } catch {
+      throw new Error(
+        `DrizzleStore: could not decrypt signing key '${keyId}' with ENCRYPTION_KEY_V1. The stored private key was encrypted with a different master secret (or the ciphertext is corrupt). Rotation to a fresh key is the only recovery — old tokens signed by this key become unverifiable. See docs/operations/KEY-ROTATION-AND-SECURITY-RUNBOOK.md.`
+      );
     }
-    // Otherwise the base constructor already generated per-process material
-    // under the default id.
+    const publicJwk = asJsonObject(row, "public_jwk");
+    return importEd25519KeyMaterialFromPrivateJwk(
+      privateJwkJson,
+      keyId,
+      JSON.stringify(publicJwk)
+    );
+  }
+
+  /**
+   * Keep signing_key_metadata (migration 0000) in sync with signing_keys:
+   * same key id, same public JWK, same lifecycle status. Same
+   * transaction as the signing_keys write, so the mirror can never
+   * diverge. Private material is NEVER written here.
+   */
+  private async syncSigningKeyMetadata(
+    client: Client,
+    row: {
+      keyId: string;
+      publicJwk: Record<string, unknown>;
+      status: "active" | "retired" | "revoked";
+      retiredAt: string | null;
+    }
+  ): Promise<void> {
+    await execSql(
+      client,
+      `INSERT INTO signing_key_metadata
+         (id, key_id, algorithm, public_key_jwk, status, activated_at, retired_at, created_at)
+       VALUES ($1, $2, 'EdDSA', $3::jsonb, $4, now(), $5, now())
+       ON CONFLICT (key_id) DO UPDATE SET
+         public_key_jwk = EXCLUDED.public_key_jwk,
+         status = EXCLUDED.status,
+         retired_at = EXCLUDED.retired_at`,
+      [
+        randomUUID(),
+        row.keyId,
+        JSON.stringify(row.publicJwk),
+        row.status,
+        row.retiredAt,
+      ]
+    );
+  }
+
+  /**
+   * Fresh rotation key id: sm-ed25519-YYYY-MM for the current month,
+   * with a -2, -3, … suffix when that id (or the suffixed one) is
+   * already taken — e.g. rotating twice in one month yields
+   * sm-ed25519-2026-11-2. Key ids are never reused, so a retired key's
+   * `kid` can never be hijacked by new material.
+   */
+  private async deriveRotationKeyId(client: Client): Promise<string> {
+    const base = deriveMonthlySigningKeyId();
+    const candidates = [
+      base,
+      ...Array.from({ length: 9 }, (_, i) => `${base}-${i + 2}`),
+    ];
+    const rows = await queryRows(
+      client,
+      `SELECT key_id FROM signing_keys WHERE key_id = ANY($1)`,
+      [candidates]
+    );
+    const taken = new Set(rows.map((r) => String(r["key_id"])));
+    for (const candidate of candidates) {
+      if (!taken.has(candidate) && !this.signingKeys.has(candidate)) {
+        return candidate;
+      }
+    }
+    throw new AppError(
+      "CONFLICT",
+      `Could not derive a fresh signing key id: '${base}' and its -2..-10 suffixes are all taken. Pass an explicit new key id to rotateSigningKey().`,
+      409
+    );
+  }
+
+  /**
+   * The active key always comes from signing_keys. Refuses to serve
+   * until the durable load in resolveSigningKey() succeeded — a store
+   * that never completed that load has only the constructor's
+   * per-process key, which must never sign a token.
+   */
+  public override getActiveSigningKey(): Ed25519KeyMaterial {
+    if (!this.signingKeysDurable) {
+      throw new Error(
+        "DrizzleStore: no durable signing key is loaded — the database-backed key load did not complete. Refusing to sign with a per-process key."
+      );
+    }
+    return super.getActiveSigningKey();
+  }
+
+  /**
+   * Durably rotate the active signing key. Generates a new key (explicit
+   * id, or a derived sm-ed25519-YYYY-MM[-n] id), encrypts its private
+   * JWK, and — inside ONE advisory-locked transaction — retires the old
+   * active row, inserts the new active row (supersedes_key_id points at
+   * the old key, rotation_reason recorded), and syncs
+   * signing_key_metadata for both. The old key stays loaded (and stays a
+   * 'retired' row), so tokens it signed keep verifying. In-memory state
+   * changes only after the durable commit.
+   */
+  public override async rotateSigningKey(
+    newKeyId?: string,
+    options?: { reason?: string }
+  ): Promise<Ed25519KeyMaterial> {
+    this.assertOpen();
+    if (!this.signingKeysDurable || !this.encryptionSecret) {
+      throw new Error(
+        "DrizzleStore: cannot rotate signing keys before the durable key load completed (see resolveSigningKey)."
+      );
+    }
+    const secret = this.encryptionSecret;
+    const release = await this.acquireQueue();
+    const client = this.pgClient;
+    let nextKeyId = "";
+    let material: Ed25519KeyMaterial | null = null;
+    try {
+      await client.query("BEGIN");
+      try {
+        await client.query("SELECT pg_advisory_xact_lock($1)", [WRITER_ADVISORY_LOCK_KEY]);
+        const activeRows = await queryRows(
+          client,
+          `SELECT key_id, public_jwk FROM signing_keys
+            WHERE status = 'active'
+            ORDER BY activated_at DESC NULLS LAST LIMIT 1`
+        );
+        const oldKeyId =
+          activeRows[0] === undefined ? null : str(activeRows[0], "key_id");
+        const oldPublicJwk =
+          activeRows[0] === undefined
+            ? null
+            : asJsonObject(activeRows[0], "public_jwk");
+        nextKeyId = newKeyId?.trim() ?? "";
+        if (nextKeyId.length === 0) {
+          nextKeyId = await this.deriveRotationKeyId(client);
+        } else {
+          if (
+            nextKeyId.length > 80 ||
+            !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(nextKeyId)
+          ) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              `Signing key ID '${nextKeyId}' is invalid: use 1-80 characters, letters/digits/dot/dash/underscore, starting with a letter or digit.`,
+              400
+            );
+          }
+          const clash = await queryRows(
+            client,
+            `SELECT key_id FROM signing_keys WHERE key_id = $1`,
+            [nextKeyId]
+          );
+          if (clash.length > 0 || this.signingKeys.has(nextKeyId)) {
+            throw new AppError(
+              "CONFLICT",
+              `Signing key ID '${nextKeyId}' already exists.`,
+              409
+            );
+          }
+        }
+        const generated = generateEd25519KeyMaterial(nextKeyId);
+        material = generated;
+        const encrypted = encryptSecretAtRest(
+          exportPrivateJwkJson(generated),
+          secret,
+          "v1",
+          signingKeyAadContext(nextKeyId)
+        );
+        const reason = options?.reason?.trim() || null;
+        const nowIso = new Date().toISOString();
+        if (oldKeyId !== null) {
+          // Retire FIRST: the single-active partial unique index forbids
+          // two active rows even for an instant inside the transaction.
+          await execSql(
+            client,
+            `UPDATE signing_keys SET status = 'retired', retired_at = now()
+              WHERE key_id = $1 AND status = 'active'`,
+            [oldKeyId]
+          );
+          await this.syncSigningKeyMetadata(client, {
+            keyId: oldKeyId,
+            publicJwk:
+              oldPublicJwk ?? this.signingKeys.get(oldKeyId)?.publicKeyJwk ?? {},
+            status: "retired",
+            retiredAt: nowIso,
+          });
+        }
+        await execSql(
+          client,
+          `INSERT INTO signing_keys
+             (id, key_id, public_jwk, encrypted_private_jwk, status,
+              created_at, activated_at, supersedes_key_id, rotation_reason)
+           VALUES ($1, $2, $3::jsonb, $4, 'active', now(), now(), $5, $6)`,
+          [
+            randomUUID(),
+            nextKeyId,
+            JSON.stringify(generated.publicKeyJwk),
+            encrypted,
+            oldKeyId,
+            reason,
+          ]
+        );
+        await this.syncSigningKeyMetadata(client, {
+          keyId: nextKeyId,
+          publicJwk: generated.publicKeyJwk,
+          status: "active",
+          retiredAt: null,
+        });
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw error;
+      }
+      if (material === null || nextKeyId.length === 0) {
+        // Unreachable: the inner try either commits with both set or throws.
+        throw new Error("DrizzleStore: rotation completed without producing a new key.");
+      }
+      this.signingKeys.set(nextKeyId, material);
+      this.activeSigningKeyId = nextKeyId;
+      return material;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Durably revoke a NON-ACTIVE signing key. The row becomes 'revoked'
+   * (signing_key_metadata synced in the same transaction) and the key
+   * is dropped from the in-memory verification set, so its tokens stop
+   * verifying and its public JWK leaves
+   * GET /api/v1/licenses/signing-keys. Revoking the active key is
+   * refused — rotate first, then revoke the retired key — so there is
+   * always exactly one active key. Revoking an already-revoked key is
+   * a no-op.
+   */
+  public override async revokeSigningKey(keyId: string): Promise<void> {
+    this.assertOpen();
+    const release = await this.acquireQueue();
+    const client = this.pgClient;
+    try {
+      await client.query("BEGIN");
+      try {
+        await client.query("SELECT pg_advisory_xact_lock($1)", [WRITER_ADVISORY_LOCK_KEY]);
+        const rows = await queryRows(
+          client,
+          `SELECT key_id, public_jwk, status, retired_at
+             FROM signing_keys WHERE key_id = $1 FOR UPDATE`,
+          [keyId]
+        );
+        if (rows.length === 0) {
+          throw new AppError("NOT_FOUND", `Signing key '${keyId}' not found.`, 404);
+        }
+        const row = rows[0]!;
+        const status = str(row, "status");
+        if (status === "active" || keyId === this.activeSigningKeyId) {
+          throw new AppError(
+            "CONFLICT",
+            `Cannot revoke the active signing key '${keyId}': rotate to a new key first, then revoke the retired key.`,
+            409
+          );
+        }
+        if (status !== "revoked") {
+          const retiredAt = iso(row, "retired_at") ?? new Date().toISOString();
+          await execSql(
+            client,
+            `UPDATE signing_keys SET status = 'revoked', retired_at = COALESCE(retired_at, now())
+              WHERE key_id = $1`,
+            [keyId]
+          );
+          await this.syncSigningKeyMetadata(client, {
+            keyId,
+            publicJwk: asJsonObject(row, "public_jwk"),
+            status: "revoked",
+            retiredAt,
+          });
+        }
+        await client.query("COMMIT");
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw error;
+      }
+      this.signingKeys.delete(keyId);
+    } finally {
+      release();
+    }
   }
 
   /**

@@ -67,6 +67,19 @@ export function createBetterAuth(
     basePath: config.basePath,
     secret: config.secret,
     trustedOrigins: config.trustedOrigins,
+    // Staff authentication is email + password. Without this, Better Auth
+    // has no credential provider at all (sign-up/sign-in return
+    // "Email and password sign up is not enabled"). Public self-registration
+    // stays closed: app.ts blocks /api/auth/sign-up/* before the Better Auth
+    // fallback, so a credential is created only server-side by
+    // ensureBetterAuthIdentity (an `accounts` row for an existing staff
+    // user — never signUpEmail, which would duplicate the `users` row).
+    // A Better Auth user without a StackMate staff record has no roles
+    // and cannot pass any admin authorization check anyway.
+    emailAndPassword: { enabled: true, requireEmailVerification: false },
+    // Staff sessions last 12h (matching the previous custom staff sessions)
+    // instead of Better Auth's 7-day default; refreshed at most hourly.
+    session: { expiresIn: 60 * 60 * 12, updateAge: 60 * 60 },
     database: drizzleAdapter(drizzleDb, {
       provider: "pg",
       schema: { users, sessions, accounts, verifications },

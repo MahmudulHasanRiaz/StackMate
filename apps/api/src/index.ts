@@ -18,10 +18,12 @@ import type { StackMateDataStore } from "./platform/db/store.ts";
  *
  * The per-request store is a DrizzleStore backed by the Hyperdrive
  * uncached connection string (see apps/api/src/platform/db/drizzle-store.ts).
- * The license signing private JWK is forwarded when configured; without it
- * the store falls back to a per-process generated key (documented open TODO
- * in drizzle-store.ts — durable key persistence needs a signing_keys table
- * or KMS).
+ * The license signing private JWK is forwarded when configured; the
+ * signing keys themselves are durable (signing_keys table, migration
+ * 0004) and the envelope-encryption secret is forwarded below, so a
+ * Worker boot decrypts the stored keys instead of generating a
+ * per-process key. Without ENCRYPTION_KEY_V1 the store fails closed
+ * at boot (see DrizzleStore.resolveEncryptionSecret).
  */
 async function createRequestStore(env: StackMateBindings): Promise<StackMateDataStore> {
   return DrizzleStore.create({
@@ -30,6 +32,8 @@ async function createRequestStore(env: StackMateBindings): Promise<StackMateData
     signingKeyId: env.LICENSE_SIGNING_KEY_ID,
     signingPrivateJwk: env.LICENSE_SIGNING_PRIVATE_JWK,
     signingPublicJwk: env.LICENSE_SIGNING_PUBLIC_JWK,
+    encryptionSecret: env.ENCRYPTION_KEY_V1,
+    appEnv: env.APP_ENV,
   });
 }
 

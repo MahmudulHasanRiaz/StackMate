@@ -131,13 +131,36 @@ were false and were corrected, not believed:
 
 ## 7. Known gaps carried forward (not silently fixed)
 
-- License signing-key material is generated per process (no durable key
+- ~~License signing-key material is generated per process (no durable key
   store in the schema — `signing_key_metadata` holds public JWKs only).
   Durable key persistence (signing_keys table or KMS) is an open TODO;
-  see `drizzle-store.ts` header and STATUS.md.
-- Staff sessions (custom identity service, store `sessions` state) and
+  see `drizzle-store.ts` header and STATUS.md.~~ **FIXED in phase 2**
+  (§8, ADR-0007 §1): `signing_keys` table (migration 0004), durable
+  boot/rotate/revoke, restart persistence verified.
+- ~~Staff sessions (custom identity service, store `sessions` state) and
   Better Auth sessions (Drizzle `sessions` table) are NOT yet unified.
-  The seam is documented in code and STATUS.md.
+  The seam is documented in code and STATUS.md.~~ **FIXED in phase 2**
+  (§8, ADR-0007 §2–§4): Better Auth is the single authentication
+  authority; the only remaining seam is the test-only in-memory fallback
+  when a store has no `drizzleDb`.
 - No live Postgres was available in this environment at implementation
   time unless the integration-test agent provisioned one; see STATUS.md
-  for the exact verification state.
+  for the exact verification state. (Phase 2 ran everything against
+  local PostgreSQL 16 on `127.0.0.1:5432/stackmate_test`.)
+
+## 8. Phase 2 (2026-11-15) — critical fixes + deployment readiness
+
+Same branch (`feat/stackmate-full-implementation`), local commits only,
+nothing pushed/merged, main and PR #1 untouched.
+
+| Fix | What changed | Evidence |
+| :--- | :--- | :--- |
+| 1 — Durable signing keys | Migration 0004 + `db/schema/signing-keys.ts`; `DrizzleStore` loads active + retired keys from `signing_keys` (AES-256-GCM under `ENCRYPTION_KEY_V1`), imports env JWK once or generates + persists one key, advisory-locked bootstrap/rotation; `rotateSigningKey`/`revokeSigningKey` now async; `index.ts` forwards `encryptionSecret` + `appEnv`; key-rotation runbook rewritten | `apps/api/test/signing-keys.test.ts` 6/6 (generate+persist, restart persistence, rotate, revoke, env import, fail-closed); `check-migrations` 64 tables / 5 migrations |
+| 2 — Unified Better Auth + staff auth | `emailAndPassword` enabled (12h sessions); `ensureBetterAuthIdentity` provisions the credential `accounts` row (`accountId === user.id`); lazy migration from the legacy scrypt hash on first sign-in; sign-in/logout/session validation through BA sessions; suspended users fail even with a live session; password change revokes other sessions via dedicated endpoint; public sign-up blocked (403); admin SPA sign-out button | `apps/api/test/better-auth-unified.test.ts` 9/9; ADR-0007 §3 records the four verified better-auth 1.7.23 behaviours |
+| 3 — Postgres business-workflow tests | `apps/api/test/business-workflows.integration.test.ts` (hermetic fresh DB, DB-state assertions): 20 tests covering auth+RBAC, product/plan, customer, order, payment, concurrent verification race, subscription activation/renewal/expiry, license issuance/activation/limit/suspension/revocation, external-site + HMAC auth, idempotency, outbox/webhooks, Meta Purchase, rollback | 20/20; full suite 60/60 across 8 files |
+| 4 — CI + deploy workflows | `ci.yml` rewritten (validate → check-migrations → lint → typecheck → unit tests → Postgres integration tests on `postgres:16` service container → build → wrangler dry-run); `deploy-production.yml` rewritten (manual-only, `production` environment approval, `confirm` must type `production`, migrations via direct `DIRECT_DATABASE_URL` before app deploy); `docs/operations/CI-CD-AND-MIGRATIONS.md` rewritten to match | Both YAMLs parse (PyYAML); `validate-repo` / `check-migrations` / `lint-repo` pass locally. **No GitHub Actions run has ever been observed** — the Muse GitHub App cannot push workflow files (403, no `workflows:write`); the owner must add the two files (paths in the phase-2 report) and trigger a run. |
+
+New gaps found by the Fix 3 suite (recorded in STATUS.md, not hidden):
+no automatic subscription-expiry job; an expired license's status flip is
+discarded by the validation transaction's rollback; public checkout never
+dedupes customers by email.

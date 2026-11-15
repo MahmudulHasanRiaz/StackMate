@@ -7,9 +7,9 @@
  * Building the auth instance for the in-memory store lazily creates a `pg`
  * Client + drizzle() but opens no connection, so this needs no live DB.
  *
- * GET /api/auth/session without credentials must still return 401 from the
- * CUSTOM staff-session route, proving custom routes win over the Better Auth
- * fallback mounted after them.
+ * GET /api/auth/session without credentials must still return 401 from
+ * the unified staff-session route (Better Auth backed when the store has
+ * a database; test-adapter sessions otherwise).
  */
 import { describe, it, beforeEach } from "vitest";
 import assert from "node:assert/strict";

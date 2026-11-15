@@ -22,7 +22,9 @@ import {
 import {
   type Ed25519KeyMaterial,
   generateEd25519KeyMaterial,
+  readEntitlementJwsKid,
   sha256Hex,
+  verifyEntitlementJws as verifyEntitlementJwsWithKey,
 } from "../crypto/index.ts";
 import { InMemoryR2Bucket } from "../storage/r2.ts";
 import { AppError } from "../../shared/errors.ts";
@@ -709,7 +711,54 @@ export class StackMateDataStore {
     return k;
   }
 
-  public rotateSigningKey(newKeyId: string): Ed25519KeyMaterial {
+  /**
+   * Public JWKs of every key this store will verify with — active first,
+   * then retired keys by key id. Revoked keys are NOT in `signingKeys`
+   * (DrizzleStore never loads them; the in-memory store deletes them on
+   * revoke), so they never appear here. This is what
+   * GET /api/v1/licenses/signing-keys publishes.
+   */
+  public listPublicSigningKeys(): Array<Record<string, unknown>> {
+    const keys = [...this.signingKeys.values()];
+    keys.sort((a, b) => {
+      if (a.keyId === this.activeSigningKeyId && b.keyId !== this.activeSigningKeyId) return -1;
+      if (b.keyId === this.activeSigningKeyId && a.keyId !== this.activeSigningKeyId) return 1;
+      return a.keyId.localeCompare(b.keyId);
+    });
+    return keys.map((k) => k.publicKeyJwk);
+  }
+
+  /**
+   * Verify an entitlement JWS against the key its header `kid` names.
+   * Retired keys still verify (they stay in `signingKeys`); revoked or
+   * unknown kids throw LICENSE_INVALID because no such key is loaded.
+   * Expiry / issuer / product checks are the same as verifyEntitlementJws.
+   */
+  public verifyEntitlementJws(
+    jwsToken: string,
+    options?: Parameters<typeof verifyEntitlementJwsWithKey>[2]
+  ): ReturnType<typeof verifyEntitlementJwsWithKey> {
+    const kid = readEntitlementJwsKid(jwsToken);
+    const material = this.signingKeys.get(kid);
+    if (!material) {
+      throw new AppError(
+        "LICENSE_INVALID",
+        `Entitlement JWS was signed with unknown or revoked key '${kid}'.`,
+        401
+      );
+    }
+    return verifyEntitlementJwsWithKey(jwsToken, material.publicKeyJwk, options);
+  }
+
+  /**
+   * Rotate the active signing key (IN-MEMORY ONLY in this base class:
+   * the new key is generated, kept in `signingKeys`, and made active;
+   * the old key stays loaded so its tokens keep verifying).
+   * DrizzleStore overrides this with the durable version, which persists
+   * the new key encrypted in signing_keys and retires the old row in the
+   * same transaction. Async so the override can do database work.
+   */
+  public async rotateSigningKey(newKeyId: string): Promise<Ed25519KeyMaterial> {
     if (this.signingKeys.has(newKeyId)) {
       throw new AppError("CONFLICT", `Signing key ID '${newKeyId}' already exists.`, 409);
     }
@@ -717,6 +766,29 @@ export class StackMateDataStore {
     this.signingKeys.set(newKeyId, nextKey);
     this.activeSigningKeyId = newKeyId;
     return nextKey;
+  }
+
+  /**
+   * Revoke a NON-ACTIVE signing key (IN-MEMORY ONLY in this base class:
+   * the key is dropped from `signingKeys`, so its tokens stop verifying
+   * and its public JWK leaves listPublicSigningKeys()).
+   * DrizzleStore overrides this with the durable version, which marks
+   * the row 'revoked' in signing_keys and syncs signing_key_metadata.
+   * The active key can never be revoked — rotate first, then revoke the
+   * retired key — so there is always exactly one active key.
+   */
+  public async revokeSigningKey(keyId: string): Promise<void> {
+    if (keyId === this.activeSigningKeyId) {
+      throw new AppError(
+        "CONFLICT",
+        `Cannot revoke the active signing key '${keyId}': rotate to a new key first, then revoke the retired key.`,
+        409
+      );
+    }
+    if (!this.signingKeys.has(keyId)) {
+      throw new AppError("NOT_FOUND", `Signing key '${keyId}' not found.`, 404);
+    }
+    this.signingKeys.delete(keyId);
   }
 
   /**

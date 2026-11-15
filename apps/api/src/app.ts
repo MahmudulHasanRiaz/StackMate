@@ -35,9 +35,13 @@ import { AppError } from "./shared/errors.ts";
 import {
   assertStaffPermission,
   bootstrapInitialSuperAdmin,
+  changeStaffPassword,
   createStaffUserByAdmin,
-  resolveStaffPrincipalFromToken,
+  ensureBetterAuthIdentity,
+  resolveStaffPrincipal,
   signInStaffSession,
+  signOutStaffSession,
+  storeSupportsBetterAuth,
   type StaffPrincipal,
   updateStaffUserRoles,
 } from "./modules/identity/service.ts";
@@ -303,6 +307,25 @@ export function createStackMateApp(
         headers: buildStandardHeaders(requestId, originHeader, trustedOrigins, extraHeaders),
       });
 
+    // Like jsonResponse, but appends multiple Set-Cookie values (e.g. the
+    // signed Better Auth session cookie). Set-Cookie values must never be
+    // joined with ", " — cookie Expires dates contain commas.
+    const jsonResponseWithCookies = <T>(
+      data: T,
+      status = 200,
+      cookies: string[] = [],
+      extraHeaders?: Record<string, string>
+    ) => {
+      const headers = new Headers(
+        buildStandardHeaders(requestId, originHeader, trustedOrigins, extraHeaders)
+      );
+      for (const cookie of cookies) headers.append("Set-Cookie", cookie);
+      return new Response(JSON.stringify(createSuccessEnvelope(data, requestId)), {
+        status,
+        headers,
+      });
+    };
+
     const collectionResponse = <T>(
       items: T[],
       nextCursor: string | null = null,
@@ -360,6 +383,17 @@ export function createStackMateApp(
             password: body.password,
             requestId,
           });
+          // Provision the Better Auth identity for the same email, so the
+          // first sign-in goes through Better Auth directly. Best-effort:
+          // if provisioning fails here, sign-in lazily migrates the
+          // account (see identity/service.ts) and never duplicates it.
+          if (storeSupportsBetterAuth(store)) {
+            await ensureBetterAuthIdentity(store, {
+              userId: created.user.id,
+              email: body.email,
+              password: body.password,
+            }).catch(() => {});
+          }
           return jsonResponse(created, 201);
         }
 
@@ -368,58 +402,124 @@ export function createStackMateApp(
           if (!body.email || !body.password) {
             throw new AppError("VALIDATION_ERROR", "email and password are required.", 422);
           }
-          const signedIn = await signInStaffSession(store, {
-            email: body.email,
-            password: body.password,
-            ipAddress: clientIp,
-            userAgent: request.headers.get("User-Agent"),
-            requestId,
-          });
+          const auth = storeSupportsBetterAuth(store)
+            ? await getBetterAuth(env, store)
+            : null;
+          const signedIn = await signInStaffSession(
+            store,
+            {
+              email: body.email,
+              password: body.password,
+              ipAddress: clientIp,
+              userAgent: request.headers.get("User-Agent"),
+              requestId,
+            },
+            auth
+          );
+          const payload = {
+            session_token: signedIn.session_token,
+            expires_at: signedIn.expires_at,
+            principal: signedIn.principal,
+          };
+          if (auth) {
+            // Better Auth path: forward the signed session cookie(s) it issued.
+            return jsonResponseWithCookies(payload, 200, signedIn.set_cookie);
+          }
           const isProd = env.APP_ENV === "production" || env.APP_ENV === "staging";
           const cookieName = isProd ? "__Host-stackmate_session" : "stackmate_session";
           const cookieValue = `${cookieName}=${signedIn.session_token}; Path=/; HttpOnly; SameSite=Lax${isProd ? "; Secure" : ""}`;
-          return jsonResponse(signedIn, 200, { "Set-Cookie": cookieValue });
+          return jsonResponse(payload, 200, { "Set-Cookie": cookieValue });
         }
 
         if (method === "POST" && pathname === "/api/auth/sign-out") {
-          const token =
-            parseSessionCookie(request.headers.get("Cookie")) ??
-            extractBearerToken(request.headers.get("Authorization"));
-          if (token) {
-            await store.withTransaction((state) => {
-              state.sessions = state.sessions.filter((s) => s.token !== token);
-            });
-          }
-          return jsonResponse(
-            { signed_out: true },
-            200,
-            {
-              "Set-Cookie":
-                "stackmate_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax",
-            }
-          );
+          const cookieHeader = request.headers.get("Cookie");
+          const bearerToken = extractBearerToken(request.headers.get("Authorization"));
+          const auth = storeSupportsBetterAuth(store)
+            ? await getBetterAuth(env, store)
+            : null;
+          const result = await signOutStaffSession(store, {
+            auth,
+            cookieHeader,
+            bearerToken,
+          });
+          return jsonResponseWithCookies({ signed_out: true }, 200, [
+            ...result.set_cookie,
+            "stackmate_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax",
+          ]);
         }
 
         if (method === "GET" && pathname === "/api/auth/session") {
-          const token =
-            parseSessionCookie(request.headers.get("Cookie")) ??
-            extractBearerToken(request.headers.get("Authorization"));
-          const principal = resolveStaffPrincipalFromToken(store, token);
+          const auth = storeSupportsBetterAuth(store)
+            ? await getBetterAuth(env, store)
+            : null;
+          const principal = await resolveStaffPrincipal(store, {
+            auth,
+            cookieHeader: request.headers.get("Cookie"),
+            bearerToken: extractBearerToken(request.headers.get("Authorization")),
+          });
           if (!principal) {
             throw new AppError("UNAUTHORIZED", "No active staff session.", 401);
           }
           return jsonResponse({ principal });
         }
 
+        if (method === "POST" && pathname === "/api/auth/change-password") {
+          const body = (await request.json()) as {
+            current_password?: string;
+            new_password?: string;
+          };
+          if (!body.current_password || !body.new_password) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              "current_password and new_password are required.",
+              422
+            );
+          }
+          const auth = storeSupportsBetterAuth(store)
+            ? await getBetterAuth(env, store)
+            : null;
+          const principal = await resolveStaffPrincipal(store, {
+            auth,
+            cookieHeader: request.headers.get("Cookie"),
+            bearerToken: extractBearerToken(request.headers.get("Authorization")),
+          });
+          if (!principal) {
+            throw new AppError("UNAUTHORIZED", "No active staff session.", 401);
+          }
+          const changed = await changeStaffPassword(store, principal, {
+            auth,
+            cookieHeader: request.headers.get("Cookie"),
+            currentPassword: body.current_password,
+            newPassword: body.new_password,
+            requestId,
+          });
+          return jsonResponse(changed, 200);
+        }
+
+        // Public self-registration is CLOSED: staff accounts are created
+        // only by bootstrap / an administrator. The Better Auth sign-up
+        // endpoint is reachable server-side only (see
+        // ensureBetterAuthIdentity). Block it here, before the fallback.
+        if (
+          pathname === "/api/auth/sign-up" ||
+          pathname.startsWith("/api/auth/sign-up/")
+        ) {
+          throw new AppError(
+            "FORBIDDEN",
+            "Public self-registration is disabled. Staff accounts are provisioned by an administrator.",
+            403
+          );
+        }
+
         // Fallback: every other /api/auth/* path is handled by real Better Auth.
         //
-        // SESSION SEAM — read before "unifying" anything: staff sessions live
-        // in the store's `sessions` state and are served by the custom
-        // identity service above (/api/auth/session stays the custom one).
-        // Better Auth sessions live in the Drizzle `sessions` table and are
-        // served by Better Auth's own endpoints (e.g. /api/auth/get-session,
-        // /api/auth/ok). The two session systems are NOT yet unified; this
-        // fallback only makes Better Auth's standard paths reachable.
+        // UNIFIED SESSIONS (2026-11-15, Fix 2): staff sign-in, session
+        // validation, sign-out and password change above all go through
+        // Better Auth sessions (Drizzle `sessions` table). The custom
+        // identity service only maps a Better Auth user to StackMate
+        // roles/permissions and enforces suspension. The only remaining
+        // seam is the in-memory test adapter (no Postgres, no Better
+        // Auth) — see modules/identity/service.ts header.
         const auth = await getBetterAuth(env, store);
         return auth.handler(request);
       }
@@ -970,10 +1070,14 @@ export function createStackMateApp(
           );
         }
 
-        const principal: StaffPrincipal | null = resolveStaffPrincipalFromToken(
-          store,
-          sessionCookie ?? bearerToken
-        );
+        const auth = storeSupportsBetterAuth(store)
+          ? await getBetterAuth(env, store)
+          : null;
+        const principal: StaffPrincipal | null = await resolveStaffPrincipal(store, {
+          auth,
+          cookieHeader: request.headers.get("Cookie"),
+          bearerToken,
+        });
         if (!principal) {
           throw new AppError("UNAUTHORIZED", "Valid staff authentication session required.", 401);
         }
@@ -1016,6 +1120,15 @@ export function createStackMateApp(
             ...body,
             requestId,
           });
+          // Provision the Better Auth identity for the same email (best
+          // effort — first sign-in lazily migrates if this fails).
+          if (storeSupportsBetterAuth(store)) {
+            await ensureBetterAuthIdentity(store, {
+              userId: created.user.id,
+              email: body.email,
+              password: body.password,
+            }).catch(() => {});
+          }
           return jsonResponse(created, 201);
         }
 

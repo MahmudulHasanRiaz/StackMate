@@ -10,6 +10,7 @@ export * from "./subscriptions.ts";
 export * from "./invoices.ts";
 export * from "./payments.ts";
 export * from "./licenses.ts";
+export * from "./signing-keys.ts";
 export * from "./tracking.ts";
 export * from "./delivery.ts";
 export * from "./audit.ts";

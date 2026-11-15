@@ -147,6 +147,17 @@ export function App() {
     }
   }
 
+  async function handleSignOut() {
+    try {
+      await apiRequest("/api/auth/sign-out", { method: "POST" });
+    } catch {
+      // Sign-out is best-effort client-side: the session may already be
+      // revoked server-side. Clear local auth state either way.
+    }
+    setPrincipal(null);
+    setOverview(null);
+  }
+
   async function loadSectionData(section: AdminSectionKey) {
     setActiveSection(section);
     setErrorBanner(null);
@@ -271,8 +282,17 @@ export function App() {
           <div style={{ fontSize: "13px", color: "var(--sm-text-muted)" }}>
             Signed in as <strong>{principal.user.name}</strong> ({principal.roles.join(", ")})
           </div>
-          <div className="sm-mono" style={{ color: "var(--sm-text-muted)" }}>
-            {formatDisplayDateDDMMYYYY(new Date())}
+          <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+            <button
+              type="button"
+              className="sm-nav-btn"
+              onClick={() => void handleSignOut()}
+            >
+              Sign out
+            </button>
+            <div className="sm-mono" style={{ color: "var(--sm-text-muted)" }}>
+              {formatDisplayDateDDMMYYYY(new Date())}
+            </div>
           </div>
         </header>
 

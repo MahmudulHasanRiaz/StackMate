@@ -24,3 +24,22 @@
 | `D-03` | Partial Payment Submissions | Disabled initially (`submitted_amount_minor` must match `order.total_minor`); data model supports multi-submission history per order | `apps/api/src/modules/payments/service.ts` |
 | `D-04` | License Offline Grace Window | Default `7 days` (`offline_grace_days = 7`) encoded in signed `Ed25519` JWS token `grace_until` claim | `apps/api/src/modules/licensing/service.ts` |
 | `D-05` | Multi-Factor Authentication (MFA) | Schema-ready (`users.mfa_enabled`, `user_mfa_factors`) with session assurance checks and RBAC enforcement across 5 system roles | `db/schema/identity.ts`, `apps/api/src/modules/identity/service.ts` |
+
+## 3. Phase 2 — critical fixes + deployment readiness (2026-11-15)
+
+Same branch (`feat/stackmate-full-implementation`), local commits only.
+Staged tasks, in dependency order; all four landed and verified (see
+`STATUS.md` for exact commands and `RECONCILIATION.md` §8 for the
+per-fix record).
+
+| # | Task | Depends on | Affected paths | Acceptance criteria (all met) |
+| :--- | :--- | :--- | :--- | :--- |
+| 1 | Durable license signing keys | — | `db/migrations/0004_signing_keys.sql`, `db/schema/signing-keys.ts`, `apps/api/src/platform/db/drizzle-store.ts`, `store.ts`, `platform/crypto/index.ts`, `apps/api/src/index.ts`, `docs/operations/KEY-ROTATION-AND-SECURITY-RUNBOOK.md` | `signing_keys` is the source of truth; restart persistence proven; rotation keeps old tokens verifiable; revoked keys reject; fail-closed on missing/undecryptable secret. Test: `signing-keys.test.ts` 6/6. |
+| 2 | Unify Better Auth + staff auth | — | `apps/api/src/modules/identity/better-auth.ts`, `service.ts`, `apps/api/src/app.ts`, `apps/admin/src/App.tsx` | One session authority (BA `sessions` table); suspended users fail; logout revokes; password change revokes other sessions; lazy migration never duplicates, wrong password never provisions; public sign-up blocked. Test: `better-auth-unified.test.ts` 9/9. Governing record: ADR-0007. |
+| 3 | Postgres business-workflow tests | 1, 2 | `apps/api/test/business-workflows.integration.test.ts` only | 17 workflows + concurrency + rollback, all with DB-state assertions against real Postgres. Test: 20/20. Three real gaps found and recorded in STATUS.md (no expiry job; expired status never persisted; checkout customer dedupe). |
+| 4 | CI + deploy workflow content | — | `.github/workflows/ci.yml`, `deploy-production.yml`, `docs/operations/CI-CD-AND-MIGRATIONS.md` | CI runs the full gate incl. Postgres integration tests; deploy is approval-gated, migrations-before-app via direct `DIRECT_DATABASE_URL`. YAML parses. **Not verified live**: no GitHub Actions run has been observed; the Muse GitHub App cannot push workflow files (403) — owner action. |
+
+Risks carried forward: production deployment still owner-owned (no
+Cloudflare resources touched); admin SPA never exercised in a browser;
+no password-change UI in the admin SPA; the three Fix 3 findings above
+are unfixed by design in this phase (recorded, not hidden).

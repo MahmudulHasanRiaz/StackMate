@@ -20,12 +20,12 @@
 | `pnpm install --frozen-lockfile` | PASS (after lockfile regen; `zod@3.24.2` direct dep removed, better-auth peer now `zod@4.6.7`) |
 | `pnpm typecheck` (real `tsc --noEmit`, all packages) | PASS |
 | `pnpm build` (admin `tsc + vite build`; API `wrangler deploy --dry-run`) | PASS — real vite output in `apps/admin/dist/`; wrangler dry-run validated the Worker bundle with placeholder Hyperdrive IDs (bundle validation only, no deploy) |
-| `DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/stackmate_test pnpm test` (vitest) | **25/25 pass**: DrizzleStore integration 5/5 (commit visibility, rollback, idempotency replay + 409, seed visibility, 93-grant role matrix), SHA-256 vectors 7/7, fail-closed 4/4, e2e (in-memory adapter) 7/7, Better Auth smoke 2/2 |
-| `pnpm test` (no `DATABASE_URL`) | 20 pass, 5 skipped — integration suite skips cleanly, does not fake-pass |
-| `DATABASE_URL=... node scripts/migrate.mjs` (real run, local test Postgres) | PASS — applied 0000–0003; verified `role_permissions` = 93, `sequence_counters` = 5 |
-| `node scripts/check-migrations.mjs` | PASS — 63 Drizzle tables verified against 4 committed SQL migrations (0000–0003) |
+| `DATABASE_URL=postgresql://postgres:postgres@127.0.0.1:5432/stackmate_test pnpm test` (vitest) | **60/60 pass, 8 files**: DrizzleStore integration 5/5 (commit visibility, rollback, idempotency replay + 409, seed visibility, 93-grant role matrix), SHA-256 vectors 7/7, fail-closed 4/4, e2e (in-memory adapter) 7/7, Better Auth smoke 2/2, **signing keys 6/6** (generate+persist, restart persistence, rotate, revoke, env-JWK import, fail-closed), **Better Auth unified 9/9** (bootstrap provisioning, BA cookie+bearer auth, sign-up blocked, wrong password, lazy migration, suspension, sign-out, password change revokes others, role change revokes sessions), **business workflows 20/20** (Postgres-backed, DB-state assertions: auth+RBAC, product/plan, customer, order, manual payment, concurrent verification race, subscription activation, license issuance/activation/limit, renewal, expiry, suspension/revocation, external-site + HMAC auth, idempotency, outbox/webhooks, Meta Purchase, rollback). Parent re-ran the suite independently 2026-11-15 15:53 +06: first run was 59/60 (business-workflow test 6 failed on a timezone-naive `toISOString` assertion for the DATE column `payment_date` — stored value was correct; fixed in commit `f25f1ad` to compare in Asia/Dhaka), second run **60/60 pass, 8 files**. |
+| `pnpm test` (no `DATABASE_URL`) | 20 pass, 40 skipped — all 4 Postgres suites skip cleanly, do not fake-pass |
+| `DATABASE_URL=... node scripts/migrate.mjs` (real run, local test Postgres) | PASS — applied 0000–0004; verified `role_permissions` = 93, `sequence_counters` = 5, `signing_keys` holds one active key `sm-ed25519-2026-11` with encrypted private JWK |
+| `node scripts/check-migrations.mjs` | PASS — 64 Drizzle tables verified against 5 committed SQL migrations (0000–0004) |
 | `node scripts/validate-repo.mjs` | PASS |
-| `node scripts/lint-repo.mjs` | PASS — 90 files |
+| `node scripts/lint-repo.mjs` | PASS — 95 files |
 | `node scripts/smoke-check.mjs` | PASS — `/api/v1/health` + `/api/v1/licenses/signing-keys` (test env, in-memory test adapter) |
 | `drizzle-kit generate` (temp copy only, out dir `/tmp`) | PASS — generated SQL reproduces the schema except the documented SQL-only items below |
 | Worker entrypoint probe (`apps/api/src/index.ts`, raw Node) | PASS — production fetch without Hyperdrive throws `HYPERDRIVE_NO_CACHE binding is required in staging/production.`; test-env fetch returns 200 (`service: "stackmate-api"`) |
@@ -36,38 +36,37 @@
 | :--- | :--- | :--- | :--- |
 | Stage 0: ADRs, date & migration safety | `docs/decisions/ADR-0001..0006`, `scripts/validate-repo.mjs` | **Verified** | validate-repo passes; ADR-0004/0002 carry verified correction records |
 | Shared contracts, money & date utilities | `packages/contracts` | **Verified** | typecheck + vite build + SHA-256 vectors; browser-safe since the `node:crypto` removal (see Known gaps) |
-| Drizzle schema (63 tables) & SQL migrations (0000–0003) | `db/schema/*`, `db/migrations/*` | **Verified** | check-migrations passes; live migrate run applied all 4; `drizzle-kit generate` diff is clean except SQL-only items |
-| Hyperdrive connector & Drizzle production store | `apps/api/src/platform/db/*` | **Verified** (live Postgres) | commit/rollback/idempotency/seed/grants all pass against real Postgres; advisory-lock transaction semantics |
-| Identity, Better Auth, 5-role RBAC & audit | `apps/api/src/modules/identity`, `audit` | **Partial** | Genuine `betterAuth()` + `drizzleAdapter(pg)` mounted at `/api/auth/*`; `GET /api/auth/ok` returns a real Better Auth response; e2e RBAC tests pass on the in-memory adapter. **Not unified**: staff sessions live in the store `sessions` state, Better Auth sessions in the Drizzle `sessions` table — the seam is documented in `app.ts` and NOT faked. Full session parity is not verified. |
-| Catalog, plans, prices, coupons | `apps/api/src/modules/catalog` | **Implemented-not-verified** (live DB) | Exercised only by the in-memory e2e suite |
-| Commerce / checkout / orders / attribution | `apps/api/src/modules/commerce`, `integrations` | **Implemented-not-verified** (live DB) | Same — in-memory e2e only |
-| Manual payments, R2 proofs, fulfillment | `apps/api/src/modules/payments`, `subscriptions` | **Implemented-not-verified** (live DB) | Same; production R2 fail-closed path is code-verified (503 without a real bucket) but no live R2 bucket exists in this environment |
-| Licensing engine (Ed25519 JWS + HMAC-SHA256) | `apps/api/src/modules/licensing` | **Implemented-not-verified** (live DB) | Same; signing-key durability gap below |
-| Meta CAPI tracking & transactional outbox | `apps/api/src/modules/tracking`, `webhooks` | **Implemented-not-verified** (live DB) | Same |
-| Admin SPA (React + Vite + TS) | `apps/admin` | **Partial** | Real `vite build` passes and produces `dist/`; **runtime UI has not been exercised in a browser** in this session |
-| Seed & bootstrap runners | `scripts/seed-reference.mjs`, `scripts/bootstrap-super-admin.mjs` | **Partial** | Seed path verified live via migration 0001 (roles/providers present); `bootstrap-super-admin` (HTTP POST to a running API) has **not** been run against a live server |
-| CI / deploy workflows | `.github/workflows/ci.yml`, `deploy-production.yml` | **Implemented-not-verified** | Fixed (pnpm + frozen lockfile; migrate-before-deploy actually applies migrations; deploy jobs run `wrangler deploy`; manual-only preserved). **No GitHub Actions run has been observed in this session.** |
+| Drizzle schema (64 tables) & SQL migrations (0000–0004) | `db/schema/*`, `db/migrations/*` | **Verified** | check-migrations passes; live migrate run applied all 5; `drizzle-kit generate` diff is clean except SQL-only items; migration 0004 adds `signing_keys` (single-active partial unique index, status CHECK) |
+| Hyperdrive connector & Drizzle production store | `apps/api/src/platform/db/*` | **Verified** (live Postgres) | commit/rollback/idempotency/seed/grants all pass against real Postgres; advisory-lock transaction semantics; signing keys durable (see Licensing row) |
+| Identity, Better Auth, 5-role RBAC & audit | `apps/api/src/modules/identity`, `audit` | **Verified** (live Postgres) | Better Auth is now the single authentication authority: staff sign-in/logout/session validation go through Better Auth sessions (Drizzle `sessions` table); suspended users fail validation even with a live session; sign-out revokes; password change revokes other sessions via the dedicated `revokeOtherSessions` endpoint; lazy migration provisions a credential account once from the legacy scrypt hash (never duplicates, wrong password never provisions); public sign-up blocked (403). Verified behaviours of better-auth 1.7.23 recorded in ADR-0007 §3 (credential `accountId === user.id`; `asResponse` error shape; `changePassword(revokeOtherSessions: true)` revokes ALL sessions; no Bearer session retrieval). Remaining seam (test-only): the in-memory session fallback when a store has no `drizzleDb` — unreachable in production/staging wiring. |
+| Catalog, plans, prices, coupons | `apps/api/src/modules/catalog` | **Verified** (live Postgres) | Business-workflow suite 20/20 with DB-state assertions (product/plan creation incl. publish version) |
+| Commerce / checkout / orders / attribution | `apps/api/src/modules/commerce`, `integrations` | **Verified** (live Postgres) | Same suite: admin + public-checkout orders, idempotency, HMAC site-to-site auth |
+| Manual payments, R2 proofs, fulfillment | `apps/api/src/modules/payments`, `subscriptions` | **Verified** (live Postgres) | Same suite: manual payment submission, concurrent verification race (exactly one 200, one 409), subscription activation/renewal; production R2 fail-closed path is code-verified (503 without a real bucket) but no live R2 bucket exists in this environment |
+| Licensing engine (Ed25519 JWS + HMAC-SHA256) | `apps/api/src/modules/licensing` | **Verified** (live Postgres) | Signing keys are durable: `signing_keys` table is the source of truth (AES-256-GCM under `ENCRYPTION_KEY_V1`, AAD per key id); boot loads active + retired keys, imports env JWK once or generates + persists one key; rotation retires + inserts in one transaction; retired keys verify, revoked keys do not; restart persistence proven (token from instance 1 verifies on instance 2). `index.ts` forwards `encryptionSecret` + `appEnv` to the store. See ADR-0007 §1 and the key-rotation runbook. |
+| Meta CAPI tracking & transactional outbox | `apps/api/src/modules/tracking`, `webhooks` | **Verified** (live Postgres) | Same suite: outbox rows per event, webhook dispatch claimed/delivered, exactly one Meta Purchase event per verified purchase |
+| Admin SPA (React + Vite + TS) | `apps/admin` | **Partial** | Real `vite build` passes and produces `dist/`; login uses the unified Better Auth flow; a working Sign out button was added. **Runtime UI has not been exercised in a browser** in this session; no password-change UI exists (endpoint + tests only). |
+| Seed & bootstrap runners | `scripts/seed-reference.mjs`, `scripts/bootstrap-super-admin.mjs` | **Partial** | Seed path verified live via migration 0001 (roles/providers present); `bootstrap-super-admin` (HTTP POST to a running API) has **not** been run against a live server — the bootstrap *route* is verified by the unified-auth test (provisions a Better Auth identity) |
+| CI / deploy workflows | `.github/workflows/ci.yml`, `deploy-production.yml` | **Implemented-not-verified** | Rewritten: CI runs validate → check-migrations → lint → typecheck → unit tests → Postgres integration tests (service container `postgres:16`) → build → wrangler dry-run; deploy is manual-only, approval-gated via `production` environment, migrations (direct `DIRECT_DATABASE_URL`, never Hyperdrive) before app deploy, `confirm` input must type exactly `production`. YAML parses; **no GitHub Actions run has been observed in this session** (the Muse GitHub App cannot push workflow files — 403, no `workflows:write` permission; owner must add the files, see `docs/operations/CI-CD-AND-MIGRATIONS.md`). |
 | Production deployment (Cloudflare) | — | **Not implemented / blocked** | No Cloudflare resources, secrets, or deploy have been touched. First setup + deploy is owner-owned per `AGENTS.md` §9. **Do not claim production readiness.** |
 
 ## Known gaps and limitations (do not hide these)
 
-1. **Signing-key private material is per-process** unless `LICENSE_SIGNING_PRIVATE_JWK`
-   is supplied: there is no durable key store. `signing_key_metadata` holds
-   public JWKs only; `rotateSigningKey` is in-memory only. Needs a
-   `signing_keys` table or KMS before production.
-2. **Staff sessions vs Better Auth sessions are NOT unified** (see Identity row).
-3. **CHECK constraints are SQL-only**: 98 CHECK constraints exist in migration
+1. **No automatic subscription expiry exists.** Nothing in code transitions a subscription to `expired` — the scheduled handler only processes the outbox, and `subscriptions/service.ts` has no expiry transition. Expiry is enforced only at license-validation time from `expires_at`/`grace_until` (`apps/api/src/modules/licensing/service.ts`, `assertLicenseIsUsable`). A real expiry job/scheduler is still missing.
+2. **An expired license's status is never persisted.** `assertLicenseIsUsable` sets `license.status = "expired"` immediately before throwing `LICENSE_EXPIRED`, inside `withTransaction` — so the rollback discards the flip and the DB row still reads `active`. Expiry is re-derived on every validation, never stored.
+3. **Public checkout never dedupes customers by email.** `createPublicCheckoutOrder` calls `createCustomerInTx` unconditionally (`apps/api/src/modules/commerce/service.ts:122`), so every website checkout creates a new customer row even for an existing email. (Asserted in the business-workflow suite: 2 customer rows share one email.)
+4. **CHECK constraints are SQL-only**: 98 CHECK constraints exist in migration
    0000 and are enforced by Postgres at runtime, but the Drizzle schema does
    not reproduce them — `drizzle-kit generate` will never emit them.
    Same for the 6 immutability triggers + 1 function (SQL-only by nature) and
    the `product_packages.current_version_id` FK (SQL-only to avoid a TS
    circular-reference cycle). See `db/schema/README.md`.
-4. **14 tables are never used by any service**: `payment_refunds`,
+4. **12 tables are never used by any business service**: `payment_refunds`,
    `notifications`, `license_events`, `license_validation_logs`,
    `subscription_events`, `order_adjustments`, `product_releases`,
    `product_distribution_channels`, `product_integration_profiles`,
-   `customer_addresses`, `accounts`, `verifications`, `staff_profiles`,
-   `tracking_deliveries`.
+   `customer_addresses`, `verifications`, `tracking_deliveries`.
+   (`accounts` is now used — Better Auth credential rows; `staff_profiles`
+   is read for staff status in the DrizzleStore user load.)
 5. **`duplicate_risk_Warning` keeps its capital-W typo verbatim** (store ↔ DB
    field name must match; renaming is a separate migration).
 6. **No UUID defaults** on either side (schema or SQL): inserts must supply `id`.
@@ -82,7 +81,9 @@
    until the lockfile's group was changed to `root:root`. CI runners are
    unaffected. `pnpm install` also prints a non-fatal EPERM for
    `node_modules/.modules.yaml` in this sandbox.
-10. **Not verified in this session**: admin UI in a real browser; Better Auth
-    end-to-end login flow against Postgres; `bootstrap-super-admin` against a
-    live server; any GitHub Actions run; any Cloudflare/Wrangler deploy
-    (dry-run only, placeholder Hyperdrive IDs).
+10. **No password-change UI in the admin SPA** (endpoint + tests only).
+11. **Not verified in this session**: admin UI in a real browser;
+    `bootstrap-super-admin` script against a live server; any GitHub Actions
+    run; any Cloudflare/Wrangler deploy (dry-run only, placeholder Hyperdrive
+    IDs). Better Auth end-to-end login against Postgres IS now verified
+    (unified-auth suite, 9/9) and the bootstrap *route* is verified too.
