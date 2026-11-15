@@ -146,13 +146,14 @@ export function StaffSection() {
   const confirm = useConfirm();
 
   /* Users list — URL-backed search/page (route /staff).
-   * The route is wired by the parent after this file lands, so the
-   * router-typed hooks take the options object as `never` until then;
-   * the paths, params, and runtime behaviour are exactly as specified
-   * and the casts can be dropped once /staff + /staff/$userId exist. */
-  const rawSearch = useSearch({ from: "/staff" } as never);
+   * The route's id is "/_main/staff" (the operational shell is a
+   * pathless `_main` layout route), so a plain-path `from: "/staff"`
+   * hook throws "Invariant failed" at render (jsdom repro 2026-11-15).
+   * Like the other list sections, read the current route's search with
+   * `strict: false` and navigate without `from`. */
+  const rawSearch = useSearch({ strict: false }) as Record<string, unknown>;
   const listSearch = parseListSearch(rawSearch as Record<string, unknown>);
-  const navigate = useNavigate({ from: "/staff" } as never);
+  const navigate = useNavigate();
   const setListSearch = (patch: {
     q?: string | undefined;
     page?: number | undefined;

@@ -67,17 +67,57 @@ function getSharedClient(connectionString: string): Promise<Client> {
   return entry;
 }
 
-/** True when the failure looks like a dead/broken TCP connection. */
+/** Evict whatever client entry is cached for this connection string (it may
+ * be the stale client, or a fresh entry created while a request was failing)
+ * so the next getSharedClient connects anew. */
+async function dropSharedClient(connectionString: string): Promise<void> {
+  const current = sharedClients.get(connectionString);
+  if (current === undefined) return;
+  sharedClients.delete(connectionString);
+  await current.catch(() => {});
+}
+
+/**
+ * True when the failure looks like a dead/broken TCP connection OR a
+ * rejected connection attempt. Besides the TCP errno family, PostgreSQL
+ * error codes that mean the connection could not be established or was
+ * lost: 53300 too_many_connections ("remaining connection slots…"),
+ * 57P03 cannot_connect_now (Neon compute waking/refusing), 08000/08001/
+ * 08003/08004/08006 connection_exception family, 57P01/57P02 admin/crash
+ * shutdown.
+ *
+ * Staging 2026-11-15: ~10% of /me (25% under 20-way concurrency) came
+ * back as Cloudflare 1101 — an uncaught throw from store creation. The
+ * load-phase retry only matched TCP-style errors, so a 53300/57P03
+ * connect rejection propagated as the opaque 1101 instead of retrying
+ * once on a fresh connection.
+ */
 function isConnectionError(error: unknown): boolean {
   const code = (error as { code?: unknown } | null)?.code;
   if (
     typeof code === "string" &&
-    ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "ENOTFOUND", "EAI_AGAIN"].includes(code)
+    [
+      "ECONNRESET",
+      "ECONNREFUSED",
+      "ETIMEDOUT",
+      "EPIPE",
+      "ENOTFOUND",
+      "EAI_AGAIN",
+      "53300",
+      "57P01",
+      "57P02",
+      "57P03",
+      "08000",
+      "08001",
+      "08003",
+      "08004",
+      "08006",
+    ].includes(code)
   ) {
     return true;
   }
   const message = error instanceof Error ? error.message : String(error);
-  return /connection (terminated|closed|reset|refused|timed out)|client has encountered a connection error|connection error/i.test(
+  return /connection (terminated|closed|reset|refused|timed out)|client has encountered a connection error|connection error|remaining connection slots|too many (clients|connections)|cannot connect now|server closed the connection|terminating connection/i.test(
     message
   );
 }
@@ -93,8 +133,19 @@ async function createRequestStore(env: StackMateBindings): Promise<StackMateData
     encryptionSecret: env.ENCRYPTION_KEY_V1,
     appEnv: env.APP_ENV,
   };
+  // Connect phase: a fresh TCP/TLS/auth handshake can fail transiently
+  // (pool exhaustion 53300, Neon wake-up 57P03, Hyperdrive hiccup) with
+  // errors that do not look "connection-like" to the load-phase matcher.
+  // Retry the connect ONCE on ANY error — a failed handshake is never a
+  // deterministic boot failure, and the second attempt decides.
+  let existingClient: Awaited<ReturnType<typeof getSharedClient>>;
   try {
-    const existingClient = await getSharedClient(connectionString);
+    existingClient = await getSharedClient(connectionString);
+  } catch {
+    await dropSharedClient(connectionString);
+    existingClient = await getSharedClient(connectionString);
+  }
+  try {
     return await DrizzleStore.create({ ...opts, existingClient });
   } catch (error) {
     // One retry on a connection-like failure, after evicting the
@@ -102,16 +153,9 @@ async function createRequestStore(env: StackMateBindings): Promise<StackMateData
     // undecryptable keys, bad config) propagates unchanged — retrying
     // a deterministic boot failure would only fail twice.
     if (!isConnectionError(error)) throw error;
-    const current = sharedClients.get(connectionString);
-    if (current !== undefined) {
-      // Evict whatever is cached (it may be the stale client, or a
-      // fresh entry created while this request was failing) so the
-      // retry connects anew; getSharedClient recreates on demand.
-      sharedClients.delete(connectionString);
-      await current.catch(() => {});
-    }
-    const existingClient = await getSharedClient(connectionString);
-    return DrizzleStore.create({ ...opts, existingClient });
+    await dropSharedClient(connectionString);
+    const freshClient = await getSharedClient(connectionString);
+    return DrizzleStore.create({ ...opts, existingClient: freshClient });
   }
 }
 

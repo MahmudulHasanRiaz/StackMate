@@ -3134,7 +3134,38 @@ export function createStackMateApp(
     ctx?: WorkerExecutionContext
   ): Promise<Response> {
     const env = resolveRuntimeConfig(rawEnv);
-    const store = await resolveRequestStore(env, ctx);
+    let store: StackMateDataStore;
+    try {
+      store = await resolveRequestStore(env, ctx);
+    } catch (error) {
+      // Store creation failed (e.g. the database was briefly unreachable
+      // even after the entrypoint's retry). Never let it escape as a bare
+      // Worker exception (Cloudflare 1101, opaque to clients): log the
+      // real error for the Worker logs and answer with the standard JSON
+      // error envelope so the SPA shows a retryable 500, not a blank
+      // failure. resolveRuntimeConfig above still throws (loud 1101) on
+      // missing bindings/secrets — that is a deployment error, not a
+      // transient store failure.
+      const requestId = `req_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+      const trustedOrigins = env.TRUSTED_ORIGINS.split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const originHeader = request.headers.get("Origin");
+      console.error("[stackmate] store creation failed", requestId, error);
+      return new Response(
+        JSON.stringify(
+          createErrorEnvelope(
+            "STORE_UNAVAILABLE",
+            "The data store is temporarily unavailable. Please retry.",
+            requestId
+          )
+        ),
+        {
+          status: 500,
+          headers: buildStandardHeaders(requestId, originHeader, trustedOrigins),
+        }
+      );
+    }
     return handleRequest(store, request, env, ctx);
   }
 
