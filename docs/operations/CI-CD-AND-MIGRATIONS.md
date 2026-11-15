@@ -41,7 +41,7 @@ Postgres integration) and build`), `runs-on: ubuntu-latest`.
   1. Checkout.
   2. Setup pnpm **10.6.1** (exact version from the `packageManager`
      field in `package.json`).
-  3. Setup Node.js from **`.nvmrc` (22.14.0)**, with pnpm cache.
+  3. Setup Node.js from **`.nvmrc` (24.22.1)**, with pnpm cache.
   4. `pnpm install --frozen-lockfile`.
   5. `node scripts/validate-repo.mjs` (also `pnpm run validate:repo`).
   6. `node scripts/check-migrations.mjs` (also `pnpm run db:check`).
