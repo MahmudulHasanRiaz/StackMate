@@ -7,17 +7,26 @@
  * Dark is the DEFAULT theme; light is the alternate. The accent is a
  * proposal the owner can change in one place (the --sm-accent tokens).
  *
- * NEON PATTERN RULES (owner 2026-11-16, screenshots image-73 + image-76):
- * (1) MINIMAL RADIUS — cap 6px everywhere, 8px max for dialogs; pills
- *     (chips, status badges, avatar, account button) stay fully rounded.
- * (2) COMPACT HEIGHTS — topbar 48px, nav rows ~32px, inputs 32px,
- *     buttons 30px (small 26px), tight but not cramped; base font never
- *     below 13–14px.
- * (3) ONE of everything — one radius scale, one spacing scale, one
- *     border color, accent only for primary actions/links, sparingly.
- *     The pattern applies to EVERY surface (dialogs, tables, forms,
- *     badges, toasts, empty states), not just the shell.
- * (4) Table headers are small WHITE semibold text (not muted, not
+ * NEON CORE PASS (owner 2026-11-16 ~01:40 +06 — "Does Neon use a direct
+ * green button anywhere like yours?" No. "You still couldn't leave the
+ * radius-type design styling structure."):
+ * (1) BUTTON SYSTEM — exactly three variants (images 80/81/82): PRIMARY
+ *     solid WHITE bg + black text (dark) / solid BLACK bg + white text
+ *     (light); SECONDARY transparent bg + 1px light-grey border + white
+ *     text; ACCENT transparent bg + 1px GREEN border + green text (brand
+ *     CTAs only). NO solid green fill anywhere. Danger renders as
+ *     secondary (Neon shows no danger button — noted in the audit).
+ * (2) RADIUS STRUCTURE — no more 999px except true status pills (dot +
+ *     word, "Default"/"Active"), status dots, and the spinner. Avatar,
+ *     account button, and chips are SQUARE (6px). Max 8px, dialogs only.
+ * (3) COLOR RULE — primary text/links white; secondary text #B0B1B2 at
+ *     13px; green only for accent-outline buttons, links, active-nav
+ *     icon, logo mark, status dots, focus ring. Never a solid fill.
+ * (4) TYPOGRAPHY — Inter Variable; base 14px; secondary 13px; group and
+ *     menu-section labels 12px normal case (not uppercase).
+ * (5) ONE of everything — one radius scale, one spacing scale, one
+ *     border color. The pattern applies to EVERY surface.
+ * (6) Table headers are small WHITE semibold text (not muted, not
  *     uppercase), no background block, bottom border only.
  *
  * Rules (design spec §5): no color/size/radius/shadow/duration may be
@@ -46,13 +55,19 @@
   --sm-border: #232323;
   --sm-border-strong: #333333;
   --sm-text: #f5f5f5;
-  --sm-text-muted: #9ca3af;
+  --sm-text-muted: #B0B1B2;
 
   /* The one accent — Neon green. Text on accent is black. */
   --sm-accent: #00e5a0;
   --sm-accent-hover: #00c98f;
   --sm-accent-soft: rgba(0, 229, 160, 0.1);
   --sm-accent-text-on: #000000;
+
+  /* Primary button — Neon (image-81 "Copy prompt"): solid WHITE bg +
+     BLACK text in dark mode. Never a green fill. */
+  --sm-btn-primary-bg: #ffffff;
+  --sm-btn-primary-text: #000000;
+  --sm-btn-primary-hover: #e5e5e5;
 
   /* Status */
   --sm-success-bg: rgba(0, 229, 160, 0.12);
@@ -101,7 +116,9 @@
   --sm-sidebar-rail-width: 64px;
   --sm-topbar-height: 48px;
 
-  /* Radii — Neon pattern: minimal. Cap 6px; dialogs 8px max; pills 999px. */
+  /* Radii — Neon CORE pass: square. Max 6px; dialogs 8px max. 999px
+     survives ONLY for true status pills (dot + word), status dots, and
+     the spinner. Avatar, account button, and chips are 6px squares. */
   --sm-radius-sm: 4px;
   --sm-radius-md: 6px;
   --sm-radius-lg: 6px;
@@ -144,6 +161,11 @@
   --sm-accent-hover: #005c44;
   --sm-accent-soft: #e6f7f0;
   --sm-accent-text-on: #ffffff;
+
+  /* Primary button, light mode — the inversion: solid BLACK bg + WHITE text. */
+  --sm-btn-primary-bg: #0f172a;
+  --sm-btn-primary-text: #ffffff;
+  --sm-btn-primary-hover: #1e293b;
 
   --sm-success-bg: #dcfce7;
   --sm-success-text: #166534;
@@ -229,13 +251,13 @@ a:hover {
   line-height: 20px;
 }
 .sm-label {
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 600;
   line-height: 16px;
   color: var(--sm-text);
 }
 .sm-hint {
-  font-size: 12.5px;
+  font-size: 13px;
   line-height: 16px;
   color: var(--sm-text-muted);
 }
@@ -252,7 +274,7 @@ a:hover {
 /* Mono is reserved for IDs, hashes, keys, tokens, references only. */
 .sm-mono {
   font-family: var(--sm-font-mono);
-  font-size: 12.5px;
+  font-size: 13px;
   line-height: 16px;
 }
 
@@ -294,10 +316,8 @@ a:hover {
   display: inline-flex;
 }
 .sm-nav-group-label {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
   color: var(--sm-text-muted);
   margin: var(--sm-space-1) 0 var(--sm-space-1);
   padding: 0 var(--sm-space-2-5);
@@ -335,6 +355,10 @@ a:hover {
   background: var(--sm-surface-muted);
   color: var(--sm-text);
   font-weight: 600;
+}
+/* Neon (image-76): the active nav item's icon is green, its text white. */
+.sm-nav-btn[aria-current="page"] svg {
+  color: var(--sm-accent);
 }
 .sm-nav-btn svg {
   flex: none;
@@ -452,7 +476,7 @@ a:hover {
   line-height: 20px;
 }
 .sm-menu-header .sm-menu-header-sub {
-  font-size: 12.5px;
+  font-size: 13px;
   line-height: 16px;
   color: var(--sm-text-muted);
   overflow-wrap: anywhere;
@@ -463,10 +487,8 @@ a:hover {
   margin: var(--sm-space-1) 0;
 }
 .sm-menu-section-label {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
   color: var(--sm-text-muted);
   padding: var(--sm-space-2) var(--sm-space-3) var(--sm-space-1);
 }
@@ -481,7 +503,7 @@ a:hover {
   padding: var(--sm-space-2) var(--sm-space-3);
   border-radius: var(--sm-radius-md);
   color: var(--sm-text);
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 500;
   font-family: var(--sm-font-sans);
   cursor: pointer;
@@ -516,7 +538,7 @@ a:hover {
   flex: none;
   width: 28px;
   height: 28px;
-  border-radius: 999px;
+  border-radius: var(--sm-radius-md);
   background: var(--sm-accent-soft);
   color: var(--sm-accent);
   font-size: 12px;
@@ -536,7 +558,7 @@ a:hover {
   height: 30px;
   padding: 2px 8px 2px 2px;
   border: 1px solid transparent;
-  border-radius: 999px;
+  border-radius: var(--sm-radius-md);
   background: transparent;
   color: var(--sm-text);
   font-size: 13px;
@@ -617,7 +639,7 @@ a:hover {
   padding: var(--sm-space-2) var(--sm-space-3);
   border-radius: var(--sm-radius-md);
   color: var(--sm-text);
-  font-size: 14px;
+  font-size: 13px;
   font-family: var(--sm-font-sans);
   cursor: pointer;
 }
@@ -695,7 +717,7 @@ a:hover {
 }
 .sm-page-subtitle {
   margin: var(--sm-space-1) 0 0;
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--sm-text-muted);
 }
 
@@ -783,7 +805,11 @@ a:hover {
 }
 
 /* ------------------------------------------------------------------ */
-/* Buttons — exactly five variants, one accent, one primary per page   */
+/* Buttons — three variants + ghost text forms (Neon, images 80/81/82). */
+/* PRIMARY is white/black, SECONDARY is a grey outline, ACCENT is a    */
+/* green outline for brand CTAs only. One primary per page. NO solid   */
+/* green fill anywhere. DANGER renders as secondary (Neon shows no     */
+/* danger button — see audit C1).                                      */
 /* ------------------------------------------------------------------ */
 .sm-btn {
   display: inline-flex;
@@ -817,26 +843,37 @@ a:hover {
   cursor: not-allowed;
 }
 .sm-btn-primary {
-  background: var(--sm-accent);
-  color: var(--sm-accent-text-on);
+  background: var(--sm-btn-primary-bg);
+  color: var(--sm-btn-primary-text);
 }
 .sm-btn-primary:hover:not(:disabled) {
-  background: var(--sm-accent-hover);
+  background: var(--sm-btn-primary-hover);
 }
 .sm-btn-secondary {
-  background: var(--sm-surface);
+  background: transparent;
   border-color: var(--sm-border-strong);
   color: var(--sm-text);
 }
 .sm-btn-secondary:hover:not(:disabled) {
   background: var(--sm-surface-muted);
 }
+.sm-btn-accent {
+  background: transparent;
+  border-color: var(--sm-accent);
+  color: var(--sm-accent);
+}
+.sm-btn-accent:hover:not(:disabled) {
+  background: var(--sm-accent-soft);
+}
 .sm-btn-danger {
-  background: var(--sm-danger);
-  color: #ffffff;
+  /* Owner spec: Neon shows no danger button — danger renders as the
+     secondary outline; the label ("Delete") is the only distinction. */
+  background: transparent;
+  border-color: var(--sm-border-strong);
+  color: var(--sm-text);
 }
 .sm-btn-danger:hover:not(:disabled) {
-  background: var(--sm-danger-hover);
+  background: var(--sm-surface-muted);
 }
 .sm-btn-ghost {
   background: transparent;
@@ -919,7 +956,7 @@ a:hover {
   display: flex;
   align-items: center;
   gap: var(--sm-space-1);
-  font-size: 12.5px;
+  font-size: 13px;
   line-height: 16px;
   color: var(--sm-danger-text);
 }
@@ -1016,7 +1053,7 @@ a:hover {
   gap: var(--sm-space-1-5);
   height: 26px;
   padding: 0 var(--sm-space-3);
-  border-radius: 999px;
+  border-radius: var(--sm-radius-md);
   border: 1px solid var(--sm-border-strong);
   background: var(--sm-surface);
   color: var(--sm-text);
@@ -1077,7 +1114,7 @@ a:hover {
   gap: var(--sm-space-4);
   padding: var(--sm-space-3) var(--sm-space-4);
   border-top: 1px solid var(--sm-border);
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--sm-text-muted);
   flex-wrap: wrap;
 }
@@ -1280,7 +1317,7 @@ a:hover {
 }
 .sm-toast .sm-toast-message {
   color: var(--sm-text-muted);
-  font-size: 12.5px;
+  font-size: 13px;
 }
 
 .sm-skeleton {
@@ -1330,7 +1367,7 @@ a:hover {
 .sm-empty p,
 .sm-error p {
   margin: 0;
-  font-size: 12.5px;
+  font-size: 13px;
 }
 
 .sm-spinner {
@@ -1434,13 +1471,120 @@ a:hover {
   margin-bottom: var(--sm-space-6);
 }
 .sm-fact .sm-fact-label {
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--sm-text-muted);
   margin-bottom: var(--sm-space-1);
 }
 .sm-fact .sm-fact-value {
   font-size: 14px;
   font-weight: 600;
+}
+
+/* ------------------------------------------------------------------ */
+/* Core utilities — stack gaps + primitive layout (no inline styles).  */
+/* Every gap/padding here comes from the spacing scale. Sections and   */
+/* primitives use these instead of inline style objects.               */
+/* ------------------------------------------------------------------ */
+.sm-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-4);
+}
+.sm-stack-sm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-3);
+}
+.sm-check-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sm-space-2);
+  font-size: 14px;
+  cursor: pointer;
+}
+.sm-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sm-space-3);
+  margin-bottom: var(--sm-space-4);
+}
+.sm-breadcrumb-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sm-space-2);
+}
+.sm-select-sm {
+  width: auto;
+  height: 26px;
+  font-size: 13px;
+}
+.sm-toast-icon {
+  margin-top: 2px;
+  flex: none;
+}
+.sm-flex-1 {
+  flex: 1;
+}
+.sm-table-skeleton {
+  padding: var(--sm-space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-3);
+}
+/* Padded table wrap — empty / error / skeleton bodies inside a table. */
+.sm-table-wrap-pad {
+  padding: var(--sm-space-4);
+}
+/* Bordered card — fieldsets and per-row grant cards (token border + radius). */
+.sm-bordered-card {
+  border: 1px solid var(--sm-border);
+  border-radius: var(--sm-radius-md);
+  padding: var(--sm-space-3);
+}
+.sm-topbar-spacer {
+  flex: 1;
+}
+.sm-settings-back {
+  border-top: 1px solid var(--sm-border);
+  padding-top: var(--sm-space-3);
+}
+.sm-menu-header-body {
+  min-width: 0;
+}
+/* Submenu fly-out (account menu Theme, Neon image-78): opens to the
+   LEFT of the menu — the account menu sits at the right edge. */
+.sm-menu-sub-wrap {
+  position: relative;
+}
+.sm-menu-sub {
+  position: absolute;
+  right: calc(100% + 4px);
+  top: 0;
+  min-width: 200px;
+  background: var(--sm-surface);
+  border: 1px solid var(--sm-border);
+  border-radius: var(--sm-radius-lg);
+  box-shadow: var(--sm-shadow-md);
+  padding: var(--sm-space-1);
+  z-index: var(--sm-z-dropdown);
+}
+.sm-menu-sub .sm-menu-item {
+  padding: var(--sm-space-1-5) var(--sm-space-2-5);
+  font-size: 13px;
+}
+/* Status row inside a menu: label left, status pill right (not a button). */
+.sm-menu-status-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sm-space-2);
+  padding: var(--sm-space-2) var(--sm-space-3);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--sm-text);
+}
+.sm-menu-status-row .sm-menu-item-label {
+  flex: 1;
 }
 
 /* ------------------------------------------------------------------ */
