@@ -1,6 +1,6 @@
 # ADR-0005: Cloudflare Hyperdrive, PostgreSQL Driver Selection, and Query Caching Strategy
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-11-15 — per-isolate client reuse; see Amendment below)
 - **Date:** 15 November 2026
 - **Decision owners:** StackMate product and engineering
 - **Related specifications:** PRD §2.3, §2.4; TAD §7.3, §17.3; Database Design §21; Security & Threat Model §4.1, §4.4
@@ -20,7 +20,7 @@ At the same time:
 2. **Dual Hyperdrive Bindings (Cache-Disabled Default + Cached Read Binding):**
    - `HYPERDRIVE_NO_CACHE`: Configured with `--caching-disabled`. Used as the **authoritative default connection** for all authentication, session lookup, RBAC permission resolution, admin mutations and reads-after-write, order creation, manual payment submission and approval, subscription periods, license activation/validation, idempotency checks, and transactional outbox processing.
    - `HYPERDRIVE_CACHED`: Configured with Hyperdrive query caching enabled (`max_age = 60s`, `stale_while_revalidate = 15s`). Used **exclusively** for explicitly opt-in, staleness-tolerant read queries (such as public product catalog listings `/api/v1/public/sites/:siteKey/products` and historical dashboard aggregate summaries). If `HYPERDRIVE_CACHED` is not bound in an environment, the database factory safely falls back to `HYPERDRIVE_NO_CACHE`.
-3. **Request-Scoped Connection Lifecycle:**
+3. **Request-Scoped Connection Lifecycle (SUPERSEDED 2026-11-15 — see Amendment below):**
    - Never instantiate a global `Client` or `Pool` at module scope in the Worker.
    - Inside each request context, `createRequestDatabaseContext(env, ctx)` lazily creates a request-scoped `pg.Client` (or single-connection pool) connected to `env.HYPERDRIVE_NO_CACHE.connectionString` (and optionally `env.HYPERDRIVE_CACHED.connectionString` when a cacheable public read is requested), and registers `ctx.waitUntil(client.end())` after request completion so connections are cleanly returned to Hyperdrive's edge transaction pool.
 4. **Interactive Transactions & Row Locking:**
@@ -32,6 +32,16 @@ At the same time:
 6. **Plan Limits & Operational Headroom:**
    - Per [Cloudflare Hyperdrive Pricing Docs](https://developers.cloudflare.com/hyperdrive/platform/pricing/), the Workers Free plan limits Hyperdrive to **100,000 queries/day** (counting both cached and uncached queries and mutations, resetting at `00:00 UTC`), whereas the Workers Paid plan includes **Unlimited** Hyperdrive queries at no extra cost.
    - Because two Hyperdrive configurations (`HYPERDRIVE_NO_CACHE` and `HYPERDRIVE_CACHED`) each maintain their own connection pool against Neon, configure origin pool sizes so their combined `max_size` stays comfortably below Neon's `max_connections` limit, leaving headroom for migrations and administrative access.
+
+## Amendment 2026-11-15 — per-isolate client reuse (supersedes Decision §3)
+
+**Evidence.** Staging measured 13–35s per request (health ≈13–14s three times back-to-back; setup-status 20–35s). Root cause: every request opened a fresh `pg` Client + connect + capability detection + table checks + a ~48-query sequential full-state load, and every transaction repeated the lock + full load. At ~250ms Hyperdrive→Neon round-trip, ~55 queries/request ≈ 13s. A fresh client per request is therefore not viable for this store design.
+
+**New rule.** One lazy singleton `pg` Client per Worker isolate, held at module scope in `apps/api/src/index.ts` (keyed by connection string; each isolate holds its own — isolates never share a client). The per-request `DrizzleStore` stays fresh (fresh in-memory state, fresh signing-key handles) and receives the shared client as `existingClient`; it never connects, ends, or owns it. The client is evicted on `error`/`end`/connect failure, and `createRequestStore` retries ONCE on connection-like errors after eviction. All statements on a shared client are serialized through a per-client promise queue (`clientQueues` in `drizzle-store.ts`); capability detection and required-table checks are memoized per client (rejected checks evict, never poison). The combined single-statement state load (`buildLoadStateQuery`, 48 `json_agg` columns) cuts a request from ~55 queries to ~6 steady-state (setup-status 106 → 10 pg queries/request, asserted ≤15 by `apps/api/test/perf-regression.test.ts`); at ~250ms RTT that predicts ~2.5s/request, down from 13–35s.
+
+**Why this is safe enough.** The connection string is Hyperdrive's (the TCP peer is Hyperdrive's edge pool, not Neon directly). A frozen isolate holding a stale socket is the known failure mode and is handled by eviction + one retry. Better Auth queries bypass the per-client queue (documented residual risk in `drizzle-store.ts`: a BA query inside another request's open transaction sees that snapshot; a BA session insert lost to a concurrent rollback just means re-sign-in; BA never writes business tables). No cross-isolate sharing exists.
+
+**Revert condition.** If the singleton causes stale-connection incidents in staging/production, revert to request-scoped clients while KEEPING the combined load + caps cache (predicted ~7 RTTs/request ≈ 1.75s). Truly fast (<300ms) needs store reuse across requests, not just client reuse — a separate future decision.
 
 ## Consequences
 

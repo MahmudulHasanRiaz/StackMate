@@ -11,17 +11,37 @@
  *
  * READ THIS FIRST — the five things that will surprise you:
  *
- * 1. ONE pg Client, serialized writers. The store holds a single `pg`
+ * 1. ONE pg Client per store, serialized writers — and ONE shared client
+ *    per Worker isolate (perf, 2026-11-15). The store holds a single `pg`
  *    Client (per the Hyperdrive design: one pinned connection). A pg
  *    Client cannot run concurrent queries, so ALL database access is
- *    serialized through an internal promise queue (`txQueue`): one
- *    withTransaction — or one loadState — at a time, across all callers.
+ *    serialized through a promise queue keyed by CLIENT, not by store
+ *    (`clientQueues`): one withTransaction — or one loadState, or one
+ *    create() init — at a time, across all stores sharing that client.
+ *    The Worker entrypoint (apps/api/src/index.ts) keeps one lazy
+ *    singleton client per isolate and passes it as
+ *    `existingClient`; a store created that way does NOT own the client
+ *    and `close()` must not end it. Tests and one-off scripts keep the
+ *    old behavior (create() opens and owns its own client).
  *    `SELECT pg_advisory_xact_lock(727271)` additionally serializes
  *    writers across SEPARATE store instances / processes hitting the same
  *    database (mirrors the in-memory mutex semantics). Nested
  *    withTransaction calls deadlock exactly like the base class — don't.
  *    `drizzleDb` shares this same client, so Better Auth queries issued
- *    through it must not run concurrently with a withTransaction either.
+ *    through it bypass the queue (see the residual-risk note on
+ *    `clientQueues` below): a BA query landing inside another
+ *    request's open transaction sees that transaction's snapshot, and a
+ *    BA session insert rolled back by a concurrent rollback is lost and
+ *    the user signs in again; no business data can corrupt this way
+ *    because BA never writes business tables and never runs inside a
+ *    store transaction).
+ *    NOTE (ADR-0005 conflict, needs a parent decision):
+ *    apps/api/src/platform/db/hyperdrive.ts §2.1 says "Never holds a
+ *    module-scoped TCP connection across Worker requests." The shared
+ *    per-isolate client directly contradicts that. It is kept because
+ *    the alternative — a fresh TCP connect + ~55 queries per request —
+ *    measured 13–35s per request on staging; the ADR must be updated
+ *    to bless the singleton (or the perf fix reverted).
  *
  * 2. Full-state load + diff-persist, raw SQL. Every withTransaction
  *    reloads ALL mapped tables into `this.state` and then diffs the
@@ -205,6 +225,15 @@ const COUNTER_BASE_VALUES: DatabaseState["sequence_counters"] = {
 
 export interface DrizzleStoreCreateOptions {
   connectionString: string;
+  /**
+   * An already-connected pg Client to use instead of opening a new one
+   * (perf, 2026-11-15). The Worker entrypoint passes its per-isolate
+   * singleton client here. The store does NOT own such a client:
+   * create() never connects it, never ends it on failure, and close()
+   * never ends it. When omitted, create() opens and owns its own
+   * client (tests, scripts, and any non-Worker wiring).
+   */
+  existingClient?: Client | undefined;
   r2Bucket?: R2BucketBinding | null | undefined;
   signingKeyId?: string | undefined;
   /**
@@ -369,7 +398,16 @@ function iso(row: Row, key: string): string | null {
   const v = row[key];
   if (v === null || v === undefined) return null;
   if (v instanceof Date) return v.toISOString();
-  if (typeof v === "string") return v;
+  if (typeof v === "string") {
+    // JSON-loaded rows carry timestamptz as an ISO string (microsecond
+    // precision, +00:00 offset). Normalize to the Date→toISOString()
+    // form the direct pg path produced (millisecond precision, Z) so
+    // API timestamps are byte-identical after the combined load.
+    // Unparseable strings pass through untouched.
+    const d = new Date(v);
+    if (!Number.isNaN(d.getTime())) return d.toISOString();
+    return v;
+  }
   return null;
 }
 
@@ -539,6 +577,62 @@ const REQUIRED_TABLES: readonly string[] = [
   "audit_logs",
 ];
 
+/**
+ * Perf (2026-11-15) — per-client caches and serialization queue.
+ *
+ * Schema facts never change at runtime, so detectCapabilities and
+ * assertRequiredTables are memoized PER CLIENT (WeakMap: a new client
+ * — reconnect, redeploy — re-checks; migrations deploy with code, so a
+ * per-isolate invariant is safe). A rejected check is evicted so a
+ * transient failure never poisons the cache.
+ *
+ * The queue is keyed by CLIENT, not by store instance: stores that
+ * share one client (the Worker singleton) must never interleave
+ * statements — a BEGIN from one store inside another store's open
+ * transaction would make the inner COMMIT commit the outer
+ * transaction. Every entry point that issues queries on the client
+ * (create() init, loadState, withTransaction) holds this queue; no
+ * nested acquisition exists anywhere (store methods call client.query
+ * directly while holding it).
+ *
+ * Residual risk — Better Auth's drizzleDb bypasses this queue: BA
+ * queries run on the same client outside it. A BA query landing inside
+ * another request's open transaction sees that transaction's snapshot
+ * (dirty read for an auth check), and a BA session insert lost to a
+ * concurrent rollback just makes the user sign in again. No business
+ * data can corrupt this way: BA never writes business tables and never
+ * runs inside a store transaction. A separate BA client was considered
+ * and rejected: pg does NOT connect lazily (query() before connect()
+ * hangs forever, verified 2026-11-15 against pg 8.20.0), so a separate
+ * client would have to connect eagerly and GET /api/auth/ok — which
+ * today needs no live database — would start requiring one.
+ */
+const capabilitiesCache = new WeakMap<Client, Promise<StoreCapabilities>>();
+const requiredTablesCache = new WeakMap<Client, Promise<void>>();
+const clientQueues = new WeakMap<Client, Promise<void>>();
+
+function cachedDetectCapabilities(client: Client): Promise<StoreCapabilities> {
+  const hit = capabilitiesCache.get(client);
+  if (hit !== undefined) return hit;
+  const p = detectCapabilities(client);
+  capabilitiesCache.set(client, p);
+  p.catch(() => {
+    if (capabilitiesCache.get(client) === p) capabilitiesCache.delete(client);
+  });
+  return p;
+}
+
+function cachedAssertRequiredTables(client: Client): Promise<void> {
+  const hit = requiredTablesCache.get(client);
+  if (hit !== undefined) return hit;
+  const p = assertRequiredTables(client);
+  requiredTablesCache.set(client, p);
+  p.catch(() => {
+    if (requiredTablesCache.get(client) === p) requiredTablesCache.delete(client);
+  });
+  return p;
+}
+
 async function detectCapabilities(client: Client): Promise<StoreCapabilities> {
   const rows = await queryRows(
     client,
@@ -623,8 +717,12 @@ export class DrizzleStore extends StackMateDataStore {
   public usesInMemoryBucket = false;
 
   private closed = false;
-  /** Serializes ALL database access on the shared client (see header 1). */
-  private txQueue: Promise<void> = Promise.resolve();
+  /**
+   * True when this store owns its pg client (create() opened it). A
+   * store built on an `existingClient` must never end the shared
+   * client in close() or on create() failure.
+   */
+  private readonly ownsClient: boolean;
   private capabilities: StoreCapabilities = NO_MIGRATION_0002;
   /**
    * Master secret resolved at create() (see resolveEncryptionSecret).
@@ -638,10 +736,15 @@ export class DrizzleStore extends StackMateDataStore {
    */
   private signingKeysDurable = false;
 
-  private constructor(pgClient: Client, drizzleDb: NodePgDatabase<typeof schema>) {
+  private constructor(
+    pgClient: Client,
+    drizzleDb: NodePgDatabase<typeof schema>,
+    ownsClient = true
+  ) {
     super(DEFAULT_SIGNING_KEY_ID);
     this.pgClient = pgClient;
     this.drizzleDb = drizzleDb;
+    this.ownsClient = ownsClient;
   }
 
   public static async create(
@@ -652,24 +755,39 @@ export class DrizzleStore extends StackMateDataStore {
         "DrizzleStore.create: connectionString is empty. Pass the PostgreSQL connection string (in production, HYPERDRIVE_NO_CACHE.connectionString)."
       );
     }
-    const pgClient = new Client({ connectionString: opts.connectionString });
+    const ownsClient = opts.existingClient === undefined;
+    const pgClient =
+      opts.existingClient ??
+      new Client({ connectionString: opts.connectionString });
     try {
-      await pgClient.connect();
+      if (ownsClient) {
+        await pgClient.connect();
+      }
     } catch (error) {
       throw new Error(
         `DrizzleStore.create: could not connect to PostgreSQL: ${(error as Error).message}`
       );
     }
     const drizzleDb = drizzle(pgClient, { schema });
-    const store = new DrizzleStore(pgClient, drizzleDb);
+    const store = new DrizzleStore(pgClient, drizzleDb, ownsClient);
     try {
-      store.capabilities = await detectCapabilities(pgClient);
-      // Throws a clear error naming the missing table when migrations
-      // 0000/0001 have not been applied. Reference rows come from
-      // migration 0001 — this store never auto-seeds them.
-      await assertRequiredTables(pgClient);
-      await store.loadStateInternal(pgClient);
-      await store.resolveSigningKey(opts);
+      // Hold the per-client queue for the whole init: caps/tables, the
+      // full load, and the signing-key transaction all issue queries on
+      // this client, and another store sharing it must not interleave
+      // (its BEGIN/COMMIT would corrupt ours). The cached caps/tables
+      // promises are computed here, under the queue, on first use.
+      const release = await store.acquireQueue();
+      try {
+        store.capabilities = await cachedDetectCapabilities(pgClient);
+        // Throws a clear error naming the missing table when migrations
+        // 0000/0001 have not been applied. Reference rows come from
+        // migration 0001 — this store never auto-seeds them.
+        await cachedAssertRequiredTables(pgClient);
+        await store.loadStateInternal(pgClient);
+        await store.resolveSigningKey(opts);
+      } finally {
+        release();
+      }
       if (opts.r2Bucket !== undefined && opts.r2Bucket !== null) {
         store.r2Bucket = opts.r2Bucket;
         store.usesInMemoryBucket = false;
@@ -678,7 +796,9 @@ export class DrizzleStore extends StackMateDataStore {
         store.usesInMemoryBucket = true;
       }
     } catch (error) {
-      await pgClient.end().catch(() => {});
+      if (ownsClient) {
+        await pgClient.end().catch(() => {});
+      }
       throw error;
     }
     return store;
@@ -1263,11 +1383,18 @@ export class DrizzleStore extends StackMateDataStore {
     return this.r2Bucket;
   }
 
-  /** End the pg client. Idempotent; the store must not be used afterwards. */
+  /**
+   * End the pg client — ONLY when this store owns it. Idempotent; the
+   * store must not be used afterwards. A store built on a shared
+   * `existingClient` just marks itself closed; the client lives on for
+   * the other stores sharing it.
+   */
   public async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    await this.pgClient.end().catch(() => {});
+    if (this.ownsClient) {
+      await this.pgClient.end().catch(() => {});
+    }
   }
 
   /** Alias for close(). */
@@ -1283,12 +1410,18 @@ export class DrizzleStore extends StackMateDataStore {
     }
   }
 
+  /**
+   * Serialize access to THIS store's pg client across all stores
+   * sharing it (see `clientQueues`). The tail promise never rejects —
+   * `release` only ever resolves it — so awaiting `prev` cannot throw.
+   */
   private async acquireQueue(): Promise<() => void> {
     let release!: () => void;
-    const prev = this.txQueue;
-    this.txQueue = new Promise<void>((resolve) => {
+    const prev = clientQueues.get(this.pgClient) ?? Promise.resolve();
+    const next = new Promise<void>((resolve) => {
       release = resolve;
     });
+    clientQueues.set(this.pgClient, next);
     await prev;
     return release;
   }
@@ -1337,21 +1470,245 @@ function deriveCountersFromData(
   };
 }
 
+/**
+ * The full-state load as ONE round-trip (perf, 2026-11-15): every mapped
+ * table is fetched as a JSON array in a single statement instead of ~48
+ * sequential queryRows calls. A single pg Client serializes queries
+ * internally (see _pulseQueryQueue), so Promise.all over one client
+ * cannot parallelize — the only way to cut the round-trips on one
+ * pinned connection is to fetch everything at once.
+ *
+ * Each entry's SQL is the pre-refactor SELECT verbatim (same columns,
+ * same caps interpolations); its ORDER BY moved into the json_agg call,
+ * where it is guaranteed (an ORDER BY inside the subquery is NOT
+ * guaranteed to survive aggregation). Mapping code below is unchanged:
+ * rows arrive as parsed JSON values and the existing row-mapping
+ * helpers already accept them (numbers stay numbers, timestamptz
+ * arrives as an ISO string — see iso(), which normalizes it).
+ * The sequence_counters column is included only when the capability
+ * exists (migration 0002); otherwise counters are derived from the
+ * data exactly as before.
+ */
+interface LoadQuery {
+  key: string;
+  sql: string;
+  orderBy: string | null;
+}
+
+function buildLoadStateQuery(caps: StoreCapabilities): string {
+  const queries: LoadQuery[] = [
+    { key: "users", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT u.id, u.name, u.email, u.email_verified, u.created_at, u.updated_at,
+            sp.status AS staff_status
+            ${caps.usersPasswordHash ? ", u.password_hash" : ""}
+       FROM users u
+       LEFT JOIN staff_profiles sp ON sp.user_id = u.id` },
+    { key: "sessions", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, token, user_id, ip_address, user_agent, expires_at, created_at
+       FROM sessions` },
+    { key: "roles", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, "key", name, description, is_system, created_at
+       FROM roles` },
+    { key: "rolePerms", orderBy: null, sql: `SELECT rp.role_id, p."key" AS permission_key
+       FROM role_permissions rp
+       JOIN permissions p ON p.id = rp.permission_id` },
+    { key: "userRoles", orderBy: "t.created_at ASC, t.user_id ASC, t.role_id ASC", sql: `SELECT user_id, role_id, created_at FROM user_roles` },
+    { key: "currencies", orderBy: null, sql: `SELECT code FROM currencies` },
+    { key: "assets", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, object_key, bucket_name, original_filename, content_type,
+            byte_size, checksum_sha256, visibility, uploaded_by_user_id,
+            owner_customer_id, created_at
+       FROM uploaded_assets` },
+    { key: "customers", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, customer_number, customer_type, name, email, normalized_email,
+            phone, normalized_phone, company_name, country_code, status,
+            registration_source, notes, created_at, updated_at
+       FROM customers` },
+    { key: "channels", orderBy: "t.product_id, t.channel_key", sql: `SELECT product_id, channel_key FROM product_distribution_channels` },
+    { key: "products", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, code, slug, name, description, product_type, fulfillment_type,
+            status, website_url, documentation_url, created_by_user_id,
+            created_at, updated_at
+            ${caps.productsDefaults ? ", default_activation_limit, offline_grace_hours" : ""}
+       FROM products` },
+    { key: "features", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, product_id, feature_key, name, description, value_type, unit,
+            default_value, status, created_at, updated_at
+       FROM product_features` },
+    { key: "packages", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, product_id, package_key, name, description, status,
+            created_at, updated_at
+            ${caps.packagesCurrentVersion ? ", current_version_id" : ""}
+       FROM product_packages` },
+    { key: "versionFeatures", orderBy: "t.package_version_id, t.feature_key_snapshot", sql: `SELECT id, package_version_id, product_id, product_feature_id,
+            feature_key_snapshot, value_type_snapshot, entitlement_value
+            ${caps.packageVersionFeaturesUnit ? ", unit_snapshot" : ""}
+       FROM package_version_features` },
+    { key: "versions", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, package_id, product_id, version_number, status,
+            change_summary, published_at, created_at
+       FROM package_versions` },
+    { key: "prices", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, package_version_id, price_key, price_kind, amount_minor,
+            currency_code, interval_unit, interval_count, trial_days,
+            setup_fee_minor, status, created_at
+            ${caps.packagePricesUsedInOrders ? ", used_in_orders" : ""}
+       FROM package_prices` },
+    { key: "siteProducts", orderBy: "t.integrated_site_id, t.product_id", sql: `SELECT integrated_site_id, product_id FROM site_products` },
+    { key: "domains", orderBy: "t.integrated_site_id, t.created_at ASC, t.id ASC", sql: `SELECT id, integrated_site_id, domain, verification_method,
+            verification_challenge, verification_status, verified_at, is_primary, created_at
+       FROM site_domains` },
+    { key: "sites", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, site_key, name, environment, status, api_version,
+            allowed_capabilities, created_at, updated_at
+       FROM integrated_sites` },
+    { key: "credentials", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, integrated_site_id, key_id, credential_type, secret_hash,
+            secret_ciphertext, encryption_key_version, scopes, status,
+            created_at, revoked_at, last_used_at
+       FROM site_credentials` },
+    { key: "nonces", orderBy: "t.created_at ASC, t.credential_id ASC, t.nonce ASC", sql: `SELECT credential_id, nonce, expires_at, created_at FROM request_nonces` },
+    { key: "attributions", orderBy: null, sql: `SELECT order_id, utm_source, utm_medium, utm_campaign, utm_content,
+            utm_term, fbp, fbc FROM order_attributions` },
+    { key: "orderSnapshotItems", orderBy: "t.snapshot_id, t.feature_key_snapshot", sql: `SELECT id, snapshot_id, feature_key_snapshot, value_type_snapshot,
+            entitlement_value, unit_snapshot
+       FROM order_item_entitlement_snapshot_items` },
+    { key: "orderSnapshots", orderBy: null, sql: `SELECT id, order_item_id, source_type, source_package_version_id,
+            schema_version, snapshot_hash, created_at
+       FROM order_item_entitlement_snapshots` },
+    { key: "orderItems", orderBy: "t.order_id, t.created_at ASC, t.id ASC", sql: `SELECT id, order_id, product_id, package_id, package_version_id,
+            package_price_id, item_kind, fulfillment_type_snapshot,
+            product_name_snapshot, package_name_snapshot,
+            package_version_snapshot, price_kind_snapshot,
+            interval_unit_snapshot, interval_count_snapshot,
+            activation_limit_snapshot, quantity, unit_amount_minor,
+            line_subtotal_minor, line_discount_minor, line_tax_minor,
+            line_total_minor, currency_code, created_at
+       FROM order_items` },
+    { key: "orders", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, order_number, public_reference, customer_id, source,
+            integrated_site_id, status, payment_status, currency_code,
+            subtotal_minor, discount_minor, tax_minor, total_minor,
+            customer_note, internal_note, created_by_user_id, created_at,
+            updated_at, completed_at, cancelled_at
+       FROM orders` },
+    { key: "periods", orderBy: "t.subscription_id, t.period_number ASC", sql: `SELECT id, subscription_id, period_number, period_start, period_end,
+            status, renewal_order_id, invoice_id, payment_transaction_id,
+            activated_at, created_at
+       FROM subscription_periods` },
+    { key: "subscriptions", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, subscription_number, customer_id, product_id,
+            source_order_item_id, source_package_version_id, status,
+            billing_kind, interval_unit, interval_count, currency_code,
+            current_period_start, current_period_end, next_renewal_at,
+            cancel_at_period_end, cancelled_at, created_at, updated_at
+            ${caps.subscriptionsUnitAmount ? ", unit_amount_minor" : ""}
+       FROM subscriptions` },
+    { key: "invoiceItems", orderBy: "t.invoice_id, t.created_at ASC, t.id ASC", sql: `SELECT id, invoice_id, description_snapshot, quantity,
+            unit_amount_minor, line_amount_minor, currency_code, created_at
+       FROM invoice_items` },
+    { key: "invoices", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, invoice_number, customer_id, order_id, subscription_id,
+            invoice_type, status, currency_code, subtotal_minor,
+            discount_minor, tax_minor, total_minor, amount_paid_minor,
+            amount_due_minor, issued_at, paid_at, created_at
+       FROM invoices` },
+    { key: "providers", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, provider_key, display_name, provider_type, adapter_key, status, created_at
+       FROM payment_providers` },
+    { key: "rails", orderBy: "t.payment_method_id, t.rail_key", sql: `SELECT payment_method_id, rail_key FROM payment_method_transfer_rails` },
+    { key: "methods", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, provider_id, method_key, display_name, method_kind,
+            account_type, account_label, instructions, configuration,
+            is_enabled, sort_order, created_at
+       FROM payment_methods` },
+    { key: "submissions", orderBy: "t.submitted_at ASC, t.id ASC", sql: `SELECT id, order_id, customer_id, payment_method_id, amount_minor,
+            currency_code, sender_name, sender_phone, sender_bank_name,
+            sender_account_reference, transfer_rail_key,
+            transaction_reference, normalized_transaction_reference,
+            payment_date, proof_asset_id, status, customer_note,
+            submitted_at, reviewed_at, reviewed_by_user_id
+            ${caps.paymentSubmissionsDuplicateWarning ? ", duplicate_risk_warning" : ""}
+       FROM payment_submissions` },
+    { key: "transactions", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, order_id, payment_method_id, payment_submission_id,
+            provider_id, provider_transaction_id, amount_minor, currency_code,
+            status, paid_at, verified_by_user_id, verification_source,
+            created_at
+       FROM payment_transactions` },
+    { key: "verificationLogs", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, payment_submission_id, actor_user_id, decision, reason_code,
+            customer_message, notes, created_at
+       FROM payment_verification_logs` },
+    { key: "licenseSnapshotItems", orderBy: "t.snapshot_id, t.feature_key_snapshot", sql: `SELECT id, snapshot_id, feature_key_snapshot, value_type_snapshot,
+            entitlement_value, unit_snapshot
+       FROM license_entitlement_snapshot_items` },
+    { key: "licenseSnapshots", orderBy: "t.license_id, t.version_number ASC", sql: `SELECT id, license_id, version_number, source_type, effective_at,
+            reason, snapshot_hash, created_by_user_id, created_at
+       FROM license_entitlement_snapshots` },
+    { key: "activations", orderBy: "t.license_id, t.activated_at ASC, t.id ASC", sql: `SELECT id, license_id, installation_id_hash, domain_normalized,
+            environment, status, activated_at, last_seen_at, deactivated_at,
+            metadata, created_at
+       FROM license_activations` },
+    { key: "licenses", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, license_number, product_id, customer_id, source_order_item_id,
+            subscription_id, license_key_hash, license_key_hint, status,
+            activation_limit, valid_from, expires_at, grace_until,
+            current_entitlement_snapshot_id, issued_at, created_at, updated_at
+       FROM licenses` },
+    { key: "trackingConfigs", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, integrated_site_id, provider, pixel_id,
+            access_token_ciphertext, encryption_key_version, test_event_code,
+            enabled_events, status, created_at, updated_at, rotated_at
+       FROM tracking_configurations` },
+    { key: "trackingEvents", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, integrated_site_id, event_name, event_id, event_time,
+            event_source_url, order_id, consent_state,
+            consent_policy_version, sanitized_payload, status, created_at
+            ${caps.trackingEventsDelivery ? ", delivery_attempts, delivered_at" : ""}
+       FROM tracking_events` },
+    { key: "endpointSecrets", orderBy: "t.webhook_endpoint_id, t.created_at ASC", sql: `SELECT webhook_endpoint_id, key_id, secret_ciphertext, key_version, status, created_at
+       FROM webhook_endpoint_secrets` },
+    { key: "endpoints", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, integrated_site_id, url, description, subscribed_events,
+            status, created_at
+       FROM webhook_endpoints` },
+    { key: "deliveries", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, webhook_endpoint_id, event_id, delivery_id, status,
+            attempt_count, last_http_status, delivered_at, created_at
+       FROM webhook_deliveries` },
+    { key: "outbox", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, event_key, aggregate_type, aggregate_id, event_type, payload,
+            status, attempt_count, available_at, locked_until, locked_by,
+            last_error_code, created_at, processed_at
+       FROM outbox_events` },
+    { key: "idempotency", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, scope_key, idempotency_key, request_hash, status,
+            response_status, expires_at, created_at
+            ${caps.idempotencyResponseBody ? ", response_body" : ", response_reference"}
+       FROM idempotency_records` },
+    { key: "audit", orderBy: "t.created_at DESC, t.id DESC", sql: `SELECT id, actor_type, actor_user_id, integrated_site_id, action,
+            resource_type, resource_id, outcome, request_id, changes, created_at
+       FROM audit_logs` },
+  ];
+  if (caps.sequenceCounters) {
+    queries.push({ key: "counters", orderBy: null, sql: `SELECT counter_key, counter_value FROM sequence_counters` });
+  }
+  const cols = queries
+    .map((q) =>
+      q.orderBy
+        ? `(SELECT COALESCE(json_agg(t ORDER BY ${q.orderBy}), '[]'::json) FROM (${q.sql}) t) AS "${q.key}"`
+        : `(SELECT COALESCE(json_agg(t), '[]'::json) FROM (${q.sql}) t) AS "${q.key}"`
+    )
+    .join(",\n");
+  return `SELECT ${cols}`;
+}
+
+/**
+ * Pull one table's rows out of the combined load row. A missing or
+ * non-array column is a corrupt load, never an empty table (empty tables
+ * arrive as [] via COALESCE).
+ */
+function loadRows(combined: Row, key: string): Row[] {
+  const value = combined[key];
+  if (!Array.isArray(value)) {
+    throw new Error(
+      `DrizzleStore: combined state load is missing the "${key}" table data.`
+    );
+  }
+  return value as unknown as Row[];
+}
+
 async function loadStateInternalImpl(
   client: Client,
   caps: StoreCapabilities
 ): Promise<DatabaseState> {
+  // One statement fetches every table (see buildLoadStateQuery). The
+  // mapping code below is unchanged — each table's rows come from the
+  // combined row instead of its own round-trip.
+  const combinedRows = await queryRows(client, buildLoadStateQuery(caps));
+  const combined = combinedRows[0];
+  if (!combined) {
+    throw new Error("DrizzleStore: combined state load returned no rows.");
+  }
+
 
   // -- Identity -------------------------------------------------------------
-  const userRows = await queryRows(
-    client,
-    `SELECT u.id, u.name, u.email, u.email_verified, u.created_at, u.updated_at,
-            sp.status AS staff_status
-            ${caps.usersPasswordHash ? ", u.password_hash" : ""}
-       FROM users u
-       LEFT JOIN staff_profiles sp ON sp.user_id = u.id
-      ORDER BY u.created_at ASC, u.id ASC`
-  );
+  const userRows = loadRows(combined, "users");
   const users: UserRecord[] = userRows.map((row) => ({
     id: reqStr(row, "id", "users"),
     name: reqStr(row, "name", "users"),
@@ -1365,11 +1722,7 @@ async function loadStateInternalImpl(
     updated_at: reqIso(row, "updated_at", "users"),
   }));
 
-  const sessionRows = await queryRows(
-    client,
-    `SELECT id, token, user_id, ip_address, user_agent, expires_at, created_at
-       FROM sessions ORDER BY created_at ASC, id ASC`
-  );
+  const sessionRows = loadRows(combined, "sessions");
   const sessions: SessionRecord[] = sessionRows.map((row) => ({
     id: reqStr(row, "id", "sessions"),
     token: reqStr(row, "token", "sessions"),
@@ -1381,17 +1734,8 @@ async function loadStateInternalImpl(
   }));
 
   // -- RBAC (roles + permission_keys via role_permissions → permissions) ----
-  const roleRows = await queryRows(
-    client,
-    `SELECT id, "key", name, description, is_system, created_at
-       FROM roles ORDER BY created_at ASC, id ASC`
-  );
-  const rolePermRows = await queryRows(
-    client,
-    `SELECT rp.role_id, p."key" AS permission_key
-       FROM role_permissions rp
-       JOIN permissions p ON p.id = rp.permission_id`
-  );
+  const roleRows = loadRows(combined, "roles");
+  const rolePermRows = loadRows(combined, "rolePerms");
   const permsByRole = groupBy(rolePermRows, (r) => String(r["role_id"]));
   const roles: RoleRecord[] = roleRows.map((row) => {
     const id = reqStr(row, "id", "roles");
@@ -1408,11 +1752,7 @@ async function loadStateInternalImpl(
     };
   });
 
-  const userRoleRows = await queryRows(
-    client,
-    `SELECT user_id, role_id, created_at FROM user_roles
-      ORDER BY created_at ASC, user_id ASC, role_id ASC`
-  );
+  const userRoleRows = loadRows(combined, "userRoles");
   const user_roles = userRoleRows.map((row) => ({
     user_id: reqStr(row, "user_id", "user_roles"),
     role_id: reqStr(row, "role_id", "user_roles"),
@@ -1420,7 +1760,7 @@ async function loadStateInternalImpl(
   }));
 
   // Reference data must come from migration 0001 — never auto-seeded here.
-  const currencyRows = await queryRows(client, `SELECT code FROM currencies`);
+  const currencyRows = loadRows(combined, "currencies");
   if (roles.length === 0 || currencyRows.length === 0) {
     throw new Error(
       "DrizzleStore: reference data is missing (roles or currencies table is empty). Migration 0001 (db/migrations/0001_seed_reference_catalog.sql) has not been applied."
@@ -1428,13 +1768,7 @@ async function loadStateInternalImpl(
   }
 
   // -- Assets / customers ----------------------------------------------------
-  const assetRows = await queryRows(
-    client,
-    `SELECT id, object_key, bucket_name, original_filename, content_type,
-            byte_size, checksum_sha256, visibility, uploaded_by_user_id,
-            owner_customer_id, created_at
-       FROM uploaded_assets ORDER BY created_at ASC, id ASC`
-  );
+  const assetRows = loadRows(combined, "assets");
   const uploaded_assets: UploadedAssetRecord[] = assetRows.map((row) => ({
     id: reqStr(row, "id", "uploaded_assets"),
     object_key: reqStr(row, "object_key", "uploaded_assets"),
@@ -1449,13 +1783,7 @@ async function loadStateInternalImpl(
     created_at: reqIso(row, "created_at", "uploaded_assets"),
   }));
 
-  const customerRows = await queryRows(
-    client,
-    `SELECT id, customer_number, customer_type, name, email, normalized_email,
-            phone, normalized_phone, company_name, country_code, status,
-            registration_source, notes, created_at, updated_at
-       FROM customers ORDER BY created_at ASC, id ASC`
-  );
+  const customerRows = loadRows(combined, "customers");
   const customers: CustomerRecord[] = customerRows.map((row) => ({
     id: reqStr(row, "id", "customers"),
     customer_number: reqStr(row, "customer_number", "customers"),
@@ -1479,20 +1807,9 @@ async function loadStateInternalImpl(
   }));
 
   // -- Catalog ---------------------------------------------------------------
-  const channelRows = await queryRows(
-    client,
-    `SELECT product_id, channel_key FROM product_distribution_channels
-      ORDER BY product_id, channel_key`
-  );
+  const channelRows = loadRows(combined, "channels");
   const channelsByProduct = groupBy(channelRows, (r) => String(r["product_id"]));
-  const productRows = await queryRows(
-    client,
-    `SELECT id, code, slug, name, description, product_type, fulfillment_type,
-            status, website_url, documentation_url, created_by_user_id,
-            created_at, updated_at
-            ${caps.productsDefaults ? ", default_activation_limit, offline_grace_hours" : ""}
-       FROM products ORDER BY created_at ASC, id ASC`
-  );
+  const productRows = loadRows(combined, "products");
   const products: ProductRecord[] = productRows.map((row) => {
     const id = reqStr(row, "id", "products");
     return {
@@ -1525,12 +1842,7 @@ async function loadStateInternalImpl(
     };
   });
 
-  const featureRows = await queryRows(
-    client,
-    `SELECT id, product_id, feature_key, name, description, value_type, unit,
-            default_value, status, created_at, updated_at
-       FROM product_features ORDER BY created_at ASC, id ASC`
-  );
+  const featureRows = loadRows(combined, "features");
   const product_features: ProductFeatureRecord[] = featureRows.map((row) => ({
     id: reqStr(row, "id", "product_features"),
     product_id: reqStr(row, "product_id", "product_features"),
@@ -1549,13 +1861,7 @@ async function loadStateInternalImpl(
     updated_at: reqIso(row, "updated_at", "product_features"),
   }));
 
-  const packageRows = await queryRows(
-    client,
-    `SELECT id, product_id, package_key, name, description, status,
-            created_at, updated_at
-            ${caps.packagesCurrentVersion ? ", current_version_id" : ""}
-       FROM product_packages ORDER BY created_at ASC, id ASC`
-  );
+  const packageRows = loadRows(combined, "packages");
   const product_packages: ProductPackageRecord[] = packageRows.map((row) => ({
     id: reqStr(row, "id", "product_packages"),
     product_id: reqStr(row, "product_id", "product_packages"),
@@ -1574,23 +1880,11 @@ async function loadStateInternalImpl(
     updated_at: reqIso(row, "updated_at", "product_packages"),
   }));
 
-  const versionFeatureRows = await queryRows(
-    client,
-    `SELECT id, package_version_id, product_id, product_feature_id,
-            feature_key_snapshot, value_type_snapshot, entitlement_value
-            ${caps.packageVersionFeaturesUnit ? ", unit_snapshot" : ""}
-       FROM package_version_features
-      ORDER BY package_version_id, feature_key_snapshot`
-  );
+  const versionFeatureRows = loadRows(combined, "versionFeatures");
   const grantsByVersion = groupBy(versionFeatureRows, (r) =>
     String(r["package_version_id"])
   );
-  const versionRows = await queryRows(
-    client,
-    `SELECT id, package_id, product_id, version_number, status,
-            change_summary, published_at, created_at
-       FROM package_versions ORDER BY created_at ASC, id ASC`
-  );
+  const versionRows = loadRows(combined, "versions");
   const package_versions: PackageVersionRecord[] = versionRows.map((row) => {
     const id = reqStr(row, "id", "package_versions");
     const features: PackageVersionFeatureGrant[] = (
@@ -1628,14 +1922,7 @@ async function loadStateInternalImpl(
     };
   });
 
-  const priceRows = await queryRows(
-    client,
-    `SELECT id, package_version_id, price_key, price_kind, amount_minor,
-            currency_code, interval_unit, interval_count, trial_days,
-            setup_fee_minor, status, created_at
-            ${caps.packagePricesUsedInOrders ? ", used_in_orders" : ""}
-       FROM package_prices ORDER BY created_at ASC, id ASC`
-  );
+  const priceRows = loadRows(combined, "prices");
   const package_prices: PackagePriceRecord[] = priceRows.map((row) => ({
     id: reqStr(row, "id", "package_prices"),
     package_version_id: reqStr(row, "package_version_id", "package_prices"),
@@ -1668,27 +1955,13 @@ async function loadStateInternalImpl(
   }));
 
   // -- Integrated sites -------------------------------------------------------
-  const siteProductRows = await queryRows(
-    client,
-    `SELECT integrated_site_id, product_id FROM site_products
-      ORDER BY integrated_site_id, product_id`
-  );
+  const siteProductRows = loadRows(combined, "siteProducts");
   const productsBySite = groupBy(siteProductRows, (r) =>
     String(r["integrated_site_id"])
   );
-  const domainRows = await queryRows(
-    client,
-    `SELECT id, integrated_site_id, domain, verification_method,
-            verification_challenge, verification_status, verified_at, is_primary
-       FROM site_domains ORDER BY integrated_site_id, created_at ASC, id ASC`
-  );
+  const domainRows = loadRows(combined, "domains");
   const domainsBySite = groupBy(domainRows, (r) => String(r["integrated_site_id"]));
-  const siteRows = await queryRows(
-    client,
-    `SELECT id, site_key, name, environment, status, api_version,
-            allowed_capabilities, created_at, updated_at
-       FROM integrated_sites ORDER BY created_at ASC, id ASC`
-  );
+  const siteRows = loadRows(combined, "sites");
   const integrated_sites: IntegratedSiteRecord[] = siteRows.map((row) => {
     const id = reqStr(row, "id", "integrated_sites");
     return {
@@ -1732,13 +2005,7 @@ async function loadStateInternalImpl(
     };
   });
 
-  const credentialRows = await queryRows(
-    client,
-    `SELECT id, integrated_site_id, key_id, credential_type, secret_hash,
-            secret_ciphertext, encryption_key_version, scopes, status,
-            created_at, revoked_at, last_used_at
-       FROM site_credentials ORDER BY created_at ASC, id ASC`
-  );
+  const credentialRows = loadRows(combined, "credentials");
   const site_credentials: SiteCredentialRecord[] = credentialRows.map((row) => ({
     id: reqStr(row, "id", "site_credentials"),
     integrated_site_id: reqStr(row, "integrated_site_id", "site_credentials"),
@@ -1762,11 +2029,7 @@ async function loadStateInternalImpl(
     last_used_at: iso(row, "last_used_at"),
   }));
 
-  const nonceRows = await queryRows(
-    client,
-    `SELECT credential_id, nonce, expires_at FROM request_nonces
-      ORDER BY created_at ASC, credential_id ASC, nonce ASC`
-  );
+  const nonceRows = loadRows(combined, "nonces");
   const request_nonces = nonceRows.map((row) => ({
     credential_id: reqStr(row, "credential_id", "request_nonces"),
     nonce: reqStr(row, "nonce", "request_nonces"),
@@ -1774,11 +2037,7 @@ async function loadStateInternalImpl(
   }));
 
   // -- Orders (items + entitlement snapshots + attributions) -----------------
-  const attributionRows = await queryRows(
-    client,
-    `SELECT order_id, utm_source, utm_medium, utm_campaign, utm_content,
-            utm_term, fbp, fbc FROM order_attributions`
-  );
+  const attributionRows = loadRows(combined, "attributions");
   const attributionByOrder = new Map<string, Record<string, string | undefined>>();
   for (const row of attributionRows) {
     const rec: Record<string, string | undefined> = {};
@@ -1799,22 +2058,11 @@ async function loadStateInternalImpl(
     }
   }
 
-  const orderSnapshotItemRows = await queryRows(
-    client,
-    `SELECT id, snapshot_id, feature_key_snapshot, value_type_snapshot,
-            entitlement_value, unit_snapshot
-       FROM order_item_entitlement_snapshot_items
-      ORDER BY snapshot_id, feature_key_snapshot`
-  );
+  const orderSnapshotItemRows = loadRows(combined, "orderSnapshotItems");
   const orderSnapshotItemsBySnapshot = groupBy(orderSnapshotItemRows, (r) =>
     String(r["snapshot_id"])
   );
-  const orderSnapshotRows = await queryRows(
-    client,
-    `SELECT id, order_item_id, source_type, source_package_version_id,
-            schema_version, snapshot_hash, created_at
-       FROM order_item_entitlement_snapshots`
-  );
+  const orderSnapshotRows = loadRows(combined, "orderSnapshots");
   const orderSnapshotByItem = new Map<string, OrderItemSnapshotRecord>();
   for (const row of orderSnapshotRows) {
     const id = reqStr(row, "id", "order_item_entitlement_snapshots");
@@ -1847,28 +2095,9 @@ async function loadStateInternalImpl(
     });
   }
 
-  const orderItemRows = await queryRows(
-    client,
-    `SELECT id, order_id, product_id, package_id, package_version_id,
-            package_price_id, item_kind, fulfillment_type_snapshot,
-            product_name_snapshot, package_name_snapshot,
-            package_version_snapshot, price_kind_snapshot,
-            interval_unit_snapshot, interval_count_snapshot,
-            activation_limit_snapshot, quantity, unit_amount_minor,
-            line_subtotal_minor, line_discount_minor, line_tax_minor,
-            line_total_minor, currency_code, created_at
-       FROM order_items ORDER BY order_id, created_at ASC, id ASC`
-  );
+  const orderItemRows = loadRows(combined, "orderItems");
   const orderItemsByOrder = groupBy(orderItemRows, (r) => String(r["order_id"]));
-  const orderRows = await queryRows(
-    client,
-    `SELECT id, order_number, public_reference, customer_id, source,
-            integrated_site_id, status, payment_status, currency_code,
-            subtotal_minor, discount_minor, tax_minor, total_minor,
-            customer_note, internal_note, created_by_user_id, created_at,
-            updated_at, completed_at, cancelled_at
-       FROM orders ORDER BY created_at ASC, id ASC`
-  );
+  const orderRows = loadRows(combined, "orders");
   const orders: OrderRecord[] = orderRows.map((row) => {
     const id = reqStr(row, "id", "orders");
     const items: OrderItemRecord[] = (orderItemsByOrder.get(id) ?? []).map((it) => {
@@ -1960,27 +2189,11 @@ async function loadStateInternalImpl(
   });
 
   // -- Subscriptions (periods) + invoices (items) -----------------------------
-  const periodRows = await queryRows(
-    client,
-    `SELECT id, subscription_id, period_number, period_start, period_end,
-            status, renewal_order_id, invoice_id, payment_transaction_id,
-            activated_at, created_at
-       FROM subscription_periods
-      ORDER BY subscription_id, period_number ASC`
-  );
+  const periodRows = loadRows(combined, "periods");
   const periodsBySubscription = groupBy(periodRows, (r) =>
     String(r["subscription_id"])
   );
-  const subscriptionRows = await queryRows(
-    client,
-    `SELECT id, subscription_number, customer_id, product_id,
-            source_order_item_id, source_package_version_id, status,
-            billing_kind, interval_unit, interval_count, currency_code,
-            current_period_start, current_period_end, next_renewal_at,
-            cancel_at_period_end, cancelled_at, created_at, updated_at
-            ${caps.subscriptionsUnitAmount ? ", unit_amount_minor" : ""}
-       FROM subscriptions ORDER BY created_at ASC, id ASC`
-  );
+  const subscriptionRows = loadRows(combined, "subscriptions");
   const subscriptions: SubscriptionRecord[] = subscriptionRows.map((row) => {
     const id = reqStr(row, "id", "subscriptions");
     const periods: SubscriptionPeriodRecord[] = (
@@ -2041,23 +2254,11 @@ async function loadStateInternalImpl(
     };
   });
 
-  const invoiceItemRows = await queryRows(
-    client,
-    `SELECT id, invoice_id, description_snapshot, quantity,
-            unit_amount_minor, line_amount_minor, currency_code
-       FROM invoice_items ORDER BY invoice_id, created_at ASC, id ASC`
-  );
+  const invoiceItemRows = loadRows(combined, "invoiceItems");
   const invoiceItemsByInvoice = groupBy(invoiceItemRows, (r) =>
     String(r["invoice_id"])
   );
-  const invoiceRows = await queryRows(
-    client,
-    `SELECT id, invoice_number, customer_id, order_id, subscription_id,
-            invoice_type, status, currency_code, subtotal_minor,
-            discount_minor, tax_minor, total_minor, amount_paid_minor,
-            amount_due_minor, issued_at, paid_at, created_at
-       FROM invoices ORDER BY created_at ASC, id ASC`
-  );
+  const invoiceRows = loadRows(combined, "invoices");
   const invoices: InvoiceRecord[] = invoiceRows.map((row) => {
     const id = reqStr(row, "id", "invoices");
     return {
@@ -2098,11 +2299,7 @@ async function loadStateInternalImpl(
   });
 
   // -- Payments ---------------------------------------------------------------
-  const providerRows = await queryRows(
-    client,
-    `SELECT id, provider_key, display_name, provider_type, adapter_key, status
-       FROM payment_providers ORDER BY created_at ASC, id ASC`
-  );
+  const providerRows = loadRows(combined, "providers");
   const payment_providers: PaymentProviderRecord[] = providerRows.map((row) => ({
     id: reqStr(row, "id", "payment_providers"),
     provider_key: reqStr(row, "provider_key", "payment_providers"),
@@ -2121,19 +2318,9 @@ async function loadStateInternalImpl(
     );
   }
 
-  const railRows = await queryRows(
-    client,
-    `SELECT payment_method_id, rail_key FROM payment_method_transfer_rails
-      ORDER BY payment_method_id, rail_key`
-  );
+  const railRows = loadRows(combined, "rails");
   const railsByMethod = groupBy(railRows, (r) => String(r["payment_method_id"]));
-  const methodRows = await queryRows(
-    client,
-    `SELECT id, provider_id, method_key, display_name, method_kind,
-            account_type, account_label, instructions, configuration,
-            is_enabled, sort_order, created_at
-       FROM payment_methods ORDER BY created_at ASC, id ASC`
-  );
+  const methodRows = loadRows(combined, "methods");
   const payment_methods: PaymentMethodRecord[] = methodRows.map((row) => {
     const id = reqStr(row, "id", "payment_methods");
     const cfg = asJsonObject(row, "configuration");
@@ -2186,17 +2373,7 @@ async function loadStateInternalImpl(
     };
   });
 
-  const submissionRows = await queryRows(
-    client,
-    `SELECT id, order_id, customer_id, payment_method_id, amount_minor,
-            currency_code, sender_name, sender_phone, sender_bank_name,
-            sender_account_reference, transfer_rail_key,
-            transaction_reference, normalized_transaction_reference,
-            payment_date, proof_asset_id, status, customer_note,
-            submitted_at, reviewed_at, reviewed_by_user_id
-            ${caps.paymentSubmissionsDuplicateWarning ? ", duplicate_risk_warning" : ""}
-       FROM payment_submissions ORDER BY submitted_at ASC, id ASC`
-  );
+  const submissionRows = loadRows(combined, "submissions");
   const payment_submissions: PaymentSubmissionRecord[] = submissionRows.map((row) => ({
     id: reqStr(row, "id", "payment_submissions"),
     order_id: reqStr(row, "order_id", "payment_submissions"),
@@ -2227,14 +2404,7 @@ async function loadStateInternalImpl(
     reviewed_by_user_id: str(row, "reviewed_by_user_id"),
   }));
 
-  const transactionRows = await queryRows(
-    client,
-    `SELECT id, order_id, payment_method_id, payment_submission_id,
-            provider_id, provider_transaction_id, amount_minor, currency_code,
-            status, paid_at, verified_by_user_id, verification_source,
-            created_at
-       FROM payment_transactions ORDER BY created_at ASC, id ASC`
-  );
+  const transactionRows = loadRows(combined, "transactions");
   const payment_transactions: PaymentTransactionRecord[] = transactionRows.map(
     (row) => ({
       id: reqStr(row, "id", "payment_transactions"),
@@ -2264,12 +2434,7 @@ async function loadStateInternalImpl(
     })
   );
 
-  const verificationLogRows = await queryRows(
-    client,
-    `SELECT id, payment_submission_id, actor_user_id, decision, reason_code,
-            customer_message, notes, created_at
-       FROM payment_verification_logs ORDER BY created_at ASC, id ASC`
-  );
+  const verificationLogRows = loadRows(combined, "verificationLogs");
   const payment_verification_logs: PaymentVerificationLogRecord[] =
     verificationLogRows.map((row) => ({
       id: reqStr(row, "id", "payment_verification_logs"),
@@ -2291,43 +2456,17 @@ async function loadStateInternalImpl(
     }));
 
   // -- Licenses (snapshots + items + activations) -----------------------------
-  const licenseSnapshotItemRows = await queryRows(
-    client,
-    `SELECT id, snapshot_id, feature_key_snapshot, value_type_snapshot,
-            entitlement_value, unit_snapshot
-       FROM license_entitlement_snapshot_items
-      ORDER BY snapshot_id, feature_key_snapshot`
-  );
+  const licenseSnapshotItemRows = loadRows(combined, "licenseSnapshotItems");
   const licenseSnapshotItemsBySnapshot = groupBy(licenseSnapshotItemRows, (r) =>
     String(r["snapshot_id"])
   );
-  const licenseSnapshotRows = await queryRows(
-    client,
-    `SELECT id, license_id, version_number, source_type, effective_at,
-            reason, snapshot_hash, created_by_user_id, created_at
-       FROM license_entitlement_snapshots
-      ORDER BY license_id, version_number ASC`
-  );
+  const licenseSnapshotRows = loadRows(combined, "licenseSnapshots");
   const licenseSnapshotsByLicense = groupBy(licenseSnapshotRows, (r) =>
     String(r["license_id"])
   );
-  const activationRows = await queryRows(
-    client,
-    `SELECT id, license_id, installation_id_hash, domain_normalized,
-            environment, status, activated_at, last_seen_at, deactivated_at,
-            metadata, created_at
-       FROM license_activations
-      ORDER BY license_id, activated_at ASC, id ASC`
-  );
+  const activationRows = loadRows(combined, "activations");
   const activationsByLicense = groupBy(activationRows, (r) => String(r["license_id"]));
-  const licenseRows = await queryRows(
-    client,
-    `SELECT id, license_number, product_id, customer_id, source_order_item_id,
-            subscription_id, license_key_hash, license_key_hint, status,
-            activation_limit, valid_from, expires_at, grace_until,
-            current_entitlement_snapshot_id, issued_at, created_at, updated_at
-       FROM licenses ORDER BY created_at ASC, id ASC`
-  );
+  const licenseRows = loadRows(combined, "licenses");
   const licenses: LicenseRecord[] = licenseRows.map((row) => {
     const id = reqStr(row, "id", "licenses");
     const snapshots: LicenseEntitlementSnapshotRecord[] = (
@@ -2422,13 +2561,7 @@ async function loadStateInternalImpl(
   });
 
   // -- Tracking -----------------------------------------------------------------
-  const trackingConfigRows = await queryRows(
-    client,
-    `SELECT id, integrated_site_id, provider, pixel_id,
-            access_token_ciphertext, encryption_key_version, test_event_code,
-            enabled_events, status, created_at, updated_at, rotated_at
-       FROM tracking_configurations ORDER BY created_at ASC, id ASC`
-  );
+  const trackingConfigRows = loadRows(combined, "trackingConfigs");
   const tracking_configurations: TrackingConfigRecord[] = trackingConfigRows.map(
     (row) => ({
       id: reqStr(row, "id", "tracking_configurations"),
@@ -2446,14 +2579,7 @@ async function loadStateInternalImpl(
     })
   );
 
-  const trackingEventRows = await queryRows(
-    client,
-    `SELECT id, integrated_site_id, event_name, event_id, event_time,
-            event_source_url, order_id, consent_state,
-            consent_policy_version, sanitized_payload, status, created_at
-            ${caps.trackingEventsDelivery ? ", delivery_attempts, delivered_at" : ""}
-       FROM tracking_events ORDER BY created_at ASC, id ASC`
-  );
+  const trackingEventRows = loadRows(combined, "trackingEvents");
   const tracking_events: TrackingEventRecord[] = trackingEventRows.map((row) => ({
     id: reqStr(row, "id", "tracking_events"),
     integrated_site_id: reqStr(row, "integrated_site_id", "tracking_events"),
@@ -2478,20 +2604,11 @@ async function loadStateInternalImpl(
   }));
 
   // -- Webhooks / outbox / idempotency / audit ----------------------------------
-  const endpointSecretRows = await queryRows(
-    client,
-    `SELECT webhook_endpoint_id, key_id, secret_ciphertext, key_version, status
-       FROM webhook_endpoint_secrets ORDER BY webhook_endpoint_id, created_at ASC`
-  );
+  const endpointSecretRows = loadRows(combined, "endpointSecrets");
   const secretsByEndpoint = groupBy(endpointSecretRows, (r) =>
     String(r["webhook_endpoint_id"])
   );
-  const endpointRows = await queryRows(
-    client,
-    `SELECT id, integrated_site_id, url, description, subscribed_events,
-            status, created_at
-       FROM webhook_endpoints ORDER BY created_at ASC, id ASC`
-  );
+  const endpointRows = loadRows(combined, "endpoints");
   const webhook_endpoints: WebhookEndpointRecord[] = endpointRows.map((row) => {
     const id = reqStr(row, "id", "webhook_endpoints");
     const secrets = secretsByEndpoint.get(id) ?? [];
@@ -2523,12 +2640,7 @@ async function loadStateInternalImpl(
     };
   });
 
-  const deliveryRows = await queryRows(
-    client,
-    `SELECT id, webhook_endpoint_id, event_id, delivery_id, status,
-            attempt_count, last_http_status, delivered_at
-       FROM webhook_deliveries ORDER BY created_at ASC, id ASC`
-  );
+  const deliveryRows = loadRows(combined, "deliveries");
   const webhook_deliveries = deliveryRows.map((row) => ({
     id: reqStr(row, "id", "webhook_deliveries"),
     webhook_endpoint_id: reqStr(row, "webhook_endpoint_id", "webhook_deliveries"),
@@ -2544,13 +2656,7 @@ async function loadStateInternalImpl(
     delivered_at: iso(row, "delivered_at"),
   }));
 
-  const outboxRows = await queryRows(
-    client,
-    `SELECT id, event_key, aggregate_type, aggregate_id, event_type, payload,
-            status, attempt_count, available_at, locked_until, locked_by,
-            last_error_code, created_at, processed_at
-       FROM outbox_events ORDER BY created_at ASC, id ASC`
-  );
+  const outboxRows = loadRows(combined, "outbox");
   const outbox_events: OutboxEventRecord[] = outboxRows.map((row) => ({
     id: reqStr(row, "id", "outbox_events"),
     event_key: reqStr(row, "event_key", "outbox_events"),
@@ -2572,13 +2678,7 @@ async function loadStateInternalImpl(
     processed_at: iso(row, "processed_at"),
   }));
 
-  const idempotencyRows = await queryRows(
-    client,
-    `SELECT id, scope_key, idempotency_key, request_hash, status,
-            response_status, expires_at, created_at
-            ${caps.idempotencyResponseBody ? ", response_body" : ", response_reference"}
-       FROM idempotency_records ORDER BY created_at ASC, id ASC`
-  );
+  const idempotencyRows = loadRows(combined, "idempotency");
   const idempotency_records: IdempotencyRecord[] = idempotencyRows.map((row) => {
     let response_body: unknown;
     if (caps.idempotencyResponseBody) {
@@ -2614,12 +2714,7 @@ async function loadStateInternalImpl(
     };
   });
 
-  const auditRows = await queryRows(
-    client,
-    `SELECT id, actor_type, actor_user_id, integrated_site_id, action,
-            resource_type, resource_id, outcome, request_id, changes, created_at
-       FROM audit_logs ORDER BY created_at DESC, id DESC`
-  );
+  const auditRows = loadRows(combined, "audit");
   const audit_logs: AuditLogRecord[] = auditRows.map((row) => ({
     id: reqStr(row, "id", "audit_logs"),
     actor_type: asEnum(
@@ -2678,10 +2773,7 @@ async function loadStateInternalImpl(
   };
 
   if (caps.sequenceCounters) {
-    const counterRows = await queryRows(
-      client,
-      `SELECT counter_key, counter_value FROM sequence_counters`
-    );
+    const counterRows = loadRows(combined, "counters");
     const values: DatabaseState["sequence_counters"] = { ...COUNTER_BASE_VALUES };
     for (const row of counterRows) {
       const key = str(row, "counter_key");
