@@ -18,6 +18,12 @@ export const ALLOWED_TRACKING_EVENTS = [
   "Purchase",
 ] as const;
 
+// Tracking providers (PRD §15, owner decision 2026-11-15): Meta is live
+// (delivery still a stub — Batch 4); TikTok is next, others later.
+// The provider is a parameter on every pixel-group call — never
+// hardcoded to "meta" in the service layer.
+export const TRACKING_PROVIDERS = ["meta", "tiktok"] as const;
+
 export type TrackingEventName = (typeof ALLOWED_TRACKING_EVENTS)[number];
 
 export const RegisterIntegratedSiteSchema = v.object({
@@ -45,12 +51,39 @@ export const CreateSiteCredentialSchema = v.object({
 });
 
 export const ConfigureSiteTrackingSchema = v.object({
-  provider: v.literal("meta"),
+  provider: v.enum(TRACKING_PROVIDERS),
   pixel_id: v.string().trim().min(4).max(80),
   access_token: v.string().trim().min(12).max(512),
   test_event_code: v.string().trim().max(80).optional(),
   enabled_events: v.array(v.enum(ALLOWED_TRACKING_EVENTS), { min: 1 }),
   status: v.enum(["enabled", "disabled"] as const).default("enabled"),
+});
+
+// Pixel groups (migration 0006): one group per (site, provider,
+// pixel_id). A group is a labelled tracking configuration — the
+// Settings UI creates one row per group. The CAPI token is write-only:
+// it is encrypted at rest and never returned by any read endpoint.
+export const CreateTrackingConfigSchema = v.object({
+  provider: v.enum(TRACKING_PROVIDERS),
+  label: v.string().trim().min(1).max(120).optional(),
+  pixel_id: v.string().trim().min(4).max(80),
+  access_token: v.string().trim().min(12).max(512),
+  test_event_code: v.string().trim().max(80).optional(),
+  enabled_events: v.array(v.enum(ALLOWED_TRACKING_EVENTS), { min: 1 }),
+  status: v.enum(["enabled", "disabled"] as const).default("enabled"),
+});
+
+// Partial update: every field optional; the service rejects a body
+// that changes nothing (422). Supplying access_token re-encrypts the
+// token and bumps rotated_at; omitting it keeps the stored token.
+export const UpdateTrackingConfigSchema = v.object({
+  provider: v.enum(TRACKING_PROVIDERS).optional(),
+  label: v.string().trim().min(1).max(120).nullable().optional(),
+  pixel_id: v.string().trim().min(4).max(80).optional(),
+  access_token: v.string().trim().min(12).max(512).optional(),
+  test_event_code: v.string().trim().max(80).nullable().optional(),
+  enabled_events: v.array(v.enum(ALLOWED_TRACKING_EVENTS), { min: 1 }).optional(),
+  status: v.enum(["enabled", "disabled"] as const).optional(),
 });
 
 export const IngestTrackingEventSchema = v.object({

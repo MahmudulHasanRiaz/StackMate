@@ -1,22 +1,24 @@
 /**
- * Webhooks & Outbox (design spec §4.1/§4.2).
+ * Webhooks (design spec §4.1/§4.2) — Settings area.
  *
- * Routes (registered in router.tsx):
- *   /webhooks, /webhooks/$webhookId
+ * Routes (registered in router.tsx, under the Settings shell):
+ *   /settings/webhooks, /settings/webhooks/$webhookId
  *
  * Search is read with `useSearch({ strict: false })`: the route id is
- * "/_main/webhooks" (the operational shell is a pathless `_main`
- * layout route), so a plain-path `from: "/webhooks"` throws
- * "Invariant failed" at render (jsdom repro 2026-11-15).
+ * "/settings/webhooks" (the Settings shell is a path route), so a
+ * plain-path `from: "/settings/webhooks"` throws "Invariant failed"
+ * at render (jsdom repro 2026-11-15).
  *
  * Endpoints used (all `integrations.manage`):
  *   GET  /api/v1/admin/webhooks
  *   POST /api/v1/admin/webhooks
+ *   DELETE /api/v1/admin/webhooks/:id
  *   POST /api/v1/admin/webhooks/:id/test
  *   GET  /api/v1/admin/webhooks/:id/deliveries
- *   GET  /api/v1/admin/outbox-events[?status=]
- *   POST /api/v1/admin/outbox-events/:id/replay
  *   GET  /api/v1/admin/integrated-sites (site names)
+ *
+ * The outbox lives under Administration now (sections/outbox.tsx,
+ * route /outbox) — it used to be a tab on the webhook detail page.
  *
  * MISSING ENDPOINT — there is NO GET /api/v1/admin/webhooks/:id.
  * The detail page therefore reads the endpoint from the webhook list
@@ -29,10 +31,9 @@
  * production delivery reached its destination.
  */
 import { useState, type FormEvent } from "react";
-import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
-import { Eye, FlaskConical, Plus, Webhook } from "lucide-react";
+import { Eye, FlaskConical, Plus, Trash2, Webhook } from "lucide-react";
 import { apiRequest } from "../lib/api-client";
 import { detailKey, listKey } from "../lib/query";
 import {
@@ -47,7 +48,6 @@ import {
 import {
   Alert,
   Button,
-  Chip,
   CopyButton,
   DateCell,
   DateTimeCell,
@@ -59,7 +59,6 @@ import {
   Select,
   StatusBadge,
   TableSkeleton,
-  Tabs,
   Toolbar,
   useConfirm,
 } from "../components/primitives";
@@ -69,10 +68,11 @@ import type { IntegratedSite } from "./integrations";
 /* Route helpers (see header note)                                     */
 /* ------------------------------------------------------------------ */
 function useRouteSearch() {
-  // No `from`: the route id is "/_main/webhooks" (pathless `_main`
-  // layout parent), so a plain-path `from: "/webhooks"` throws
-  // "Invariant failed" at render (jsdom repro 2026-11-15). Read the
-  // current route's search like the other list sections.
+  // No `from`: the route id is "/settings/webhooks" (the Settings
+  // shell is a path route), so a plain-path `from:
+  // "/settings/webhooks"` throws "Invariant failed" at render (jsdom
+  // repro 2026-11-15). Read the current route's search like the other
+  // list sections.
   return useSearch({ strict: false }) as unknown as Record<string, unknown>;
 }
 
@@ -111,23 +111,6 @@ export interface WebhookDelivery {
   delivered_at: string | null;
 }
 
-export interface OutboxEvent {
-  id: string;
-  event_key: string;
-  aggregate_type: string;
-  aggregate_id: string;
-  event_type: string;
-  payload: Record<string, unknown>;
-  status: "pending" | "processing" | "delivered" | "dead_letter";
-  attempt_count: number;
-  available_at: string;
-  locked_until: string | null;
-  locked_by: string | null;
-  last_error_code: string | null;
-  created_at: string;
-  processed_at: string | null;
-}
-
 interface RegisteredWebhook {
   endpoint: WebhookEndpoint;
   raw_signing_secret_once: string;
@@ -140,23 +123,6 @@ interface WebhookTestResult {
   http_status: number | null;
   delivered: boolean;
   error: string | null;
-}
-
-const OUTBOX_FILTERS = ["all", "pending", "processing", "delivered", "dead_letter"] as const;
-type OutboxFilter = (typeof OUTBOX_FILTERS)[number];
-
-function useOutboxEvents(filter: OutboxFilter) {
-  return useQuery({
-    queryKey: ["admin", "outbox-events", "list", filter],
-    queryFn: async () => {
-      const path =
-        filter === "all"
-          ? "/api/v1/admin/outbox-events"
-          : `/api/v1/admin/outbox-events?status=${filter}`;
-      const res = await apiRequest<{ items: OutboxEvent[] }>(path);
-      return res.items;
-    },
-  });
 }
 
 /** Test-result banner: shows the real fetch outcome verbatim. */
@@ -216,7 +182,7 @@ export function WebhooksSection() {
       if (value === undefined) delete next[key];
       else next[key] = value;
     }
-    navigate({ to: "/webhooks", search: next });
+    navigate({ to: "/settings/webhooks", search: next });
   };
 
   const runTest = async (endpointId: string) => {
@@ -240,6 +206,16 @@ export function WebhooksSection() {
       setTestingId(null);
     }
   };
+
+  const confirm = useConfirm();
+  const deleteEndpoint = useAdminMutation<WebhookEndpoint, string>({
+    mutationFn: (endpointId) =>
+      apiRequest<WebhookEndpoint>(`/api/v1/admin/webhooks/${endpointId}`, {
+        method: "DELETE",
+      }),
+    invalidateKeys: [listKey("webhooks")],
+    successTitle: "Webhook deleted",
+  });
 
   const columns: ColumnDef<WebhookEndpoint, unknown>[] = [
     {
@@ -315,9 +291,31 @@ export function WebhooksSection() {
                 label: "View details",
                 onSelect: () =>
                   navigate({
-                    to: "/webhooks/$webhookId",
+                    to: "/settings/webhooks/$webhookId",
                     params: { webhookId: ep.id },
                   }),
+              },
+              {
+                icon: Trash2,
+                label: "Delete",
+                danger: true,
+                onSelect: () =>
+                  void (async () => {
+                    const ok = await confirm({
+                      title: "Delete webhook endpoint?",
+                      body: (
+                        <div>
+                          <p>
+                            {ep.url} will stop receiving deliveries. Its past
+                            deliveries are removed with it; outbox history is
+                            kept.
+                          </p>
+                        </div>
+                      ),
+                      confirmLabel: "Delete",
+                    });
+                    if (ok) deleteEndpoint.mutate(ep.id);
+                  })(),
               },
             ]}
           />
@@ -329,11 +327,11 @@ export function WebhooksSection() {
   return (
     <section aria-labelledby="webhooks-heading">
       <PageHeader
-        breadcrumb={[{ label: "Integrations" }, { label: "Webhooks & Outbox" }]}
-        title="Webhooks & Outbox"
-        subtitle="Outbound webhook endpoints and the transactional outbox"
+        breadcrumb={[{ label: "Settings" }, { label: "Webhooks" }]}
+        title="Webhooks"
+        subtitle="Outbound webhook endpoints"
         action={
-          <Button variant="primary" icon={Plus} onClick={() => setRegisterOpen(true)}>
+          <Button variant="accent" icon={Plus} onClick={() => setRegisterOpen(true)}>
             Register webhook
           </Button>
         }
@@ -473,7 +471,7 @@ function RegisterWebhookDialog({
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={create.isPending} onClick={doSubmit}>
+          <Button variant="accent" loading={create.isPending} onClick={doSubmit}>
             Register webhook
           </Button>
         </>
@@ -541,12 +539,12 @@ function RegisterWebhookDialog({
 }
 
 /* ------------------------------------------------------------------ */
-/* Detail: /webhooks/$webhookId — tabs: Deliveries, Outbox events     */
+/* Detail: /settings/webhooks/$webhookId — deliveries only. The outbox */
+/* lives under Administration now (sections/outbox.tsx, /outbox).      */
 /* No GET /api/v1/admin/webhooks/:id exists, so the endpoint is read  */
 /* from the list.                                                       */
 /* ------------------------------------------------------------------ */
 export function WebhookDetailSection({ id }: { id: string }) {
-  const [tab, setTab] = useState("deliveries");
   const [lastTest, setLastTest] = useState<WebhookTestResult | null>(null);
   const navigate = useRouteNavigate();
 
@@ -579,8 +577,8 @@ export function WebhookDetailSection({ id }: { id: string }) {
       <section aria-labelledby="webhook-detail-heading">
         <PageHeader
           breadcrumb={[
-            { label: "Integrations" },
-            { label: "Webhooks & Outbox", href: "/webhooks" },
+            { label: "Settings" },
+            { label: "Webhooks", href: "/settings/webhooks" },
           ]}
           title="Webhook endpoint"
         />
@@ -594,8 +592,8 @@ export function WebhookDetailSection({ id }: { id: string }) {
       <section aria-labelledby="webhook-detail-heading">
         <PageHeader
           breadcrumb={[
-            { label: "Integrations" },
-            { label: "Webhooks & Outbox", href: "/webhooks" },
+            { label: "Settings" },
+            { label: "Webhooks", href: "/settings/webhooks" },
           ]}
           title="Webhook endpoint"
         />
@@ -617,15 +615,15 @@ export function WebhookDetailSection({ id }: { id: string }) {
     <section aria-labelledby="webhook-detail-heading">
       <PageHeader
         breadcrumb={[
-          { label: "Integrations" },
-          { label: "Webhooks & Outbox", href: "/webhooks" },
+          { label: "Settings" },
+          { label: "Webhooks", href: "/settings/webhooks" },
           { label: endpoint.description },
         ]}
         title={endpoint.description}
         subtitle={endpoint.url}
         action={
           <Button
-            variant="primary"
+            variant="accent"
             disabled={endpoint.status !== "active"}
             loading={test.isPending}
             onClick={() => test.mutate()}
@@ -666,23 +664,11 @@ export function WebhookDetailSection({ id }: { id: string }) {
           { label: "Created", value: <DateCell value={endpoint.created_at} /> },
         ]}
       />
-      <Tabs
-        tabs={[
-          { key: "deliveries", label: "Deliveries" },
-          { key: "outbox", label: "Outbox events" },
-        ]}
-        active={tab}
-        onChange={setTab}
-      />
-      {tab === "deliveries" ? (
-        <WebhookDeliveriesTab webhookId={id} />
-      ) : (
-        <OutboxTab />
-      )}
+      <WebhookDeliveriesTab webhookId={id} />
       <Button
         variant="ghost"
         size="sm"
-        onClick={() => navigate({ to: "/webhooks" })}
+        onClick={() => navigate({ to: "/settings/webhooks" })}
       >
         ← Back to webhooks
       </Button>
@@ -771,155 +757,3 @@ function WebhookDeliveriesTab({ webhookId }: { webhookId: string }) {
   );
 }
 
-/* ------------------------------------------------------------------ */
-/* Outbox tab                                                          */
-/* ------------------------------------------------------------------ */
-function OutboxTab() {
-  const [filter, setFilter] = useState<OutboxFilter>("all");
-  const query = useOutboxEvents(filter);
-  const confirm = useConfirm();
-  const rows = query.data ?? [];
-
-  const replay = useAdminMutation<OutboxEvent, string>({
-    mutationFn: (eventId) =>
-      apiRequest<OutboxEvent>(`/api/v1/admin/outbox-events/${eventId}/replay`, {
-        method: "POST",
-      }),
-    invalidateKeys: [
-      ["admin", "outbox-events", "list", "all"],
-      ["admin", "outbox-events", "list", "pending"],
-      ["admin", "outbox-events", "list", "processing"],
-      ["admin", "outbox-events", "list", "delivered"],
-      ["admin", "outbox-events", "list", "dead_letter"],
-    ],
-    successTitle: "Outbox event replayed",
-    successMessage: "The event is pending again with its attempt count reset.",
-  });
-
-  return (
-    <div>
-      <Toolbar>
-        {OUTBOX_FILTERS.map((f) => (
-          <Chip
-            key={f}
-            active={filter === f}
-            onClick={() => setFilter(f)}
-          >
-            {f === "all"
-              ? "All"
-              : f === "dead_letter"
-                ? "Dead letter"
-                : f}
-          </Chip>
-        ))}
-      </Toolbar>
-      {query.isPending ? (
-        <TableSkeleton rows={5} />
-      ) : query.isError ? (
-        <div className="sm-table-wrap">
-          <ErrorState
-            message={
-              query.error instanceof Error
-                ? query.error.message
-                : "Could not load outbox events."
-            }
-            onRetry={() => void query.refetch()}
-          />
-        </div>
-      ) : rows.length === 0 ? (
-        <div className="sm-table-wrap">
-          <div className="sm-empty">
-            <Webhook size={18} strokeWidth={2} className="sm-empty-icon" />
-            <div className="sm-empty-title">No outbox events</div>
-            <p>
-              {filter === "all"
-                ? "No outbox events have been recorded yet."
-                : `No ${filter === "dead_letter" ? "dead-lettered" : filter} outbox events.`}
-            </p>
-          </div>
-        </div>
-      ) : (
-        <div className="sm-table-wrap">
-          <table className="sm-table">
-            <thead>
-              <tr>
-                <th>Event key</th>
-                <th>Type</th>
-                <th>Aggregate</th>
-                <th>Status</th>
-                <th>Attempts</th>
-                <th>Last error</th>
-                <th>Created</th>
-                <th>Processed</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((e) => (
-                <tr key={e.id}>
-                  <td>
-                    <span className="sm-mono">{e.event_key}</span>
-                  </td>
-                  <td>{e.event_type}</td>
-                  <td>
-                    {e.aggregate_type} ·{" "}
-                    <span className="sm-mono">{e.aggregate_id}</span>
-                  </td>
-                  <td>
-                    <StatusBadge status={e.status} />
-                  </td>
-                  <td>
-                    <span className="sm-tabular">{e.attempt_count}</span>
-                  </td>
-                  <td>{e.last_error_code ?? "—"}</td>
-                  <td>
-                    <DateCell value={e.created_at} />
-                  </td>
-                  <td>
-                    <DateTimeCell value={e.processed_at} />
-                  </td>
-                  <td>
-                    {e.status === "dead_letter" ? (
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        loading={
-                          replay.isPending && replay.variables === e.id
-                        }
-                        onClick={() =>
-                          void (async () => {
-                            const ok = await confirm({
-                              title: "Replay outbox event?",
-                              body: (
-                                <div>
-                                  <p>
-                                    {e.event_key} returns to pending with its
-                                    attempt count reset to 0 and will be
-                                    dispatched again.
-                                  </p>
-                                  <p>
-                                    Only dead-lettered events can be replayed.
-                                  </p>
-                                </div>
-                              ),
-                              confirmLabel: "Replay",
-                            });
-                            if (ok) replay.mutate(e.id);
-                          })()
-                        }
-                      >
-                        Replay
-                      </Button>
-                    ) : (
-                      "—"
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </div>
-  );
-}

@@ -87,6 +87,50 @@ export async function registerWebhookEndpointByAdmin(
   });
 }
 
+/**
+ * Delete a webhook endpoint (hard delete + audit).
+ *
+ * The endpoint's deliveries are removed from state in the same
+ * transaction: Postgres would cascade-delete them through the
+ * `webhook_deliveries.webhook_endpoint_id` FK anyway, and leaving
+ * them in state would make persistStateDiff re-insert orphaned rows
+ * against that FK (500 on the next persist). The endpoint secrets
+ * cascade the same way (FK on `webhook_endpoint_secrets`); they are
+ * folded into the endpoint record in state, so deleting the record
+ * removes them. `outbox_events` stay — they carry no FK to the
+ * endpoint, so the dispatch history survives the delete.
+ */
+export async function deleteWebhookEndpointByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  endpointId: string,
+  requestId: string
+): Promise<Omit<WebhookEndpointRecord, "secret_ciphertext">> {
+  assertStaffPermission(actor, "integrations.manage");
+  return store.withTransaction((state) => {
+    const endpoint = state.webhook_endpoints.find((ep) => ep.id === endpointId);
+    if (!endpoint) throw new AppError("NOT_FOUND", "Webhook endpoint not found.", 404);
+    state.webhook_endpoints = state.webhook_endpoints.filter((ep) => ep.id !== endpointId);
+    state.webhook_deliveries = state.webhook_deliveries.filter(
+      (d) => d.webhook_endpoint_id !== endpointId
+    );
+
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "webhooks.endpoint.deleted",
+      resource_type: "webhook_endpoint",
+      resource_id: endpoint.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { url: endpoint.url, description: endpoint.description },
+    });
+
+    const { secret_ciphertext: _, ...safeEndpoint } = endpoint;
+    return safeEndpoint;
+  });
+}
+
 export async function testWebhookEndpointByAdmin(
   store: StackMateDataStore,
   actor: StaffPrincipal,

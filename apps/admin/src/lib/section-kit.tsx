@@ -3,7 +3,10 @@
  *
  * Shared building blocks for every admin section route. Sections MUST use
  * these instead of inventing their own list/detail patterns:
- *  - PageHeader: breadcrumb + title + subtitle + ONE primary action.
+ *  - PageHeader: breadcrumb + title + subtitle + ONE main action
+ *    (usually the accent variant; `primary` — white — is reserved
+ *    for the single most-important creation on its page, e.g.
+ *    "Create product" on the Products list).
  *  - useAdminList / useAdminDetail: TanStack Query over apiRequest.
  *  - useAdminMutation: mutation + toast + exact key invalidation.
  *  - ListTable: TanStack Table — client-side search/sort/pagination over

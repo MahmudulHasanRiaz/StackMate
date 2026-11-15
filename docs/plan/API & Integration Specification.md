@@ -1075,6 +1075,22 @@ Rules:
 - Track delivery status separately from event acceptance.
 - Deduplication policy must follow current official Meta documentation and must be verified in test events before production.
 
+### 17.6 Admin API — tracking pixel groups
+
+A pixel group is one (provider, pixel_id) configuration for one integrated site. A site may have several groups per provider — for example two Meta pixels on the same store. Configuration is managed from Settings in the admin panel (UI-based, never via environment variables). Multi-platform ready: `provider` is a parameter on every call, never hardcoded to `meta`.
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/integrated-sites/{siteId}/tracking | List a site's pixel groups (CAPI token never returned) |
+| POST | /api/v1/admin/integrated-sites/{siteId}/tracking | Create a pixel group; 201; 409 on a duplicate (site, provider, pixel_id); 404 unknown site |
+| PATCH | /api/v1/admin/integrated-sites/{siteId}/tracking/{configId} | Update a group (partial); supplying `access_token` re-encrypts the token and bumps `rotated_at`; omitting it keeps the stored token; 422 on a no-op body; 409 when the update would collide with another group's (site, provider, pixel_id) |
+| DELETE | /api/v1/admin/integrated-sites/{siteId}/tracking/{configId} | Hard delete a group (stored token deleted with it); 404 unknown config |
+| PUT | /api/v1/admin/integrated-sites/{siteId}/tracking | Legacy single-config upsert: matches on (site, provider, pixel_id) — a new pixel creates a group, a known pixel updates in place |
+
+Enable/disable is `PATCH {status: "enabled" | "disabled"}` — no redundant toggle endpoint. Create body: `provider` (`meta` | `tiktok`), `label?` (human group name, max 120 chars; null falls back to the pixel ID in the UI), `pixel_id` (4–80 chars), `access_token` (write-only, encrypted at rest, min 8 chars), `test_event_code?`, `enabled_events` (≥1 of `PageView`, `ViewContent`, `Lead`, `InitiateCheckout`, `AddPaymentInfo`, `Purchase`), `status?` (default `enabled`). All calls require `tracking.manage` and are audit-logged (`tracking.configuration.created` / `.updated` / `.deleted`).
+
+Event intake accepts an event when ANY enabled group for the site enables it — not only the first group. Meta CAPI delivery is a stub in the current API (events are recorded, no call to Meta is made — Batch 4); TikTok has no delivery at all yet, its groups only store configuration. The admin UI says so plainly and never claims a delivery reached its destination.
+
 ---
 
 ## 18. Webhook Contract
@@ -1165,6 +1181,18 @@ Webhook URLs are user-controlled destinations. Before delivery, enforce HTTPS in
 ### 18.6 Secret rotation
 
 Support overlapping active/retiring endpoint secrets for a planned rotation window. List APIs return key IDs and status only. The raw secret is shown once at creation/rotation.
+
+### 18.7 Admin API — webhook endpoints
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/webhooks | List registered endpoints |
+| POST | /api/v1/admin/webhooks | Register an endpoint; returns the signing secret once (`raw_signing_secret_once`) |
+| DELETE | /api/v1/admin/webhooks/{webhookId} | Hard delete an endpoint (permission-gated, audit-logged `webhooks.endpoint.deleted`); the endpoint's deliveries are removed with it; outbox events stay as history |
+| POST | /api/v1/admin/webhooks/{webhookId}/test | Real test delivery (signed, 10s timeout); the result is shown verbatim |
+| GET | /api/v1/admin/webhooks/{webhookId}/deliveries | Delivery attempts for one endpoint |
+
+There is no `GET /api/v1/admin/webhooks/{webhookId}` — the admin detail page reads the endpoint from the list. Webhook endpoints are configuration and live under Settings in the admin panel; the outbox lives under Administration as its own section.
 
 ---
 

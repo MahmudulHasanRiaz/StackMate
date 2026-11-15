@@ -124,9 +124,13 @@ import {
 } from "./modules/integrations/service.ts";
 import {
   configureSiteTrackingByAdmin,
+  createTrackingConfigByAdmin,
+  deleteTrackingConfigByAdmin,
   ingestExternalTrackingEvent,
+  updateTrackingConfigByAdmin,
 } from "./modules/tracking/service.ts";
 import {
+  deleteWebhookEndpointByAdmin,
   processTransactionalOutboxBatch,
   registerWebhookEndpointByAdmin,
   replayOutboxEventByAdmin,
@@ -2988,6 +2992,71 @@ export function createStackMateApp(
           return jsonResponse(cfg);
         }
 
+        // Pixel groups (migration 0006): per-group CRUD under Settings.
+        // GET lists a site's groups (ciphertext stripped); POST creates
+        // one (201, 409 on a duplicate (provider, pixel_id)); the
+        // toggle is PATCH status — no redundant endpoint.
+        if (method === "GET" && mSiteTracking) {
+          assertStaffPermission(principal, "tracking.manage");
+          const site = store.state.integrated_sites.find(
+            (s) => s.id === mSiteTracking.params.siteId
+          );
+          if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
+          return collectionResponse(
+            store.state.tracking_configurations
+              .filter((tc) => tc.integrated_site_id === site.id)
+              .map(({ access_token_ciphertext: _, ...safeTc }) => safeTc)
+          );
+        }
+
+        if (method === "POST" && mSiteTracking) {
+          const body = await request.json();
+          const created = await createTrackingConfigByAdmin(
+            store,
+            principal,
+            mSiteTracking.params.siteId!,
+            body,
+            {
+              encryptionKey: env.ENCRYPTION_KEY_V1,
+              keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION,
+              requestId,
+            }
+          );
+          return jsonResponse(created, 201);
+        }
+
+        const mSiteTrackingConfig = matchPath(
+          "/api/v1/admin/integrated-sites/:siteId/tracking/:configId",
+          pathname
+        );
+        if (method === "PATCH" && mSiteTrackingConfig) {
+          const body = await request.json();
+          const updated = await updateTrackingConfigByAdmin(
+            store,
+            principal,
+            mSiteTrackingConfig.params.siteId!,
+            mSiteTrackingConfig.params.configId!,
+            body,
+            {
+              encryptionKey: env.ENCRYPTION_KEY_V1,
+              keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION,
+              requestId,
+            }
+          );
+          return jsonResponse(updated);
+        }
+
+        if (method === "DELETE" && mSiteTrackingConfig) {
+          const deleted = await deleteTrackingConfigByAdmin(
+            store,
+            principal,
+            mSiteTrackingConfig.params.siteId!,
+            mSiteTrackingConfig.params.configId!,
+            requestId
+          );
+          return jsonResponse(deleted);
+        }
+
         if (method === "GET" && pathname === "/api/v1/admin/tracking/events") {
           assertStaffPermission(principal, "tracking.manage");
           return collectionResponse(store.state.tracking_events);
@@ -3010,6 +3079,20 @@ export function createStackMateApp(
             requestId,
           });
           return jsonResponse(created, 201);
+        }
+
+        const mWebhookDelete = matchPath(
+          "/api/v1/admin/webhooks/:webhookId",
+          pathname
+        );
+        if (method === "DELETE" && mWebhookDelete) {
+          const deleted = await deleteWebhookEndpointByAdmin(
+            store,
+            principal,
+            mWebhookDelete.params.webhookId!,
+            requestId
+          );
+          return jsonResponse(deleted);
         }
 
         // Batch 1: webhook test delivery + delivery history + outbox reads/replay.

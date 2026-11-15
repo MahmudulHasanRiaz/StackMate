@@ -2,7 +2,7 @@
  * Admin shell (design spec §12 + owner decisions 2026-11-15).
  *
  * Two layouts, chosen by route — never both at once:
- *  - MainShell: operational nav (6 groups, 15 sections) + topbar.
+ *  - MainShell: operational nav (5 groups, 13 sections) + topbar.
  *    Sidebar is 248px; the "Collapse menu" button at the sidebar
  *    bottom toggles it to a 64px icon rail (persisted in localStorage
  *    `sm-nav-collapsed`); 900–1280px it is a rail regardless;
@@ -13,8 +13,10 @@
  *    correction 2026-11-15). The same collapse toggle + persisted
  *    state work here as in MainShell; entering Settings defaults the
  *    main rail to collapsed. <900px the main rail is hidden and the
- *    settings nav is the drawer. Settings contents are placeholders —
- *    owner decision pending.
+ *    settings nav is the drawer. Settings holds ALL configuration
+ *    (Websites, Webhooks, Tracking pixel-groups, Payment Methods) in
+ *    real categories — the main menu carries no config items
+ *    (restructure batch, owner decision 2026-11-16).
  *
  * Topbar (both shells): ⌘K QuickNav (client-side section/action
  * search) + ONE account button (avatar initials + name + chevron)
@@ -43,8 +45,6 @@ import {
   BarChart3,
   ChevronDown,
   ClipboardCheck,
-  CreditCard,
-  Globe,
   KeyRound,
   LayoutDashboard,
   ListChecks,
@@ -56,6 +56,7 @@ import {
   RefreshCw,
   ScrollText,
   Search,
+  Send,
   Settings as SettingsIcon,
   ShieldCheck,
   ShoppingCart,
@@ -63,7 +64,6 @@ import {
   Tags,
   User,
   Users,
-  Webhook,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -136,7 +136,12 @@ export function AuthProvider({
 }
 
 /* ------------------------------------------------------------------ */
-/* Navigation model — the 15 operational sections (PRD §2.1)            */
+/* Navigation model — the 13 operational sections (PRD §2.1).           */
+/* Configuration lives ONLY in Settings (restructure batch): the       */
+/* Integrations group is gone — Websites / Webhooks / Tracking config  */
+/* moved to /settings/*, Payment Methods to /settings/payment-methods; */
+/* the Tracking events list and Outbox & Deliveries are audit/report   */
+/* views, so they live under Administration.                            */
 /* ------------------------------------------------------------------ */
 export interface NavItem {
   to: string;
@@ -166,7 +171,6 @@ export const NAVIGATION_GROUPS: ReadonlyArray<{
     items: [
       { to: "/customers", label: "Customers", icon: Users, permission: "customers.read" },
       { to: "/orders", label: "Orders & Invoices", icon: ShoppingCart, permission: "orders.read" },
-      { to: "/payment-methods", label: "Payment Methods", icon: CreditCard, permission: "payments.read" },
       { to: "/payment-review", label: "Payment Review", icon: ClipboardCheck, permission: "payments.read" },
     ],
   },
@@ -178,18 +182,12 @@ export const NAVIGATION_GROUPS: ReadonlyArray<{
     ],
   },
   {
-    group: "Integrations",
-    items: [
-      { to: "/integrations", label: "Websites & Credentials", icon: Globe, permission: "integrations.manage" },
-      { to: "/tracking", label: "Tracking / Meta CAPI", icon: BarChart3, permission: "tracking.manage" },
-      { to: "/webhooks", label: "Webhooks & Outbox", icon: Webhook, permission: "integrations.manage" },
-    ],
-  },
-  {
     group: "Administration",
     items: [
       { to: "/staff", label: "Staff & Roles", icon: ShieldCheck, permission: "users.manage" },
       { to: "/audit-logs", label: "Audit Log", icon: ScrollText, permission: "audit_logs.read" },
+      { to: "/tracking-events", label: "Tracking Events", icon: BarChart3, permission: "tracking.manage" },
+      { to: "/outbox", label: "Outbox & Deliveries", icon: Send, permission: "integrations.manage" },
     ],
   },
 ];
@@ -354,6 +352,13 @@ function QuickNav() {
         if (can(item.permission)) {
           list.push({ to: item.to, label: item.label, group: group.group, icon: item.icon });
         }
+      }
+    }
+    // Settings categories (restructure batch): the moved config pages
+    // are searchable here too, grouped under "Settings".
+    for (const cat of SETTINGS_CATEGORIES) {
+      if (can(cat.permission)) {
+        list.push({ to: cat.to, label: cat.label, group: "Settings", icon: cat.icon });
       }
     }
     list.push({ to: "/settings", label: "Settings", group: "System", icon: SettingsIcon });
@@ -528,7 +533,7 @@ function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={saving} onClick={() => void save()}>
+          <Button variant="accent" loading={saving} onClick={() => void save()}>
             Save changes
           </Button>
         </>
@@ -629,7 +634,7 @@ function PasswordDialog({ open, onClose }: { open: boolean; onClose: () => void 
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={saving} onClick={() => void save()}>
+          <Button variant="accent" loading={saving} onClick={() => void save()}>
             Change password
           </Button>
         </>
@@ -870,9 +875,28 @@ export function MainShell() {
 /* icon rail beside the expanded Settings nav (collapse ≠ hide).        */
 /* ------------------------------------------------------------------ */
 export function SettingsShell() {
+  const { principal } = useAuth();
   const [navOpen, setNavOpen] = useState(false);
   const [navCollapsed, toggleNavCollapsed, setNavCollapsed] = useNavCollapsed(true);
   const pathname = useRouterState({ select: (s) => s.location.pathname });
+
+  // Settings categories, permission-filtered like the main nav and
+  // grouped by their `group` field (first-seen order).
+  const categoryGroups = useMemo(() => {
+    const can = (permission?: string) =>
+      !permission || principal.permissions.includes(permission);
+    const groups: Array<{
+      group: string;
+      items: typeof SETTINGS_CATEGORIES;
+    }> = [];
+    for (const cat of SETTINGS_CATEGORIES) {
+      if (!can(cat.permission)) continue;
+      const found = groups.find((g) => g.group === cat.group);
+      if (found) found.items.push(cat);
+      else groups.push({ group: cat.group, items: [cat] });
+    }
+    return groups;
+  }, [principal.permissions]);
 
   useEffect(() => {
     setNavOpen(false);
@@ -906,19 +930,23 @@ export function SettingsShell() {
           <span className="sm-brand-name">Settings</span>
         </div>
         <nav className="sm-flex-1">
-          <div className="sm-nav-group-label">Categories</div>
-          {SETTINGS_CATEGORIES.map((cat) => (
-            <Link
-              key={cat.slug}
-              to="/settings/$category"
-              params={{ category: cat.slug }}
-              className="sm-nav-btn"
-              activeProps={{ "aria-current": "page" }}
-              title={cat.label}
-            >
-              <cat.icon size={16} strokeWidth={2} />
-              <span className="sm-nav-label">{cat.label}</span>
-            </Link>
+          {categoryGroups.map((g, i) => (
+            <div key={g.group}>
+              {i > 0 ? <div className="sm-nav-divider" aria-hidden="true" /> : null}
+              <div className="sm-nav-group-label">{g.group}</div>
+              {g.items.map((cat) => (
+                <Link
+                  key={cat.slug}
+                  to={cat.to}
+                  className="sm-nav-btn"
+                  activeProps={{ "aria-current": "page" }}
+                  title={cat.label}
+                >
+                  <cat.icon size={16} strokeWidth={2} />
+                  <span className="sm-nav-label">{cat.label}</span>
+                </Link>
+              ))}
+            </div>
           ))}
         </nav>
         <div className="sm-settings-back">
@@ -937,9 +965,6 @@ export function SettingsShell() {
             className="sm-hamburger"
             onClick={() => setNavOpen((v) => !v)}
           />
-          <span className="sm-hint">
-            Settings — contents pending owner decision
-          </span>
           <div className="sm-topbar-spacer" />
           <QuickNav />
           <AccountMenu />
