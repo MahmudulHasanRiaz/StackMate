@@ -93,3 +93,39 @@ Do not guess on Neon connectivity/transactions, Better Auth compatibility, SPA/A
 ## 11. Completion report
 
 Report implemented behavior, changed files, tests/build/typecheck/lint actually run, migrations and deployment impact, commit/push destination if applicable, open decisions/risks, and next recommended task.
+
+
+## 11. Date and time policy
+
+- User-facing dates must use DD/MM/YYYY.
+- Date-only API values use ISO 8601 YYYY-MM-DD; instants use ISO 8601 with explicit timezone and are persisted with UTC semantics.
+- Never store locale-formatted date strings in PostgreSQL.
+- Never parse ambiguous date strings with native Date.parse; use a strict shared parser and tests.
+- Keep date-only values distinct from timestamps. Format dates only at the presentation boundary.
+- See ADR-0001.
+
+## 12. Release and migration policy
+
+- A schema change and its reviewed, ordered Drizzle migration belong in the same pull request.
+- Never use schema push/sync against staging or production.
+- CI must verify migration consistency. Production deploy applies pending migrations before deploying application code.
+- A migration failure blocks deployment. Do not bypass or manually mark a failed migration as applied.
+- Use expand-and-contract migrations; do not combine breaking DDL with code that immediately requires the new shape.
+- Do not automatically roll back production database migrations. Prefer a corrective forward migration; restore only under incident procedure.
+- Run exactly one controlled migration job; use a database lock/advisory lock where supported.
+- Keep runtime DB credentials separate from migration credentials.
+- Production deploys are serialized. Staging and production secrets/resources must be isolated.
+- See ADR-0002 and docs/operations/CI-CD-AND-MIGRATIONS.md.
+
+## 13. Future digital-services marketplace compatibility
+
+- Orders must not assume every purchase creates a license or subscription.
+- Keep catalog, checkout/payment, and fulfillment boundaries separable.
+- Support distinct fulfillment handlers for software entitlements and future digital-service jobs.
+- Preserve provider/seller ownership as a future extension point, with server-side seller isolation.
+- Do not implement provider onboarding, service listings, milestones, payouts, or dispute workflows until separately scoped and approved.
+- See ADR-0003.
+
+## 14. Completion report
+
+Report implemented behavior, changed files, tests/build/typecheck/lint actually run, migrations and deployment impact, commit/push destination if applicable, open decisions/risks, and next recommended task.
