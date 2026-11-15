@@ -24,10 +24,13 @@ See docs/README.md for links.
 - [x] Admin/API/contracts directory placeholders.
 - [x] Database workspace placeholder.
 - [x] Environment template and gitignore.
-- [ ] Runnable admin/API source skeleton and package manifests.
+- [x] Workspace package manifests for admin, API, and contracts.
+- [ ] Runnable admin/API source entry points and dependency/toolchain selection.
 - [ ] Drizzle configuration after database connectivity spike.
 - [ ] CI checks.
 - [ ] Clean install, typecheck, lint, tests, and build evidence.
+
+- [x] AI agent handoff prompt and ADR template.
 
 ## Technical spikes
 
