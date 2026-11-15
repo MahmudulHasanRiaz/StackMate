@@ -160,3 +160,160 @@ right inspector rail (G7) still not built; staging latency unchanged
 (~2s/call — p95 <1s target still not met); the white-primary decision
 in §5 ("primary button color stays green — decision OPEN") is now
 CLOSED by this pass (owner answered 2026-11-16 ~01:40–01:41 +06).
+
+## 7. Restructure batch — nav moves + Settings real categories + tracking pixel-groups + webhook delete (2026-11-16, uncommitted)
+
+Owner-confirmed (2026-11-16 ~00:00 +06): ALL configuration lives ONLY
+inside Settings, never in the main menu; Tracking events list is an
+audit/report view → Administration; tracking CONFIG is built inside
+Settings, UI-based, never via ENV, multi-platform ready (Meta now,
+TikTok + others later), multiple PIXEL GROUPS per platform (enable/
+disable, pixel ID, test code, CAPI token). Websites & Credentials →
+Settings (no website report view exists — do NOT build one); Payment
+Methods → Settings (Payment Review stays operational); Webhooks
+endpoints → Settings; Outbox & Deliveries → Administration.
+Features / Products / Packages stay operational. Settings categories
+are Muse's design job within the principle. Danger-button style is
+NOT touched (owner decision open).
+
+### Nav map (before → after)
+
+| Item | Before | After |
+|---|---|---|
+| Websites & Credentials | Main menu, Integrations group, `/integrations` (+ `/$siteId`) | Settings → Integrations group, `/settings/websites` (+ `/$siteId`) |
+| Payment Methods | Main menu, Commerce group, `/payment-methods` (+ `/$methodId`) | Settings → Commerce group, `/settings/payment-methods` (+ `/$methodId`) |
+| Webhooks endpoints | Main menu, Integrations group, `/webhooks` (+ `/$webhookId`) | Settings → Integrations group, `/settings/webhooks` (+ `/$webhookId`); detail keeps Deliveries tab only |
+| Tracking config | — (no UI; `PUT .../tracking` only) | Settings → Integrations group, `/settings/tracking` (new pixel-groups page) |
+| Tracking Events (list) | Main menu, Integrations group, `/tracking` | Administration group, `/tracking-events` |
+| Outbox & Deliveries | Inside webhook detail ("Outbox events" tab) | Administration group, `/outbox` (own section, extracted) |
+| Integrations group | Main menu (3 items) | REMOVED — group disappears with its last item |
+| Settings categories | 3 placeholder slots | 4 real categories, grouped (Integrations: Websites / Webhooks / Tracking; Commerce: Payment Methods), permission-filtered; stale "contents pending" topbar hint removed |
+
+### Tasks
+
+| # | Task | Affected paths | Acceptance criteria |
+|---|---|---|---|
+| 1 | Migration 0006 — pixel groups | `db/migrations/0006_tracking_pixel_groups.sql`, `db/migrations/meta/_journal.json`, `db/schema/tracking.ts` | `label varchar(120)` nullable added; unique `uq_tracking_configurations_site_provider` (site, provider) → `uq_tracking_configurations_site_provider_pixel` (site, provider, pixel_id); expand-and-contract, no data migration (existing rows satisfy the new unique — one row per site+provider, each with a pixel_id); journal idx 6 |
+| 2 | Store + Drizzle wiring for `label` + provider | `apps/api/src/platform/db/store.ts` (`TrackingConfigRecord`: `label: string \| null`, `provider: "meta" \| "tiktok"`), `apps/api/src/platform/db/drizzle-store.ts` (load query + row mapper + insert/update sync spec) | Label round-trips through load + persist; provider enum widened in the mapper (`asEnum` over `["meta", "tiktok"]`) |
+| 3 | Contracts | `packages/contracts/src/domains/integrations-tracking.ts` | `TRACKING_PROVIDERS = ["meta", "tiktok"]`; `CreateTrackingConfigSchema` (provider enum, pixel_id, access_token, test_event_code?, enabled_events, status?, label?); `UpdateTrackingConfigSchema` (all-optional partial); `ConfigureSiteTrackingSchema` provider becomes the enum (PUT keeps working) |
+| 4 | Tracking pixel-groups service + routes | `apps/api/src/modules/tracking/service.ts` (create/list/update/delete per group; PUT upsert now matches on site+provider+pixel_id instead of site+provider so it stays safe under multi-group; ingest event check uses ANY enabled config that enables the event, not the first enabled config), `apps/api/src/app.ts` (`GET/POST /api/v1/admin/integrated-sites/:siteId/tracking`, `PATCH/DELETE .../:configId`; toggle = PATCH `status`, no redundant endpoint) | Create 201 / duplicate (site, provider, pixel_id) 409 / missing site 404 / missing config 404 / unauthenticated 401 / wrong permission 403; token never returned (ciphertext stripped); update re-encrypts only when a new token is supplied (rotated_at then); delete is a hard delete + audit `tracking.configuration.deleted`; PUT still 200s the existing tests (single PUT per site, fresh pixel) |
+| 5 | Webhook endpoint delete | `apps/api/src/modules/webhooks/service.ts` (`deleteWebhookEndpointByAdmin` — hard delete + audit `webhooks.endpoint.deleted`; endpoint's deliveries removed from state too, so persistStateDiff never re-inserts orphaned rows against the FK — Postgres FK cascade removes secrets + deliveries rows; outbox_events stay (no FK to endpoints)), `apps/api/src/app.ts` (`DELETE /api/v1/admin/webhooks/:webhookId`) | Delete 200 + endpoint gone from list + deliveries gone; unknown id 404; unauthenticated 401; wrong permission 403; deliveries/outbox history rule documented in the service comment |
+| 6 | Admin nav + shell | `apps/admin/src/components/shell.tsx` (NAVIGATION_GROUPS: Commerce loses payment-methods, Integrations group deleted, Administration gains Tracking Events + Outbox & Deliveries; QuickNav gains Settings categories; SettingsShell renders grouped, permission-filtered categories + drops the stale hint), `apps/admin/src/sections/settings.tsx` (real `SETTINGS_CATEGORIES` with `to`/`group`/`permission`; `SettingsCategoryPage` placeholder removed) | Main menu has no config items; Settings nav shows 4 real categories in 2 groups; categories hidden without their permission; QuickNav finds the moved pages |
+| 7 | Admin routes | `apps/admin/src/router.tsx` (settings children via new `makeSettingsListRoute`/`makeSettingsDetailRoute`; main children `/tracking-events`, `/outbox`; settings index redirects to `/settings/websites`; old `/integrations`, `/payment-methods`, `/webhooks`, `/tracking`, `/settings/$category` routes removed) | Every old URL 404s (no silent alias — the moves are the point); every new URL mounts its section |
+| 8 | Moved sections | `apps/admin/src/sections/integrations.tsx` (refs → `/settings/websites*`, breadcrumb Settings, `TrackingConfig` type +label/provider union), `apps/admin/src/sections/payment-methods.tsx` (refs → `/settings/payment-methods*`, breadcrumb Settings), `apps/admin/src/sections/webhooks.tsx` (refs → `/settings/webhooks*`, breadcrumb Settings, Outbox tab removed, Delete in RowMenu + confirm + DELETE mutation), `apps/admin/src/sections/tracking.tsx` (route → `/tracking-events`, breadcrumb Administration, title "Tracking Events", "View outbox →" → `/outbox`) | Sections render under their new routes with no other behavior change; webhooks detail has Deliveries only |
+| 9 | New sections | `apps/admin/src/sections/tracking-config.tsx` (site picker → groups table → create/edit dialogs, toggle switch → PATCH status, delete confirm; token via password input, never echoed), `apps/admin/src/sections/outbox.tsx` (`OutboxSection` — the extracted OutboxTab table + replay, own route) | Built ONLY with existing primitives (no custom one-offs) per the CORE-pass constraint; all five states per section (loading/empty/error/no-results/success) |
+| 10 | Tests | `apps/api/test/tracking-pixel-groups.test.ts` (in-memory, same pattern as `catalog-bulk-features.test.ts`), `apps/api/test/webhook-endpoint-delete.test.ts` | Tracking: create/list/update/delete/toggle + 409 + 404 + 401 + PUT compat + ingest with 2 groups (event enabled only on the 2nd group is accepted); webhook delete: register → delete → 200 + list no longer contains it + deliveries gone + 404 on unknown + 401 |
+| 11 | Verification | — | Full `verify-batch1.sh` green (vitest incl. new files; tsc api+admin; vite build; lint-repo; check-migrations **65 tables / 7 migrations**; wrangler dry-run staging); jsdom smoke updated for moved routes (all checks pass — report the new count); probe grew through the owner follow-ups (font stack +1, button/radius +5, light mode +12) — final count reported in Status; API spec §17/§18 + PLAN/STATUS + prd-ui-coverage.md (N8, O1 → ✅; P4 reference updated) |
+
+Risks: PUT semantics change (pixel-match upsert) — the two existing
+PUT tests call PUT once per site with a fresh pixel, so they still
+pass; the old "update the single config regardless of pixel_id"
+behavior is intentionally gone. TikTok appears as a provider option
+before any TikTok delivery exists — the config page carries the same
+honest "delivery is not live yet" note as the Meta banner; delivery
+itself is Batch 4. The `$category` route is deleted outright — any
+bookmarked `/settings/category-N` URL 404s (placeholders never had
+real content, so nothing is lost).
+
+### Status — DONE (2026-11-16, uncommitted; parent verifies + pushes)
+
+Full `verify-batch1.sh` green: vitest **112/112, 15 files** (10 new:
+8 tracking pixel-groups + 2 webhook delete); tsc api + admin exit 0;
+vite build (initial chunk 460.66 kB / 136.40 kB gzip,
+`index-Bz7uVOdx.js`); lint-repo **149 files**; check-migrations
+**65 tables / 7 migrations**; wrangler dry-run staging exit 0; pnpm
+frozen-lockfile skipped locally (no binary — CI runs it). jsdom
+smoke (harness `~/workspace/stackmate-work/spa-repro/`, rebuilt
+bundle): **93/93 PASS** (was 76/76 — harness updated for the moved
+routes; +17 new checks: Settings real categories + redirect,
+Tracking Events + Outbox pages, tracking-config site picker →
+groups → create dialog, webhooks RowMenu Delete + confirm-cancel).
+Computed-style probe
+(`~/workspace/stackmate-work/neon-core-pass/probe-computed.mjs` on the
+built CSS `dist/assets/index-InK-ZJil.css`): **66/66 PASS** (was
+48/48 — +1 font-stack, +5 button/radius, +12 light-mode checks, see
+the follow-ups below; one probe failure found and fixed along the
+way: the minifier shortens literal `#000000` → `#000` in built CSS
+while `var()` token values stay verbatim — the expectation was
+corrected to the built form). API spec §17.6 + §18.7
+added; PLAN/STATUS + prd-ui-coverage.md updated (N8, O1 → ✅).
+
+Two fixes found during verification (not in the original plan):
+- Migration 0006 was NOT re-runnable: plain `ADD CONSTRAINT` has no
+  `IF NOT EXISTS` in Postgres, so the second Postgres suite re-applying
+  all migrations failed with "relation already exists". Fixed with the
+  repo's established DO-block form (same as migration 0002's FK add).
+- Typed `navigate`/`Navigate` to `/settings/*` failed tsc: the
+  `makeSettings*Route` helpers took `path: string`, widening the
+  literal out of the router type. Fixed by making the helpers generic
+  over the path literal (`<TPath extends string>`).
+
+FONT STACK follow-up (owner 2026-11-16 ~03:03 +06, screenshot
+image-83): `--sm-font-sans` was a 9-item stack; Neon's computed stack
+is exactly two items. Changed to `"Inter Variable", sans-serif` —
+nothing else in the stack; verified no other sans stack exists in the
+admin source (every `font-family` use goes through
+`var(--sm-font-sans)` or `var(--sm-font-mono)`; no stack in
+`index.html`/`main.tsx`). Package, import, and weights untouched —
+the font itself already loaded (live CSS @font-face, woff2 200s).
+Probe +1 check asserting the resolved token equals
+`"Inter Variable", sans-serif` (dark theme); probe 49/49.
+
+BUTTON SYSTEM rework (owner 2026-11-16 ~03:07 +06, screenshots
+image-84/85; evidence from Neon's live CSS fetched 03:07 +06):
+Neon's green is `#00E599`, NOT `#00E5A0`; the green FILL is a
+gradient `linear-gradient(180deg, #00E599 24.85%, #007F55 68.32%)`,
+not flat; accent buttons fill green on hover (screenshot 85) and
+white appears only on the single most-important action. Applied:
+`--sm-accent` #00e5a0 → #00e599 (dark), light accent #007a55 →
+#007f55, `--sm-accent-soft` → rgba(0,229,153,0.1), new token
+`--sm-accent-gradient` (one token, both themes); accent hover =
+gradient + black text + transparent border; white primary kept ONLY
+on "Create product" (Products list) — all other 56 static
+`variant="primary"` sites + 2 dynamic ones (ConfirmDialog confirm,
+payment-method Enable) → `variant="accent"` (58 accent call sites
+total). Derived (NOT from Neon CSS — documented as derived):
+`--sm-accent-hover` #00c98f → #00c987 (dark), #005c44 → #005f40
+(light). Danger style NOT touched (owner decision open). Probe +5
+(gradient token, hover fill dark + light, hover text, hover border);
+probe 54/54 after the rework.
+
+RADIUS fix (owner 2026-11-16 ~03:11 +06; Neon live CSS, Tailwind
+v4: base radius `.25rem` = 4px): `--sm-radius-md/lg` 6px → **4px**,
+`--sm-radius-xl` 8px → **6px** (dialogs only); `--sm-radius-sm`
+(4px, small controls only) unchanged. No hardcoded radii in TSX,
+so the token change covers everything. Probe radius checks updated
+to 4px (dialogs 6px).
+
+LIGHT-MODE learning (owner 2026-11-16 ~03:13 +06, screenshots
+image-86/87/88 — Neon console light mode, read first-hand): light
+is NOT dark inverted — white surfaces on a #f8fafc page, dark text,
+pale green TINTS where dark uses transparent/outline. Applied (light
+only, dark unchanged): accent button bg `rgba(0,229,153,0.12)` +
+#007F55 border/text (new `--sm-btn-accent-bg` token; dark stays
+transparent); secondary button WHITE bg (new
+`--sm-btn-secondary-bg`; dark stays transparent); success banner
+pale green tint bg `rgba(0,229,153,0.08)` + soft green border
+`rgba(0,229,153,0.35)` + #007F55 text (light-only
+`[data-theme="light"] .sm-alert-success` rule; dark alerts stay
+bordered panels on surface bg); light `--sm-success-bg` #dcfce7 →
+`rgba(0,229,153,0.08)`, `--sm-success-text` #166534 → #007f55,
+`--sm-success-border` rgba(22,101,52,0.35) → rgba(0,229,153,0.35)
+(badge + banner share these tokens); active tab dark text + 2px dark
+underline (new `--sm-tab-active`: dark #00e599 / light #0f172a).
+Already correct via tokens, probe-checked: active nav light-grey
+pill + dark text + #007F55 icon; neutral badge #f1f5f9 + dark text;
+table headers dark semibold. No sub-tab component exists
+(single-level `Tabs` only) — the pill-group sub-tab pattern is
+recorded, nothing invented. Info alert already a pale tint in light
+— unchanged. Audit doc C7 + design-system §9.2 record the rules.
+Probe +12 light checks (accent bg tint, secondary bg white, banner
+bg tint, badge success bg + text, badge neutral bg, active-nav bg +
+icon, tab active text + underline, table header color, accent bg
+dark transparent); probe 66/66.
+
+Environment note: this VM was rebuilt during the batch — local
+Postgres 16 was gone entirely (no binaries, no service). Reinstalled
+via apt (the boot-time `apt-get update` held the lock ~13 min),
+started the service, set the `postgres` password, recreated
+`stackmate_test`; the full suite then ran green on the first pass.

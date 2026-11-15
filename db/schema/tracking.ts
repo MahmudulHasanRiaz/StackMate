@@ -21,6 +21,10 @@ export const trackingConfigurations = pgTable(
       .notNull()
       .references(() => integratedSites.id, { onDelete: "cascade" }),
     provider: text("provider").notNull().default("meta"),
+    // Human group label shown in the Settings UI ("Main pixel").
+    // NULL for groups created before migration 0006 — the UI falls
+    // back to the pixel ID when no label is set.
+    label: varchar("label", { length: 120 }),
     pixelId: varchar("pixel_id", { length: 80 }).notNull(),
     accessTokenCiphertext: text("access_token_ciphertext").notNull(),
     encryptionKeyVersion: varchar("encryption_key_version", { length: 50 }).notNull().default("v1"),
@@ -32,7 +36,15 @@ export const trackingConfigurations = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
     rotatedAt: timestamp("rotated_at", { withTimezone: true }),
   },
-  (table) => [unique("uq_tracking_configurations_site_provider").on(table.integratedSiteId, table.provider)]
+  (table) => [
+    // Migration 0006: one group per pixel per provider per site
+    // (was: one config per site+provider — unique on (site, provider)).
+    unique("uq_tracking_configurations_site_provider_pixel").on(
+      table.integratedSiteId,
+      table.provider,
+      table.pixelId
+    ),
+  ]
 );
 
 export const trackingEvents = pgTable(

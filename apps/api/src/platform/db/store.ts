@@ -503,7 +503,10 @@ export interface SiteCredentialRecord {
 export interface TrackingConfigRecord {
   id: string;
   integrated_site_id: string;
-  provider: "meta";
+  provider: "meta" | "tiktok";
+  // Human group label (migration 0006). NULL for groups created before
+  // the label existed — the UI falls back to the pixel ID.
+  label: string | null;
   pixel_id: string;
   access_token_ciphertext: string;
   encryption_key_version: string;

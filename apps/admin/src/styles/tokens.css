@@ -3,7 +3,7 @@
  *
  * Design direction: Neon (owner decision 2026-11-15) — dark-first
  * developer-tool aesthetic, near-black surfaces, subtle 1px borders,
- * minimal elevation, one restrained green accent (#00E5A0).
+ * minimal elevation, one restrained green accent (#00E599).
  * Dark is the DEFAULT theme; light is the alternate. The accent is a
  * proposal the owner can change in one place (the --sm-accent tokens).
  *
@@ -57,11 +57,22 @@
   --sm-text: #f5f5f5;
   --sm-text-muted: #B0B1B2;
 
-  /* The one accent — Neon green. Text on accent is black. */
-  --sm-accent: #00e5a0;
-  --sm-accent-hover: #00c98f;
-  --sm-accent-soft: rgba(0, 229, 160, 0.1);
+  /* The one accent — Neon green #00E599 (live neon.com CSS:          */
+  /* .bg-green-45 / .text-green-45 / .border-primary-1). Text on      */
+  /* accent is black. The green FILL is a gradient, never flat:      */
+  /* linear-gradient(180deg, #00E599 24.85%, #007F55 68.32%).         */
+  --sm-accent: #00e599;
+  --sm-accent-hover: #00c987;
+  --sm-accent-soft: rgba(0, 229, 153, 0.1);
   --sm-accent-text-on: #000000;
+  --sm-accent-gradient: linear-gradient(180deg, #00e599 24.85%, #007f55 68.32%);
+  /* Accent button bg: transparent in dark (Neon image-85). Light gets
+     the pale green tint — see the light block. */
+  --sm-btn-accent-bg: transparent;
+  --sm-btn-secondary-bg: transparent;
+  /* Active tab: green in dark (established pattern); dark text + dark
+     underline in light (Neon image-88) — see the light block. */
+  --sm-tab-active: #00e599;
 
   /* Primary button — Neon (image-81 "Copy prompt"): solid WHITE bg +
      BLACK text in dark mode. Never a green fill. */
@@ -70,8 +81,8 @@
   --sm-btn-primary-hover: #e5e5e5;
 
   /* Status */
-  --sm-success-bg: rgba(0, 229, 160, 0.12);
-  --sm-success-text: #00e5a0;
+  --sm-success-bg: rgba(0, 229, 153, 0.12);
+  --sm-success-text: #00e599;
   --sm-warning-bg: rgba(251, 191, 36, 0.12);
   --sm-warning-text: #fcd34d;
   --sm-danger-bg: rgba(248, 113, 113, 0.12);
@@ -82,17 +93,19 @@
   --sm-danger-hover: #b91c1c;
 
   /* Alert borders — Neon banners are bordered panels, not tinted fills */
-  --sm-success-border: rgba(0, 229, 160, 0.35);
+  --sm-success-border: rgba(0, 229, 153, 0.35);
   --sm-warning-border: rgba(251, 191, 36, 0.35);
   --sm-danger-border: rgba(248, 113, 113, 0.35);
   --sm-info-border: rgba(125, 211, 252, 0.35);
 
   --sm-overlay: rgba(0, 0, 0, 0.7);
-  --sm-focus-ring: 0 0 0 2px #000000, 0 0 0 4px #00e5a0;
+  --sm-focus-ring: 0 0 0 2px #000000, 0 0 0 4px #00e599;
 
-  /* Typography — Inter Variable (self-hosted via npm), system stack as fallback */
-  --sm-font-sans: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-    "Helvetica Neue", Arial, sans-serif;
+  /* Typography — Inter Variable (self-hosted via npm). The stack is
+     exactly Neon's: "Inter Variable", sans-serif — no system
+     fallbacks in between (owner 2026-11-16; Neon's computed stack is
+     the same two items). */
+  --sm-font-sans: "Inter Variable", sans-serif;
   --sm-font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas,
     "Roboto Mono", monospace;
 
@@ -116,13 +129,16 @@
   --sm-sidebar-rail-width: 64px;
   --sm-topbar-height: 48px;
 
-  /* Radii — Neon CORE pass: square. Max 6px; dialogs 8px max. 999px
-     survives ONLY for true status pills (dot + word), status dots, and
-     the spinner. Avatar, account button, and chips are 6px squares. */
+  /* Radii — Neon base .25rem = 4px (live neon.com CSS, Tailwind v4
+     --radius-sm). Max 4px on every visible surface; dialogs 6px.
+     999px survives ONLY for true status pills (dot + word), status
+     dots, and the spinner. Avatar, account button, and chips are 4px
+     squares. --sm-radius-sm (4px) stays for small controls only
+     (kbd, focus rings). */
   --sm-radius-sm: 4px;
-  --sm-radius-md: 6px;
-  --sm-radius-lg: 6px;
-  --sm-radius-xl: 8px;
+  --sm-radius-md: 4px;
+  --sm-radius-lg: 4px;
+  --sm-radius-xl: 6px;
 
   /* Elevation — minimal in dark (Neon: borders do the work, not shadows) */
   --sm-shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.4);
@@ -148,7 +164,7 @@
 
 /* ------------------------------------------------------------------ */
 /* Light theme — alternate. Same green hue, darkened for contrast on  */
-/* white (bright #00E5A0 as text on white is ~1.9:1 and unreadable).   */
+/* white (bright #00E599 as text on white is ~1.9:1 and unreadable).   */
 /* ------------------------------------------------------------------ */
 [data-theme="light"] {
   color-scheme: light;
@@ -162,18 +178,29 @@
   --sm-text: #0f172a;
   --sm-text-muted: #475569;
 
-  --sm-accent: #007a55;
-  --sm-accent-hover: #005c44;
-  --sm-accent-soft: #e6f7f0;
+  --sm-accent: #007f55;
+  --sm-accent-hover: #005f40;
+  --sm-accent-soft: rgba(0, 229, 153, 0.1);
   --sm-accent-text-on: #ffffff;
+  /* Light accent button (Neon image-86/87 "Connect"): pale green tint
+     fill, NOT transparent. Hover is the same gradient as dark. */
+  --sm-btn-accent-bg: rgba(0, 229, 153, 0.12);
+  /* Light outline buttons ("Share", "Create child branch", image-86):
+     WHITE bg, not transparent (the page bg is #f8fafc). */
+  --sm-btn-secondary-bg: #ffffff;
+  --sm-tab-active: #0f172a;
 
   /* Primary button, light mode — the inversion: solid BLACK bg + WHITE text. */
   --sm-btn-primary-bg: #0f172a;
   --sm-btn-primary-text: #ffffff;
   --sm-btn-primary-hover: #1e293b;
 
-  --sm-success-bg: #dcfce7;
-  --sm-success-text: #166534;
+  /* Light success (Neon image-86 "Onboard your agent" banner, image-87
+     "Active" pill): pale green tint bg + #007f55 text + soft green
+     border. The banner bg (0.08) and the badge/button tint (0.12)
+     share this token — both read as the same pale tint. */
+  --sm-success-bg: rgba(0, 229, 153, 0.08);
+  --sm-success-text: #007f55;
   --sm-warning-bg: #fef3c7;
   --sm-warning-text: #92400e;
   --sm-danger-bg: #fee2e2;
@@ -184,13 +211,13 @@
   --sm-danger-hover: #991b1b;
 
   /* Alert borders (light) */
-  --sm-success-border: rgba(22, 101, 52, 0.35);
+  --sm-success-border: rgba(0, 229, 153, 0.35);
   --sm-warning-border: rgba(146, 64, 14, 0.35);
   --sm-danger-border: rgba(153, 27, 27, 0.35);
   --sm-info-border: rgba(30, 64, 175, 0.35);
 
   --sm-overlay: rgba(15, 23, 42, 0.45);
-  --sm-focus-ring: 0 0 0 2px #ffffff, 0 0 0 4px #007a55;
+  --sm-focus-ring: 0 0 0 2px #ffffff, 0 0 0 4px #007f55;
 
   --sm-shadow-sm: 0 1px 2px 0 rgba(15, 23, 42, 0.05);
   --sm-shadow-md: 0 4px 12px -2px rgba(15, 23, 42, 0.08);
@@ -859,7 +886,7 @@ a:hover {
   background: var(--sm-btn-primary-hover);
 }
 .sm-btn-secondary {
-  background: transparent;
+  background: var(--sm-btn-secondary-bg);
   border-color: var(--sm-border-strong);
   color: var(--sm-text);
 }
@@ -867,12 +894,19 @@ a:hover {
   background: var(--sm-surface-muted);
 }
 .sm-btn-accent {
-  background: transparent;
+  background: var(--sm-btn-accent-bg);
   border-color: var(--sm-accent);
   color: var(--sm-accent);
 }
-.sm-btn-accent:hover:not(:disabled) {
-  background: var(--sm-accent-soft);
+/* Accent hover/focus: the button FILLS with Neon's green gradient
+   (owner screenshot 85 — hovered "Create child branch" is solid
+   green, dark text). Default stays unfilled. The gradient lives in
+   --sm-accent-gradient; never hardcode it per component. */
+.sm-btn-accent:hover:not(:disabled),
+.sm-btn-accent:focus-visible:not(:disabled) {
+  background-image: var(--sm-accent-gradient);
+  color: #000000;
+  border-color: transparent;
 }
 .sm-btn-danger {
   /* Owner spec: Neon shows no danger button — danger renders as the
@@ -1107,8 +1141,8 @@ a:hover {
   color: var(--sm-text);
 }
 .sm-tab[aria-selected="true"] {
-  color: var(--sm-accent);
-  border-bottom-color: var(--sm-accent);
+  color: var(--sm-tab-active);
+  border-bottom-color: var(--sm-tab-active);
 }
 .sm-tab:focus-visible {
   outline: none;
@@ -1281,6 +1315,12 @@ a:hover {
 .sm-alert-success {
   border-color: var(--sm-success-border);
   color: var(--sm-success-text);
+}
+/* Light only: the success banner IS tinted in Neon light (image-86
+   "Onboard your agent") — pale green tint bg. Dark alerts stay
+   bordered panels on the surface bg (CORE pass rule, unchanged). */
+[data-theme="light"] .sm-alert-success {
+  background: var(--sm-success-bg);
 }
 .sm-alert-warning {
   border-color: var(--sm-warning-border);

@@ -1675,7 +1675,7 @@ function buildLoadStateQuery(caps: StoreCapabilities): string {
             activation_limit, valid_from, expires_at, grace_until,
             current_entitlement_snapshot_id, issued_at, created_at, updated_at
        FROM licenses` },
-    { key: "trackingConfigs", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, integrated_site_id, provider, pixel_id,
+    { key: "trackingConfigs", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, integrated_site_id, provider, label, pixel_id,
             access_token_ciphertext, encryption_key_version, test_event_code,
             enabled_events, status, created_at, updated_at, rotated_at
        FROM tracking_configurations` },
@@ -2626,7 +2626,8 @@ async function loadStateInternalImpl(
     (row) => ({
       id: reqStr(row, "id", "tracking_configurations"),
       integrated_site_id: reqStr(row, "integrated_site_id", "tracking_configurations"),
-      provider: asEnum(str(row, "provider"), ["meta"] as const, "meta"),
+      provider: asEnum(str(row, "provider"), ["meta", "tiktok"] as const, "meta"),
+      label: str(row, "label"),
       pixel_id: reqStr(row, "pixel_id", "tracking_configurations"),
       access_token_ciphertext: reqStr(row, "access_token_ciphertext", "tracking_configurations"),
       encryption_key_version: reqStr(row, "encryption_key_version", "tracking_configurations"),
@@ -5123,6 +5124,7 @@ async function persistStateDiff(
           "id",
           "integrated_site_id",
           "provider",
+          "label",
           "pixel_id",
           "access_token_ciphertext",
           "encryption_key_version",
@@ -5137,6 +5139,7 @@ async function persistStateDiff(
           r.id,
           r.integrated_site_id,
           r.provider,
+          r.label,
           r.pixel_id,
           r.access_token_ciphertext,
           r.encryption_key_version,
@@ -5153,6 +5156,7 @@ async function persistStateDiff(
       const cols = [
         "integrated_site_id",
         "provider",
+        "label",
         "pixel_id",
         "access_token_ciphertext",
         "encryption_key_version",
@@ -5168,6 +5172,7 @@ async function persistStateDiff(
         [
           r.integrated_site_id,
           r.provider,
+          r.label,
           r.pixel_id,
           r.access_token_ciphertext,
           r.encryption_key_version,

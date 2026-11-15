@@ -252,7 +252,7 @@ function CreateProductDialog({
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={create.isPending} onClick={submitForm}>
+          <Button variant="accent" loading={create.isPending} onClick={submitForm}>
             Create product
           </Button>
         </>
@@ -631,7 +631,7 @@ function EditProductDialog({
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={save.isPending} onClick={submitForm}>
+          <Button variant="accent" loading={save.isPending} onClick={submitForm}>
             Save changes
           </Button>
         </>
@@ -796,7 +796,7 @@ export function ProductDetailSection({ id }: { id: string }) {
             </Button>
             {product.status === "draft" ? (
               <Button
-                variant="primary"
+                variant="accent"
                 loading={setStatus.isPending}
                 onClick={() => setStatus.mutate("publish")}
               >
@@ -805,7 +805,7 @@ export function ProductDetailSection({ id }: { id: string }) {
             ) : null}
             {product.status === "archived" ? (
               <Button
-                variant="primary"
+                variant="accent"
                 loading={setStatus.isPending}
                 onClick={() => setStatus.mutate("publish")}
               >

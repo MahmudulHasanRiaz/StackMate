@@ -1,13 +1,13 @@
 /**
  * Tracking / Meta CAPI — tracking events list (design spec §4.1).
  *
- * Route (registered in router.tsx):
- *   /tracking
+ * Route (registered in router.tsx, Administration group):
+ *   /tracking-events
  *
  * Search is read with `useSearch({ strict: false })`: the route id is
- * "/_main/tracking" (the operational shell is a pathless `_main`
- * layout route), so a plain-path `from: "/tracking"` throws
- * "Invariant failed" at render (jsdom repro 2026-11-15).
+ * "/_main/tracking-events" (the operational shell is a pathless
+ * `_main` layout route), so a plain-path `from: "/tracking-events"`
+ * throws "Invariant failed" at render (jsdom repro 2026-11-15).
  *
  * Endpoint used (`tracking.manage`):
  *   GET /api/v1/admin/tracking/events
@@ -47,10 +47,10 @@ import type { IntegratedSite } from "./integrations";
 /* Route helpers (see header note)                                     */
 /* ------------------------------------------------------------------ */
 function useRouteSearch() {
-  // No `from`: the route id is "/_main/tracking" (pathless `_main`
-  // layout parent), so a plain-path `from: "/tracking"` throws
-  // "Invariant failed" at render (jsdom repro 2026-11-15). Read the
-  // current route's search like the other list sections.
+  // No `from`: the route id is "/_main/tracking-events" (pathless
+  // `_main` layout parent), so a plain-path `from: "/tracking-events"`
+  // throws "Invariant failed" at render (jsdom repro 2026-11-15).
+  // Read the current route's search like the other list sections.
   return useSearch({ strict: false }) as unknown as Record<string, unknown>;
 }
 
@@ -121,7 +121,7 @@ export function TrackingSection() {
       if (value === undefined) delete next[key];
       else next[key] = value;
     }
-    navigate({ to: "/tracking", search: next });
+    navigate({ to: "/tracking-events", search: next });
   };
 
   const filtered =
@@ -197,8 +197,8 @@ export function TrackingSection() {
   return (
     <section aria-labelledby="tracking-heading">
       <PageHeader
-        breadcrumb={[{ label: "Integrations" }, { label: "Tracking / Meta CAPI" }]}
-        title="Tracking / Meta CAPI"
+        breadcrumb={[{ label: "Administration" }, { label: "Tracking Events" }]}
+        title="Tracking Events"
         subtitle="Events received from integrated sites"
       />
       <Alert variant="warning">
@@ -247,7 +247,7 @@ export function TrackingSection() {
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => navigate({ to: "/webhooks" })}
+          onClick={() => navigate({ to: "/outbox" })}
         >
           View outbox →
         </Button>

@@ -1,11 +1,12 @@
 /**
  * Payment Methods — list + detail (design spec §4.1/§4.2).
  *
- * Routes (wired by the parent after delivery): /payment-methods and
- * /payment-methods/$methodId. The list search/page state is URL-backed
- * via useRouterState + useNavigate (not useSearch({ from }) — that
- * literal only typechecks once the parent registers the routes; this
- * helper is behaviourally identical and compiles before wiring).
+ * Routes (registered in router.tsx, under the Settings shell):
+ * /settings/payment-methods and /settings/payment-methods/$methodId.
+ * The list search/page state is URL-backed via useRouterState +
+ * useNavigate (not useSearch({ from }) — that literal only typechecks
+ * once the parent registers the routes; this helper is behaviourally
+ * identical and compiles before wiring).
  *
  * Endpoints used (all verified in apps/api/src/app.ts):
  *  - GET  /api/v1/admin/payment-methods            payments.read
@@ -144,7 +145,7 @@ function useGoDetail(base: string, param: string) {
 /* ------------------------------------------------------------------ */
 export function PaymentMethodsSection() {
   const { parsed, setSearch } = useListSearch();
-  const goDetail = useGoDetail("/payment-methods", "methodId");
+  const goDetail = useGoDetail("/settings/payment-methods", "methodId");
   const [tab, setTab] = useState<"methods" | "providers">("methods");
   const [createMethodOpen, setCreateMethodOpen] = useState(false);
   const [createProviderOpen, setCreateProviderOpen] = useState(false);
@@ -233,16 +234,16 @@ export function PaymentMethodsSection() {
   return (
     <section aria-labelledby="payment-methods-heading">
       <PageHeader
-        breadcrumb={[{ label: "Commerce" }, { label: "Payment Methods" }]}
+        breadcrumb={[{ label: "Settings" }, { label: "Payment Methods" }]}
         title="Payment Methods"
         subtitle="Manual MFS / bank accounts and automated checkout methods"
         action={
           tab === "methods" ? (
-            <Button variant="primary" icon={Plus} onClick={() => setCreateMethodOpen(true)}>
+            <Button variant="accent" icon={Plus} onClick={() => setCreateMethodOpen(true)}>
               Create method
             </Button>
           ) : (
-            <Button variant="primary" icon={Plus} onClick={() => setCreateProviderOpen(true)}>
+            <Button variant="accent" icon={Plus} onClick={() => setCreateProviderOpen(true)}>
               Create provider
             </Button>
           )
@@ -537,7 +538,7 @@ function ProviderForm({
         <Button variant="secondary" onClick={onCancel}>
           Cancel
         </Button>
-        <Button variant="primary" loading={mutation.isPending} onClick={submit}>
+        <Button variant="accent" loading={mutation.isPending} onClick={submit}>
           {initial ? "Save changes" : "Create provider"}
         </Button>
       </div>
@@ -760,7 +761,7 @@ function MethodCreateForm({
         <Button variant="secondary" onClick={onCancel}>
           Cancel
         </Button>
-        <Button variant="primary" loading={mutation.isPending} onClick={submit}>
+        <Button variant="accent" loading={mutation.isPending} onClick={submit}>
           Create method
         </Button>
       </div>
@@ -808,7 +809,7 @@ export function PaymentMethodDetailSection({ id }: { id: string }) {
   if (detail.isPending) {
     return (
       <section aria-labelledby="method-detail-heading">
-        <PageHeader breadcrumb={[{ label: "Commerce" }, { label: "Payment Methods", href: "/payment-methods" }, { label: "…" }]} title="Payment method" />
+        <PageHeader breadcrumb={[{ label: "Settings" }, { label: "Payment Methods", href: "/settings/payment-methods" }, { label: "…" }]} title="Payment method" />
         <div className="sm-table-wrap sm-table-wrap-pad">
           <Skeleton height={20} width="40%" />
           <div style={{ marginTop: 12 }}>
@@ -824,7 +825,7 @@ export function PaymentMethodDetailSection({ id }: { id: string }) {
   if (detail.isError || !detail.data) {
     return (
       <section aria-labelledby="method-detail-heading">
-        <PageHeader breadcrumb={[{ label: "Commerce" }, { label: "Payment Methods", href: "/payment-methods" }, { label: "Not found" }]} title="Payment method" />
+        <PageHeader breadcrumb={[{ label: "Settings" }, { label: "Payment Methods", href: "/settings/payment-methods" }, { label: "Not found" }]} title="Payment method" />
         <div className="sm-table-wrap">
           <ErrorState
             message={detail.error instanceof Error ? detail.error.message : "Payment method not found."}
@@ -840,7 +841,7 @@ export function PaymentMethodDetailSection({ id }: { id: string }) {
   return (
     <section aria-labelledby="method-detail-heading">
       <PageHeader
-        breadcrumb={[{ label: "Commerce" }, { label: "Payment Methods", href: "/payment-methods" }, { label: method.display_name }]}
+        breadcrumb={[{ label: "Settings" }, { label: "Payment Methods", href: "/settings/payment-methods" }, { label: method.display_name }]}
         title={method.display_name}
         subtitle={`${KIND_LABELS[method.method_kind]} · ${providerById.get(method.provider_id)?.display_name ?? "—"}`}
         action={
@@ -849,7 +850,7 @@ export function PaymentMethodDetailSection({ id }: { id: string }) {
               Edit
             </Button>
             <Button
-              variant={method.is_enabled ? "danger-ghost" : "primary"}
+              variant={method.is_enabled ? "danger-ghost" : "accent"}
               loading={toggleMutation.isPending}
               onClick={() => void onToggle()}
             >
@@ -1050,7 +1051,7 @@ function MethodEditForm({
         <Button variant="secondary" onClick={onCancel}>
           Cancel
         </Button>
-        <Button variant="primary" loading={mutation.isPending} onClick={submit}>
+        <Button variant="accent" loading={mutation.isPending} onClick={submit}>
           Save changes
         </Button>
       </div>

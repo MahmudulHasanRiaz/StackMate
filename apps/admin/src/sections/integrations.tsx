@@ -1,13 +1,14 @@
 /**
  * Websites & Credentials — Integrated Sites (design spec §4.1/§4.2).
  *
- * Routes (registered in router.tsx):
- *   /integrations, /integrations/$siteId
+ * Routes (registered in router.tsx, under the Settings shell):
+ *   /settings/websites, /settings/websites/$siteId
  *
  * Search is read with `useSearch({ strict: false })`: the route id is
- * "/_main/integrations" (the operational shell is a pathless `_main`
- * layout route), so a plain-path `from: "/integrations"` throws
- * "Invariant failed" at render (jsdom repro 2026-11-15).
+ * "/settings/websites" (the Settings shell is a path route), so a
+ * plain-path `from: "/settings/websites"` throws "Invariant failed"
+ * at render (jsdom repro 2026-11-15 — same lesson as the old
+ * "/_main/integrations" route id).
  *
  * Endpoints used (all `integrations.manage`, except credential
  * create/rotate/revoke which are `integrations.rotate_credentials`):
@@ -75,10 +76,11 @@ import {
 /* Route helpers (see header note)                                     */
 /* ------------------------------------------------------------------ */
 function useRouteSearch() {
-  // No `from`: the route id is "/_main/integrations" (pathless `_main`
-  // layout parent), so a plain-path `from: "/integrations"` throws
-  // "Invariant failed" at render (jsdom repro 2026-11-15). Read the
-  // current route's search like the other list sections.
+  // No `from`: the route id is "/settings/websites" (the Settings
+  // shell is a path route), so a plain-path `from:
+  // "/settings/websites"` throws "Invariant failed" at render (jsdom
+  // repro 2026-11-15). Read the current route's search like the other
+  // list sections.
   return useSearch({ strict: false }) as unknown as Record<string, unknown>;
 }
 
@@ -123,7 +125,10 @@ export interface SiteCredential {
 export interface TrackingConfig {
   id: string;
   integrated_site_id: string;
-  provider: "meta";
+  provider: "meta" | "tiktok";
+  // Human group label (migration 0006); null for groups created
+  // before labels existed — the UI falls back to the pixel ID.
+  label: string | null;
   pixel_id: string;
   test_event_code: string | null;
   enabled_events: string[];
@@ -227,7 +232,7 @@ export function IntegrationsSection() {
       if (value === undefined) delete next[key];
       else next[key] = value;
     }
-    navigate({ to: "/integrations", search: next });
+    navigate({ to: "/settings/websites", search: next });
   };
 
   const columns: ColumnDef<IntegratedSite, unknown>[] = [
@@ -291,7 +296,7 @@ export function IntegrationsSection() {
           icon={Eye}
           onClick={() =>
             navigate({
-              to: "/integrations/$siteId",
+              to: "/settings/websites/$siteId",
               params: { siteId: row.original.id },
             })
           }
@@ -305,11 +310,11 @@ export function IntegrationsSection() {
   return (
     <section aria-labelledby="integrations-heading">
       <PageHeader
-        breadcrumb={[{ label: "Integrations" }, { label: "Websites & Credentials" }]}
+        breadcrumb={[{ label: "Settings" }, { label: "Websites & Credentials" }]}
         title="Websites & Credentials"
         subtitle="Integrated sites, their credentials and domains"
         action={
-          <Button variant="primary" icon={Plus} onClick={() => setRegisterOpen(true)}>
+          <Button variant="accent" icon={Plus} onClick={() => setRegisterOpen(true)}>
             Register site
           </Button>
         }
@@ -434,7 +439,7 @@ function RegisterSiteDialog({
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={create.isPending} onClick={doSubmit}>
+          <Button variant="accent" loading={create.isPending} onClick={doSubmit}>
             Register site
           </Button>
         </>
@@ -603,7 +608,7 @@ export function IntegratedSiteDetailSection({ id }: { id: string }) {
     return (
       <section aria-labelledby="site-detail-heading">
         <PageHeader
-          breadcrumb={[{ label: "Integrations" }, { label: "Websites & Credentials" }]}
+          breadcrumb={[{ label: "Settings" }, { label: "Websites & Credentials" }]}
           title="Integrated site"
         />
         <TableSkeleton rows={4} />
@@ -616,8 +621,8 @@ export function IntegratedSiteDetailSection({ id }: { id: string }) {
       <section aria-labelledby="site-detail-heading">
         <PageHeader
           breadcrumb={[
-            { label: "Integrations" },
-            { label: "Websites & Credentials", href: "/integrations" },
+            { label: "Settings" },
+            { label: "Websites & Credentials", href: "/settings/websites" },
           ]}
           title="Integrated site"
         />
@@ -642,14 +647,14 @@ export function IntegratedSiteDetailSection({ id }: { id: string }) {
     <section aria-labelledby="site-detail-heading">
       <PageHeader
         breadcrumb={[
-          { label: "Integrations" },
-          { label: "Websites & Credentials", href: "/integrations" },
+          { label: "Settings" },
+          { label: "Websites & Credentials", href: "/settings/websites" },
           { label: site.name },
         ]}
         title={site.name}
         subtitle={primaryDomain?.domain ?? ""}
         action={
-          <Button variant="primary" onClick={() => setEditOpen(true)}>
+          <Button variant="accent" onClick={() => setEditOpen(true)}>
             Edit site
           </Button>
         }
@@ -720,7 +725,7 @@ export function IntegratedSiteDetailSection({ id }: { id: string }) {
       <Button
         variant="ghost"
         size="sm"
-        onClick={() => navigate({ to: "/integrations" })}
+        onClick={() => navigate({ to: "/settings/websites" })}
       >
         ← Back to sites
       </Button>
@@ -793,7 +798,7 @@ function EditSiteDialog({
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={save.isPending} onClick={doSubmit}>
+          <Button variant="accent" loading={save.isPending} onClick={doSubmit}>
             Save changes
           </Button>
         </>
@@ -910,7 +915,7 @@ function SiteProductsTab({ site }: { site: IntegratedSite }) {
             <Globe size={18} strokeWidth={2} className="sm-empty-icon" />
             <div className="sm-empty-title">No products assigned</div>
             <p>Assign a product so this site can sell it.</p>
-            <Button variant="primary" onClick={() => setAssignOpen(true)}>
+            <Button variant="accent" onClick={() => setAssignOpen(true)}>
               Assign product
             </Button>
           </div>
@@ -1032,7 +1037,7 @@ function AssignProductDialog({
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={assign.isPending} onClick={doSubmit}>
+          <Button variant="accent" loading={assign.isPending} onClick={doSubmit}>
             Assign product
           </Button>
         </>
@@ -1344,7 +1349,7 @@ function CreateCredentialDialog({
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={create.isPending} onClick={doSubmit}>
+          <Button variant="accent" loading={create.isPending} onClick={doSubmit}>
             Create credential
           </Button>
         </>
@@ -1634,7 +1639,7 @@ function AddDomainDialog({
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={add.isPending} onClick={doSubmit}>
+          <Button variant="accent" loading={add.isPending} onClick={doSubmit}>
             Add domain
           </Button>
         </>
@@ -1730,7 +1735,7 @@ function VerifyDomainDialog({
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={verify.isPending} onClick={doSubmit}>
+          <Button variant="accent" loading={verify.isPending} onClick={doSubmit}>
             Verify domain
           </Button>
         </>

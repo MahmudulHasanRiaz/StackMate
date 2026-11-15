@@ -48,10 +48,15 @@ export function Spinner() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Button — six variants (Neon button system, images 80/81/82). One    */
-/* primary per page. PRIMARY is white/black, SECONDARY is a grey       */
-/* outline, ACCENT is a green outline for brand CTAs only. DANGER      */
-/* renders as secondary (Neon shows no danger button).                 */
+/* Button — six variants (Neon button system, images 80/81/82,      */
+/* corrected 2026-11-16 ~03:07 +06 from Neon's live CSS). PRIMARY     */
+/* (white/black) is reserved for the SINGLE most-important action on  */
+/* a page — "Create product" on the Products list (mirrors Neon's     */
+/* "Create branch"); white everywhere else looked bad. Every other    */
+/* main action is ACCENT: green outline, filling with the green       */
+/* gradient on hover/focus (Neon image-85). SECONDARY is a grey       */
+/* outline. DANGER renders as secondary (Neon shows no danger        */
+/* button).                                                           */
 /* ------------------------------------------------------------------ */
 type ButtonVariant =
   | "primary"
@@ -1111,7 +1116,7 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
                 Cancel
               </Button>
               <Button
-                variant={request.danger ? "danger" : "primary"}
+                variant={request.danger ? "danger" : "accent"}
                 onClick={() => close(true)}
               >
                 {request.confirmLabel ?? "Confirm"}
@@ -1301,7 +1306,7 @@ export function EmptyState({
       <div className="sm-empty-title">{title}</div>
       <p>{body}</p>
       {actionLabel && onAction ? (
-        <Button variant="primary" onClick={onAction}>
+        <Button variant="accent" onClick={onAction}>
           {actionLabel}
         </Button>
       ) : null}
