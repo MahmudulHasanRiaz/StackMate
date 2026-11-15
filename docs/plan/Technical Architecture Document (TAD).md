@@ -207,7 +207,7 @@ StackMate/
 └── tsconfig.base.json
 ```
 
-The current repository has a root-level `PRD` file. Do not move or rename it as part of unrelated setup work. The structure above is the target organization; move documents only in a deliberate documentation-organization change.
+The current foundation documents are maintained under `docs/plan/`. Preserve their existing paths during Stage 0; do not move or rename them as unrelated setup work. The structure above is the target organization and the current repository may be incrementally aligned to it.
 
 ### 4.1 Backend module shape
 
