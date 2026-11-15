@@ -1,21 +1,38 @@
 /**
  * TEMPORARY reproduction for the staging Worker 1101 (2026-11-15).
  *
- * Staging: GET /api/v1/admin/me returns Cloudflare error 1101
+ * Staging: GET /api/v1/admin/me returned Cloudflare error 1101
  * ("Worker threw exception") on ~10% of sequential requests and ~25%
- * of 20 concurrent requests. The throw escapes handleRequest, so it
- * must come from store creation (fetchHandler -> resolveRequestStore
- * -> createRequestStore -> DrizzleStore.create / getSharedClient).
+ * of 20 concurrent requests, then 12/12 store-dependent calls failed
+ * 22:11–22:15 +06 (including the owner's own sign-in attempts).
+ * Cloudflare Real-time Logs proved the cause: store creation threw
+ * "This promise was created by a request that has since ended, so it
+ * can never settle" (handle_cross_request_promise_resolution flag),
+ * from `DrizzleStore.acquireQueue → DrizzleStore.create →
+ * createRequestStore → fetchHandler`. The Batch 0 perf fix's
+ * per-isolate shared pg Client + per-client promise-chain queue
+ * created promises in one request and awaited them in another; warm
+ * isolates got poisoned, so the failure rate climbed with warmth.
  *
- * This file pins the two defenses added for it:
- *  1. Concurrent /me through the REAL Worker entrypoint (module-level
- *     shared client included) stays clean against local Postgres.
+ * The fix (ADR-0005 evening amendment — the pre-recorded revert path)
+ * is REQUEST-SCOPED clients: one fresh pg Client per create(), closed
+ * when the request finishes; no module-level client, no promise queue,
+ * no module-scope promise. This file pins the reverted behavior:
+ *  1. Concurrent /me through the REAL Worker entrypoint stays clean
+ *     against local Postgres.
  *  2. A first connection rejected with PostgreSQL 53300
  *     (too_many_connections — "remaining connection slots…") is
  *     recovered by the connect-phase retry: a fake pg proxy rejects
  *     the first handshake with a 53300 ErrorResponse and TCP-proxies
  *     later handshakes to the real database; the request must still
  *     answer 401 (unauthenticated), never throw.
+ *  3. Structural: two sequential requests through the real entrypoint
+ *     open TWO distinct pg connections (handshake count via a
+ *     counting proxy) — a shared client would open one.
+ *  4. Structural: concurrent requests each hold their own backend
+ *     (pg_stat_activity shows >= 2 distinct backends mid-flight) and
+ *     no backend lingers after the requests settle (stores closed per
+ *     request).
  *
  * Requires DATABASE_URL (same convention as the other Postgres suites).
  */
@@ -67,9 +84,10 @@ describe.skipIf(!DATABASE_URL)("worker 1101 repro (Postgres)", () => {
   }, 120_000);
 
   afterAll(async () => {
-    // The Worker entrypoint keeps a module-level shared client connected
-    // to the repro DB (it has no close API); terminate its backends
-    // first or DROP DATABASE waits forever.
+    // Stores are request-scoped now and the entrypoint closes each one
+    // after its request, so no Worker backend should linger — but a
+    // test that failed mid-flight could still hold one; terminate the
+    // repro DB's backends first or DROP DATABASE waits forever.
     const maintenance = new Client({ connectionString: MAINTENANCE_URL });
     await maintenance.connect();
     await maintenance
@@ -183,10 +201,125 @@ describe.skipIf(!DATABASE_URL)("worker 1101 repro (Postgres)", () => {
       assert.equal(res.status, 401, `expected 401 after 53300 recovery, got ${res.status}: ${body.slice(0, 200)}`);
       assert.ok(handshakes >= 2, `expected a retry handshake, saw ${handshakes}`);
     } finally {
-      // The Worker's shared client still holds the proxied connection;
-      // destroy the sockets first or proxy.close() waits forever.
+      // The request's store is closed after the request, so its proxied
+      // connection should already be gone; destroy the sockets first
+      // anyway or proxy.close() waits forever if anything lingered.
       for (const s of liveSockets) s.destroy();
       await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    }
+  }, 120_000);
+
+  it("two sequential requests open two distinct pg connections (counting proxy)", async () => {
+    // Structural proof of request-scoped clients through the REAL
+    // entrypoint: a plain TCP proxy counts handshakes. Two sequential
+    // /me requests must produce >= 2 handshakes — a shared client
+    // would produce exactly 1. (The Cloudflare cross-request promise
+    // flag cannot be reproduced under Node, so the handshake count is
+    // the observable property: fresh client per request.)
+    const proxy = net.createServer();
+    let handshakes = 0;
+    const liveSockets = new Set<net.Socket>();
+    proxy.on("connection", (socket) => {
+      liveSockets.add(socket);
+      socket.on("close", () => liveSockets.delete(socket));
+      handshakes += 1;
+      const upstream = net.connect(5432, "127.0.0.1");
+      liveSockets.add(upstream);
+      upstream.on("close", () => liveSockets.delete(upstream));
+      socket.pipe(upstream);
+      upstream.pipe(socket);
+      const destroyBoth = () => {
+        socket.destroy();
+        upstream.destroy();
+      };
+      socket.on("error", destroyBoth);
+      upstream.on("error", destroyBoth);
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+    const address = proxy.address() as net.AddressInfo;
+    try {
+      const proxyUrl = `postgresql://postgres:postgres@127.0.0.1:${address.port}/${REPRO_DB_NAME}`;
+      const proxyEnv = resolveRuntimeConfig({
+        APP_ENV: "test",
+        HYPERDRIVE_NO_CACHE: { connectionString: proxyUrl },
+        HYPERDRIVE_CACHED: { connectionString: proxyUrl },
+      } as never);
+      for (let i = 0; i < 2; i++) {
+        const res = await worker.fetch(
+          new Request("http://localhost:8787/api/v1/admin/me"),
+          proxyEnv as never,
+          undefined as never
+        );
+        const body = await res.text();
+        assert.equal(res.status, 401, `request ${i + 1}: expected 401, got ${res.status}: ${body.slice(0, 200)}`);
+      }
+      console.log(`[1101-repro] sequential-fresh-client test: ${handshakes} handshake(s) for 2 requests`);
+      assert.ok(
+        handshakes >= 2,
+        `expected >= 2 pg handshakes for 2 sequential requests (fresh client per request), saw ${handshakes}`
+      );
+    } finally {
+      for (const s of liveSockets) s.destroy();
+      await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    }
+  }, 120_000);
+
+  it("concurrent requests hold distinct backends and none lingers (pg_stat_activity)", async () => {
+    // Black-box proof through the real entrypoint: while 20 /me
+    // requests are in flight, pg_stat_activity must show >= 2 distinct
+    // backends for the repro DB (a shared client could never show 2),
+    // and after they settle, none may linger (stores closed per
+    // request — a leaked/shared client would leave 1 behind).
+    const activity = new Client({ connectionString: MAINTENANCE_URL });
+    await activity.connect();
+    const countBackends = async (): Promise<number> => {
+      const r = await activity.query(
+        `SELECT pid FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
+        [REPRO_DB_NAME]
+      );
+      return r.rowCount ?? 0;
+    };
+    try {
+      assert.equal(await countBackends(), 0, "no Worker backend should exist before the requests");
+      const inFlight = Promise.all(
+        Array.from({ length: 20 }, () =>
+          worker.fetch(
+            new Request("http://localhost:8787/api/v1/admin/me"),
+            env as never,
+            undefined as never
+          )
+        )
+      );
+      let maxDistinct = 0;
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        maxDistinct = Math.max(maxDistinct, await countBackends());
+        if (maxDistinct >= 2) break;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      const results = await inFlight;
+      assert.ok(
+        results.every((r) => r.status === 401),
+        `all 20 concurrent /me requests must return 401, got ${results.map((r) => r.status).join(",")}`
+      );
+      console.log(`[1101-repro] concurrent-backends test: max ${maxDistinct} distinct backends mid-flight`);
+      assert.ok(
+        maxDistinct >= 2,
+        `expected >= 2 distinct backends mid-flight (fresh client per request), saw max ${maxDistinct}`
+      );
+      // Settle: no lingering backends once the requests are done.
+      let lingering = await countBackends();
+      for (let i = 0; i < 40 && lingering > 0; i++) {
+        await new Promise((r) => setTimeout(r, 50));
+        lingering = await countBackends();
+      }
+      assert.equal(
+        lingering,
+        0,
+        `request-scoped clients must be closed after the request; ${lingering} backend(s) still linger`
+      );
+    } finally {
+      await activity.end().catch(() => {});
     }
   }, 120_000);
 });

@@ -43,6 +43,16 @@ At the same time:
 
 **Revert condition.** If the singleton causes stale-connection incidents in staging/production, revert to request-scoped clients while KEEPING the combined load + caps cache (predicted ~7 RTTs/request ≈ 1.75s). Truly fast (<300ms) needs store reuse across requests, not just client reuse — a separate future decision.
 
+## Amendment 2026-11-15 (evening) — revert to request-scoped clients (supersedes the per-isolate amendment above)
+
+**Trigger — the revert condition fired the same evening.** Staging failure rate on store-dependent calls climbed through the day (10% → 25% under concurrency → 12/12 failed 22:11–22:15 +06, including the owner's own sign-in attempts, all surfacing in the SPA as "The data store is temporarily unavailable"). Cloudflare Real-time Logs showed one error on every failure: `[stackmate] store creation failed` + `Error: This promise was created by a request that has since ended, so it can never settle. With the handle_cross_request_promise_resolution compatibility flag, a promise can only settle in the request that created it, and settling it after that request ends is dropped.` Stack: `DrizzleStore.acquireQueue → DrizzleStore.create → createRequestStore → fetchHandler`. The per-client promise-chain queue (`clientQueues`) is the mechanism: a queue promise created in request A and awaited in request B can never settle once A ends. As isolates warmed up, more requests hit poisoned warm isolates — the rate climbed with warmth, which is why the fix measured fine at 19:53 and broke later in the evening. The bare 1101s seen by curl earlier (7/30 on `/me`) are believed to be the same poisoned chain escaping as an unhandled rejection; the revert should fix both.
+
+**New rule.** Request-scoped clients (the pre-Batch-0 shape): `DrizzleStore.create()` opens its own fresh `pg` Client, and the entrypoint closes the store when the request finishes (`closeRequestStore` in `apps/api/src/app.ts`, `storeFactory` mode only — fetch and scheduled/cron both). No module-level client, no promise queue, no module-scope promise of any kind. The `existingClient` option and `clientQueues`/`acquireQueue` are deleted. Capability detection and required-table checks stay cached, now as resolved plain values keyed by connection string (never a promise, never awaited from module scope); a failed detection is never cached. The combined single-statement state load is unchanged.
+
+**Retries kept.** Connect-phase retry ONCE on ANY error now lives inside `DrizzleStore.create` (`connectWithRetry`; the 53300 fake-proxy recovery test still pins it), and the entrypoint retries `create()` once on connection-like failures from the load/signing-key phase. The JSON 500 `STORE_UNAVAILABLE` envelope in `fetchHandler` is unchanged, and `resolveRuntimeConfig` failures still throw (deployment errors stay loud).
+
+**Cost.** ~7 round-trips/request (≈1.75s predicted on staging at ~250ms RTT), as the original revert condition predicted — slower than the singleton's ~2.5s-measured-but-poisoned path, correct instead of fast-but-broken. Truly fast (<300ms) still needs store reuse across requests, a separate future decision that must solve the cross-request promise constraint first (e.g. no shared promise chains at all, or a different driver).
+
 ## Consequences
 
 - Zero cross-request I/O violations in Cloudflare Workers.

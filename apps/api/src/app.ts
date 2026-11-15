@@ -289,6 +289,26 @@ export function createStackMateApp(
   }
 
   /**
+   * End a factory-owned (per-request) store's resources. Only the
+   * DrizzleStore owns anything closeable (its request-scoped pg
+   * Client); the in-memory store has no dispose/close and this is a
+   * no-op for it. Called only for storeFactory mode, where the factory
+   * created the store for this request — an injected store's lifetime
+   * belongs to its owner and is never closed here. Never throws: a
+   * close failure must not mask the request's response (or the cron
+   * result). Without this, every request would leak one pg connection
+   * per Worker isolate until Neon/Hyperdrive rejects new connects.
+   */
+  async function closeRequestStore(store: StackMateDataStore): Promise<void> {
+    const dispose = (
+      store as unknown as { dispose?: () => Promise<void> }
+    ).dispose;
+    if (typeof dispose === "function") {
+      await dispose.call(store).catch(() => {});
+    }
+  }
+
+  /**
    * Build the Better Auth instance for one request from the request's store.
    * A DrizzleStore exposes its `drizzleDb` directly. Any other store (the
    * in-memory test adapter) gets a lazily created `pg` Client + drizzle()
@@ -3114,10 +3134,16 @@ export function createStackMateApp(
   ) {
     const env = resolveRuntimeConfig(rawEnv);
     const store = await resolveRequestStore(env, ctx);
-    return processTransactionalOutboxBatch(store, {
-      encryptionKey: env.ENCRYPTION_KEY_V1,
-      allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
-    });
+    try {
+      return processTransactionalOutboxBatch(store, {
+        encryptionKey: env.ENCRYPTION_KEY_V1,
+        allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
+      });
+    } finally {
+      // The cron uses the same request-scoped store path as fetch (see
+      // closeRequestStore): a factory-created store is closed here.
+      if (storeFactory) await closeRequestStore(store);
+    }
   }
 
   /**
@@ -3166,7 +3192,17 @@ export function createStackMateApp(
         }
       );
     }
-    return handleRequest(store, request, env, ctx);
+    try {
+      return await handleRequest(store, request, env, ctx);
+    } finally {
+      // Request-scoped store (storeFactory mode only): the factory
+      // created this store for this request, so it is closed here —
+      // its pg Client is ended and never outlives the request. The
+      // response body is fully materialized JSON, so closing before
+      // the runtime sends it is safe. An injected store is never
+      // closed: its lifetime belongs to its owner.
+      if (storeFactory) await closeRequestStore(store);
+    }
   }
 
   return {

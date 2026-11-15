@@ -11,37 +11,53 @@
  *
  * READ THIS FIRST — the five things that will surprise you:
  *
- * 1. ONE pg Client per store, serialized writers — and ONE shared client
- *    per Worker isolate (perf, 2026-11-15). The store holds a single `pg`
- *    Client (per the Hyperdrive design: one pinned connection). A pg
- *    Client cannot run concurrent queries, so ALL database access is
- *    serialized through a promise queue keyed by CLIENT, not by store
- *    (`clientQueues`): one withTransaction — or one loadState, or one
- *    create() init — at a time, across all stores sharing that client.
- *    The Worker entrypoint (apps/api/src/index.ts) keeps one lazy
- *    singleton client per isolate and passes it as
- *    `existingClient`; a store created that way does NOT own the client
- *    and `close()` must not end it. Tests and one-off scripts keep the
- *    old behavior (create() opens and owns its own client).
- *    `SELECT pg_advisory_xact_lock(727271)` additionally serializes
- *    writers across SEPARATE store instances / processes hitting the same
- *    database (mirrors the in-memory mutex semantics). Nested
- *    withTransaction calls deadlock exactly like the base class — don't.
- *    `drizzleDb` shares this same client, so Better Auth queries issued
- *    through it bypass the queue (see the residual-risk note on
- *    `clientQueues` below): a BA query landing inside another
- *    request's open transaction sees that transaction's snapshot, and a
- *    BA session insert rolled back by a concurrent rollback is lost and
+ * 1. ONE pg Client per store, REQUEST-SCOPED — one fresh client per
+ *    create(), owned by that store and ended by close(). The store
+ *    holds a single `pg` Client (per the Hyperdrive design: one pinned
+ *    connection). The Worker entrypoint creates one store per request
+ *    and closes it when the request finishes (see
+ *    apps/api/src/app.ts closeRequestStore), so a client never outlives
+ *    its request and nothing is shared across requests.
+ *    REVERT 2026-11-15 (evening): the Batch 0 perf fix shared ONE
+ *    client per Worker isolate (module-level singleton) and serialized
+ *    all statements through a per-client promise queue
+ *    (`clientQueues`). That poisoned warm isolates: a queue promise
+ *    created in request A and awaited in request B throws under
+ *    Cloudflare's handle_cross_request_promise_resolution flag ("This
+ *    promise was created by a request that has since ended…"), and
+ *    staging went from ~10% failures to 12/12 store-dependent calls
+ *    failing with it (live Worker logs, 2026-11-15 22:11–22:15 +06).
+ *    The singleton + queue are deleted; this is the ADR-0005
+ *    pre-recorded revert path. The combined single-statement load and
+ *    the caps/tables cache are KEPT (the cache now holds resolved
+ *    plain values keyed by connection string — never a promise — see
+ *    below). Cost: ~2 extra RTTs/request vs the singleton (caps +
+ *    tables re-checked only on a cold cache); predicted ~1.75s/request
+ *    on staging at ~250ms RTT.
+ *    `SELECT pg_advisory_xact_lock(727271)` serializes writers across
+ *    SEPARATE store instances / processes hitting the same database
+ *    (mirrors the in-memory mutex semantics). Within ONE store
+ *    instance, concurrent operations are serialized by an
+ *    instance-level lock (`acquireStoreLock`) — the advisory lock
+ *    cannot do that job, because two transactions on the SAME client
+ *    share one session and the lock never blocks itself (a payment
+ *    verification race run on one shared store would let both sides
+ *    see pre-race state and both fail). The lock chain lives on the
+ *    instance, NOT at module scope: in the Worker path the instance
+ *    is created and closed within ONE request, so the chain can never
+ *    span requests and the Cloudflare cross-request promise flag
+ *    cannot fire on it — unlike the deleted module-level
+ *    `clientQueues`. Nested withTransaction calls deadlock exactly
+ *    like the base class — don't.
+ *    `drizzleDb` shares this store's client, so Better Auth queries
+ *    run on the request's own client: no cross-request contamination
+ *    is possible, and within a request BA queries execute sequentially
+ *    with store operations (a BA query landing inside this request's
+ *    open transaction sees that transaction's snapshot, and a BA
+ *    session insert rolled back by a concurrent rollback is lost and
  *    the user signs in again; no business data can corrupt this way
  *    because BA never writes business tables and never runs inside a
  *    store transaction).
- *    NOTE (ADR-0005 conflict, needs a parent decision):
- *    apps/api/src/platform/db/hyperdrive.ts §2.1 says "Never holds a
- *    module-scoped TCP connection across Worker requests." The shared
- *    per-isolate client directly contradicts that. It is kept because
- *    the alternative — a fresh TCP connect + ~55 queries per request —
- *    measured 13–35s per request on staging; the ADR must be updated
- *    to bless the singleton (or the perf fix reverted).
  *
  * 2. Full-state load + diff-persist, raw SQL. Every withTransaction
  *    reloads ALL mapped tables into `this.state` and then diffs the
@@ -226,15 +242,6 @@ const COUNTER_BASE_VALUES: DatabaseState["sequence_counters"] = {
 
 export interface DrizzleStoreCreateOptions {
   connectionString: string;
-  /**
-   * An already-connected pg Client to use instead of opening a new one
-   * (perf, 2026-11-15). The Worker entrypoint passes its per-isolate
-   * singleton client here. The store does NOT own such a client:
-   * create() never connects it, never ends it on failure, and close()
-   * never ends it. When omitted, create() opens and owns its own
-   * client (tests, scripts, and any non-Worker wiring).
-   */
-  existingClient?: Client | undefined;
   r2Bucket?: R2BucketBinding | null | undefined;
   signingKeyId?: string | undefined;
   /**
@@ -581,59 +588,46 @@ const REQUIRED_TABLES: readonly string[] = [
 ];
 
 /**
- * Perf (2026-11-15) — per-client caches and serialization queue.
+ * Perf (2026-11-15) — schema facts cached as RESOLVED PLAIN VALUES,
+ * keyed by connection string.
  *
  * Schema facts never change at runtime, so detectCapabilities and
- * assertRequiredTables are memoized PER CLIENT (WeakMap: a new client
- * — reconnect, redeploy — re-checks; migrations deploy with code, so a
- * per-isolate invariant is safe). A rejected check is evicted so a
- * transient failure never poisons the cache.
+ * assertRequiredTables are memoized (migrations deploy with code, so a
+ * per-isolate invariant is safe). The cache holds ONLY resolved plain
+ * values — NEVER a promise, and nothing here is ever awaited from
+ * module scope: a promise created in one Worker request and awaited in
+ * another throws under Cloudflare's
+ * handle_cross_request_promise_resolution flag, which is exactly what
+ * killed the per-isolate shared client (see header note 1). If two
+ * requests populate the same key concurrently they just re-detect and
+ * the last write wins (same value). A failed detection is never cached,
+ * so a transient failure retries on the next request.
  *
- * The queue is keyed by CLIENT, not by store instance: stores that
- * share one client (the Worker singleton) must never interleave
- * statements — a BEGIN from one store inside another store's open
- * transaction would make the inner COMMIT commit the outer
- * transaction. Every entry point that issues queries on the client
- * (create() init, loadState, withTransaction) holds this queue; no
- * nested acquisition exists anywhere (store methods call client.query
- * directly while holding it).
- *
- * Residual risk — Better Auth's drizzleDb bypasses this queue: BA
- * queries run on the same client outside it. A BA query landing inside
- * another request's open transaction sees that transaction's snapshot
- * (dirty read for an auth check), and a BA session insert lost to a
- * concurrent rollback just makes the user sign in again. No business
- * data can corrupt this way: BA never writes business tables and never
- * runs inside a store transaction. A separate BA client was considered
- * and rejected: pg does NOT connect lazily (query() before connect()
- * hangs forever, verified 2026-11-15 against pg 8.20.0), so a separate
- * client would have to connect eagerly and GET /api/auth/ok — which
- * today needs no live database — would start requiring one.
+ * Keyed by connection string, not by client: every store now owns a
+ * fresh client per request, and the string identifies the database
+ * (tests use one string per database, so no cross-database leakage).
  */
-const capabilitiesCache = new WeakMap<Client, Promise<StoreCapabilities>>();
-const requiredTablesCache = new WeakMap<Client, Promise<void>>();
-const clientQueues = new WeakMap<Client, Promise<void>>();
+const capabilitiesByConnectionString = new Map<string, StoreCapabilities>();
+const requiredTablesVerified = new Set<string>();
 
-function cachedDetectCapabilities(client: Client): Promise<StoreCapabilities> {
-  const hit = capabilitiesCache.get(client);
+async function detectCapabilitiesCached(
+  connectionString: string,
+  client: Client
+): Promise<StoreCapabilities> {
+  const hit = capabilitiesByConnectionString.get(connectionString);
   if (hit !== undefined) return hit;
-  const p = detectCapabilities(client);
-  capabilitiesCache.set(client, p);
-  p.catch(() => {
-    if (capabilitiesCache.get(client) === p) capabilitiesCache.delete(client);
-  });
-  return p;
+  const caps = await detectCapabilities(client);
+  capabilitiesByConnectionString.set(connectionString, caps);
+  return caps;
 }
 
-function cachedAssertRequiredTables(client: Client): Promise<void> {
-  const hit = requiredTablesCache.get(client);
-  if (hit !== undefined) return hit;
-  const p = assertRequiredTables(client);
-  requiredTablesCache.set(client, p);
-  p.catch(() => {
-    if (requiredTablesCache.get(client) === p) requiredTablesCache.delete(client);
-  });
-  return p;
+async function assertRequiredTablesCached(
+  connectionString: string,
+  client: Client
+): Promise<void> {
+  if (requiredTablesVerified.has(connectionString)) return;
+  await assertRequiredTables(client);
+  requiredTablesVerified.add(connectionString);
 }
 
 async function detectCapabilities(client: Client): Promise<StoreCapabilities> {
@@ -729,11 +723,18 @@ export class DrizzleStore extends StackMateDataStore {
 
   private closed = false;
   /**
-   * True when this store owns its pg client (create() opened it). A
-   * store built on an `existingClient` must never end the shared
-   * client in close() or on create() failure.
+   * Instance-level serialization chain for THIS store's client (see
+   * header note 1). Deliberately NOT module-level: a chain stored at
+   * module scope (the deleted `clientQueues`) is what the Cloudflare
+   * cross-request promise flag killed. This chain lives on the store
+   * instance, which in the Worker path is created and closed within
+   * ONE request — a promise created here can only ever settle in that
+   * request. A store shared across requests (tests, scripts) still
+   * gets correct serialization; that is the tested contract
+   * (concurrent payment-verification / activation races in
+   * business-workflows.integration.test.ts).
    */
-  private readonly ownsClient: boolean;
+  private storeQueue: Promise<void> = Promise.resolve();
   private capabilities: StoreCapabilities = NO_MIGRATION_0002;
   /**
    * Master secret resolved at create() (see resolveEncryptionSecret).
@@ -749,13 +750,42 @@ export class DrizzleStore extends StackMateDataStore {
 
   private constructor(
     pgClient: Client,
-    drizzleDb: NodePgDatabase<typeof schema>,
-    ownsClient = true
+    drizzleDb: NodePgDatabase<typeof schema>
   ) {
     super(DEFAULT_SIGNING_KEY_ID);
     this.pgClient = pgClient;
     this.drizzleDb = drizzleDb;
-    this.ownsClient = ownsClient;
+  }
+
+  /**
+   * Connect a FRESH pg Client, retrying the handshake ONCE on ANY
+   * error. A failed handshake is never a deterministic boot failure:
+   * pool exhaustion (PostgreSQL 53300 "remaining connection slots…"),
+   * Neon wake-up (57P03), or a Hyperdrive hiccup can all reject the
+   * first attempt and succeed on the second — the second attempt
+   * decides. The failed client is ended before retrying so it never
+   * leaks a half-open socket. The final failure propagates as the raw
+   * pg error (code preserved) so the caller's isConnectionError check
+   * in apps/api/src/index.ts can still match it.
+   */
+  private static async connectWithRetry(
+    connectionString: string
+  ): Promise<Client> {
+    const first = new Client({ connectionString });
+    try {
+      await first.connect();
+      return first;
+    } catch {
+      await first.end().catch(() => {});
+    }
+    const retry = new Client({ connectionString });
+    try {
+      await retry.connect();
+      return retry;
+    } catch (error) {
+      await retry.end().catch(() => {});
+      throw error;
+    }
   }
 
   public static async create(
@@ -766,39 +796,36 @@ export class DrizzleStore extends StackMateDataStore {
         "DrizzleStore.create: connectionString is empty. Pass the PostgreSQL connection string (in production, HYPERDRIVE_NO_CACHE.connectionString)."
       );
     }
-    const ownsClient = opts.existingClient === undefined;
-    const pgClient =
-      opts.existingClient ??
-      new Client({ connectionString: opts.connectionString });
+    // Request-scoped client (header note 1): every create() opens its
+    // own fresh client and owns it — close() ends it. Nothing is ever
+    // shared across requests or stored at module scope.
+    let pgClient: Client;
     try {
-      if (ownsClient) {
-        await pgClient.connect();
-      }
+      pgClient = await DrizzleStore.connectWithRetry(opts.connectionString);
     } catch (error) {
-      throw new Error(
+      const wrapped = new Error(
         `DrizzleStore.create: could not connect to PostgreSQL: ${(error as Error).message}`
       );
+      // Preserve the pg error code so the entrypoint's isConnectionError
+      // check (apps/api/src/index.ts) can still match it.
+      (wrapped as { code?: unknown }).code = (
+        error as { code?: unknown }
+      )?.code;
+      throw wrapped;
     }
     const drizzleDb = drizzle(pgClient, { schema });
-    const store = new DrizzleStore(pgClient, drizzleDb, ownsClient);
+    const store = new DrizzleStore(pgClient, drizzleDb);
     try {
-      // Hold the per-client queue for the whole init: caps/tables, the
-      // full load, and the signing-key transaction all issue queries on
-      // this client, and another store sharing it must not interleave
-      // (its BEGIN/COMMIT would corrupt ours). The cached caps/tables
-      // promises are computed here, under the queue, on first use.
-      const release = await store.acquireQueue();
-      try {
-        store.capabilities = await cachedDetectCapabilities(pgClient);
-        // Throws a clear error naming the missing table when migrations
-        // 0000/0001 have not been applied. Reference rows come from
-        // migration 0001 — this store never auto-seeds them.
-        await cachedAssertRequiredTables(pgClient);
-        await store.loadStateInternal(pgClient);
-        await store.resolveSigningKey(opts);
-      } finally {
-        release();
-      }
+      store.capabilities = await detectCapabilitiesCached(
+        opts.connectionString,
+        pgClient
+      );
+      // Throws a clear error naming the missing table when migrations
+      // 0000/0001 have not been applied. Reference rows come from
+      // migration 0001 — this store never auto-seeds them.
+      await assertRequiredTablesCached(opts.connectionString, pgClient);
+      await store.loadStateInternal(pgClient);
+      await store.resolveSigningKey(opts);
       if (opts.r2Bucket !== undefined && opts.r2Bucket !== null) {
         store.r2Bucket = opts.r2Bucket;
         store.usesInMemoryBucket = false;
@@ -807,9 +834,7 @@ export class DrizzleStore extends StackMateDataStore {
         store.usesInMemoryBucket = true;
       }
     } catch (error) {
-      if (ownsClient) {
-        await pgClient.end().catch(() => {});
-      }
+      await pgClient.end().catch(() => {});
       throw error;
     }
     return store;
@@ -1138,8 +1163,8 @@ export class DrizzleStore extends StackMateDataStore {
       );
     }
     const secret = this.encryptionSecret;
-    const release = await this.acquireQueue();
     const client = this.pgClient;
+    const release = await this.acquireStoreLock();
     let nextKeyId = "";
     let material: Ed25519KeyMaterial | null = null;
     try {
@@ -1262,8 +1287,8 @@ export class DrizzleStore extends StackMateDataStore {
    */
   public override async revokeSigningKey(keyId: string): Promise<void> {
     this.assertOpen();
-    const release = await this.acquireQueue();
     const client = this.pgClient;
+    const release = await this.acquireStoreLock();
     try {
       await client.query("BEGIN");
       try {
@@ -1314,12 +1339,12 @@ export class DrizzleStore extends StackMateDataStore {
 
   /**
    * Reload all tables into this.state (per-request refresh). Serialized
-   * against withTransaction through the same queue so two callers never
-   * interleave queries on the shared client.
+   * against withTransaction through the instance lock so two callers
+   * never interleave queries on this store's client.
    */
   public async loadState(): Promise<DatabaseState> {
     this.assertOpen();
-    const release = await this.acquireQueue();
+    const release = await this.acquireStoreLock();
     try {
       this.queryMetrics.uncachedQueries += 1;
       await this.loadStateInternal(this.pgClient);
@@ -1347,7 +1372,7 @@ export class DrizzleStore extends StackMateDataStore {
     fn: (state: DatabaseState) => Promise<T> | T
   ): Promise<T> {
     this.assertOpen();
-    const release = await this.acquireQueue();
+    const release = await this.acquireStoreLock();
     const client = this.pgClient;
     let begun = false;
     let snapshotJson: string | null = null;
@@ -1395,17 +1420,16 @@ export class DrizzleStore extends StackMateDataStore {
   }
 
   /**
-   * End the pg client — ONLY when this store owns it. Idempotent; the
-   * store must not be used afterwards. A store built on a shared
-   * `existingClient` just marks itself closed; the client lives on for
-   * the other stores sharing it.
+   * End this store's pg client. Idempotent; the store must not be used
+   * afterwards. Every store owns its client (request-scoped, header
+   * note 1), so close() always ends it — the Worker entrypoint calls
+   * this when the request finishes (see apps/api/src/app.ts
+   * closeRequestStore).
    */
   public async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    if (this.ownsClient) {
-      await this.pgClient.end().catch(() => {});
-    }
+    await this.pgClient.end().catch(() => {});
   }
 
   /** Alias for close(). */
@@ -1422,20 +1446,21 @@ export class DrizzleStore extends StackMateDataStore {
   }
 
   /**
-   * Serialize access to THIS store's pg client across all stores
-   * sharing it (see `clientQueues`). The tail promise never rejects —
-   * `release` only ever resolves it — so awaiting `prev` cannot throw.
+   * Serialize operations on THIS store's client (see the `storeQueue`
+   * field comment). The tail promise never rejects — `release` only
+   * ever resolves it — so awaiting `prev` cannot throw.
    */
-  private async acquireQueue(): Promise<() => void> {
+  private async acquireStoreLock(): Promise<() => void> {
     let release!: () => void;
-    const prev = clientQueues.get(this.pgClient) ?? Promise.resolve();
+    const prev = this.storeQueue;
     const next = new Promise<void>((resolve) => {
       release = resolve;
     });
-    clientQueues.set(this.pgClient, next);
+    this.storeQueue = next;
     await prev;
     return release;
   }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1484,10 +1509,9 @@ function deriveCountersFromData(
 /**
  * The full-state load as ONE round-trip (perf, 2026-11-15): every mapped
  * table is fetched as a JSON array in a single statement instead of ~48
- * sequential queryRows calls. A single pg Client serializes queries
- * internally (see _pulseQueryQueue), so Promise.all over one client
- * cannot parallelize — the only way to cut the round-trips on one
- * pinned connection is to fetch everything at once.
+ * sequential queryRows calls. A single pg Client executes queries in
+ * call order and cannot parallelize them, so the only way to cut the
+ * round-trips on one pinned connection is to fetch everything at once.
  *
  * Each entry's SQL is the pre-refactor SELECT verbatim (same columns,
  * same caps interpolations); its ORDER BY moved into the json_agg call,
