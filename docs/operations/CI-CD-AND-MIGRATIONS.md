@@ -2,13 +2,28 @@
 
 ## 0. Status — read this first
 
-**No GitHub Actions run has been observed yet.** Neither `ci.yml` nor
-`deploy-production.yml` has ever run on GitHub Actions (the Muse GitHub
-App has no `workflows:write` permission, so these files could not even
-be pushed to the branch by automation — the owner must add them).
-Everything below describes what the workflows *will* do once the owner
-completes the setup in §5. Do not claim CI or production deployment is
-live until a real workflow run plus its smoke checks succeed.
+**CI has now run on GitHub Actions.** Run #7 (commit `f0c2dab`,
+2026-11-15 15:58 +06) **FAILED** at the last step
+(`pnpm run smoke:check`): `scripts/smoke-check.mjs` imports
+`apps/api/src/app.ts` directly, which needs Node type stripping —
+Node 22.14.0 (`.nvmrc` at the time) throws
+`ERR_UNKNOWN_FILE_EXTENSION`. Every earlier step passed (validate,
+migration check, lint, typecheck, unit tests, Postgres integration
+tests, build, wrangler `--dry-run`). Fix pushed as commit `9660b15`:
+`.nvmrc` 22.14.0 → **24.22.1** (the Node version all local
+verification used; Node 24 is the current LTS). The re-run result had
+**not** been observed yet at the time of writing — do not claim CI is
+green until a run is seen passing. `deploy-production.yml` has never
+run (manual-only, and production setup in §5 is not complete).
+
+**Staging infrastructure now exists** (created 2026-11-15 via the
+owner's browser, commerciansbd account): Neon `staging` branch
+`br-plain-voice-b3vx916o`, Hyperdrive `stackmate-no-cache`
+(`30a29917780c4aff91b9a198b63eb387`) + `stackmate-cached`
+(`3ae1e99fbd6d4fcea9a0cb35de71ae4c`), R2 bucket
+`stackmate-private-assets`. See §3.5 for the staging deploy path and
+§5.6 for the remaining owner-side setup. Staging has **not** been
+deployed yet.
 
 Verified locally 2026-11-15 (not on GitHub Actions): `pnpm run
 validate:repo`, `pnpm run db:check` (63 Drizzle tables vs 4 migrations:
@@ -96,19 +111,47 @@ The `../../apps/admin/dist` path is relative to `apps/api`, where
 `stackmate-admin` is the name declared in `apps/admin/package.json`,
 not an invented name.
 
-**There is no staging deploy path.** No staging Cloudflare resources
-and no staging Neon branch/database exist (verified 2026-11-15).
-Staging needs its own Neon branch/database (never the production
-branch), plus its own environment/secrets/vars — document those first,
-then add the workflow; do not invent resource names.
+**Staging deploy path — `.github/workflows/deploy-staging.yml`**
+(see §3.5).** The production workflow still has no staging path, by
+design: staging is a separate workflow with its own `staging`
+environment, its own Neon branch, and its own Hyperdrive bindings.
 
-**Known gap — admin ↔ API routing in production:** the admin SPA
-calls relative `/api/v1/...` paths (`apps/admin/src/lib/api-client.ts`)
-and consumes no build-time API URL variable. There is therefore no
-`VITE_API_URL` (or similar) build variable in the deploy workflow —
-none exists to set. How the deployed admin reaches the deployed API
-(same-domain routing, proxy, or an absolute URL) is still undecided;
-do not invent it here.
+**Admin ↔ API routing — DECIDED for staging, still open for
+production:** the admin SPA calls relative `/api/v1/...` paths
+(`apps/admin/src/lib/api-client.ts`) and consumes no build-time API
+URL variable. There is therefore no `VITE_API_URL` (or similar) build
+variable in either deploy workflow — none exists to set. For
+**staging**, the admin SPA is served as static assets from the same
+Worker (`apps/api/wrangler.jsonc` `env.staging.assets`, directory
+`../../apps/admin/dist`, SPA fallback), so relative calls and Better
+Auth cookies stay same-origin. For **production**, how the deployed
+admin reaches the deployed API (same-domain routing, proxy, or an
+absolute URL) is still undecided; do not invent it here.
+
+### 3.5 Staging deployment — `.github/workflows/deploy-staging.yml`
+
+**Manual only** (`workflow_dispatch`, no push trigger). Three jobs, in
+strict order; the staging-touching jobs reference
+`environment: staging` (approval protection — see §5.6).
+
+| Job | Needs | Environment | What it does |
+| --- | --- | --- | --- |
+| `verify` — Pre-Deployment Verification Gate | — | *(none)* | Fails fast unless the `confirm` input is exactly `staging`; then `validate:repo`, `db:check`, `lint`, `typecheck`, `pnpm test` (unit tests only), `build`. |
+| `migrate-staging` — Apply Forward-Only PostgreSQL Migrations (Direct Staging Neon URL) | `verify` | `staging` | Guards `STAGING_DIRECT_DATABASE_URL` (fails if unset, if it looks like a Hyperdrive URL, or if it points at the **production** branch `br-soft-brook-b3v47kp6`); `db:check`; then `pnpm run db:migrate:deploy` against the staging branch. |
+| `deploy-api-staging` — Deploy Cloudflare Worker API (staging env) + Admin SPA assets | `migrate-staging` | `staging` | `pnpm run build`; `wrangler deploy --env staging` (Worker `stackmate-api-staging`, staging Hyperdrive + R2, admin SPA as static assets); live smoke checks `curl -fsS ${STACKMATE_STAGING_API_URL}/api/v1/health` and `curl -fsS ${STACKMATE_STAGING_API_URL}`. |
+
+Staging resources (verified 2026-11-15, commerciansbd account):
+Neon StackMate project `frosty-surf-68878874`, branch `staging`
+`br-plain-voice-b3vx916o` (child of production, auto-delete Never),
+own `neondb` on pooled host
+`ep-round-queen-b3nfs18o-pooler.c-4.ap-southeast-1.aws.neon.tech`
+(port 5432, user `neondb_owner`); Hyperdrive `stackmate-no-cache`
+`30a29917780c4aff91b9a198b63eb387` (caching disabled) and
+`stackmate-cached` `3ae1e99fbd6d4fcea9a0cb35de71ae4c` (max_age 60s, swr
+15s), both pointing at the staging `neondb`; R2 bucket
+`stackmate-private-assets` (Standard, Asia Pacific, Public Access
+Disabled). The production branch (`br-soft-brook-b3v47kp6`) is
+untouched and must never be used for staging.
 
 ## 4. Rollback & Recovery Procedure
 
@@ -124,9 +167,11 @@ only.
 
 ### 5.1 Cloudflare (dashboard, commerciansbd account)
 
-Verified 2026-11-15: the account currently has **no** `stackmate-api`
-Worker, **no** Hyperdrive configs at all, and **no** R2 bucket
-`stackmate-private-assets` — all of these must be created.
+Verified 2026-11-15: the account currently has **no production**
+`stackmate-api` Worker, **no production** Hyperdrive configs, and the
+R2 bucket `stackmate-private-assets` exists only because it was
+created for **staging** (§3.5) — production Hyperdrive configs still
+do not exist and must be created.
 
 1. Create two Hyperdrive configs pointing at the production Neon
    database (direct Neon host; see §5.2):
@@ -194,4 +239,48 @@ Neon branch/database, never the production branch.
    environment prompt.
 4. Verify: migrations applied, Worker and Pages deploys succeeded,
    and both live smoke checks passed. The deploy is complete only
+   then.
+
+### 5.6 Staging setup — required before the first staging deploy
+
+Staging infrastructure (§3.5) already exists. What remains is
+owner-side (dashboard / GitHub Settings) setup:
+
+1. **Worker secrets** (Cloudflare dashboard → Workers & Pages →
+   `stackmate-api-staging` → Settings → Variables → Secrets; values
+   are generated in the dashboard and never written here or in chat):
+   `BETTER_AUTH_SECRET`, `ENCRYPTION_KEY_V1`,
+   `LICENSE_VERIFIER_SECRET`, `CHECKOUT_TOKEN_SECRET`. The first
+   `wrangler deploy --env staging` run creates the Worker; the URL
+   secrets below can only be set after the Worker URL is known, so
+   expect **two passes**: deploy once, set the URL secrets, re-run
+   the workflow.
+2. **Worker URL variables** (same page, plain variables, not
+   secrets): `BETTER_AUTH_URL`, `TRUSTED_ORIGINS`, `APP_URL`,
+   `API_URL` — all equal to the deployed staging Worker URL, e.g.
+   `https://stackmate-api-staging.<subdomain>.workers.dev` (no
+   trailing slash). `TRUSTED_ORIGINS` is a comma-separated list;
+   for staging it is just the Worker URL itself (admin is
+   same-origin).
+3. **GitHub — repo Settings → Environments → `staging`**: create
+   the environment, add the owner as a required reviewer.
+4. **Staging environment secrets** (same page → Secrets):
+   - `STAGING_DIRECT_DATABASE_URL` — **direct (non-pooled)**
+     connection string for the **staging** Neon branch
+     (`br-plain-voice-b3vx916o`). Never the pooled (`-pooler`)
+     host, never a Hyperdrive URL, never the production branch.
+   - `CLOUDFLARE_API_TOKEN` — API token with minimum required
+     permissions (Workers deploy for this account).
+   - `CLOUDFLARE_ACCOUNT_ID` — Cloudflare account ID
+     (`4b86a3e96cec5a2f9f841c7a3cbbb5cf`).
+5. **Staging environment variables** (same page → Variables):
+   - `STACKMATE_STAGING_API_URL` — deployed staging API base URL,
+     e.g. `https://stackmate-api-staging.<subdomain>.workers.dev`
+     (no trailing slash). Used by the live smoke checks.
+6. **First staging deploy**: Actions → **Deploy Staging** → Run
+   workflow → type `staging` in the `confirm` input → approve the
+   `staging` environment prompt. Then set the Worker URL secrets
+   (§5.6 steps 1–2) and re-run. Verify: migrations 0000–0004
+   applied to the staging branch, Worker deploy succeeded, and
+   both live smoke checks passed. The deploy is complete only
    then.

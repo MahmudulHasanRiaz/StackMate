@@ -37,6 +37,53 @@
       "preview_bucket_name": "stackmate-private-assets-preview"
     }
   ],
+  // Staging environment (2026-11-15, commerciansbd account): Worker
+  // `stackmate-api-staging` bound to the STAGING Neon branch via the two
+  // Hyperdrive configs created for staging (never production). The admin
+  // SPA is served from this same Worker (static assets) so its relative
+  // `/api/v1/...` calls and Better Auth cookies stay same-origin; there
+  // is no separate staging Pages project. Secrets (BETTER_AUTH_SECRET,
+  // ENCRYPTION_KEY_V1, LICENSE_VERIFIER_SECRET, CHECKOUT_TOKEN_SECRET,
+  // BETTER_AUTH_URL, TRUSTED_ORIGINS, APP_URL, API_URL) are set on the
+  // Worker in the Cloudflare dashboard, never in this file.
+  // Hyperdrive IDs (verified 2026-11-15):
+  //   NO_CACHE: 30a29917780c4aff91b9a198b63eb387 (caching disabled)
+  //   CACHED:   3ae1e99fbd6d4fcea9a0cb35de71ae4c (max_age 60s, swr 15s)
+  "env": {
+    "staging": {
+      "name": "stackmate-api-staging",
+      "vars": {
+        "APP_ENV": "staging",
+        "DEFAULT_TIMEZONE": "Asia/Dhaka",
+        "DEFAULT_CURRENCY": "BDT",
+        "ACTIVE_ENCRYPTION_KEY_VERSION": "v1",
+        "LICENSE_SIGNING_KEY_ID": "sm-ed25519-2026-11",
+        "META_GRAPH_API_VERSION": "v21.0"
+      },
+      "hyperdrive": [
+        {
+          "binding": "HYPERDRIVE_NO_CACHE",
+          "id": "30a29917780c4aff91b9a198b63eb387"
+        },
+        {
+          "binding": "HYPERDRIVE_CACHED",
+          "id": "3ae1e99fbd6d4fcea9a0cb35de71ae4c"
+        }
+      ],
+      "r2_buckets": [
+        {
+          "binding": "R2_BUCKET",
+          "bucket_name": "stackmate-private-assets",
+          "preview_bucket_name": "stackmate-private-assets-preview"
+        }
+      ],
+      "assets": {
+        "directory": "../../apps/admin/dist",
+        "binding": "ASSETS",
+        "not_found_handling": "single-page-application"
+      }
+    }
+  },
   "triggers": {
     "crons": ["* * * * *"]
   }
