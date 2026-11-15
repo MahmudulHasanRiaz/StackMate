@@ -1,0 +1,202 @@
+name: Deploy Staging
+
+# Manual only. There is NO push trigger: the owner triggers this from
+# the Actions tab and approves it via the GitHub `staging` environment.
+# A staging deployment is complete only when this workflow and the
+# post-deployment live smoke checks succeed.
+#
+# Order (ADR-0002): verify -> migrations (direct STAGING Neon URL,
+# NEVER Hyperdrive, NEVER the production branch) -> deploy API Worker
+# (env staging, with the admin SPA served as static assets from the
+# same Worker so relative /api calls and Better Auth cookies stay
+# same-origin) -> live smoke checks.
+#
+# Staging resources (verified 2026-11-15, commerciansbd account):
+# - Neon StackMate project frosty-surf-68878874, branch "staging"
+#   br-plain-voice-b3vx916o (child of production), own neondb on the
+#   pooled host ep-round-queen-b3nfs18o-pooler.c-4.ap-southeast-1.aws.neon.tech.
+#   Migrations use the DIRECT (non-pooled) staging connection string.
+# - Hyperdrive stackmate-no-cache 30a29917780c4aff91b9a198b63eb387
+#   (caching disabled) and stackmate-cached
+#   3ae1e99fbd6d4fcea9a0cb35de71ae4c (max_age 60s, swr 15s), both
+#   pointing at the staging neondb; bound in apps/api/wrangler.jsonc
+#   under env.staging.
+# - R2 bucket stackmate-private-assets.
+# Worker secrets (BETTER_AUTH_SECRET, ENCRYPTION_KEY_V1,
+# LICENSE_VERIFIER_SECRET, CHECKOUT_TOKEN_SECRET, BETTER_AUTH_URL,
+# TRUSTED_ORIGINS, APP_URL, API_URL) live on the Worker in the
+# Cloudflare dashboard, never in this file. BETTER_AUTH_URL /
+# TRUSTED_ORIGINS / APP_URL / API_URL must equal the deployed staging
+# Worker URL; the first deploy creates the Worker, after which those
+# secrets are set in the dashboard and the workflow is re-run.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "staging" to confirm this deploys to STAGING (never production)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging-deploy
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Pre-Deployment Verification Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Confirm staging deployment was explicitly typed
+        run: |
+          if [ "${{ inputs.confirm }}" != "staging" ]; then
+            echo 'Aborting: the confirm input must be exactly "staging".'
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # Exact version from the packageManager field in package.json.
+          version: 10.6.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # Node version from .nvmrc (24.22.1).
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Run repository, migration, lint, typecheck, test, and build gates
+        # pnpm test here runs unit tests only (no DATABASE_URL, so the
+        # Postgres integration suite skips cleanly). The integration
+        # suite runs, unskipped, in CI on the same commit.
+        run: |
+          pnpm run validate:repo
+          pnpm run db:check
+          pnpm run lint
+          pnpm run typecheck
+          pnpm test
+          pnpm run build
+
+  migrate-staging:
+    name: Apply Forward-Only PostgreSQL Migrations (Direct Staging Neon URL)
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Guard STAGING_DIRECT_DATABASE_URL (must be set, direct Neon, never Hyperdrive, never production)
+        # Migrations use the DIRECT staging Neon connection, NEVER
+        # Hyperdrive (Hyperdrive transaction pooling breaks DDL
+        # advisory locks) and NEVER the production branch. The
+        # migrate runner itself also fails closed when the URL is
+        # unset; this guard additionally rejects a Hyperdrive URL or
+        # a production-branch URL pasted into the secret by mistake.
+        # The secret value is never printed.
+        env:
+          STAGING_DIRECT_DATABASE_URL: ${{ secrets.STAGING_DIRECT_DATABASE_URL }}
+        run: |
+          if [ -z "$STAGING_DIRECT_DATABASE_URL" ]; then
+            echo "ERROR: secrets.STAGING_DIRECT_DATABASE_URL is not set. Add the direct (non-pooled) staging Neon connection string to the staging environment secrets."
+            exit 1
+          fi
+          case "$STAGING_DIRECT_DATABASE_URL" in
+            *[Hh]yperdrive*)
+              echo "ERROR: STAGING_DIRECT_DATABASE_URL looks like a Hyperdrive URL. Migrations must use the direct Neon connection string, never Hyperdrive."
+              exit 1
+              ;;
+          esac
+          case "$STAGING_DIRECT_DATABASE_URL" in
+            *br-soft-brook-b3v47kp6*)
+              echo "ERROR: STAGING_DIRECT_DATABASE_URL points at the PRODUCTION Neon branch (br-soft-brook-b3v47kp6). Refusing to migrate production from the staging workflow."
+              exit 1
+              ;;
+          esac
+          echo "STAGING_DIRECT_DATABASE_URL is set, is not a Hyperdrive URL, and does not point at the production branch."
+
+      - name: Verify migration journal and SQL checksums
+        run: pnpm run db:check
+
+      - name: Execute forward-only SQL migrations against STAGING_DIRECT_DATABASE_URL
+        # scripts/migrate.mjs: advisory-locked, checksum-verified,
+        # transactional per migration; fails closed on checksum
+        # mismatch or SQL error. Reads DATABASE_MIGRATION_URL first,
+        # then DATABASE_URL. No destructive down-migrations exist.
+        env:
+          DATABASE_MIGRATION_URL: ${{ secrets.STAGING_DIRECT_DATABASE_URL }}
+        run: pnpm run db:migrate:deploy
+
+  deploy-api-staging:
+    name: Deploy Cloudflare Worker API (staging env) + Admin SPA assets
+    needs: migrate-staging
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Build API bundle and Admin SPA
+        run: pnpm run build
+
+      - name: Deploy Worker API (staging env) to Cloudflare
+        # --env staging selects apps/api/wrangler.jsonc env.staging:
+        # Worker name stackmate-api-staging, staging Hyperdrive
+        # bindings, R2 bucket, and the admin SPA served as static
+        # assets from ../../apps/admin/dist (built by the step above).
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: pnpm --filter @stackmate/api exec wrangler deploy --env staging
+
+      - name: Guard deployed staging API URL variable
+        run: |
+          if [ -z "${{ vars.STACKMATE_STAGING_API_URL }}" ]; then
+            echo "ERROR: vars.STACKMATE_STAGING_API_URL is not set. Set the deployed staging API base URL (e.g. https://stackmate-api-staging.<subdomain>.workers.dev) as a staging environment variable."
+            exit 1
+          fi
+
+      - name: Live smoke check against the deployed staging API
+        run: curl -fsS "${{ vars.STACKMATE_STAGING_API_URL }}/api/v1/health"
+
+      - name: Live smoke check against the deployed staging Admin SPA
+        # Same origin as the API (Worker static assets).
+        run: curl -fsS "${{ vars.STACKMATE_STAGING_API_URL }}"
