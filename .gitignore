@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build outputs
+dist/
+build/
+coverage/
+.turbo/
+.wrangler/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+
+# Logs and temporary files
+*.log
+*.tmp
+.DS_Store
+*.swp
+
+# Local databases and generated artifacts
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.backup
+
+# Editors
+.idea/
+.vscode/*
+!.vscode/extensions.json
