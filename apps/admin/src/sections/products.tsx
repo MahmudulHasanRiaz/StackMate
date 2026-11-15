@@ -399,14 +399,7 @@ function CreateProductDialog({
             />
           </Field>
         </div>
-        <fieldset
-          style={{
-            marginTop: 16,
-            border: "1px solid var(--sm-border)",
-            borderRadius: "var(--sm-radius-md)",
-            padding: 12,
-          }}
-        >
+        <fieldset className="sm-bordered-card" style={{ marginTop: 16 }}>
           <legend className="sm-label">Distribution channels</legend>
           <span className="sm-hint">Leave all unchecked to use the server default.</span>
           <div
@@ -733,7 +726,7 @@ export function ProductDetailSection({ id }: { id: string }) {
           breadcrumb={[{ label: "Products", href: "/products" }, { label: "…" }]}
           title="Product"
         />
-        <div className="sm-table-wrap" style={{ padding: 16 }}>
+        <div className="sm-table-wrap sm-table-wrap-pad">
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             <div style={{ height: 20, width: "40%" }} className="sm-skeleton" />
             <div style={{ height: 20, width: "70%" }} className="sm-skeleton" />

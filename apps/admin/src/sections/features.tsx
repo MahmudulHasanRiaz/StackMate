@@ -983,7 +983,7 @@ export function FeaturesSection() {
         }
       />
       {productsQuery.isPending ? (
-        <div className="sm-table-wrap" style={{ padding: 16 }}>
+        <div className="sm-table-wrap sm-table-wrap-pad">
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             <div style={{ height: 20, width: "40%" }} className="sm-skeleton" />
             <div style={{ height: 20, width: "70%" }} className="sm-skeleton" />
@@ -1314,8 +1314,8 @@ export function FeatureDetailSection({ id }: { id: string }) {
             breadcrumb={[{ label: "Features", href: "/features" }, { label: "…" }]}
             title="Feature"
           />
-          <div className="sm-table-wrap" style={{ padding: 16 }}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div className="sm-table-wrap sm-table-wrap-pad">
+            <div className="sm-stack-sm">
               <div style={{ height: 20, width: "40%" }} className="sm-skeleton" />
               <div style={{ height: 20, width: "70%" }} className="sm-skeleton" />
             </div>
@@ -1346,7 +1346,7 @@ export function FeatureDetailSection({ id }: { id: string }) {
           breadcrumb={[{ label: "Features", href: "/features" }, { label: "…" }]}
           title="Feature"
         />
-        <div className="sm-table-wrap" style={{ padding: 16 }}>
+        <div className="sm-table-wrap sm-table-wrap-pad">
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             <div style={{ height: 20, width: "40%" }} className="sm-skeleton" />
             <div style={{ height: 20, width: "70%" }} className="sm-skeleton" />

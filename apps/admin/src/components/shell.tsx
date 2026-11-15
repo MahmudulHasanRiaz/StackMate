@@ -59,6 +59,7 @@ import {
   Settings as SettingsIcon,
   ShieldCheck,
   ShoppingCart,
+  SunMoon,
   Tags,
   User,
   Users,
@@ -82,6 +83,8 @@ import {
   MenuHeader,
   MenuItem,
   MenuSectionLabel,
+  MenuSub,
+  StatusBadge,
   useToast,
 } from "./primitives";
 import { SETTINGS_CATEGORIES } from "../sections/settings";
@@ -268,7 +271,7 @@ function MainNav({
         </span>
         <span className="sm-brand-name">StackMate</span>
       </div>
-      <nav style={{ flex: 1 }}>
+      <nav className="sm-flex-1">
         {visibleGroups.map((group, i) => (
           <div key={group.group}>
             {i > 0 ? <div className="sm-nav-divider" aria-hidden="true" /> : null}
@@ -414,7 +417,7 @@ function QuickNav() {
         }}
         title="Quick navigation"
       >
-        <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        <div className="sm-stack-sm">
           <Input
             autoFocus
             value={query}
@@ -531,7 +534,7 @@ function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }
         </>
       }
     >
-      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div className="sm-stack">
         {error ? <Alert variant="danger">{error}</Alert> : null}
         <Field label="Name" required error={fieldError} htmlFor="profile-name">
           <Input
@@ -632,11 +635,11 @@ function PasswordDialog({ open, onClose }: { open: boolean; onClose: () => void 
         </>
       }
     >
-      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-        <p className="sm-hint" style={{ margin: 0 }}>
+      <div className="sm-stack">
+        <div className="sm-hint">
           Changing your password signs out your other sessions. This session
           stays signed in.
-        </p>
+        </div>
         {error ? <Alert variant="danger">{error}</Alert> : null}
         <Field label="Current password" required htmlFor="pw-current">
           <Input
@@ -695,6 +698,38 @@ const THEME_CHOICES: { key: ThemeChoice; label: string }[] = [
   { key: "light", label: "Light" },
 ];
 
+/* API status for the account menu (Neon "Status — All OK" pill, image-78).
+   One GET /api/v1/health per session, cached at module level so both
+   shells share it. Honest values only: "checking" until the fetch
+   settles, then "ok" (HTTP 200) or "down" (anything else). */
+let apiHealthPromise: Promise<boolean> | null = null;
+function fetchApiHealth(): Promise<boolean> {
+  if (!apiHealthPromise) {
+    apiHealthPromise = apiRequest<unknown>("/api/v1/health")
+      .then(() => true)
+      .catch(() => false);
+  }
+  return apiHealthPromise;
+}
+type ApiStatus = "checking" | "ok" | "down";
+function useApiStatus(): ApiStatus {
+  const [status, setStatus] = useState<ApiStatus>("checking");
+  useEffect(() => {
+    let alive = true;
+    void fetchApiHealth().then((ok) => {
+      if (alive) setStatus(ok ? "ok" : "down");
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  return status;
+}
+
+/* The account menu (Neon image-78): avatar + name + chevron opens a
+   square dark menu with sections — header (avatar, name, email, roles),
+   "Manage" (Profile, Change password, Settings, Theme submenu), a live
+   API Status row (one GET /api/v1/health per session), then Sign out. */
 function AccountMenu() {
   const { principal, signOut } = useAuth();
   const navigate = useNavigate();
@@ -703,6 +738,7 @@ function AccountMenu() {
   const [themeChoice, setThemeChoice] = useState<ThemeChoice>(() =>
     resolveThemeChoice(),
   );
+  const apiStatus = useApiStatus();
 
   const chooseTheme = (choice: ThemeChoice) => {
     setThemeChoice(choice);
@@ -724,25 +760,14 @@ function AccountMenu() {
       >
         <MenuHeader>
           <Avatar name={principal.user.name} size="lg" />
-          <div style={{ minWidth: 0 }}>
+          <div className="sm-menu-header-body">
             <div className="sm-menu-header-name">{principal.user.name}</div>
             <div className="sm-menu-header-sub">{principal.user.email}</div>
             <div className="sm-menu-header-sub">{principal.roles.join(", ")}</div>
           </div>
         </MenuHeader>
         <MenuDivider />
-        <MenuSectionLabel>Theme</MenuSectionLabel>
-        {THEME_CHOICES.map((choice) => (
-          <MenuItem
-            key={choice.key}
-            role="menuitemradio"
-            checked={themeChoice === choice.key}
-            onClick={() => chooseTheme(choice.key)}
-          >
-            {choice.label}
-          </MenuItem>
-        ))}
-        <MenuDivider />
+        <MenuSectionLabel>Manage</MenuSectionLabel>
         <MenuItem icon={User} onClick={() => setProfileOpen(true)}>
           Profile
         </MenuItem>
@@ -752,6 +777,28 @@ function AccountMenu() {
         <MenuItem icon={SettingsIcon} onClick={() => void navigate({ to: "/settings" })}>
           Settings
         </MenuItem>
+        <MenuSub icon={SunMoon} label="Theme">
+          {THEME_CHOICES.map((choice) => (
+            <MenuItem
+              key={choice.key}
+              role="menuitemradio"
+              checked={themeChoice === choice.key}
+              onClick={() => chooseTheme(choice.key)}
+            >
+              {choice.label}
+            </MenuItem>
+          ))}
+        </MenuSub>
+        <div className="sm-menu-status-row" role="status">
+          <span className="sm-menu-item-label">Status</span>
+          {apiStatus === "ok" ? (
+            <StatusBadge status="active" label="All OK" />
+          ) : apiStatus === "down" ? (
+            <StatusBadge status="failed" label="Unavailable" />
+          ) : (
+            <StatusBadge status="pending" label="Checking…" />
+          )}
+        </div>
         <MenuDivider />
         <MenuItem icon={LogOut} danger onClick={() => void signOut()}>
           Sign out
@@ -805,9 +852,9 @@ export function MainShell() {
             className="sm-hamburger"
             onClick={() => setDrawerOpen((v) => !v)}
           />
-          <div style={{ flex: 1 }} />
+          <div className="sm-topbar-spacer" />
           <QuickNav />
-          <div style={{ flex: 1 }} />
+          <div className="sm-topbar-spacer" />
           <AccountMenu />
         </header>
         <main className="sm-content">
@@ -858,7 +905,7 @@ export function SettingsShell() {
           </span>
           <span className="sm-brand-name">Settings</span>
         </div>
-        <nav style={{ flex: 1 }}>
+        <nav className="sm-flex-1">
           <div className="sm-nav-group-label">Categories</div>
           {SETTINGS_CATEGORIES.map((cat) => (
             <Link
@@ -874,7 +921,7 @@ export function SettingsShell() {
             </Link>
           ))}
         </nav>
-        <div style={{ borderTop: "1px solid var(--sm-border)", paddingTop: 12 }}>
+        <div className="sm-settings-back">
           <Link to="/" className="sm-nav-btn">
             <ArrowLeft size={16} strokeWidth={2} />
             <span className="sm-nav-label">Back to admin</span>
@@ -890,10 +937,10 @@ export function SettingsShell() {
             className="sm-hamburger"
             onClick={() => setNavOpen((v) => !v)}
           />
-          <span style={{ fontSize: 13, color: "var(--sm-text-muted)" }}>
+          <span className="sm-hint">
             Settings — contents pending owner decision
           </span>
-          <div style={{ flex: 1 }} />
+          <div className="sm-topbar-spacer" />
           <QuickNav />
           <AccountMenu />
         </header>

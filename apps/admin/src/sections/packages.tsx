@@ -297,14 +297,7 @@ function FeatureGrantsEditor({
       {features.map((f) => {
         const draft = drafts[f.id] ?? grantDraftFromFeature(f);
         return (
-          <div
-            key={f.id}
-            style={{
-              border: "1px solid var(--sm-border)",
-              borderRadius: "var(--sm-radius-md)",
-              padding: 12,
-            }}
-          >
+          <div key={f.id} className="sm-bordered-card">
             <Checkbox
               label={`${f.name} (${f.feature_key})`}
               checked={draft.included}
@@ -890,7 +883,7 @@ export function PackagesSection() {
         }
       />
       {productsQuery.isPending ? (
-        <div className="sm-table-wrap" style={{ padding: 16 }}>
+        <div className="sm-table-wrap sm-table-wrap-pad">
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             <div style={{ height: 20, width: "40%" }} className="sm-skeleton" />
             <div style={{ height: 20, width: "70%" }} className="sm-skeleton" />
@@ -1728,7 +1721,7 @@ export function PackageDetailSection({ id }: { id: string }) {
           breadcrumb={[{ label: "Packages & Pricing", href: "/packages" }, { label: "…" }]}
           title="Package"
         />
-        <div className="sm-table-wrap" style={{ padding: 16 }}>
+        <div className="sm-table-wrap sm-table-wrap-pad">
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
             <div style={{ height: 20, width: "40%" }} className="sm-skeleton" />
             <div style={{ height: 20, width: "70%" }} className="sm-skeleton" />

@@ -121,3 +121,42 @@ automatically. The smoke harness caught one of its own bugs during
 this batch (two "Next" buttons — ListTable pager + wizard footer —
 `byText` returned the pager; wizard button lookups are now
 dialog-scoped) — a harness artifact, not a product bug.
+
+## 6. Neon CORE pass — tokens + primitives first (2026-11-16, uncommitted)
+
+Owner verdict (2026-11-16 ~01:40 +06): "Does Neon use a direct green
+button anywhere like yours?" (No.) + "You still couldn't leave the
+radius-type design styling structure." The previous passes capped
+tokens and fixed instances while the FOUNDATION stayed round and
+green. This pass changes the six core systems in `tokens.css` +
+`primitives.tsx` + `section-kit.tsx` + `shell.tsx`; every screen is
+built from these, so the whole design follows in one flow. No nav
+items move. Owner button spec (2026-11-16 ~01:41 +06, images 80/81/82):
+exactly three variants — PRIMARY solid white/black, SECONDARY
+transparent + grey border, ACCENT green outline for brand CTAs only.
+References: `~/workspace/stackmate-work/neon-gap-audit.md` (C1–C6) +
+screenshots image-73/76/77/78/79/80/81/82.
+
+| # | Task | Affected paths | Acceptance criteria |
+| :--- | :--- | :--- | :--- |
+| 1 | Button system — exactly 3 variants, no solid green fill | `apps/admin/src/styles/tokens.css` (new `--sm-btn-primary-bg/text/hover` per theme), `apps/admin/src/components/primitives.tsx` (`ButtonVariant` gains `"accent"`) | PRIMARY dark = white `#ffffff` bg + black `#000000` text (hover `#e5e5e5`), light = black `#0f172a` bg + white text (the inversion); SECONDARY = transparent bg + 1px light-grey border + white text; ACCENT = transparent bg + 1px green border + green text, brand CTAs only; DANGER renders as secondary (Neon shows no danger button); RowMenu trigger = bordered secondary square 26px; all ~6px radius, ~30px height, 13–14px Inter. All 87 primary/danger call sites change by the primitive alone. Built-CSS check: zero `.sm-btn-*` rules with a solid green fill |
+| 2 | Radius STRUCTURE goes (not a cap) | `tokens.css` | `.sm-avatar` / `.sm-account-btn` / `.sm-chip` 999px → 6px square; 999px survives ONLY for `.sm-badge` (true status pill + dot), `.sm-badge-dot`, `.sm-spinner` — exactly 3 occurrences in the built CSS |
+| 3 | Color-application rule (one rule, everywhere) | `tokens.css` | `--sm-text-muted` dark `#9ca3af` → `#B0B1B2` (measured from image-79 inspector, contrast 8.65); light stays `#475569` (`#B0B1B2` on white would fail contrast); active nav icon → green (image-76), text stays white; green appears ONLY as accent-outline button border/text, links, active-nav icon, logo mark, status dots, focus ring — never a solid fill |
+| 4 | Typography scale | `tokens.css` | Secondary text 13px `#B0B1B2` everywhere (all `12.5px` → 13px, 10 rules; no 12.5px remains); group/section labels 11px UPPERCASE + tracking → 12px normal case; menu items 14px → 13px; Inter Variable, base 14px |
+| 5 | Primitives layer + account menu (image-78) | `primitives.tsx` (new `MenuSub` — fly-out to the LEFT, 150ms close delay bridging the 4px gap, hover/click/Enter/ArrowRight open, ArrowLeft close; `RowMenu` trigger class; token classes replace every primitive one-off: `.sm-check-label`, `.sm-card-head`, `.sm-breadcrumb-item`, `.sm-select-sm` 28px → 26px, `.sm-toast-icon`, `.sm-flex-1`, `.sm-table-skeleton`, `.sm-topbar-spacer`, `.sm-settings-back`, `.sm-menu-header-body`), `shell.tsx` (AccountMenu restructured: header → "Manage" → Profile / Change password / Settings / Theme submenu / Status row → Sign out; `useApiStatus` — one `GET /api/v1/health` per session, module-cached, honest "All OK" / "Checking…" / "Unavailable" pill), `tokens.css` (new `.sm-stack` / `.sm-stack-sm` stack-gap primitives — the gap the product-flow batch noted as absent) | Account menu mirrors Neon's structure using the fixed Menu primitive, not a custom build; theme choice lives ONLY in the submenu; Status pill is a real live check, never hardcoded. `shell.tsx` has ZERO inline styles after this pass; the only inline styles left in `primitives.tsx` are the two genuinely dynamic ones (RowMenu portal position, Skeleton height/width props) |
+| 6 | Layout skeleton | — (no change) | Already at target: topbar 48px, sidebar 248px / rail 64px, content 20px, PageHeader title-first 24px + breadcrumb under, ListTable full-width search, white semibold table headers |
+| 7 | Section sweep (one-off overrides → core) | `apps/admin/src/sections/products.tsx`, `packages.tsx`, `features.tsx` (+ `payment-methods.tsx`, `payment-review.tsx` for the shared class) | Grep-verified: sections contain ZERO color/radius/font-size inline overrides, ZERO hardcoded hex, ZERO `sm-accent` references. Repeated patterns converted to token classes: 8× `padding: 16` on `.sm-table-wrap` → `.sm-table-wrap-pad`; feature-detail skeleton stack → `.sm-stack-sm`; products fieldset + packages grant cards (token border + token radius) → `.sm-bordered-card`. The ~120 remaining inline styles are layout spacing ON the 4px scale, deliberately kept (not pattern violations). The product-flow screens (features picker/bulk, packages wizard) inherit the core fix with NO edits of their own |
+| 8 | Verification | — | Full `verify-batch1.sh` green (vitest 102/102, 13 files; tsc api+admin; vite build chunk `index-BhUs9wnY.js`; lint-repo 141 files; check-migrations 65 tables / 6 migrations; wrangler dry-run staging; pnpm frozen-lockfile skipped locally — CI runs it); jsdom smoke **76/76** (was 73/73 — harness updated for the Theme submenu flow + Status pill; +3 new checks); computed-style probe **45/45** on the built CSS (`~/workspace/stackmate-work/neon-core-pass/probe-computed.mjs`, resolves every `var(--sm-*)` against both theme token blocks); before/after table in `~/workspace/stackmate-work/neon-core-pass/computed-styles.md`. **No pixel screenshots** — no headless browser exists in this environment; pixel confirmation is the parent's browser re-test |
+
+Risks / noted gaps (for the parent's browser re-test, not this batch):
+light-mode primary is the inversion by rule (Neon light theme was never
+screenshotted — verify it reads as premium, not heavy, on a real light
+screen); the Theme submenu fly-out direction (left) + 150ms hover
+bridge need a real pointer to confirm they feel right; danger buttons
+now look like secondary (Cancel vs Delete differ only by label — owner
+decision if a distinct destructive style is wanted); ACCENT has no call
+sites yet (no brand/Connect-style CTA exists in the admin today);
+right inspector rail (G7) still not built; staging latency unchanged
+(~2s/call — p95 <1s target still not met); the white-primary decision
+in §5 ("primary button color stays green — decision OPEN") is now
+CLOSED by this pass (owner answered 2026-11-16 ~01:40–01:41 +06).

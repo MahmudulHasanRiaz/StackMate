@@ -27,6 +27,7 @@ import {
   AlertTriangle,
   Check,
   CheckCircle2,
+  ChevronRight,
   Copy,
   Info,
   MoreHorizontal,
@@ -47,11 +48,15 @@ export function Spinner() {
 }
 
 /* ------------------------------------------------------------------ */
-/* Button — exactly five variants (spec §3.1). One primary per page.    */
+/* Button — six variants (Neon button system, images 80/81/82). One    */
+/* primary per page. PRIMARY is white/black, SECONDARY is a grey       */
+/* outline, ACCENT is a green outline for brand CTAs only. DANGER      */
+/* renders as secondary (Neon shows no danger button).                 */
 /* ------------------------------------------------------------------ */
 type ButtonVariant =
   | "primary"
   | "secondary"
+  | "accent"
   | "danger"
   | "ghost"
   | "danger-ghost";
@@ -184,15 +189,7 @@ export function Checkbox({
   ...props
 }: InputHTMLAttributes<HTMLInputElement> & { label: string }) {
   return (
-    <label
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 8,
-        fontSize: 14,
-        cursor: "pointer",
-      }}
-    >
+    <label className="sm-check-label">
       <input type="checkbox" className="sm-checkbox" {...props} />
       {label}
     </label>
@@ -204,15 +201,7 @@ export function Switch({
   ...props
 }: InputHTMLAttributes<HTMLInputElement> & { label: string }) {
   return (
-    <label
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 8,
-        fontSize: 14,
-        cursor: "pointer",
-      }}
-    >
+    <label className="sm-check-label">
       <input type="checkbox" role="switch" className="sm-switch" {...props} />
       {label}
     </label>
@@ -322,15 +311,7 @@ export function Card({
   return (
     <section className="sm-card">
       {title ? (
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 12,
-            marginBottom: 16,
-          }}
-        >
+        <div className="sm-card-head">
           <h2 className="sm-card-title">{title}</h2>
           {actions}
         </div>
@@ -438,7 +419,7 @@ export function Pagination({
             value={pageSize}
             onChange={(e) => onPageSizeChange(Number(e.target.value))}
             aria-label="Rows per page"
-            style={{ width: "auto", height: 28, fontSize: 13 }}
+            className="sm-select-sm"
           >
             {[25, 50, 100].map((n) => (
               <option key={n} value={n}>
@@ -482,7 +463,7 @@ export function Breadcrumb({
   return (
     <nav className="sm-breadcrumb" aria-label="Breadcrumb">
       {items.map((item, i) => (
-        <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+        <span key={i} className="sm-breadcrumb-item">
           {i > 0 ? <span aria-hidden="true">/</span> : null}
           {item.href ? (
             <a href={item.href}>{item.label}</a>
@@ -526,7 +507,8 @@ export function CopyButton({ value, label }: { value: string; label?: string }) 
 }
 
 /* ------------------------------------------------------------------ */
-/* Avatar — initials circle (account menu).                            */
+/* Avatar — initials square tile (account menu; Neon uses square       */
+/* tiles, not circles — CORE pass C2).                                 */
 /* ------------------------------------------------------------------ */
 function getInitials(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean);
@@ -707,6 +689,97 @@ export function MenuItem({
 }
 
 /* ------------------------------------------------------------------ */
+/* MenuSub — a submenu row inside a Menu (Neon account menu "Theme",   */
+/* image-78). The fly-out opens to the LEFT of the menu (the account   */
+/* menu sits at the right edge). Hover opens it; click/Enter toggles;  */
+/* ArrowRight opens, ArrowLeft closes. A 150ms close delay bridges    */
+/* the 4px gap between the trigger row and the panel so the pointer    */
+/* can travel across it without the submenu vanishing.                 */
+/* ------------------------------------------------------------------ */
+export function MenuSub({
+  icon: Icon,
+  label,
+  children,
+}: {
+  icon?: LucideIcon;
+  label: string;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const closeTimer = useRef<number | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const cancelClose = useCallback(() => {
+    if (closeTimer.current !== null) {
+      window.clearTimeout(closeTimer.current);
+      closeTimer.current = null;
+    }
+  }, []);
+  const scheduleClose = useCallback(() => {
+    cancelClose();
+    closeTimer.current = window.setTimeout(() => setOpen(false), 150);
+  }, [cancelClose]);
+  const openSub = useCallback(() => {
+    cancelClose();
+    setOpen(true);
+  }, [cancelClose]);
+
+  useEffect(
+    () => () => {
+      if (closeTimer.current !== null) window.clearTimeout(closeTimer.current);
+    },
+    [],
+  );
+
+  return (
+    <div
+      className="sm-menu-sub-wrap"
+      onMouseEnter={openSub}
+      onMouseLeave={scheduleClose}
+    >
+      <button
+        type="button"
+        ref={triggerRef}
+        role="menuitem"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className="sm-menu-item"
+        onClick={() => (open ? scheduleClose() : openSub())}
+        onKeyDown={(e) => {
+          if (e.key === "ArrowRight" || e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            openSub();
+          } else if (e.key === "ArrowLeft") {
+            e.preventDefault();
+            setOpen(false);
+          }
+        }}
+      >
+        {Icon ? <Icon size={16} strokeWidth={2} /> : null}
+        <span className="sm-menu-item-label">{label}</span>
+        <ChevronRight size={16} strokeWidth={2} aria-hidden="true" />
+      </button>
+      {open ? (
+        <div
+          className="sm-menu-sub"
+          role="menu"
+          aria-label={label}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowLeft") {
+              e.preventDefault();
+              setOpen(false);
+              triggerRef.current?.focus();
+            }
+          }}
+        >
+          {children}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* RowMenu — the "…" per-row action menu (Neon Branches pattern).       */
 /* A table with 2+ row actions gets ONE "…" button per row instead of  */
 /* a run of inline buttons; single-action tables keep their inline     */
@@ -823,7 +896,7 @@ export function RowMenu({
       <button
         type="button"
         ref={triggerRef}
-        className="sm-btn sm-btn-ghost sm-btn-icon"
+        className="sm-btn sm-btn-secondary sm-btn-icon"
         aria-haspopup="menu"
         aria-expanded={open}
         aria-label={label}
@@ -983,7 +1056,7 @@ export function Drawer({
           <h2 className="sm-section-title">{title}</h2>
           <IconButton label="Close drawer" icon={X} onClick={onClose} />
         </div>
-        <div className="sm-dialog-body" style={{ flex: 1 }}>
+        <div className="sm-dialog-body sm-flex-1">
           {children}
         </div>
       </aside>
@@ -1083,7 +1156,7 @@ export function Alert({
       role={role ?? (variant === "danger" ? "alert" : "status")}
     >
       <Icon size={16} strokeWidth={2} />
-      <div style={{ flex: 1 }}>{children}</div>
+      <div className="sm-flex-1">{children}</div>
       {onDismiss ? (
         <button
           type="button"
@@ -1163,8 +1236,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               className="sm-toast"
               role={t.variant === "danger" ? "alert" : "status"}
             >
-              <Icon size={16} strokeWidth={2} style={{ marginTop: 2, flex: "none" }} />
-              <div style={{ flex: 1 }}>
+              <Icon size={16} strokeWidth={2} className="sm-toast-icon" />
+              <div className="sm-flex-1">
                 <div className="sm-toast-title">{t.title}</div>
                 {t.message ? <div className="sm-toast-message">{t.message}</div> : null}
               </div>
@@ -1200,7 +1273,7 @@ export function Skeleton({ height = 16, width }: { height?: number; width?: stri
 export function TableSkeleton({ rows = 5 }: { rows?: number }) {
   return (
     <div className="sm-table-wrap" aria-label="Loading">
-      <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 12 }}>
+      <div className="sm-table-skeleton">
         {Array.from({ length: rows }).map((_, i) => (
           <Skeleton key={i} height={20} />
         ))}

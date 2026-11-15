@@ -649,7 +649,7 @@ export function PaymentSubmissionDetailSection({ id }: { id: string }) {
           breadcrumb={[{ label: "Commerce" }, { label: "Payment Review", href: "/payment-review" }, { label: "…" }]}
           title="Payment submission"
         />
-        <div className="sm-table-wrap" style={{ padding: 16 }}>
+        <div className="sm-table-wrap sm-table-wrap-pad">
           <Skeleton height={20} width="40%" />
           <div style={{ marginTop: 12 }}>
             <Skeleton height={16} />
