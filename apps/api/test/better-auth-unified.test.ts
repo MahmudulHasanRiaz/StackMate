@@ -30,6 +30,10 @@ import {
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const AUTH_DB_NAME = "stackmate_test_auth";
+// Test-only fixture value (never a real secret): the operator-set
+// SETUP_TOKEN that gates POST /api/auth/bootstrap-super-admin.
+const TEST_SETUP_TOKEN =
+  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const MIGRATIONS_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../../../db/migrations"
@@ -111,7 +115,7 @@ describe.skipIf(!DATABASE_URL)("Better Auth unified staff auth (Postgres)", () =
       url.pathname.replace(/^\//, "").includes("test"),
       "Refusing to run: DATABASE_URL database name must contain 'test'."
     );
-    env = resolveRuntimeConfig({ APP_ENV: "test" });
+    env = resolveRuntimeConfig({ APP_ENV: "test", SETUP_TOKEN: TEST_SETUP_TOKEN });
 
     // Fresh, hermetic database for this suite.
     const maintenanceUrl = new URL(DATABASE_URL);
@@ -162,7 +166,7 @@ describe.skipIf(!DATABASE_URL)("Better Auth unified staff auth (Postgres)", () =
     const email = `${uniq("super")}@example.com`;
     const res = await apiRequest("/api/auth/bootstrap-super-admin", {
       method: "POST",
-      body: { name: "Super Admin", email, password: "SuperAdminPass123!" },
+      body: { name: "Super Admin", email, password: "SuperAdminPass123!", setupToken: TEST_SETUP_TOKEN },
     });
     assert.equal(res.status, 201, JSON.stringify(res.body));
     assert.equal(

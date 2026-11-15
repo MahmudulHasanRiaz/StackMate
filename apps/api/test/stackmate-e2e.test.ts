@@ -27,13 +27,17 @@ import {
 import { verifyFileMagicBytes } from "../src/platform/storage/r2";
 
 describe("StackMate End-to-End Domain, Security, Concurrency & Hyperdrive Test Suite (in-memory test adapter — NOT Postgres)", () => {
+  // Test-only fixture value (never a real secret): the operator-set
+  // SETUP_TOKEN that gates POST /api/auth/bootstrap-super-admin.
+  const TEST_SETUP_TOKEN =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
   let store: StackMateDataStore;
   let app: ReturnType<typeof createStackMateApp>;
   let env: ReturnType<typeof resolveRuntimeConfig>;
 
   beforeEach(() => {
     store = new StackMateDataStore();
-    env = resolveRuntimeConfig({ APP_ENV: "test" });
+    env = resolveRuntimeConfig({ APP_ENV: "test", SETUP_TOKEN: TEST_SETUP_TOKEN });
     app = createStackMateApp(store);
   });
 
@@ -73,6 +77,7 @@ describe("StackMate End-to-End Domain, Security, Concurrency & Hyperdrive Test S
         name: "Mahmudul Hasan Riaz",
         email: "admin@stackmate.local",
         password: "StackMate#SuperAdmin2026!",
+        setupToken: TEST_SETUP_TOKEN,
       }),
     });
     assert.equal(bootRes.status, 201);

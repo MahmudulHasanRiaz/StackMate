@@ -115,6 +115,26 @@ export function App() {
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [emailInput, setEmailInput] = useState("");
   const [passwordInput, setPasswordInput] = useState("");
+  // First-admin setup (Security, 2026-11-15): the setup form is shown
+  // ONLY when GET /api/v1/setup-status positively says setup is
+  // required. Any fetch error fails closed toward the sign-in form.
+  const [setupStatus, setSetupStatus] = useState<"loading" | "required" | "not-required">(
+    "loading"
+  );
+  const [setupName, setSetupName] = useState("");
+  const [setupEmail, setSetupEmail] = useState("");
+  const [setupPassword, setSetupPassword] = useState("");
+  const [setupTokenInput, setSetupTokenInput] = useState("");
+  const [setupSuccess, setSetupSuccess] = useState<string | null>(null);
+
+  async function loadSetupStatus() {
+    try {
+      const res = await apiRequest<{ setup_required: boolean }>("/api/v1/setup-status");
+      setSetupStatus(res.setup_required ? "required" : "not-required");
+    } catch {
+      setSetupStatus("not-required");
+    }
+  }
 
   async function loadInitialSession() {
     try {
@@ -129,7 +149,32 @@ export function App() {
 
   useEffect(() => {
     void loadInitialSession();
+    void loadSetupStatus();
   }, []);
+
+  async function handleSetupSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setErrorBanner(null);
+    setSetupSuccess(null);
+    try {
+      await apiRequest("/api/auth/bootstrap-super-admin", {
+        method: "POST",
+        body: JSON.stringify({
+          name: setupName,
+          email: setupEmail,
+          password: setupPassword,
+          setupToken: setupTokenInput,
+        }),
+      });
+      setSetupSuccess("First admin created. Sign in with the new account.");
+      setSetupStatus("not-required");
+      setEmailInput(setupEmail);
+      setSetupPassword("");
+      setSetupTokenInput("");
+    } catch (err) {
+      setErrorBanner((err as Error).message);
+    }
+  }
 
   async function handleSignIn(e: React.FormEvent) {
     e.preventDefault();
@@ -204,8 +249,17 @@ export function App() {
       >
         <section className="sm-card" style={{ width: "100%", maxWidth: "400px" }}>
           <h1 className="sm-page-title" style={{ marginBottom: "16px" }}>
-            StackMate Staff Sign In
+            {setupStatus === "required" ? "Set up your first admin" : "StackMate Staff Sign In"}
           </h1>
+          {setupSuccess ? (
+            <div
+              role="status"
+              className="sm-badge sm-badge-success"
+              style={{ display: "block", marginBottom: "12px", padding: "8px 12px" }}
+            >
+              {setupSuccess}
+            </div>
+          ) : null}
           {errorBanner ? (
             <div
               role="alert"
@@ -215,6 +269,74 @@ export function App() {
               {errorBanner}
             </div>
           ) : null}
+          {setupStatus === "loading" ? (
+            <div style={{ fontSize: "14px", color: "var(--sm-text-muted)" }}>Loading…</div>
+          ) : setupStatus === "required" ? (
+            <form onSubmit={handleSetupSubmit} style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+              <div style={{ fontSize: "13px", color: "var(--sm-text-muted)" }}>
+                No admin account exists yet. Create the first one — this form
+                appears only once. The setup token is the secret set by the
+                owner in the Cloudflare dashboard (Worker secret SETUP_TOKEN).
+              </div>
+              <div className="sm-field">
+                <label className="sm-label" htmlFor="sm-setup-name">
+                  Name
+                </label>
+                <input
+                  id="sm-setup-name"
+                  type="text"
+                  className="sm-input"
+                  required
+                  value={setupName}
+                  onChange={(e) => setSetupName(e.target.value)}
+                />
+              </div>
+              <div className="sm-field">
+                <label className="sm-label" htmlFor="sm-setup-email">
+                  Email
+                </label>
+                <input
+                  id="sm-setup-email"
+                  type="email"
+                  className="sm-input"
+                  required
+                  value={setupEmail}
+                  onChange={(e) => setSetupEmail(e.target.value)}
+                />
+              </div>
+              <div className="sm-field">
+                <label className="sm-label" htmlFor="sm-setup-password">
+                  Password (at least 10 characters)
+                </label>
+                <input
+                  id="sm-setup-password"
+                  type="password"
+                  className="sm-input"
+                  required
+                  minLength={10}
+                  value={setupPassword}
+                  onChange={(e) => setSetupPassword(e.target.value)}
+                />
+              </div>
+              <div className="sm-field">
+                <label className="sm-label" htmlFor="sm-setup-token">
+                  Setup token
+                </label>
+                <input
+                  id="sm-setup-token"
+                  type="password"
+                  className="sm-input"
+                  required
+                  autoComplete="off"
+                  value={setupTokenInput}
+                  onChange={(e) => setSetupTokenInput(e.target.value)}
+                />
+              </div>
+              <button type="submit" className="sm-btn sm-btn-primary" style={{ justifyContent: "center" }}>
+                Create first admin
+              </button>
+            </form>
+          ) : (
           <form onSubmit={handleSignIn} style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
             <div className="sm-field">
               <label className="sm-label" htmlFor="sm-email">
@@ -246,6 +368,7 @@ export function App() {
               Sign In
             </button>
           </form>
+          )}
         </section>
       </main>
     );

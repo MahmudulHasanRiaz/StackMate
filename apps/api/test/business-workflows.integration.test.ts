@@ -65,6 +65,10 @@ const uniq = (prefix: string) =>
 
 const SUPER_EMAIL = "biz-super-admin@stackmate.local";
 const SUPER_PASSWORD = "BizSuperAdminPass123!";
+// Test-only fixture value (never a real secret): the operator-set
+// SETUP_TOKEN that gates POST /api/auth/bootstrap-super-admin.
+const TEST_SETUP_TOKEN =
+  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const FINANCE_EMAIL = "biz-finance@stackmate.local";
 const FINANCE_PASSWORD = "BizFinancePass123!";
 const READONLY_EMAIL = "biz-readonly@stackmate.local";
@@ -180,7 +184,7 @@ describe.skipIf(!DATABASE_URL)("Business workflows (Postgres)", () => {
       url.pathname.replace(/^\//, "").includes("test"),
       "Refusing to run: DATABASE_URL database name must contain 'test'."
     );
-    env = resolveRuntimeConfig({ APP_ENV: "test" });
+    env = resolveRuntimeConfig({ APP_ENV: "test", SETUP_TOKEN: TEST_SETUP_TOKEN });
 
     const maintenanceUrl = new URL(DATABASE_URL);
     maintenanceUrl.pathname = "/postgres";
@@ -239,7 +243,7 @@ describe.skipIf(!DATABASE_URL)("Business workflows (Postgres)", () => {
     // Bootstrap the first super admin (fresh DB: no staff exists yet).
     const boot = await apiRequest("/api/auth/bootstrap-super-admin", {
       method: "POST",
-      body: { name: "Biz Super Admin", email: SUPER_EMAIL, password: SUPER_PASSWORD },
+      body: { name: "Biz Super Admin", email: SUPER_EMAIL, password: SUPER_PASSWORD, setupToken: TEST_SETUP_TOKEN },
     });
     assert.equal(boot.status, 201, JSON.stringify(boot.body));
     superCookie = await signIn(SUPER_EMAIL, SUPER_PASSWORD);
@@ -250,7 +254,7 @@ describe.skipIf(!DATABASE_URL)("Business workflows (Postgres)", () => {
     // Second bootstrap must fail: exactly one super admin can be bootstrapped.
     const bootAgain = await apiRequest("/api/auth/bootstrap-super-admin", {
       method: "POST",
-      body: { name: "Second", email: "second@stackmate.local", password: "SecondPass123!" },
+      body: { name: "Second", email: "second@stackmate.local", password: "SecondPass123!", setupToken: TEST_SETUP_TOKEN },
     });
     assert.notEqual(bootAgain.status, 201, "bootstrap must be one-time only");
 

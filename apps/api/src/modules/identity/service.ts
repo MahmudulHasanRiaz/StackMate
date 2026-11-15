@@ -197,6 +197,23 @@ export async function bootstrapInitialSuperAdmin(
   });
 }
 
+/**
+ * Read-only check used by GET /api/v1/setup-status: true once a
+ * super_admin exists, false otherwise. Uses the SAME single source of
+ * truth as bootstrapInitialSuperAdmin (a user_roles row for the
+ * super_admin role), read inside withTransaction so the answer is fresh
+ * (state is reloaded from the database inside the transaction). A missing
+ * super_admin role means no super admin can exist yet, so setup is
+ * required. This reveals exactly one bit and nothing else.
+ */
+export async function isSuperAdminProvisioned(store: StackMateDataStore): Promise<boolean> {
+  return store.withTransaction((state) => {
+    const superAdminRole = state.roles.find((r) => r.key === "super_admin");
+    if (!superAdminRole) return false;
+    return state.user_roles.some((ur) => ur.role_id === superAdminRole.id);
+  });
+}
+
 export async function createStaffUserByAdmin(
   store: StackMateDataStore,
   actor: StaffPrincipal,

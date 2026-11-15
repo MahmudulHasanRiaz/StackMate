@@ -14,7 +14,7 @@
  *    - `/api/v1/integrations/sites/:siteKey/*`
  *    - `/api/v1/licenses/*`
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   createCollectionEnvelope,
   createErrorEnvelope,
@@ -38,6 +38,7 @@ import {
   changeStaffPassword,
   createStaffUserByAdmin,
   ensureBetterAuthIdentity,
+  isSuperAdminProvisioned,
   resolveStaffPrincipal,
   signInStaffSession,
   signOutStaffSession,
@@ -134,6 +135,18 @@ function extractBearerToken(authHeader: string | null): string | null {
   if (!authHeader) return null;
   const match = /^Bearer\s+(.+)$/i.exec(authHeader.trim());
   return match ? match[1]!.trim() : null;
+}
+
+/**
+ * Constant-time setup-token comparison for the first-admin bootstrap
+ * gate. Both values are SHA-256 hashed first, so the comparison itself
+ * runs over fixed-length digests and leaks neither the token nor its
+ * length through timing.
+ */
+function setupTokenMatches(provided: string, expected: string): boolean {
+  const a = createHash("sha256").update(provided, "utf8").digest();
+  const b = createHash("sha256").update(expected, "utf8").digest();
+  return timingSafeEqual(a, b);
 }
 
 /**
@@ -360,16 +373,56 @@ export function createStackMateApp(
         });
       }
 
+      // First-admin setup status (public, reveals exactly one bit):
+      // true while no super_admin exists yet, false afterwards. The admin
+      // SPA uses it to decide whether to show the first-time setup form
+      // instead of the sign-in form. It never reveals users, counts, or
+      // whether a setup token is configured.
+      if (method === "GET" && pathname === "/api/v1/setup-status") {
+        const provisioned = await isSuperAdminProvisioned(store);
+        return jsonResponse({ setup_required: !provisioned });
+      }
+
       // 2. Authentication Routes (/api/auth/*)
       if (pathname.startsWith("/api/auth")) {
         checkRateLimit(`auth:${clientIp}`, 60);
 
         if (method === "POST" && pathname === "/api/auth/bootstrap-super-admin") {
+          // TOKEN-GATED first-admin bootstrap (Security, 2026-11-15 — the
+          // open endpoint it replaces let anyone who found the URL claim
+          // a fresh instance, so it must never ship to production):
+          //  - SETUP_TOKEN unset/empty => the endpoint does not exist:
+          //    404 identical to an unknown route, so a prober cannot
+          //    tell it apart from any other missing path.
+          //  - SETUP_TOKEN set but the request's setupToken is missing or
+          //    wrong => 403 with a generic message (no hint about the
+          //    configured token). Compared in constant time.
+          //  - Single-use is unchanged: bootstrapInitialSuperAdmin throws
+          //    409 once a super_admin exists. Password >= 10 chars,
+          //    auth rate limiting, and Better Auth provisioning are
+          //    unchanged. The token is the operator-set Worker secret
+          //    SETUP_TOKEN (Cloudflare dashboard, never in code).
+          const configuredSetupToken = env.SETUP_TOKEN?.trim() ?? "";
+          if (!configuredSetupToken) {
+            throw new AppError(
+              "NOT_FOUND",
+              `Route '${method} ${pathname}' not found.`,
+              404
+            );
+          }
           const body = (await request.json()) as {
             name?: string;
             email?: string;
             password?: string;
+            setupToken?: string;
           };
+          if (!body.setupToken || !setupTokenMatches(body.setupToken, configuredSetupToken)) {
+            throw new AppError(
+              "FORBIDDEN",
+              "Setup token is missing or invalid.",
+              403
+            );
+          }
           if (!body.name || !body.email || !body.password) {
             throw new AppError(
               "VALIDATION_ERROR",
@@ -507,6 +560,24 @@ export function createStackMateApp(
           throw new AppError(
             "FORBIDDEN",
             "Public self-registration is disabled. Staff accounts are provisioned by an administrator.",
+            403
+          );
+        }
+
+        // Direct Better Auth email sign-in is CLOSED for the same reason:
+        // POST /api/auth/sign-in above is the only sign-in path. It
+        // requires a StackMate staff record and rejects suspended staff
+        // BEFORE any session is issued; the raw Better Auth route
+        // (/api/auth/sign-in/email) checks neither, so a suspended user
+        // could mint a live session through it. Admin routes re-check
+        // staff status on every request, so that session could not call
+        // the admin API — but the bypass is closed anyway, defence in
+        // depth. Internal server-side calls use auth.api.signInEmail
+        // directly and are unaffected.
+        if (pathname.startsWith("/api/auth/sign-in/")) {
+          throw new AppError(
+            "FORBIDDEN",
+            "Use POST /api/auth/sign-in. Direct Better Auth sign-in routes are disabled.",
             403
           );
         }

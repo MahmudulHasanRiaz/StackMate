@@ -44,8 +44,10 @@
   // `/api/v1/...` calls and Better Auth cookies stay same-origin; there
   // is no separate staging Pages project. Secrets (BETTER_AUTH_SECRET,
   // ENCRYPTION_KEY_V1, LICENSE_VERIFIER_SECRET, CHECKOUT_TOKEN_SECRET,
-  // BETTER_AUTH_URL, TRUSTED_ORIGINS, APP_URL, API_URL) are set on the
-  // Worker in the Cloudflare dashboard, never in this file.
+  // SETUP_TOKEN, BETTER_AUTH_URL, TRUSTED_ORIGINS, APP_URL, API_URL) are set on the
+  // Worker in the Cloudflare dashboard, never in this file. SETUP_TOKEN is
+  // the operator-set secret gating POST /api/auth/bootstrap-super-admin:
+  // when unset the endpoint is disabled (404); see apps/api/src/app.ts.
   // Hyperdrive IDs (verified 2026-11-15):
   //   NO_CACHE: 30a29917780c4aff91b9a198b63eb387 (caching disabled)
   //   CACHED:   3ae1e99fbd6d4fcea9a0cb35de71ae4c (max_age 60s, swr 15s)
