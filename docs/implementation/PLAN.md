@@ -78,3 +78,46 @@ inspector rail is a follow-up (needs detail-page layout changes);
 390px mobile still unverified by tooling (user checks on his phone).
 The white-primary question (S6) is open — the parent decides it with
 the owner; do NOT flip the primary system to white without that decision.
+
+## 5. Product-flow fix — Features + Packages, product-first UX (2026-11-16, uncommitted)
+
+Owner finding (live, 2026-11-16 ~00:03 +06): the Features/Packages UI
+hid the product context — a small toolbar `<Select>` silently defaulted
+to the first product, create dialogs never named the product, features
+were one-at-a-time only, the list showed no package-association info
+(matrix E7 ❌), and the package form was a single form with no
+wizard/review (matrix F2 🟡). PRD §6.1 + API spec §9.2/§9.3 + DB
+(`product_features.product_id` NOT NULL, unique `(product_id,
+feature_key)`) are product-first by design — the gap was UX flow, not
+data. No nav items move in this batch (restructure batch owns the
+shell/nav); primary button color stays green (white-vs-green decision
+OPEN). Pattern constraints from the owner (2026-11-16 ~01:11 +06,
+~01:14 +06): build ONLY with the existing primitives
+(`components/primitives.tsx` + `lib/section-kit.tsx` + `styles/tokens.css`) —
+no custom one-off components, custom radii, custom colors, or inline
+styles; radii ≤6px (dialogs ≤8px), no 999px pills, no circular avatars;
+status as a small pill only where Neon does, otherwise plain text.
+
+| # | Task | Affected paths | Acceptance criteria |
+| :--- | :--- | :--- | :--- |
+| 1 | Features explicit product-first | `apps/admin/src/sections/features.tsx` | `/features` with no `product` param shows a "Choose a product" picker (table of products with Features/Packages counts + Select per row) — never a silent default; once selected, the subtitle names the product ("Features of {name}") and the header action appears only then; the product selector stays for switching |
+| 2 | Create feature dialog names its product | `apps/admin/src/sections/features.tsx` | Title `Create feature — {product name}` + read-only disabled Product field |
+| 3 | Bulk feature add (API decision: single bulk endpoint, not sequential creates) | `packages/contracts/src/domains/catalog.ts` (`BulkCreateProductFeaturesSchema`, 1–100 rows), `apps/api/src/modules/catalog/service.ts` (`createProductFeaturesBulk` — one transaction, per-row safeParse + key-uniqueness vs product AND earlier batch rows + entitlement validation; 201 if ≥1 created, 422 with `details.errors` if none; one summary audit `catalog.feature.bulk_created` only when ≥1 created), `apps/api/src/app.ts` (`POST /api/v1/admin/products/:productId/features/bulk`, registered before `:featureId` detail routes), `apps/api/test/catalog-bulk-features.test.ts` 6/6, `apps/admin/src/sections/features.tsx` (Tabs "One feature" / "Several at once"; multi-row form with add/remove rows, per-row client validation, server errors attached per row, partial success drops landed rows + keeps failed rows with a summary Alert; dialog size md in bulk mode) | One transaction, per-row results, auditable (one summary audit entry), no partial-state ambiguity from N separate requests; partial failure reported per row by index, never silent; the list refreshes showing exactly what landed |
+| 4 | Association view (E7) | `apps/api/src/modules/catalog/service.ts` (`featureUsageByPackages` — highest referencing version per package, sorted by package name; `withFeatureUsage`), `apps/api/src/app.ts` (GET list + GET detail + POST single-create return `used_by_packages`), `apps/admin/src/sections/features.tsx` ("Used by" column — plain white links `name vN · status`, comma-separated; "Not used in any package" when zero; detail Card "Used by packages (N)" with Package/Version/Status table or hint text when unused) | Real data only — `used_by_packages[]` from package versions' feature values; zero usage shows the empty text, never a fake |
+| 5 | Create package dialog names its product | `apps/admin/src/sections/packages.tsx` | Wizard title `Create package — {product name}` from step 2 on + read-only product field on the review step |
+| 6 | Stepped package builder (F2) | `apps/admin/src/sections/packages.tsx` (`CreatePackageDialog` → 4-step wizard: 1 Product (pre-filled from context, changeable — resets grants + errors), 2 Details, 3 Features (grants editor from THAT product's active features only), 4 Review (full summary via `DetailFacts` + "Creates as a draft" hint); `Tabs` step indicator, back-jump to any reached step, forward jumps blocked; review submit re-validates and jumps back to the offending step; Enter advances / submits on review) | Creates as DRAFT; publish stays a separate explicit action on the package page (never auto-publish); existing edit/version/publish flows untouched |
+| 7 | Packages list product-first | `apps/admin/src/sections/packages.tsx` | Same picker treatment as features (no silent default; selected product prominent; header action conditional) |
+| 8 | Verification | — | Full `verify-batch1.sh` green (vitest 102/102, 13 files — was 96/96, 12; tsc api+admin; vite build; lint-repo 141 files; check-migrations 65 tables / 6 migrations; wrangler dry-run staging); jsdom smoke 73/73 (was 44/44 — 29 new checks: picker states, Used by column, bulk dialog + submit toast, wizard steps + review + create → detail); API spec §9.2 documents the bulk endpoint; docs/implementation/PLAN.md + STATUS.md updated with exact numbers |
+
+Risks / noted gaps (for the CORE pattern pass, not this batch): no
+generic stack-gap primitive exists in `tokens.css` (stacked Cards /
+fields have no gap utility — `.sm-form-grid` gap 16px, `.sm-facts`
+margin-bottom 24px, `.sm-tabs` 20px, `.sm-alert` 16px are the spacing
+facts this batch relied on); secondary text token `--sm-text-muted`
+`#9ca3af` is too grey vs Neon's `#B0B1B2` (13px); six 999px rules
+remain in tokens.css (badges/chips/avatar). The bulk rows and wizard
+use existing primitives only, so they inherit the core fix
+automatically. The smoke harness caught one of its own bugs during
+this batch (two "Next" buttons — ListTable pager + wizard footer —
+`byText` returned the pager; wizard button lookups are now
+dialog-scoped) — a harness artifact, not a product bug.

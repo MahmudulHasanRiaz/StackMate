@@ -402,7 +402,10 @@ Product code and slug uniqueness are server-enforced. Product type, distribution
 |---|---|---|
 | GET | /api/v1/admin/products/{productId}/features | List feature catalogue for one product |
 | POST | /api/v1/admin/products/{productId}/features | Create feature definition |
+| POST | /api/v1/admin/products/{productId}/features/bulk | Create 1–100 feature definitions in one transaction; per-row results `{created, errors: [{index, feature_key, error}]}`; 201 if ≥1 created, 422 with `details.errors` if none created; one summary audit entry `catalog.feature.bulk_created` when ≥1 created |
 | GET | /api/v1/admin/products/{productId}/features/{featureId} | Feature detail |
+
+Feature list and detail responses carry `used_by_packages[]` (real associations only — package id/key/name + the highest referencing version number + version status; empty means "Not used in any package").
 | PATCH | /api/v1/admin/products/{productId}/features/{featureId} | Update allowed metadata; stable key/value type protected after usage |
 | POST | /api/v1/admin/products/{productId}/features/{featureId}/archive | Archive feature |
 

@@ -407,16 +407,35 @@ function FeatureGrantsEditor({
 /* ------------------------------------------------------------------ */
 const PACKAGE_KEY_RE = /^[a-z0-9_-]+$/;
 
+/* ------------------------------------------------------------------ */
+/* Create package — stepped builder (F2): product → details →         */
+/* features → review. Creates a DRAFT (v1 draft); publishing stays a  */
+/* separate explicit action on the package detail page.               */
+/* ------------------------------------------------------------------ */
+const WIZARD_STEPS = [
+  { key: "product", label: "1 · Product" },
+  { key: "details", label: "2 · Details" },
+  { key: "features", label: "3 · Features" },
+  { key: "review", label: "4 · Review" },
+] as const;
+
+type WizardStep = (typeof WIZARD_STEPS)[number]["key"];
+
 function CreatePackageDialog({
   open,
   onClose,
   productId,
+  products,
 }: {
   open: boolean;
   onClose: () => void;
   productId: string;
+  products: ProductListItem[];
 }) {
   const navigate = useNavigate();
+  const [step, setStep] = useState<WizardStep>("product");
+  const [maxStep, setMaxStep] = useState(0);
+  const [wizardProductId, setWizardProductId] = useState(productId);
   const [packageKey, setPackageKey] = useState("");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -425,11 +444,29 @@ function CreatePackageDialog({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
 
+  // Fresh wizard on every open, pre-filled with the product the user
+  // came from (list picker or product detail).
+  useEffect(() => {
+    if (!open) return;
+    setStep("product");
+    setMaxStep(0);
+    setWizardProductId(productId);
+    setPackageKey("");
+    setName("");
+    setDescription("");
+    setChangeSummary("");
+    setDrafts({});
+    setErrors({});
+    setSubmitError(null);
+  }, [open, productId]);
+
+  const wizardProduct = products.find((p) => p.id === wizardProductId);
+
   const featuresQuery = useQuery({
-    queryKey: ["admin", "features", "list", productId],
+    queryKey: ["admin", "features", "list", wizardProductId],
     queryFn: async () => {
       const res = await apiRequest<{ items: FeatureDto[] }>(
-        `/api/v1/admin/products/${productId}/features`,
+        `/api/v1/admin/products/${wizardProductId}/features`,
       );
       return res.items;
     },
@@ -442,12 +479,12 @@ function CreatePackageDialog({
   const create = useAdminMutation({
     mutationFn: (body: Record<string, unknown>) =>
       apiRequest<{ package: PackageDto }>(
-        `/api/v1/admin/products/${productId}/packages`,
+        `/api/v1/admin/products/${wizardProductId}/packages`,
         { method: "POST", body: JSON.stringify(body) },
       ),
     invalidateKeys: [
-      ["admin", "packages", "list", productId],
-      detailKey("products", productId),
+      ["admin", "packages", "list", wizardProductId],
+      detailKey("products", wizardProductId),
       ["admin", "products", "list"],
     ],
     successTitle: "Package created",
@@ -457,8 +494,7 @@ function CreatePackageDialog({
     },
   });
 
-  function submitForm() {
-    setSubmitError(null);
+  function validateDetails(): Record<string, string> {
     const next: Record<string, string> = {};
     const key = packageKey.trim().toLowerCase();
     if (key.length < 2 || key.length > 100 || !PACKAGE_KEY_RE.test(key)) {
@@ -467,21 +503,81 @@ function CreatePackageDialog({
     if (name.trim().length < 2 || name.trim().length > 160) {
       next.name = "Name is required (2–160 chars).";
     }
-    const grants: { product_feature_id: string; entitlement_value: unknown }[] = [];
+    return next;
+  }
+
+  function composeGrants(): {
+    grants: Array<{ product_feature_id: string; entitlement_value: unknown }>;
+    error?: string;
+  } {
+    const grants: Array<{ product_feature_id: string; entitlement_value: unknown }> = [];
     for (const f of features) {
       const draft = drafts[f.id];
       if (!draft?.included) continue;
       const composed = composeGrant(f, draft);
-      if (composed.error) {
-        next.grants = composed.error;
-        break;
-      }
+      if (composed.error) return { grants, error: composed.error };
       grants.push(composed.grant);
     }
+    return { grants };
+  }
+
+  function advance(next: WizardStep) {
+    const idx = WIZARD_STEPS.findIndex((s) => s.key === next);
+    setMaxStep((m) => Math.max(m, idx));
+    setStep(next);
+  }
+
+  /** Step tabs: back to any step already reached, never forward past it. */
+  function goStep(key: string) {
+    const idx = WIZARD_STEPS.findIndex((s) => s.key === key);
+    if (idx <= maxStep) setStep(key as WizardStep);
+  }
+
+  function goNext() {
+    if (step === "product") {
+      if (!wizardProductId) return;
+      advance("details");
+      return;
+    }
+    if (step === "details") {
+      const next = validateDetails();
+      setErrors(next);
+      if (Object.keys(next).length > 0) return;
+      advance("features");
+      return;
+    }
+    if (step === "features") {
+      const { error } = composeGrants();
+      if (error) {
+        setErrors({ grants: error });
+        return;
+      }
+      setErrors({});
+      advance("review");
+    }
+  }
+
+  function goBack() {
+    const idx = WIZARD_STEPS.findIndex((s) => s.key === step);
+    const prev = WIZARD_STEPS[idx - 1];
+    if (prev) setStep(prev.key);
+  }
+
+  function submitForm() {
+    setSubmitError(null);
+    const next = validateDetails();
+    const { grants, error } = composeGrants();
+    if (error) next.grants = error;
     setErrors(next);
-    if (Object.keys(next).length > 0) return;
+    if (Object.keys(next).length > 0) {
+      // Should not happen (each step validates on entry), but never
+      // create from the review step with a bad value — go back to it.
+      if (next.packageKey || next.name) setStep("details");
+      else if (next.grants) setStep("features");
+      return;
+    }
     const body: Record<string, unknown> = {
-      package_key: key,
+      package_key: packageKey.trim().toLowerCase(),
       name: name.trim(),
       features: grants,
     };
@@ -492,23 +588,45 @@ function CreatePackageDialog({
     });
   }
 
+  const includedGrants = features.filter((f) => drafts[f.id]?.included);
+
   return (
     <Dialog
       open={open}
       onClose={onClose}
-      title="Create package"
+      title={
+        step === "product" || !wizardProduct
+          ? "Create package"
+          : `Create package — ${wizardProduct.name}`
+      }
       size="md"
       footer={
         <>
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={create.isPending} onClick={submitForm}>
-            Create package
-          </Button>
+          {step !== "product" ? (
+            <Button variant="secondary" onClick={goBack}>
+              Back
+            </Button>
+          ) : null}
+          {step !== "review" ? (
+            <Button variant="primary" onClick={goNext}>
+              Next
+            </Button>
+          ) : (
+            <Button variant="primary" loading={create.isPending} onClick={submitForm}>
+              Create package
+            </Button>
+          )}
         </>
       }
     >
+      <Tabs
+        tabs={WIZARD_STEPS.map((s) => ({ key: s.key, label: s.label }))}
+        active={step}
+        onChange={goStep}
+      />
       {submitError ? (
         <Alert variant="danger" role="alert">
           {submitError}
@@ -517,69 +635,138 @@ function CreatePackageDialog({
       <form
         onSubmit={(e: FormEvent) => {
           e.preventDefault();
-          submitForm();
+          if (step === "review") submitForm();
+          else goNext();
         }}
       >
-        <div className="sm-form-grid">
+        {step === "product" ? (
           <Field
-            label="Package key"
+            label="Product"
             required
-            {...(errors.packageKey ? { error: errors.packageKey } : {})}
-            htmlFor="cpk-key"
+            hint="Packages belong to one product — the features in step 3 come from this product only."
+            htmlFor="cpk-product"
           >
-            <Input
-              id="cpk-key"
-              value={packageKey}
-              aria-invalid={errors.packageKey ? true : undefined}
-              onChange={(e) => setPackageKey(e.target.value.toLowerCase())}
-              placeholder="starter"
-            />
+            <Select
+              id="cpk-product"
+              value={wizardProductId}
+              onChange={(e) => {
+                setWizardProductId(e.target.value);
+                setDrafts({});
+                setErrors({});
+              }}
+            >
+              {products.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </Select>
           </Field>
-          <Field label="Name" required {...(errors.name ? { error: errors.name } : {})} htmlFor="cpk-name">
-            <Input
-              id="cpk-name"
-              value={name}
-              aria-invalid={errors.name ? true : undefined}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="Starter"
-            />
-          </Field>
-          <Field label="Change summary" htmlFor="cpk-summary">
-            <Input
-              id="cpk-summary"
-              value={changeSummary}
-              onChange={(e) => setChangeSummary(e.target.value)}
-              placeholder="Initial version"
-            />
-          </Field>
-        </div>
-        <div style={{ marginTop: 16 }}>
-          <Field label="Description" htmlFor="cpk-description">
-            <Textarea
-              id="cpk-description"
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-            />
-          </Field>
-        </div>
-        <div style={{ marginTop: 16 }}>
-          <div className="sm-label" style={{ marginBottom: 8 }}>
-            Features in version 1
-          </div>
-          {featuresQuery.isPending ? (
-            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-              <div style={{ height: 20, width: "60%" }} className="sm-skeleton" />
-              <div style={{ height: 20, width: "45%" }} className="sm-skeleton" />
+        ) : null}
+        {step === "details" ? (
+          <>
+            <div className="sm-form-grid">
+              <Field
+                label="Package key"
+                required
+                {...(errors.packageKey ? { error: errors.packageKey } : {})}
+                htmlFor="cpk-key"
+              >
+                <Input
+                  id="cpk-key"
+                  value={packageKey}
+                  aria-invalid={errors.packageKey ? true : undefined}
+                  onChange={(e) => setPackageKey(e.target.value.toLowerCase())}
+                  placeholder="starter"
+                />
+              </Field>
+              <Field label="Name" required {...(errors.name ? { error: errors.name } : {})} htmlFor="cpk-name">
+                <Input
+                  id="cpk-name"
+                  value={name}
+                  aria-invalid={errors.name ? true : undefined}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="Starter"
+                />
+              </Field>
+              <Field label="Change summary" htmlFor="cpk-summary">
+                <Input
+                  id="cpk-summary"
+                  value={changeSummary}
+                  onChange={(e) => setChangeSummary(e.target.value)}
+                  placeholder="Initial version"
+                />
+              </Field>
             </div>
-          ) : (
-            <FeatureGrantsEditor
-              features={features}
-              drafts={drafts}
-              onChange={setDrafts}
-              {...(errors.grants ? { error: errors.grants } : {})}
+            <div style={{ marginTop: 16 }}>
+              <Field label="Description" htmlFor="cpk-description">
+                <Textarea
+                  id="cpk-description"
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                />
+              </Field>
+            </div>
+          </>
+        ) : null}
+        {step === "features" ? (
+          <Field
+            label="Features in version 1"
+            hint={`Features of ${wizardProduct?.name ?? "this product"} — tick the ones version 1 grants.`}
+            {...(errors.grants ? { error: errors.grants } : {})}
+          >
+            {featuresQuery.isPending ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                <div style={{ height: 20, width: "60%" }} className="sm-skeleton" />
+                <div style={{ height: 20, width: "45%" }} className="sm-skeleton" />
+              </div>
+            ) : (
+              <FeatureGrantsEditor
+                features={features}
+                drafts={drafts}
+                onChange={setDrafts}
+                {...(errors.grants ? { error: errors.grants } : {})}
+              />
+            )}
+          </Field>
+        ) : null}
+        {step === "review" ? (
+          <>
+            <DetailFacts
+              facts={[
+                { label: "Product", value: wizardProduct?.name ?? "—" },
+                {
+                  label: "Package key",
+                  value: (
+                    <span className="sm-mono">{packageKey.trim().toLowerCase()}</span>
+                  ),
+                },
+                { label: "Name", value: name.trim() },
+                { label: "Description", value: description.trim() || "—" },
+                {
+                  label: "Change summary",
+                  value: changeSummary.trim() || "Initial version",
+                },
+                {
+                  label: "Features",
+                  value:
+                    includedGrants.length === 0
+                      ? "None — version 1 grants nothing"
+                      : includedGrants
+                          .map((f) => {
+                            const draft = drafts[f.id]!;
+                            const composed = composeGrant(f, draft);
+                            return `${f.name} (${f.feature_key}) — ${formatEntitlement(composed.grant.entitlement_value)}`;
+                          })
+                          .join(", "),
+                },
+              ]}
             />
-          )}
-        </div>
+            <p className="sm-hint">
+              Creates as a draft — publishing is a separate step on the package page.
+            </p>
+          </>
+        ) : null}
       </form>
     </Dialog>
   );
@@ -607,16 +794,10 @@ export function PackagesSection() {
       ? raw.product
       : undefined;
 
-  useEffect(() => {
-    if (!productParam && products.length > 0) {
-      const first = products[0];
-      if (first) updateSearch({ product: first.id });
-    }
-    // Run only when the product list first arrives.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [products.length === 0, productParam]);
-
-  const productId = productParam ?? products[0]?.id;
+  // Explicit product-first: no silent default. Landing here without a
+  // product in the URL shows the picker below; a product=… that names
+  // nothing is treated the same way.
+  const productId = productParam;
   const selectedProduct = products.find((p) => p.id === productId);
 
   const packagesQuery = useQuery({
@@ -701,14 +882,11 @@ export function PackagesSection() {
             : "Packages live under a product — pick one"
         }
         action={
-          <Button
-            variant="primary"
-            icon={Plus}
-            disabled={!productId}
-            onClick={() => setCreateOpen(true)}
-          >
-            Create package
-          </Button>
+          selectedProduct ? (
+            <Button variant="primary" icon={Plus} onClick={() => setCreateOpen(true)}>
+              Create package
+            </Button>
+          ) : undefined
         }
       />
       {productsQuery.isPending ? (
@@ -738,6 +916,50 @@ export function PackagesSection() {
             }}
           />
         </div>
+      ) : !selectedProduct ? (
+        <Card title="Choose a product">
+          <p className="sm-hint">
+            Packages live under a product — pick one to see its packages.
+          </p>
+          <div className="sm-table-wrap">
+            <table className="sm-table">
+              <thead>
+                <tr>
+                  <th>Product</th>
+                  <th>Code</th>
+                  <th>Features</th>
+                  <th>Packages</th>
+                  <th>Select</th>
+                </tr>
+              </thead>
+              <tbody>
+                {products.map((p) => (
+                  <tr key={p.id}>
+                    <td>{p.name}</td>
+                    <td>
+                      <span className="sm-mono">{p.code}</span>
+                    </td>
+                    <td>
+                      <span className="sm-tabular">{p.features_count}</span>
+                    </td>
+                    <td>
+                      <span className="sm-tabular">{p.packages_count}</span>
+                    </td>
+                    <td>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => updateSearch({ product: p.id, page: 1 })}
+                      >
+                        Select
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
       ) : (
         <ListTable
           columns={columns}
@@ -789,11 +1011,12 @@ export function PackagesSection() {
           }
         />
       )}
-      {productId ? (
+      {selectedProduct ? (
         <CreatePackageDialog
           open={createOpen}
           onClose={() => setCreateOpen(false)}
-          productId={productId}
+          productId={selectedProduct.id}
+          products={products}
         />
       ) : null}
     </section>
