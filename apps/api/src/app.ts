@@ -50,6 +50,7 @@ import {
   type StaffPrincipal,
   updateRoleByAdmin,
   updateStaffUserRoles,
+  updateOwnProfile,
 } from "./modules/identity/service.ts";
 import {
   archiveProductFeatureByAdmin,
@@ -1525,6 +1526,18 @@ export function createStackMateApp(
         // Identity & RBAC routes
         if (method === "GET" && pathname === "/api/v1/admin/me") {
           return jsonResponse(principal);
+        }
+
+        if (method === "PATCH" && pathname === "/api/v1/admin/me") {
+          // Self-service profile: name ONLY. Email is the login identity
+          // (administrator change only) and roles are never self-editable
+          // — extra fields in the body are ignored, never applied.
+          const body = (await request.json()) as { name?: unknown };
+          const updated = await updateOwnProfile(store, principal, {
+            name: body.name,
+            requestId,
+          });
+          return jsonResponse(updated, 200);
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/users") {

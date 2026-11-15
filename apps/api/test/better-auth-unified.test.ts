@@ -515,4 +515,127 @@ describe.skipIf(!DATABASE_URL)("Better Auth unified staff auth (Postgres)", () =
     const again = await signIn(staffEmail, "RolePass12345!");
     assert.deepEqual(again.principal.roles, ["support_staff"]);
   });
+
+  it("Better Auth update-user works through the mounted instance (verification)", async () => {
+    // The account menu needs a name update. Before building a new
+    // endpoint, verify the mounted Better Auth update-user endpoint
+    // through the real API: it shares the `users` table with the staff
+    // record, so GET /me must reflect the new name.
+    const email = `${uniq("baupdate")}@example.com`;
+    const { randomUUID } = await import("node:crypto");
+    const now = new Date().toISOString();
+    await store.withTransaction((state: any) => {
+      state.users.push({
+        id: randomUUID(),
+        name: "BA Original",
+        email,
+        email_verified: true,
+        password_hash: hashPasswordScrypt("BaUpdate12345!"),
+        status: "active",
+        created_at: now,
+        updated_at: now,
+      });
+      const role = state.roles.find((r: any) => r.key === "read_only");
+      state.user_roles.push({
+        user_id: state.users[state.users.length - 1].id,
+        role_id: role.id,
+        assigned_at: now,
+      });
+    });
+    const session = await signIn(email, "BaUpdate12345!");
+    const userId = session.principal.user.id as string;
+
+    const updated = await apiRequest("/api/auth/update-user", {
+      method: "POST",
+      cookie: session.cookie,
+      body: { name: "BA Renamed" },
+    });
+    assert.equal(updated.status, 200, JSON.stringify(updated.body));
+
+    const me = await apiRequest("/api/v1/admin/me", { cookie: session.cookie });
+    assert.equal(me.status, 200, JSON.stringify(me.body));
+    assert.equal(me.body.data.user.name, "BA Renamed");
+
+    // update-user writes NO StackMate audit log entry — that is why the
+    // account menu uses PATCH /api/v1/admin/me instead (next test).
+    const audit = await adminClient.query(
+      "SELECT COUNT(*) AS count FROM audit_logs WHERE action = 'identity.profile.name_updated' AND actor_user_id = $1",
+      [userId]
+    );
+    assert.equal(Number(audit.rows[0].count), 0);
+  });
+
+  it("PATCH /api/v1/admin/me updates only the caller's own name (audited)", async () => {
+    const email = `${uniq("ownprofile")}@example.com`;
+    const { randomUUID } = await import("node:crypto");
+    const now = new Date().toISOString();
+    await store.withTransaction((state: any) => {
+      state.users.push({
+        id: randomUUID(),
+        name: "Own Original",
+        email,
+        email_verified: true,
+        password_hash: hashPasswordScrypt("OwnProfile12345!"),
+        status: "active",
+        created_at: now,
+        updated_at: now,
+      });
+      const role = state.roles.find((r: any) => r.key === "read_only");
+      state.user_roles.push({
+        user_id: state.users[state.users.length - 1].id,
+        role_id: role.id,
+        assigned_at: now,
+      });
+    });
+    const session = await signIn(email, "OwnProfile12345!");
+    const userId = session.principal.user.id as string;
+
+    const updated = await apiRequest("/api/v1/admin/me", {
+      method: "PATCH",
+      cookie: session.cookie,
+      body: { name: "Renamed By Me" },
+    });
+    assert.equal(updated.status, 200, JSON.stringify(updated.body));
+    assert.equal(updated.body.data.user.name, "Renamed By Me");
+    assert.equal(updated.body.data.user.email, email);
+
+    const me = await apiRequest("/api/v1/admin/me", { cookie: session.cookie });
+    assert.equal(me.body.data.user.name, "Renamed By Me");
+
+    const audit = await adminClient.query(
+      "SELECT COUNT(*) AS count FROM audit_logs WHERE action = 'identity.profile.name_updated' AND actor_user_id = $1",
+      [userId]
+    );
+    assert.equal(Number(audit.rows[0].count), 1, "name change must be audited");
+
+    // Validation: empty / over-long names are rejected.
+    const empty = await apiRequest("/api/v1/admin/me", {
+      method: "PATCH",
+      cookie: session.cookie,
+      body: { name: "   " },
+    });
+    assert.equal(empty.status, 422, JSON.stringify(empty.body));
+    const tooLong = await apiRequest("/api/v1/admin/me", {
+      method: "PATCH",
+      cookie: session.cookie,
+      body: { name: "x".repeat(121) },
+    });
+    assert.equal(tooLong.status, 422, JSON.stringify(tooLong.body));
+
+    // Email and roles sent in the body are IGNORED, never applied.
+    const sneaky = await apiRequest("/api/v1/admin/me", {
+      method: "PATCH",
+      cookie: session.cookie,
+      body: { name: "Still Renamed", email: "hacker@example.com", roles: ["super_admin"] },
+    });
+    assert.equal(sneaky.status, 200, JSON.stringify(sneaky.body));
+    assert.equal(sneaky.body.data.user.email, email);
+    assert.deepEqual(sneaky.body.data.roles, ["read_only"]);
+
+    const unauth = await apiRequest("/api/v1/admin/me", {
+      method: "PATCH",
+      body: { name: "Nope" },
+    });
+    assert.equal(unauth.status, 401, JSON.stringify(unauth.body));
+  });
 });

@@ -37,7 +37,7 @@
 import { useState, type FormEvent } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
-import { Eye, Globe, KeyRound, Plus } from "lucide-react";
+import { Ban, Eye, Globe, KeyRound, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 import { SITE_CAPABILITIES } from "../../../../packages/contracts/src/index.ts";
 import { apiRequest } from "../lib/api-client";
 import { detailKey, listKey } from "../lib/query";
@@ -61,6 +61,7 @@ import {
   ErrorState,
   Field,
   Input,
+  RowMenu,
   Select,
   StatusBadge,
   TableSkeleton,
@@ -1159,62 +1160,61 @@ function SiteCredentialsTab({ siteId }: { siteId: string }) {
       cell: ({ row }) => {
         const cred = row.original;
         const active = cred.status === "active";
+        // 2 row actions → one "…" menu (Neon Branches pattern). The
+        // confirm dialogs still gate both actions; the mutation toasts
+        // ("Credential rotated"/"Credential revoked") + the one-time
+        // secret panel report the outcome, so no inline spinner is lost.
         return (
-          <span>
-            <Button
-              variant="secondary"
-              size="sm"
-              disabled={!active}
-              loading={rotate.isPending && rotate.variables === cred.id}
-              onClick={() =>
-                void (async () => {
-                  const ok = await confirm({
-                    title: "Rotate credential?",
-                    body: (
-                      <div>
+          <RowMenu
+            items={[
+              {
+                icon: RefreshCw,
+                label: "Rotate credential",
+                disabled: !active,
+                onSelect: () =>
+                  void (async () => {
+                    const ok = await confirm({
+                      title: "Rotate credential?",
+                      body: (
+                        <div>
+                          <p>
+                            {cred.key_id} is revoked and a new credential of
+                            the same type is issued. The old secret stops
+                            working immediately.
+                          </p>
+                          <p>The new secret is shown once — copy it now.</p>
+                        </div>
+                      ),
+                      confirmLabel: "Rotate",
+                      danger: true,
+                    });
+                    if (ok) rotate.mutate(cred.id);
+                  })(),
+              },
+              {
+                icon: Ban,
+                label: "Revoke credential",
+                danger: true,
+                disabled: !active,
+                onSelect: () =>
+                  void (async () => {
+                    const ok = await confirm({
+                      title: "Revoke credential?",
+                      body: (
                         <p>
-                          {cred.key_id} is revoked and a new credential of
-                          the same type is issued. The old secret stops
-                          working immediately.
+                          {cred.key_id} stops authenticating immediately. Any
+                          integration using it will fail until it switches to
+                          another credential.
                         </p>
-                        <p>The new secret is shown once — copy it now.</p>
-                      </div>
-                    ),
-                    confirmLabel: "Rotate",
-                    danger: true,
-                  });
-                  if (ok) rotate.mutate(cred.id);
-                })()
-              }
-            >
-              Rotate
-            </Button>{" "}
-            <Button
-              variant="danger-ghost"
-              size="sm"
-              disabled={!active}
-              loading={revoke.isPending && revoke.variables === cred.id}
-              onClick={() =>
-                void (async () => {
-                  const ok = await confirm({
-                    title: "Revoke credential?",
-                    body: (
-                      <p>
-                        {cred.key_id} stops authenticating immediately. Any
-                        integration using it will fail until it switches to
-                        another credential.
-                      </p>
-                    ),
-                    confirmLabel: "Revoke",
-                    danger: true,
-                  });
-                  if (ok) revoke.mutate(cred.id);
-                })()
-              }
-            >
-              Revoke
-            </Button>
-          </span>
+                      ),
+                      confirmLabel: "Revoke",
+                      danger: true,
+                    });
+                    if (ok) revoke.mutate(cred.id);
+                  })(),
+              },
+            ]}
+          />
         );
       },
     },
@@ -1471,58 +1471,54 @@ function SiteDomainsTab({ site }: { site: IntegratedSite }) {
       cell: ({ row }) => {
         const domain = row.original;
         const verified = domain.verification_status === "verified";
+        // 3 row actions → one "…" menu (Neon Branches pattern). The
+        // confirm dialog still gates Delete; the mutation toasts
+        // ("Challenge regenerated"/"Domain deleted") + the verify dialog
+        // report the outcome, so no inline spinner is lost.
         return (
-          <span>
-            <Button
-              variant="secondary"
-              size="sm"
-              loading={
-                challenge.isPending && challenge.variables === domain.id
-              }
-              onClick={() => challenge.mutate(domain.id)}
-            >
-              New challenge
-            </Button>{" "}
-            <Button
-              variant="secondary"
-              size="sm"
-              disabled={verified}
-              onClick={() => setVerifyTarget(domain)}
-            >
-              Verify
-            </Button>{" "}
-            <Button
-              variant="danger-ghost"
-              size="sm"
-              disabled={site.domains.length <= 1}
-              loading={remove.isPending && remove.variables === domain.id}
-              onClick={() =>
-                void (async () => {
-                  const ok = await confirm({
-                    title: "Delete domain?",
-                    body: (
-                      <div>
-                        <p>
-                          {domain.domain} will be removed from {site.name}.
-                        </p>
-                        {domain.is_primary ? (
+          <RowMenu
+            items={[
+              {
+                icon: RefreshCw,
+                label: "New challenge",
+                onSelect: () => challenge.mutate(domain.id),
+              },
+              {
+                icon: ShieldCheck,
+                label: "Verify",
+                disabled: verified,
+                onSelect: () => setVerifyTarget(domain),
+              },
+              {
+                icon: Trash2,
+                label: "Delete",
+                danger: true,
+                disabled: site.domains.length <= 1,
+                onSelect: () =>
+                  void (async () => {
+                    const ok = await confirm({
+                      title: "Delete domain?",
+                      body: (
+                        <div>
                           <p>
-                            It is the primary domain — the first remaining
-                            domain becomes primary.
+                            {domain.domain} will be removed from {site.name}.
                           </p>
-                        ) : null}
-                      </div>
-                    ),
-                    confirmLabel: "Delete",
-                    danger: true,
-                  });
-                  if (ok) remove.mutate(domain.id);
-                })()
-              }
-            >
-              Delete
-            </Button>
-          </span>
+                          {domain.is_primary ? (
+                            <p>
+                              It is the primary domain — the first remaining
+                              domain becomes primary.
+                            </p>
+                          ) : null}
+                        </div>
+                      ),
+                      confirmLabel: "Delete",
+                      danger: true,
+                    });
+                    if (ok) remove.mutate(domain.id);
+                  })(),
+              },
+            ]}
+          />
         );
       },
     },

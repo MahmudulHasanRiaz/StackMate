@@ -32,7 +32,7 @@ import { useState, type FormEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
-import { Eye, Plus, Webhook } from "lucide-react";
+import { Eye, FlaskConical, Plus, Webhook } from "lucide-react";
 import { apiRequest } from "../lib/api-client";
 import { detailKey, listKey } from "../lib/query";
 import {
@@ -55,6 +55,7 @@ import {
   ErrorState,
   Field,
   Input,
+  RowMenu,
   Select,
   StatusBadge,
   TableSkeleton,
@@ -297,31 +298,29 @@ export function WebhooksSection() {
       enableSorting: false,
       cell: ({ row }) => {
         const ep = row.original;
+        // 2+ row actions → one "…" menu (Neon Branches pattern). The test
+        // result surfaces in the page's last-test panel; the mutation
+        // toasts report success/failure, so no inline spinner is lost.
         return (
-          <span>
-            <Button
-              variant="secondary"
-              size="sm"
-              disabled={ep.status !== "active"}
-              loading={testingId === ep.id}
-              onClick={() => void runTest(ep.id)}
-            >
-              Test
-            </Button>{" "}
-            <Button
-              variant="ghost"
-              size="sm"
-              icon={Eye}
-              onClick={() =>
-                navigate({
-                  to: "/webhooks/$webhookId",
-                  params: { webhookId: ep.id },
-                })
-              }
-            >
-              View
-            </Button>
-          </span>
+          <RowMenu
+            items={[
+              {
+                icon: FlaskConical,
+                label: "Test delivery",
+                disabled: ep.status !== "active" || testingId === ep.id,
+                onSelect: () => void runTest(ep.id),
+              },
+              {
+                icon: Eye,
+                label: "View details",
+                onSelect: () =>
+                  navigate({
+                    to: "/webhooks/$webhookId",
+                    params: { webhookId: ep.id },
+                  }),
+              },
+            ]}
+          />
         );
       },
     },

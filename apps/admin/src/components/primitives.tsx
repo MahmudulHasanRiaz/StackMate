@@ -11,6 +11,7 @@ import {
   useContext,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -20,6 +21,7 @@ import {
   type SelectHTMLAttributes,
   type TextareaHTMLAttributes,
 } from "react";
+import { createPortal } from "react-dom";
 import {
   AlertCircle,
   AlertTriangle,
@@ -27,6 +29,7 @@ import {
   CheckCircle2,
   Copy,
   Info,
+  MoreHorizontal,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -147,8 +150,8 @@ export function Field({
 }: {
   label: string;
   required?: boolean;
-  hint?: string;
-  error?: string;
+  hint?: string | undefined;
+  error?: string | undefined;
   htmlFor?: string;
   children: ReactNode;
 }) {
@@ -519,6 +522,348 @@ export function CopyButton({ value, label }: { value: string; label?: string }) 
     >
       {copied ? <Check size={16} strokeWidth={2} /> : <Copy size={16} strokeWidth={2} />}
     </button>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Avatar — initials circle (account menu).                            */
+/* ------------------------------------------------------------------ */
+function getInitials(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "?";
+  const first = parts[0]?.charAt(0) ?? "";
+  const second = parts.length > 1 ? parts[parts.length - 1]?.charAt(0) ?? "" : "";
+  return (first + second).toUpperCase();
+}
+
+export function Avatar({ name, size = "md" }: { name: string; size?: "md" | "lg" }) {
+  return (
+    <span
+      className={`sm-avatar${size === "lg" ? " sm-avatar-lg" : ""}`}
+      aria-hidden="true"
+    >
+      {getInitials(name)}
+    </span>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Menu — dropdown (account menu). Outside click + Esc close, arrow    */
+/* keys cycle items, focus returns to the trigger on close. Any        */
+/* MenuItem click closes the menu after its own action runs.           */
+/* ------------------------------------------------------------------ */
+const MenuContext = createContext<{ close: () => void }>({
+  close: () => undefined,
+});
+
+export function Menu({
+  trigger,
+  triggerLabel,
+  triggerClassName,
+  children,
+}: {
+  trigger: ReactNode;
+  triggerLabel: string;
+  triggerClassName?: string;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const close = useCallback(() => {
+    setOpen(false);
+    triggerRef.current?.focus();
+  }, []);
+
+  const menuItems = useCallback(
+    () =>
+      Array.from(
+        wrapRef.current?.querySelectorAll<HTMLElement>(
+          '[role="menuitem"], [role="menuitemradio"]',
+        ) ?? [],
+      ),
+    [],
+  );
+
+  const focusItem = useCallback(
+    (index: number) => {
+      const items = menuItems();
+      if (items.length === 0) return;
+      const next = items[(index + items.length) % items.length];
+      next?.focus();
+    },
+    [menuItems],
+  );
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        close();
+      }
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+    };
+  }, [open, close]);
+
+  const onWrapKeyDown = (e: React.KeyboardEvent) => {
+    if (!open) return;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const items = menuItems();
+      const activeIdx = items.findIndex((el) => el === document.activeElement);
+      if (activeIdx === -1) {
+        focusItem(e.key === "ArrowDown" ? 0 : items.length - 1);
+      } else {
+        focusItem(activeIdx + (e.key === "ArrowDown" ? 1 : -1));
+      }
+    }
+  };
+
+  return (
+    <div className="sm-menu-wrap" ref={wrapRef} onKeyDown={onWrapKeyDown}>
+      <button
+        type="button"
+        ref={triggerRef}
+        className={triggerClassName}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={triggerLabel}
+        onClick={() => setOpen((v) => !v)}
+      >
+        {trigger}
+      </button>
+      {open ? (
+        <MenuContext.Provider value={{ close: () => setOpen(false) }}>
+          <div className="sm-menu" role="menu" aria-label={triggerLabel}>
+            {children}
+          </div>
+        </MenuContext.Provider>
+      ) : null}
+    </div>
+  );
+}
+
+export function MenuHeader({ children }: { children: ReactNode }) {
+  return <div className="sm-menu-header">{children}</div>;
+}
+
+export function MenuSectionLabel({ children }: { children: ReactNode }) {
+  return <div className="sm-menu-section-label">{children}</div>;
+}
+
+export function MenuDivider() {
+  return <div className="sm-menu-divider" role="separator" />;
+}
+
+export function MenuItem({
+  icon: Icon,
+  children,
+  onClick,
+  danger,
+  checked,
+  role = "menuitem",
+}: {
+  icon?: LucideIcon;
+  children: ReactNode;
+  onClick?: () => void;
+  danger?: boolean;
+  checked?: boolean;
+  role?: "menuitem" | "menuitemradio";
+}) {
+  const { close } = useContext(MenuContext);
+  return (
+    <button
+      type="button"
+      role={role}
+      aria-checked={role === "menuitemradio" ? (checked ?? false) : undefined}
+      data-danger={danger || undefined}
+      className="sm-menu-item"
+      onClick={() => {
+        onClick?.();
+        close();
+      }}
+    >
+      {Icon ? <Icon size={16} strokeWidth={2} /> : null}
+      <span className="sm-menu-item-label">{children}</span>
+      {checked ? (
+        <span className="sm-menu-item-check" aria-hidden="true">
+          <Check size={16} strokeWidth={2} />
+        </span>
+      ) : null}
+    </button>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* RowMenu — the "…" per-row action menu (Neon Branches pattern).       */
+/* A table with 2+ row actions gets ONE "…" button per row instead of  */
+/* a run of inline buttons; single-action tables keep their inline     */
+/* button (a one-item menu is worse UX). The dropdown is portaled to    */
+/* <body> with fixed positioning — an absolutely-positioned menu       */
+/* inside `.sm-table-wrap` (overflow-x: auto) would be clipped.        */
+/* Opens below the trigger, flips above it when the viewport bottom    */
+/* is near; closes on outside pointerdown, Escape, scroll, resize.    */
+/* Arrow keys cycle items; focus returns to the trigger on close.      */
+/* ------------------------------------------------------------------ */
+export interface RowMenuItem {
+  icon?: LucideIcon;
+  label: string;
+  onSelect: () => void;
+  danger?: boolean;
+  disabled?: boolean;
+}
+
+export function RowMenu({
+  items,
+  label = "Row actions",
+}: {
+  items: RowMenuItem[];
+  label?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; right: number } | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  const close = useCallback(() => {
+    setOpen(false);
+    triggerRef.current?.focus();
+  }, []);
+
+  const openMenu = useCallback(() => {
+    const rect = triggerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    setPos({
+      top: rect.bottom + 4,
+      right: Math.max(8, window.innerWidth - rect.right),
+    });
+    setOpen(true);
+  }, []);
+
+  // Flip above the trigger when the menu would overflow the viewport bottom.
+  useLayoutEffect(() => {
+    if (!open || !pos) return;
+    const menu = menuRef.current;
+    const rect = triggerRef.current?.getBoundingClientRect();
+    if (!menu || !rect) return;
+    const height = menu.getBoundingClientRect().height;
+    if (pos.top + height > window.innerHeight - 8) {
+      setPos({ top: Math.max(8, rect.top - height - 4), right: pos.right });
+    }
+    // Runs once per open on purpose: the position is set on open, then
+    // flipped at most once. Re-running on `pos` would loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const target = e.target as Node;
+      if (menuRef.current?.contains(target)) return;
+      if (triggerRef.current?.contains(target)) return;
+      setOpen(false);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        close();
+      }
+    };
+    const onScrollOrResize = () => setOpen(false);
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("scroll", onScrollOrResize, true);
+    window.addEventListener("resize", onScrollOrResize);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("scroll", onScrollOrResize, true);
+      window.removeEventListener("resize", onScrollOrResize);
+    };
+  }, [open, close]);
+
+  const menuItems = useCallback(
+    () =>
+      Array.from(
+        menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? [],
+      ),
+    [],
+  );
+
+  const onMenuKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    e.preventDefault();
+    const items = menuItems().filter((el) => !el.hasAttribute("disabled"));
+    if (items.length === 0) return;
+    const activeIdx = items.findIndex((el) => el === document.activeElement);
+    const next =
+      activeIdx === -1
+        ? e.key === "ArrowDown"
+          ? 0
+          : items.length - 1
+        : (activeIdx + (e.key === "ArrowDown" ? 1 : -1) + items.length) %
+          items.length;
+    items[next]?.focus();
+  };
+
+  return (
+    <>
+      <button
+        type="button"
+        ref={triggerRef}
+        className="sm-btn sm-btn-ghost sm-btn-icon"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={label}
+        title={label}
+        onClick={() => (open ? close() : openMenu())}
+      >
+        <MoreHorizontal size={16} strokeWidth={2} />
+      </button>
+      {open && pos
+        ? createPortal(
+            <div
+              ref={menuRef}
+              className="sm-row-menu"
+              role="menu"
+              aria-label={label}
+              style={{ top: pos.top, right: pos.right }}
+              onKeyDown={onMenuKeyDown}
+            >
+              {items.map((item) => (
+                <button
+                  key={item.label}
+                  type="button"
+                  role="menuitem"
+                  className="sm-menu-item"
+                  data-danger={item.danger || undefined}
+                  disabled={item.disabled}
+                  onClick={() => {
+                    setOpen(false);
+                    item.onSelect();
+                  }}
+                >
+                  {item.icon ? <item.icon size={16} strokeWidth={2} /> : null}
+                  <span className="sm-menu-item-label">{item.label}</span>
+                </button>
+              ))}
+            </div>,
+            document.body,
+          )
+        : null}
+    </>
   );
 }
 
