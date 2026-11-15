@@ -1,23 +1,34 @@
 /**
- * Perf regression tests (2026-11-15) — the staging slowness fix.
+ * Perf regression tests (2026-11-15) — the staging slowness fix, as
+ * reverted the same evening.
  *
  * Staging measured 13–35s per request: every request ran a fresh pg
  * Client + connect + detectCapabilities + assertRequiredTables + a
  * 48-query sequential full-state load, and every withTransaction
- * re-ran the full load. The fix: ONE combined JSON load statement,
- * caps/tables cached per client, and ONE shared pg Client per Worker
- * isolate (passed as `existingClient`). These tests pin the new
- * behavior so it cannot silently regress:
+ * re-ran the full load. The Batch 0 fix (ONE combined JSON load
+ * statement, caps/tables cached, ONE shared pg Client per Worker
+ * isolate) cut that to ~10 queries/request — but the shared client
+ * poisoned warm isolates: its per-client promise-chain queue created
+ * promises in one request and awaited them in another, which throws
+ * under Cloudflare's handle_cross_request_promise_resolution flag
+ * (live Worker logs, 12/12 store-dependent calls failing). The
+ * revert (ADR-0005, evening amendment) keeps the combined load + the
+ * caps/tables cache and goes back to REQUEST-SCOPED clients: one
+ * fresh client per create(), closed when the request finishes. These
+ * tests pin the reverted behavior so it cannot silently regress:
  *
- *  1. caps/tables are queried once per client, not once per create().
+ *  1. Caps/tables are detected once per connection string (plain-value
+ *     cache), not once per create(); a different connection string
+ *     re-detects.
  *  2. The combined load returns the same state a fresh store sees
  *     (per-table row counts + exact seeded rows).
- *  3. Concurrent withTransactions on stores sharing one client do not
- *     corrupt each other (per-client serialization queue).
- *  4. close() on a shared-client store does not end the shared client.
+ *  3. Concurrent withTransactions on SEPARATE stores (own clients) do
+ *     not corrupt each other (the advisory lock serializes writers).
+ *  4. close() ends the store's OWN client; other stores keep working.
  *  5. App-level GET /api/v1/health + GET /api/v1/setup-status through
- *     a storeFactory mimicking apps/api/src/index.ts stay cheap in pg
- *     queries per request (was 55 + 51; now ~6 + ~4).
+ *     a request-scoped storeFactory stay cheap in pg queries per
+ *     request (was 55 + 51 before Batch 0; ~10 with the singleton)
+ *     AND use a fresh client per request, closed afterwards.
  *
  * Requires DATABASE_URL (same convention as the other Postgres suites);
  * skips cleanly without it. Uses its own database
@@ -72,18 +83,34 @@ function makeCustomer(tag: string): CustomerRecord {
   };
 }
 
-/** Count queries on one client instance (restores the original after). */
-function countQueriesOn(client: Client) {
+/**
+ * Assert a query on the given client fails (ended clients reject;
+ * pg may also throw synchronously, so wrap in a promise first).
+ */
+async function queryMustReject(client: Client, why: string): Promise<void> {
+  await assert.rejects(
+    Promise.resolve().then(() => client.query("SELECT 1")),
+    why
+  );
+}
+
+/**
+ * Count queries issued on EVERY pg Client while patched (restores the
+ * original after). Request-scoped clients are created inside
+ * DrizzleStore.create, so per-client patching can no longer see them —
+ * prototype patching counts the true per-request total instead.
+ */
+function countQueriesGlobally() {
   let count = 0;
   let infoSchema = 0;
-  const orig = client.query.bind(client) as (...args: unknown[]) => unknown;
-  const patched = (...args: unknown[]) => {
+  const orig = Client.prototype.query as (...args: unknown[]) => unknown;
+  const patched = function (this: unknown, ...args: unknown[]) {
     count += 1;
     const sql = String((args[0] as { text?: unknown } | undefined)?.text ?? args[0] ?? "");
     if (sql.includes("information_schema")) infoSchema += 1;
-    return orig(...args);
+    return (orig as (...a: unknown[]) => unknown).apply(this, args);
   };
-  (client as unknown as { query: unknown }).query = patched;
+  Client.prototype.query = patched as never;
   return {
     reset() {
       count = 0;
@@ -93,7 +120,7 @@ function countQueriesOn(client: Client) {
       return { count, infoSchema };
     },
     restore() {
-      (client as unknown as { query: unknown }).query = orig;
+      Client.prototype.query = orig as never;
     },
   };
 }
@@ -101,17 +128,15 @@ function countQueriesOn(client: Client) {
 describe.skipIf(!DATABASE_URL)("perf regression (Postgres)", () => {
   let regressionDbUrl = "";
   let env: ReturnType<typeof resolveRuntimeConfig>;
-  let sharedClient: Client;
   let storeA: Awaited<ReturnType<typeof import("../src/platform/db/drizzle-store.ts").DrizzleStore.create>>;
   const extraStores: Array<{ close: () => Promise<void> }> = [];
 
-  async function freshSharedStore() {
+  async function freshStore() {
     const { DrizzleStore } = await import(
       "../src/platform/db/drizzle-store.ts"
     );
     const next = await DrizzleStore.create({
       connectionString: regressionDbUrl,
-      existingClient: sharedClient,
     });
     extraStores.push(next);
     return next;
@@ -138,15 +163,12 @@ describe.skipIf(!DATABASE_URL)("perf regression (Postgres)", () => {
       await admin.query(sql);
     }
     await admin.end();
-    sharedClient = new Client({ connectionString: regressionDbUrl });
-    await sharedClient.connect();
-    storeA = await freshSharedStore();
+    storeA = await freshStore();
   }, 120_000);
 
   afterAll(async () => {
     for (const s of extraStores) await s.close().catch(() => {});
     await storeA?.close().catch(() => {});
-    await sharedClient?.end().catch(() => {});
     const maintenance = new Client({ connectionString: MAINTENANCE_URL });
     await maintenance.connect();
     await maintenance
@@ -155,34 +177,28 @@ describe.skipIf(!DATABASE_URL)("perf regression (Postgres)", () => {
     await maintenance.end();
   }, 120_000);
 
-  it("queries capabilities + required tables once per client, not per create()", async () => {
+  it("queries capabilities + required tables once per connection string, not per create()", async () => {
     const { DrizzleStore } = await import(
       "../src/platform/db/drizzle-store.ts"
     );
-    // A fresh client, so the first create pays the schema checks.
-    const probe = new Client({ connectionString: regressionDbUrl });
-    await probe.connect();
-    const counter = countQueriesOn(probe);
+    // A fresh connection string (new cache key), so the first create
+    // pays the schema checks.
+    const probeUrl = `${regressionDbUrl}?application_name=perf-caps-probe`;
+    const counter = countQueriesGlobally();
     try {
-      const first = await DrizzleStore.create({
-        connectionString: regressionDbUrl,
-        existingClient: probe,
-      });
+      const first = await DrizzleStore.create({ connectionString: probeUrl });
       const firstCounts = counter.counts();
       assert.ok(
         firstCounts.infoSchema >= 2,
-        `first create on a fresh client should run the schema checks (saw ${firstCounts.infoSchema} information_schema queries)`
+        `first create on a fresh connection string should run the schema checks (saw ${firstCounts.infoSchema} information_schema queries)`
       );
       counter.reset();
-      const second = await DrizzleStore.create({
-        connectionString: regressionDbUrl,
-        existingClient: probe,
-      });
+      const second = await DrizzleStore.create({ connectionString: probeUrl });
       const secondCounts = counter.counts();
       assert.equal(
         secondCounts.infoSchema,
         0,
-        `second create on the same client must not re-run schema checks (saw ${secondCounts.infoSchema})`
+        `second create on the same connection string must not re-run schema checks (saw ${secondCounts.infoSchema})`
       );
       // And the second create is cheaper overall: load (1) + signing-key
       // section (BEGIN + lock + 2 SELECTs + COMMIT = 5) = 6 queries.
@@ -192,9 +208,20 @@ describe.skipIf(!DATABASE_URL)("perf regression (Postgres)", () => {
       );
       await first.close();
       await second.close();
+      // A DIFFERENT connection string is a different cache key and
+      // re-detects (no cross-database leakage of the plain-value cache).
+      counter.reset();
+      const third = await DrizzleStore.create({
+        connectionString: `${regressionDbUrl}?application_name=perf-caps-probe-2`,
+      });
+      const thirdCounts = counter.counts();
+      assert.ok(
+        thirdCounts.infoSchema >= 2,
+        `create on a different connection string must re-run schema checks (saw ${thirdCounts.infoSchema})`
+      );
+      await third.close();
     } finally {
       counter.restore();
-      await probe.end().catch(() => {});
     }
   }, 60_000);
 
@@ -203,7 +230,7 @@ describe.skipIf(!DATABASE_URL)("perf regression (Postgres)", () => {
     await storeA.withTransaction((state) => {
       for (const c of seeded) state.customers.push(c);
     });
-    const storeB = await freshSharedStore();
+    const storeB = await freshStore();
     await storeB.loadState();
     const a = await storeA.loadState();
     // Same DB content, same load path: identical row counts everywhere.
@@ -224,8 +251,8 @@ describe.skipIf(!DATABASE_URL)("perf regression (Postgres)", () => {
     }
   }, 60_000);
 
-  it("concurrent withTransactions on stores sharing one client do not corrupt", async () => {
-    const storeB = await freshSharedStore();
+  it("concurrent withTransactions on separate stores (own clients) do not corrupt", async () => {
+    const storeB = await freshStore();
     const tags = Array.from({ length: 8 }, (_, i) => `CONC-${i}`);
     await Promise.all(
       tags.map((tag, i) =>
@@ -243,29 +270,38 @@ describe.skipIf(!DATABASE_URL)("perf regression (Postgres)", () => {
     }
   }, 60_000);
 
-  it("close() on a shared-client store does not end the shared client", async () => {
-    const doomed = await freshSharedStore();
+  it("close() ends the store's OWN client and other stores keep working", async () => {
+    const doomed = await freshStore();
+    const doomedClient = doomed.pgClient;
     await doomed.close();
-    // The shared client must still serve other stores afterwards.
-    const survivor = await freshSharedStore();
-    const state = await survivor.loadState();
-    assert.ok(Array.isArray(state.customers));
+    // The store's own client is ended: queries on it reject.
+    await queryMustReject(doomedClient, "ended client must reject queries");
     // And the closed store itself refuses further use.
     await assert.rejects(doomed.loadState(), /closed/);
+    // Other stores on the same database are unaffected.
+    const survivor = await freshStore();
+    const state = await survivor.loadState();
+    assert.ok(Array.isArray(state.customers));
   }, 60_000);
 
-  it("health + setup-status through a shared-client storeFactory stay cheap", async () => {
+  it("health + setup-status through a request-scoped storeFactory stay cheap and use a fresh client per request", async () => {
     const { DrizzleStore } = await import(
       "../src/platform/db/drizzle-store.ts"
     );
-    const counter = countQueriesOn(sharedClient);
+    // Record every client the factory creates: each request must get
+    // its own instance, and the app must close it when the request
+    // finishes (no cross-request reuse, no leaked connections).
+    const createdClients: Client[] = [];
     const app = createStackMateApp({
-      storeFactory: async () =>
-        DrizzleStore.create({
+      storeFactory: async () => {
+        const store = await DrizzleStore.create({
           connectionString: regressionDbUrl,
-          existingClient: sharedClient,
-        }),
+        });
+        createdClients.push(store.pgClient);
+        return store;
+      },
     });
+    const counter = countQueriesGlobally();
     const healthMs: number[] = [];
     const setupMs: number[] = [];
     const setupQueries: number[] = [];
@@ -310,9 +346,27 @@ describe.skipIf(!DATABASE_URL)("perf regression (Postgres)", () => {
     console.log(
       `PERF-REGRESSION pg queries per setup-status request: ${setupQueries.join(", ")}`
     );
-    // Before the fix: create 55 queries + setup-status 51 = 106 per
-    // request. After: create ~6 + handler (BEGIN + lock + load + COMMIT
-    // = 4) = ~10. The bound leaves headroom for the signing-key section.
+    // Structural: 6 requests → 6 distinct clients, each closed after
+    // its request (a shared client would show 1 distinct instance and
+    // a live connection afterwards).
+    assert.equal(createdClients.length, 6, `expected 6 store creations, saw ${createdClients.length}`);
+    assert.equal(
+      new Set(createdClients).size,
+      6,
+      "each request must get a FRESH pg Client instance (no cross-request reuse)"
+    );
+    for (const [i, client] of createdClients.entries()) {
+      await queryMustReject(
+        client,
+        `client ${i} must be ended after its request (store closed by the app)`
+      );
+    }
+    // Before Batch 0: create 55 queries + setup-status 51 = 106 per
+    // request. With the singleton: create ~6 + handler (BEGIN + lock +
+    // load + COMMIT = 4) = ~10. Request-scoped keeps the combined load
+    // + caps cache, so warm-cache create is still ~6 and a
+    // setup-status request stays ~10. The bound leaves headroom for
+    // the signing-key section and a cold-cache first request.
     for (const q of setupQueries) {
       assert.ok(q <= 15, `setup-status request issued ${q} pg queries (expected <= 15)`);
     }
