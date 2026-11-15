@@ -16,5 +16,5 @@ transpile-only "typecheck", copy-only "build", transpile-and-run-one-file
 | `scripts/lint-repo.mjs` | Static code & security lint across the repo |
 | `scripts/migrate.mjs` | Applies pending migrations in journal order to `DATABASE_MIGRATION_URL` / `DATABASE_URL`; `--dry-run` lists them. Records applied migrations in `__stackmate_migrations`. Resolves `pg` through the API package (bare `import("pg")` does not resolve from the repo root under pnpm) |
 | `scripts/seed-reference.mjs` | Idempotent reference-data seed (migration 0001) against `DATABASE_MIGRATION_URL` / `DATABASE_URL` |
-| `scripts/bootstrap-super-admin.mjs` | Creates the super admin via HTTP POST to a running API (env vars only, never committed credentials) |
+| `scripts/bootstrap-super-admin.mjs` | Creates the super admin via HTTP POST to a running API (env vars only, never committed credentials). Requires `SETUP_TOKEN` — the operator-set Worker secret that gates the bootstrap endpoint (404 when unset server-side, 403 on a wrong token) |
 | `scripts/smoke-check.mjs` | Boots the real TS API source (Node 24 type stripping) and checks `/api/v1/health` + signing-keys in the test env |

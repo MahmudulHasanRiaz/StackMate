@@ -46,6 +46,18 @@ export interface StackMateBindings {
   ACTIVE_ENCRYPTION_KEY_VERSION: string;
   LICENSE_VERIFIER_SECRET: string;
   CHECKOUT_TOKEN_SECRET: string;
+  /**
+   * First-admin setup token (Security, 2026-11-15): the operator-set
+   * secret that gates POST /api/auth/bootstrap-super-admin. OPTIONAL by
+   * design — when unset/empty the bootstrap endpoint is DISABLED entirely
+   * (it answers 404, as if it did not exist). It is NEVER given a
+   * fallback/default value: a default would let anyone who reads the
+   * source claim a fresh instance. Set it as a Worker secret in the
+   * Cloudflare dashboard (staging/production) or in local env.
+   * When set in staging/production it must be at least 32 characters;
+   * resolveRuntimeConfig throws otherwise (fail-closed at boot).
+   */
+  SETUP_TOKEN?: string | undefined;
   LICENSE_SIGNING_PRIVATE_JWK?: string | undefined;
   LICENSE_SIGNING_PUBLIC_JWK?: string | undefined;
   LICENSE_SIGNING_KEY_ID: string;
@@ -76,6 +88,8 @@ export function resolveRuntimeConfig(rawEnv: Partial<StackMateBindings> = {}): S
     rawEnv.CHECKOUT_TOKEN_SECRET ??
     process.env.CHECKOUT_TOKEN_SECRET ??
     (isProd ? "" : "local-dev-checkout-access-token-hmac-secret-2026");
+  const setupToken =
+    rawEnv.SETUP_TOKEN ?? process.env.SETUP_TOKEN ?? "";
 
   if (isProd) {
     if (!betterAuthSecret || betterAuthSecret.length < 32) {
@@ -86,6 +100,12 @@ export function resolveRuntimeConfig(rawEnv: Partial<StackMateBindings> = {}): S
     }
     if (!licenseVerifierSecret || !checkoutTokenSecret) {
       throw new Error("LICENSE_VERIFIER_SECRET and CHECKOUT_TOKEN_SECRET must be set in staging/production.");
+    }
+    // A short SETUP_TOKEN is barely better than none: reject it at boot
+    // instead of serving a weakly-gated bootstrap endpoint. Unset is
+    // fine — the endpoint is disabled then (see app.ts).
+    if (setupToken && setupToken.length < 32) {
+      throw new Error("SETUP_TOKEN must be at least 32 characters when set in staging/production.");
     }
     if (!rawEnv.HYPERDRIVE_NO_CACHE?.connectionString) {
       throw new Error("HYPERDRIVE_NO_CACHE binding is required in staging/production.");
@@ -112,6 +132,7 @@ export function resolveRuntimeConfig(rawEnv: Partial<StackMateBindings> = {}): S
       rawEnv.ACTIVE_ENCRYPTION_KEY_VERSION ?? process.env.ACTIVE_ENCRYPTION_KEY_VERSION ?? "v1",
     LICENSE_VERIFIER_SECRET: licenseVerifierSecret,
     CHECKOUT_TOKEN_SECRET: checkoutTokenSecret,
+    SETUP_TOKEN: setupToken || undefined,
     LICENSE_SIGNING_PRIVATE_JWK:
       rawEnv.LICENSE_SIGNING_PRIVATE_JWK ?? process.env.LICENSE_SIGNING_PRIVATE_JWK,
     LICENSE_SIGNING_PUBLIC_JWK:
