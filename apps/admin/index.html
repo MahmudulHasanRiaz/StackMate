@@ -5,14 +5,24 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>StackMate Admin</title>
     <script>
-      // Theme bootstrap: apply the persisted theme (localStorage `sm-theme`,
-      // default dark — Neon) before React mounts, so there is no flash.
+      // Theme bootstrap: apply the persisted theme choice (localStorage
+      // `sm-theme`: "system" | "dark" | "light", default dark — Neon)
+      // before React mounts, so there is no flash. "system" follows the
+      // OS preference at load; the live listener in lib/theme.ts takes
+      // over after mount.
       try {
         var t = localStorage.getItem("sm-theme");
-        document.documentElement.setAttribute(
-          "data-theme",
-          t === "light" ? "light" : "dark"
-        );
+        var theme = "dark";
+        if (t === "light") {
+          theme = "light";
+        } else if (
+          t === "system" &&
+          window.matchMedia &&
+          window.matchMedia("(prefers-color-scheme: light)").matches
+        ) {
+          theme = "light";
+        }
+        document.documentElement.setAttribute("data-theme", theme);
       } catch (e) {
         document.documentElement.setAttribute("data-theme", "dark");
       }

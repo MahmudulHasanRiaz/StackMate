@@ -57,13 +57,15 @@ export function PageHeader({
 }) {
   return (
     <div>
-      <Breadcrumb items={breadcrumb} />
-      <div className="sm-page-header" style={{ marginTop: 8 }}>
+      <div className="sm-page-header">
         <div>
           <h1 className="sm-page-title">{title}</h1>
           {subtitle ? <p className="sm-page-subtitle">{subtitle}</p> : null}
         </div>
         {action}
+      </div>
+      <div className="sm-page-breadcrumb">
+        <Breadcrumb items={breadcrumb} />
       </div>
     </div>
   );
@@ -244,7 +246,9 @@ export function ListTable<T>({
   const filteredCount = table.getFilteredRowModel().rows.length;
   return (
     <div>
-      <Toolbar>
+      {/* Neon list pattern: the search is full-width, directly under the
+          breadcrumb — the toolbar below it holds only filters/actions. */}
+      <div className="sm-list-search">
         <Input
           className="sm-search-input"
           type="search"
@@ -253,8 +257,8 @@ export function ListTable<T>({
           value={search}
           onChange={(e) => onSearchChange(e.target.value)}
         />
-        {toolbar}
-      </Toolbar>
+      </div>
+      {toolbar ? <Toolbar>{toolbar}</Toolbar> : null}
       {filteredCount === 0 ? (
         <div className="sm-table-wrap">
           <EmptyState

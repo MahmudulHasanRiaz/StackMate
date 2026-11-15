@@ -7,11 +7,30 @@
  * Dark is the DEFAULT theme; light is the alternate. The accent is a
  * proposal the owner can change in one place (the --sm-accent tokens).
  *
+ * NEON PATTERN RULES (owner 2026-11-16, screenshots image-73 + image-76):
+ * (1) MINIMAL RADIUS — cap 6px everywhere, 8px max for dialogs; pills
+ *     (chips, status badges, avatar, account button) stay fully rounded.
+ * (2) COMPACT HEIGHTS — topbar 48px, nav rows ~32px, inputs 32px,
+ *     buttons 30px (small 26px), tight but not cramped; base font never
+ *     below 13–14px.
+ * (3) ONE of everything — one radius scale, one spacing scale, one
+ *     border color, accent only for primary actions/links, sparingly.
+ *     The pattern applies to EVERY surface (dialogs, tables, forms,
+ *     badges, toasts, empty states), not just the shell.
+ * (4) Table headers are small WHITE semibold text (not muted, not
+ *     uppercase), no background block, bottom border only.
+ *
  * Rules (design spec §5): no color/size/radius/shadow/duration may be
- * hardcoded anywhere else. Typography: system stack only (no webfont).
+ * hardcoded anywhere else. Typography: Inter (self-hosted, see below).
  * Money/dates use tabular sans — mono is reserved for IDs/keys/tokens.
  * Contrast: body text >= 4.5:1, UI >= 3:1 (both themes).
  */
+
+/* ------------------------------------------------------------------ */
+/* Inter (Neon font) — @fontsource-variable/inter, imported in         */
+/* main.tsx; the variable font covers weights 100–900. The system      */
+/* stack below is the fallback if the font ever fails to load.         */
+/* ------------------------------------------------------------------ */
 
 /* ------------------------------------------------------------------ */
 /* Dark theme — DEFAULT (:root). Neon.                                 */
@@ -19,9 +38,9 @@
 :root {
   color-scheme: dark;
 
-  /* Surfaces & text */
-  --sm-bg: #0a0a0a;
-  --sm-surface: #121212;
+  /* Surfaces & text (Neon: pure-black page, panels ~#101010) */
+  --sm-bg: #000000;
+  --sm-surface: #101010;
   --sm-surface-muted: #1a1a1a;
   --sm-surface-hover: #222222;
   --sm-border: #232323;
@@ -47,18 +66,27 @@
   --sm-danger: #dc2626;
   --sm-danger-hover: #b91c1c;
 
-  --sm-overlay: rgba(0, 0, 0, 0.7);
-  --sm-focus-ring: 0 0 0 2px #0a0a0a, 0 0 0 4px #00e5a0;
+  /* Alert borders — Neon banners are bordered panels, not tinted fills */
+  --sm-success-border: rgba(0, 229, 160, 0.35);
+  --sm-warning-border: rgba(251, 191, 36, 0.35);
+  --sm-danger-border: rgba(248, 113, 113, 0.35);
+  --sm-info-border: rgba(125, 211, 252, 0.35);
 
-  /* Typography — system stack only */
-  --sm-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+  --sm-overlay: rgba(0, 0, 0, 0.7);
+  --sm-focus-ring: 0 0 0 2px #000000, 0 0 0 4px #00e5a0;
+
+  /* Typography — Inter Variable (self-hosted via npm), system stack as fallback */
+  --sm-font-sans: "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     "Helvetica Neue", Arial, sans-serif;
   --sm-font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas,
     "Roboto Mono", monospace;
 
-  /* Spacing (4px base) */
+  /* Spacing (4px base; half-steps only where a compact row needs them:
+     nav buttons 6px/10px, menu rows 6px/10px) */
   --sm-space-1: 4px;
+  --sm-space-1-5: 6px;
   --sm-space-2: 8px;
+  --sm-space-2-5: 10px;
   --sm-space-3: 12px;
   --sm-space-4: 16px;
   --sm-space-5: 20px;
@@ -71,13 +99,13 @@
   --sm-content-max: 1400px;
   --sm-sidebar-width: 248px;
   --sm-sidebar-rail-width: 64px;
-  --sm-topbar-height: 56px;
+  --sm-topbar-height: 48px;
 
-  /* Radii */
+  /* Radii — Neon pattern: minimal. Cap 6px; dialogs 8px max; pills 999px. */
   --sm-radius-sm: 4px;
   --sm-radius-md: 6px;
-  --sm-radius-lg: 8px;
-  --sm-radius-xl: 12px;
+  --sm-radius-lg: 6px;
+  --sm-radius-xl: 8px;
 
   /* Elevation — minimal in dark (Neon: borders do the work, not shadows) */
   --sm-shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.4);
@@ -128,6 +156,12 @@
   --sm-danger: #b91c1c;
   --sm-danger-hover: #991b1b;
 
+  /* Alert borders (light) */
+  --sm-success-border: rgba(22, 101, 52, 0.35);
+  --sm-warning-border: rgba(146, 64, 14, 0.35);
+  --sm-danger-border: rgba(153, 27, 27, 0.35);
+  --sm-info-border: rgba(30, 64, 175, 0.35);
+
   --sm-overlay: rgba(15, 23, 42, 0.45);
   --sm-focus-ring: 0 0 0 2px #ffffff, 0 0 0 4px #007a55;
 
@@ -177,9 +211,9 @@ a:hover {
 /* ------------------------------------------------------------------ */
 .sm-page-title {
   margin: 0;
-  font-size: 20px;
-  font-weight: 600;
-  line-height: 28px;
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 32px;
   letter-spacing: -0.01em;
 }
 .sm-section-title {
@@ -237,10 +271,10 @@ a:hover {
 .sm-sidebar {
   background: var(--sm-surface);
   border-right: 1px solid var(--sm-border);
-  padding: var(--sm-space-4);
+  padding: var(--sm-space-3);
   display: flex;
   flex-direction: column;
-  gap: var(--sm-space-4);
+  gap: var(--sm-space-3);
   position: sticky;
   top: 0;
   height: 100vh;
@@ -265,8 +299,16 @@ a:hover {
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--sm-text-muted);
-  margin: var(--sm-space-3) 0 var(--sm-space-1);
-  padding: 0 var(--sm-space-3);
+  margin: var(--sm-space-1) 0 var(--sm-space-1);
+  padding: 0 var(--sm-space-2-5);
+}
+/* 1px divider BETWEEN nav groups (Neon separates sections with a line,
+   not just a label). Hidden labels in rail mode leave the line as the
+   separator between icon clusters. */
+.sm-nav-divider {
+  height: 1px;
+  background: var(--sm-border);
+  margin: var(--sm-space-2) 0;
 }
 .sm-nav-btn {
   width: 100%;
@@ -276,10 +318,10 @@ a:hover {
   text-align: left;
   background: transparent;
   border: none;
-  padding: var(--sm-space-2) var(--sm-space-3);
+  padding: var(--sm-space-1-5) var(--sm-space-2-5);
   border-radius: var(--sm-radius-md);
   color: var(--sm-text);
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 500;
   cursor: pointer;
   transition: background var(--sm-transition), color var(--sm-transition);
@@ -291,7 +333,7 @@ a:hover {
 }
 .sm-nav-btn[aria-current="page"] {
   background: var(--sm-surface-muted);
-  color: var(--sm-accent);
+  color: var(--sm-text);
   font-weight: 600;
 }
 .sm-nav-btn svg {
@@ -306,6 +348,292 @@ a:hover {
 .sm-shell[data-sidebar="rail"] .sm-sidebar-brand .sm-brand-name {
   display: none;
 }
+/* Manual collapse (persisted, `sm-nav-collapsed`): the same rail
+   treatment as the 900–1280px breakpoint. */
+.sm-shell[data-nav-collapsed="true"] {
+  grid-template-columns: var(--sm-sidebar-rail-width) 1fr;
+}
+.sm-shell[data-nav-collapsed="true"] .sm-nav-btn {
+  justify-content: center;
+  padding: var(--sm-space-2);
+}
+.sm-shell[data-nav-collapsed="true"] .sm-nav-btn .sm-nav-label,
+.sm-shell[data-nav-collapsed="true"] .sm-nav-group-label,
+.sm-shell[data-nav-collapsed="true"] .sm-sidebar-brand .sm-brand-name {
+  display: none;
+}
+
+/* "Collapse menu" button — sidebar bottom (Neon parity). */
+.sm-nav-collapse-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: var(--sm-space-2);
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-top: 1px solid var(--sm-border);
+  padding: var(--sm-space-1-5) var(--sm-space-2-5);
+  border-radius: var(--sm-radius-md);
+  color: var(--sm-text-muted);
+  font-size: 13px;
+  font-weight: 500;
+  font-family: var(--sm-font-sans);
+  cursor: pointer;
+}
+.sm-nav-collapse-btn:hover {
+  background: var(--sm-surface-hover);
+  color: var(--sm-text);
+}
+.sm-nav-collapse-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--sm-focus-ring);
+}
+.sm-shell[data-nav-collapsed="true"] .sm-nav-collapse-btn,
+.sm-settings-shell .sm-main-rail .sm-nav-collapse-btn {
+  justify-content: center;
+  padding: var(--sm-space-2);
+}
+.sm-shell[data-nav-collapsed="true"] .sm-nav-collapse-btn .sm-nav-label,
+.sm-settings-shell .sm-main-rail .sm-nav-collapse-btn .sm-nav-label {
+  display: none;
+}
+.sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-nav-collapse-btn {
+  justify-content: flex-start;
+  padding: var(--sm-space-2) var(--sm-space-3);
+}
+.sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-nav-collapse-btn .sm-nav-label {
+  display: inline;
+}
+
+/* ------------------------------------------------------------------ */
+/* Dropdown menu (account menu primitive) + avatar + QuickNav          */
+/* ------------------------------------------------------------------ */
+.sm-menu-wrap {
+  position: relative;
+}
+/* Shared dropdown visuals. `.sm-menu` is anchored to its trigger
+   (account menu); `.sm-row-menu` is portaled to <body> with fixed
+   positioning so a table's scroll container never clips it. */
+.sm-menu,
+.sm-row-menu {
+  min-width: 264px;
+  max-width: calc(100vw - 32px);
+  background: var(--sm-surface);
+  border: 1px solid var(--sm-border);
+  border-radius: var(--sm-radius-lg);
+  box-shadow: var(--sm-shadow-md);
+  padding: var(--sm-space-1);
+  z-index: var(--sm-z-dropdown);
+}
+.sm-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+}
+.sm-row-menu {
+  position: fixed;
+  min-width: 200px;
+}
+/* Row-menu items are ~32px (Neon menu rows), tighter than the account menu. */
+.sm-row-menu .sm-menu-item {
+  padding: var(--sm-space-1-5) var(--sm-space-2-5);
+  font-size: 13px;
+}
+.sm-menu-header {
+  display: flex;
+  align-items: center;
+  gap: var(--sm-space-3);
+  padding: var(--sm-space-3);
+}
+.sm-menu-header .sm-menu-header-name {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 20px;
+}
+.sm-menu-header .sm-menu-header-sub {
+  font-size: 12.5px;
+  line-height: 16px;
+  color: var(--sm-text-muted);
+  overflow-wrap: anywhere;
+}
+.sm-menu-divider {
+  height: 1px;
+  background: var(--sm-border);
+  margin: var(--sm-space-1) 0;
+}
+.sm-menu-section-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--sm-text-muted);
+  padding: var(--sm-space-2) var(--sm-space-3) var(--sm-space-1);
+}
+.sm-menu-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: var(--sm-space-2);
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: var(--sm-space-2) var(--sm-space-3);
+  border-radius: var(--sm-radius-md);
+  color: var(--sm-text);
+  font-size: 14px;
+  font-weight: 500;
+  font-family: var(--sm-font-sans);
+  cursor: pointer;
+}
+.sm-menu-item:hover,
+.sm-menu-item[data-active="true"] {
+  background: var(--sm-surface-hover);
+}
+.sm-menu-item:focus-visible {
+  outline: none;
+  box-shadow: var(--sm-focus-ring);
+}
+.sm-menu-item[data-danger="true"] {
+  color: var(--sm-danger-text);
+}
+.sm-menu-item[data-danger="true"]:hover {
+  background: var(--sm-danger-bg);
+}
+.sm-menu-item .sm-menu-item-label {
+  flex: 1;
+}
+.sm-menu-item .sm-menu-item-check {
+  margin-left: auto;
+  color: var(--sm-accent);
+  display: inline-flex;
+}
+
+.sm-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: var(--sm-accent-soft);
+  color: var(--sm-accent);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+}
+.sm-avatar-lg {
+  width: 36px;
+  height: 36px;
+  font-size: 14px;
+}
+
+.sm-account-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sm-space-2);
+  height: 30px;
+  padding: 2px 8px 2px 2px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--sm-text);
+  font-size: 13px;
+  font-weight: 500;
+  font-family: var(--sm-font-sans);
+  cursor: pointer;
+}
+.sm-account-btn:hover {
+  background: var(--sm-surface-hover);
+}
+.sm-account-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--sm-focus-ring);
+}
+.sm-account-btn .sm-account-name {
+  max-width: 160px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.sm-quicknav-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sm-space-2);
+  height: 30px;
+  width: 280px;
+  padding: 0 var(--sm-space-2-5);
+  border: 1px solid var(--sm-border-strong);
+  border-radius: var(--sm-radius-md);
+  background: var(--sm-surface);
+  color: var(--sm-text-muted);
+  font-size: 13px;
+  font-family: var(--sm-font-sans);
+  cursor: pointer;
+  margin: 0 auto;
+}
+.sm-quicknav-btn:hover {
+  border-color: var(--sm-text-muted);
+  color: var(--sm-text);
+}
+.sm-quicknav-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--sm-focus-ring);
+}
+.sm-quicknav-btn .sm-quicknav-label {
+  flex: 1;
+  text-align: left;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.sm-kbd {
+  font-family: var(--sm-font-mono);
+  font-size: 11px;
+  line-height: 1;
+  color: var(--sm-text-muted);
+  border: 1px solid var(--sm-border-strong);
+  border-radius: var(--sm-radius-sm);
+  padding: 2px 5px;
+  background: var(--sm-surface-muted);
+}
+.sm-quicknav-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-1);
+  max-height: 320px;
+  overflow-y: auto;
+}
+.sm-quicknav-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sm-space-2);
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: var(--sm-space-2) var(--sm-space-3);
+  border-radius: var(--sm-radius-md);
+  color: var(--sm-text);
+  font-size: 14px;
+  font-family: var(--sm-font-sans);
+  cursor: pointer;
+}
+.sm-quicknav-item[data-active="true"] {
+  background: var(--sm-surface-hover);
+}
+.sm-quicknav-item:focus-visible {
+  outline: none;
+  box-shadow: var(--sm-focus-ring);
+}
+.sm-quicknav-item .sm-quicknav-group {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--sm-text-muted);
+}
+
 .sm-sidebar-backdrop {
   display: none;
 }
@@ -341,7 +669,7 @@ a:hover {
   }
 }
 .sm-content {
-  padding: var(--sm-space-6);
+  padding: var(--sm-space-5);
   max-width: var(--sm-content-max);
   width: 100%;
   margin: 0 auto;
@@ -351,8 +679,19 @@ a:hover {
   align-items: center;
   justify-content: space-between;
   gap: var(--sm-space-4);
-  margin-bottom: var(--sm-space-5);
+  margin-bottom: var(--sm-space-2);
   flex-wrap: wrap;
+}
+/* Breadcrumb sits UNDER the title (Neon page-header pattern). */
+.sm-page-breadcrumb {
+  margin-bottom: var(--sm-space-4);
+}
+/* Full-width search directly under the breadcrumb (Neon list pattern). */
+.sm-list-search {
+  margin-bottom: var(--sm-space-3);
+}
+.sm-list-search .sm-search-input {
+  width: 100%;
 }
 .sm-page-subtitle {
   margin: var(--sm-space-1) 0 0;
@@ -368,7 +707,7 @@ a:hover {
   border: 1px solid var(--sm-border);
   border-radius: var(--sm-radius-lg);
   box-shadow: var(--sm-shadow-sm);
-  padding: var(--sm-space-5);
+  padding: var(--sm-space-4);
 }
 /* Stacked cards on detail pages sit one gap apart (no wrapper needed). */
 .sm-card + .sm-card {
@@ -384,7 +723,7 @@ a:hover {
   background: var(--sm-surface);
   border: 1px solid var(--sm-border);
   border-radius: var(--sm-radius-lg);
-  padding: var(--sm-space-4) var(--sm-space-5);
+  padding: var(--sm-space-3) var(--sm-space-4);
 }
 .sm-kpi-card .sm-label {
   color: var(--sm-text-muted);
@@ -402,7 +741,7 @@ a:hover {
 }
 .sm-table th,
 .sm-table td {
-  padding: var(--sm-space-3) var(--sm-space-4);
+  padding: 10px var(--sm-space-4);
   border-bottom: 1px solid var(--sm-border);
   text-align: left;
   font-size: 14px;
@@ -411,14 +750,15 @@ a:hover {
 .sm-table tbody tr:last-child td {
   border-bottom: none;
 }
+/* Neon header (screenshot 2, image-76): small WHITE semibold text, not
+   uppercase, no background block — just a bottom border. This supersedes
+   the muted-header choice from screenshot 1 (audit G2). */
 .sm-table th {
-  background: var(--sm-surface-muted);
+  background: transparent;
   font-weight: 600;
-  color: var(--sm-text-muted);
+  color: var(--sm-text);
   font-size: 12px;
   line-height: 16px;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
   position: sticky;
   top: 0;
   z-index: var(--sm-z-sticky);
@@ -450,8 +790,8 @@ a:hover {
   align-items: center;
   justify-content: center;
   gap: var(--sm-space-2);
-  height: 32px;
-  padding: 7px 14px;
+  height: 30px;
+  padding: 0 var(--sm-space-3);
   border-radius: var(--sm-radius-md);
   border: 1px solid transparent;
   font-size: 14px;
@@ -464,8 +804,8 @@ a:hover {
   text-decoration: none;
 }
 .sm-btn-sm {
-  height: 28px;
-  padding: 5px 10px;
+  height: 26px;
+  padding: 0 var(--sm-space-2-5);
   font-size: 13px;
 }
 .sm-btn:focus-visible {
@@ -514,19 +854,21 @@ a:hover {
 }
 .sm-btn-icon {
   padding: 0;
-  width: 28px;
-  height: 28px;
+  width: 26px;
+  height: 26px;
 }
 
 /* ------------------------------------------------------------------ */
 /* Badges — dot + word, never color alone                              */
 /* ------------------------------------------------------------------ */
+/* Badges are PILLS in Neon ("Default" / "Idle" / "Active") — fully
+   rounded, dot + word, never color alone. */
 .sm-badge {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--sm-space-1-5);
   padding: 2px 8px;
-  border-radius: var(--sm-radius-sm);
+  border-radius: 999px;
   font-size: 12px;
   font-weight: 600;
   line-height: 16px;
@@ -584,8 +926,8 @@ a:hover {
 .sm-input,
 .sm-select,
 .sm-textarea {
-  height: 36px;
-  padding: 8px 12px;
+  height: 32px;
+  padding: 0 var(--sm-space-3);
   border: 1px solid var(--sm-border-strong);
   border-radius: var(--sm-radius-md);
   font-size: 14px;
@@ -597,6 +939,7 @@ a:hover {
 .sm-textarea {
   height: auto;
   min-height: 96px;
+  padding: var(--sm-space-2) var(--sm-space-3);
   resize: vertical;
 }
 .sm-select {
@@ -670,9 +1013,9 @@ a:hover {
 .sm-chip {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  height: 28px;
-  padding: 0 12px;
+  gap: var(--sm-space-1-5);
+  height: 26px;
+  padding: 0 var(--sm-space-3);
   border-radius: 999px;
   border: 1px solid var(--sm-border-strong);
   background: var(--sm-surface);
@@ -703,7 +1046,7 @@ a:hover {
   margin-bottom: var(--sm-space-5);
 }
 .sm-tab {
-  padding: 8px 12px;
+  padding: var(--sm-space-1-5) var(--sm-space-2-5);
   font-size: 14px;
   font-weight: 500;
   color: var(--sm-text-muted);
@@ -772,8 +1115,8 @@ a:hover {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
-  height: 28px;
+  width: 26px;
+  height: 26px;
   padding: 0;
   border: none;
   border-radius: var(--sm-radius-md);
@@ -824,10 +1167,10 @@ a:hover {
   align-items: center;
   justify-content: space-between;
   gap: var(--sm-space-4);
-  padding: var(--sm-space-5) var(--sm-space-5) 0;
+  padding: var(--sm-space-4) var(--sm-space-4) 0;
 }
 .sm-dialog-body {
-  padding: var(--sm-space-4) var(--sm-space-5);
+  padding: var(--sm-space-4) var(--sm-space-4);
   overflow-y: auto;
   font-size: 14px;
 }
@@ -836,7 +1179,7 @@ a:hover {
   align-items: center;
   justify-content: flex-end;
   gap: var(--sm-space-2);
-  padding: 0 var(--sm-space-5) var(--sm-space-5);
+  padding: 0 var(--sm-space-4) var(--sm-space-4);
 }
 @keyframes sm-fade-in {
   from { opacity: 0; }
@@ -880,6 +1223,8 @@ a:hover {
   gap: var(--sm-space-3);
   padding: var(--sm-space-3) var(--sm-space-4);
   border-radius: var(--sm-radius-lg);
+  border: 1px solid var(--sm-border);
+  background: var(--sm-surface);
   font-size: 14px;
   margin-bottom: var(--sm-space-4);
 }
@@ -888,19 +1233,19 @@ a:hover {
   margin-top: 2px;
 }
 .sm-alert-success {
-  background: var(--sm-success-bg);
+  border-color: var(--sm-success-border);
   color: var(--sm-success-text);
 }
 .sm-alert-warning {
-  background: var(--sm-warning-bg);
+  border-color: var(--sm-warning-border);
   color: var(--sm-warning-text);
 }
 .sm-alert-danger {
-  background: var(--sm-danger-bg);
+  border-color: var(--sm-danger-border);
   color: var(--sm-danger-text);
 }
 .sm-alert-info {
-  background: var(--sm-info-bg);
+  border-color: var(--sm-info-border);
   color: var(--sm-info-text);
 }
 .sm-alert .sm-alert-dismiss {
@@ -1018,7 +1363,7 @@ a:hover {
   border: 1px solid var(--sm-border);
   border-radius: var(--sm-radius-xl);
   box-shadow: var(--sm-shadow-md);
-  padding: var(--sm-space-8);
+  padding: var(--sm-space-6);
 }
 .sm-auth-card .sm-auth-form {
   display: flex;
@@ -1028,21 +1373,47 @@ a:hover {
 }
 
 /* ------------------------------------------------------------------ */
-/* Settings shell — dedicated area. Main nav collapses (hidden) while  */
-/* inside Settings; the settings sub-menu is the only nav shown.       */
+/* Settings shell — dedicated area. The main nav stays visible as a    */
+/* COLLAPSED icon rail (64px) beside the expanded Settings nav         */
+/* (240px); collapse ≠ hide (owner correction 2026-11-15). The         */
+/* "Collapse menu" toggle expands the main rail to 248px.              */
 /* ------------------------------------------------------------------ */
 .sm-settings-shell {
   display: grid;
-  grid-template-columns: 240px 1fr;
+  grid-template-columns: var(--sm-sidebar-rail-width) 240px 1fr;
   min-height: 100vh;
+}
+.sm-settings-shell[data-nav-collapsed="false"] {
+  grid-template-columns: var(--sm-sidebar-width) 240px 1fr;
+}
+/* Main rail inside Settings: icon-only while collapsed. */
+.sm-settings-shell .sm-main-rail .sm-nav-btn {
+  justify-content: center;
+  padding: var(--sm-space-2);
+}
+.sm-settings-shell .sm-main-rail .sm-nav-btn .sm-nav-label,
+.sm-settings-shell .sm-main-rail .sm-nav-group-label,
+.sm-settings-shell .sm-main-rail .sm-sidebar-brand .sm-brand-name {
+  display: none;
+}
+.sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-nav-btn {
+  justify-content: flex-start;
+  padding: var(--sm-space-1-5) var(--sm-space-2-5);
+}
+.sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-nav-group-label {
+  display: block;
+}
+.sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-nav-btn .sm-nav-label,
+.sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-sidebar-brand .sm-brand-name {
+  display: inline;
 }
 .sm-settings-nav {
   background: var(--sm-surface);
   border-right: 1px solid var(--sm-border);
-  padding: var(--sm-space-4);
+  padding: var(--sm-space-3);
   display: flex;
   flex-direction: column;
-  gap: var(--sm-space-4);
+  gap: var(--sm-space-3);
   position: sticky;
   top: 0;
   height: 100vh;
@@ -1056,7 +1427,7 @@ a:hover {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: var(--sm-space-4);
-  padding: var(--sm-space-5);
+  padding: var(--sm-space-4);
   background: var(--sm-surface);
   border: 1px solid var(--sm-border);
   border-radius: var(--sm-radius-lg);
@@ -1117,6 +1488,14 @@ a:hover {
   .sm-settings-shell {
     grid-template-columns: 1fr;
   }
+  /* On mobile the main rail is hidden inside Settings — the settings
+     nav is the drawer; the main menu is one "Back to admin" tap away. */
+  .sm-settings-shell .sm-main-rail {
+    display: none;
+  }
+  .sm-nav-collapse-btn {
+    display: none;
+  }
   .sm-settings-nav {
     position: fixed;
     left: 0;
@@ -1141,6 +1520,21 @@ a:hover {
 @media (max-width: 640px) {
   .sm-search-input {
     width: 100%;
+  }
+  .sm-quicknav-btn {
+    width: auto;
+    min-width: 0;
+  }
+  .sm-quicknav-btn .sm-kbd {
+    display: none;
+  }
+  /* User menu behind the avatar button (spec §5.5). */
+  .sm-account-btn .sm-account-name,
+  .sm-account-btn .sm-account-chevron {
+    display: none;
+  }
+  .sm-account-btn {
+    padding: 2px;
   }
   .sm-form-grid {
     grid-template-columns: 1fr;

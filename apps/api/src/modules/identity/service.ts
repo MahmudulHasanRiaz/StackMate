@@ -843,6 +843,63 @@ export async function changeStaffPassword(
   });
 }
 
+/**
+ * Update the signed-in staff member's OWN display name (account menu).
+ *
+ * Why this exists instead of Better Auth's POST /api/auth/update-user:
+ * update-user DOES work through the mounted instance (verified by
+ * better-auth-unified.test.ts — it updates the shared `users.name` row
+ * and GET /me reflects it), but it returns Better Auth's raw response
+ * shape (not the StackMate envelope the SPA client parses) and writes
+ * NO StackMate audit log entry. A profile change is a consequential
+ * identity change, so it goes through this endpoint: StackMate
+ * envelope, audit-logged (`identity.profile.name_updated`), and the
+ * updated principal is returned so the SPA can refresh in place.
+ *
+ * Only `name` is accepted. `email` is the login identity and is changed
+ * by an administrator only; `roles` are never self-editable. Extra
+ * fields in the body are ignored, never applied.
+ */
+export async function updateOwnProfile(
+  store: StackMateDataStore,
+  principal: StaffPrincipal,
+  input: { name: unknown; requestId: string }
+): Promise<StaffPrincipal> {
+  const name = typeof input.name === "string" ? input.name.trim() : "";
+  if (name.length < 1 || name.length > 120) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "Name must be between 1 and 120 characters.",
+      422
+    );
+  }
+  const now = new Date().toISOString();
+  await store.withTransaction((state) => {
+    const user = state.users.find((u) => u.id === principal.user.id);
+    if (!user) throw new AppError("NOT_FOUND", "Staff user not found.", 404);
+    const previousName = user.name;
+    user.name = name;
+    user.updated_at = now;
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: principal.user.id,
+      action: "identity.profile.name_updated",
+      resource_type: "user",
+      resource_id: principal.user.id,
+      outcome: "success",
+      request_id: input.requestId,
+      changes: { previous_name: previousName, name },
+    });
+  });
+  // The staff record IS the Better Auth `users` row (same table, same
+  // id), so this one update keeps both in sync — no separate BA call.
+  // withTransaction already mutated the live in-memory state, so the
+  // principal below reads the new name with no reload.
+  const user = store.state.users.find((u) => u.id === principal.user.id);
+  if (!user) throw new AppError("NOT_FOUND", "Staff user not found.", 404);
+  return buildPrincipal(store.state, user);
+}
+
 export async function updateStaffUserRoles(
   store: StackMateDataStore,
   actor: StaffPrincipal,
