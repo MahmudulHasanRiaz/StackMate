@@ -1,0 +1,109 @@
+name: CI
+
+# Runs on every pull request to main and on pushes to main / feature
+# branches. Needs NO secrets and NO production credential: the only
+# database is an ephemeral postgres:16 service container, and the only
+# Cloudflare step is `wrangler deploy --dry-run` (bundles locally,
+# uploads nothing).
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, "feat/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A newer push to a PR supersedes the older run; pushes to main are
+  # never cancelled mid-run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate-and-test:
+    name: Validate, typecheck, test (incl. Postgres integration) and build
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          # The database name MUST contain "test": the integration suite
+          # refuses to apply migrations to any other database name.
+          POSTGRES_DB: stackmate_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # Exact version from the packageManager field in package.json.
+          version: 10.6.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # Node version from .nvmrc (22.14.0).
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate repository structure and ADR governance
+        run: node scripts/validate-repo.mjs
+
+      - name: Verify SQL migrations and Drizzle schema alignment
+        run: node scripts/check-migrations.mjs
+
+      - name: Run static security and code lint checks
+        run: pnpm run lint
+
+      - name: Run real TypeScript typecheck (tsc --noEmit)
+        # scripts/typecheck.mjs runs genuine `tsc --noEmit` in every
+        # workspace package via `pnpm -r run typecheck`.
+        run: pnpm run typecheck
+
+      - name: Run unit tests (integration suite skips without DATABASE_URL)
+        # scripts/run-tests.mjs runs `vitest run`. With DATABASE_URL
+        # unset, the DrizzleStore Postgres suite skips cleanly and
+        # reports the skip; it is never presented as a pass.
+        run: pnpm test
+
+      - name: Run Postgres integration tests (NOT skipped)
+        # Same vitest suite, scoped to the integration file, with
+        # DATABASE_URL pointing at the postgres:16 service container.
+        # The suite applies every journaled migration to the fresh
+        # stackmate_test database itself before running.
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/stackmate_test
+        run: pnpm exec vitest run apps/api/test/drizzle-store.integration.test.ts
+
+      - name: Build packages, Worker bundle, and Admin SPA
+        # scripts/build-all.mjs: real typecheck, then the admin Vite
+        # build, then `wrangler deploy --dry-run` for the API bundle
+        # (with a local esbuild bundle fallback if wrangler cannot run).
+        run: pnpm run build
+
+      - name: Verify API Worker bundle with wrangler --dry-run
+        # Bundles and validates apps/api/wrangler.jsonc without
+        # uploading anything. Verified locally: exits 0 even while
+        # wrangler.jsonc still carries REPLACE_WITH_* Hyperdrive IDs.
+        run: pnpm --filter @stackmate/api exec wrangler deploy --dry-run
+
+      - name: Run API smoke check (in-memory, test env only)
+        # Boots the real API app in memory and checks /api/v1/health
+        # and /api/v1/licenses/signing-keys. This is NOT a check
+        # against a deployed URL; the deployed-URL check lives in
+        # deploy-production.yml.
+        run: pnpm run smoke:check
