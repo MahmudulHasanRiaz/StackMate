@@ -26,6 +26,7 @@ import {
 } from "../../platform/crypto/index.ts";
 import type {
   DatabaseState,
+  LicenseActivationRecord,
   LicenseEntitlementSnapshotRecord,
   LicenseRecord,
   OrderItemRecord,
@@ -721,5 +722,57 @@ export async function appendLicenseEntitlementSnapshotByAdmin(
     });
 
     return snapshot;
+  });
+}
+
+/**
+ * Staff deactivation of one license installation (API Spec §12.2).
+ * The customer-side deactivateLicenseInstallation (license key + product
+ * code) is a different trust boundary — this one is staff-authorized and
+ * takes the activation id directly. Deactivation frees one seat under
+ * the license's activation limit.
+ */
+export async function deactivateLicenseActivationByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  licenseId: string,
+  activationId: string,
+  rawInput: unknown,
+  requestId: string
+): Promise<{ license: LicenseRecord; activation: LicenseActivationRecord }> {
+  assertStaffPermission(actor, "licenses.manage");
+  const reason =
+    typeof (rawInput as { reason?: unknown } | null)?.reason === "string" &&
+    ((rawInput as { reason: string }).reason.trim().length ?? 0) > 0
+      ? (rawInput as { reason: string }).reason.trim()
+      : "Deactivated by staff";
+  return store.withTransaction((state) => {
+    const license = state.licenses.find((l) => l.id === licenseId);
+    if (!license) throw new AppError("NOT_FOUND", "License not found.", 404);
+    const activation = license.activations.find((a) => a.id === activationId);
+    if (!activation) throw new AppError("NOT_FOUND", "License activation not found.", 404);
+    if (activation.status !== "active") {
+      throw new AppError(
+        "CONFLICT",
+        `Activation is already '${activation.status}'.`,
+        409
+      );
+    }
+    const nowIso = new Date().toISOString();
+    activation.status = "deactivated";
+    activation.deactivated_at = nowIso;
+    license.updated_at = nowIso;
+
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "licensing.activation.deactivated_by_staff",
+      resource_type: "license",
+      resource_id: license.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { activation_id: activation.id, reason },
+    });
+    return { license, activation };
   });
 }

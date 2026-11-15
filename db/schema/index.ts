@@ -14,4 +14,5 @@ export * from "./signing-keys.ts";
 export * from "./tracking.ts";
 export * from "./delivery.ts";
 export * from "./audit.ts";
+export * from "./invitations.ts";
 export * from "./sequence-counters.ts";

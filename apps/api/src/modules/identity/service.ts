@@ -8,7 +8,21 @@ import {
   sessions as baSessions,
   users as baUsers,
 } from "../../../../../db/schema/auth.ts";
-import type { DatabaseState, StackMateDataStore, UserRecord } from "../../platform/db/store.ts";
+import { SEED_PERMISSIONS } from "../../../../../db/seeds/seed-reference.ts";
+import {
+  AcceptStaffInvitationSchema,
+  CreateRoleSchema,
+  CreateStaffInvitationSchema,
+  UpdateRoleSchema,
+} from "../../../../../packages/contracts/src/index.ts";
+import { randomOpaqueToken, sha256Hex } from "../../platform/crypto/index.ts";
+import type {
+  DatabaseState,
+  RoleRecord,
+  StaffInvitationRecord,
+  StackMateDataStore,
+  UserRecord,
+} from "../../platform/db/store.ts";
 import { AppError } from "../../shared/errors.ts";
 import { appendAuditLog } from "../audit/service.ts";
 import type { createBetterAuth } from "./better-auth.ts";
@@ -903,4 +917,377 @@ export function assertStaffPermission(
       403
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Roles (API Spec §8) — custom roles. The spec names permissions
+// users.invite / roles.create / roles.update, but the seeded permission
+// catalogue (db/seeds/seed-reference.ts) has no such keys; the existing
+// users.manage permission ("Manage staff users, roles, and permissions")
+// is the equivalent gate and is used for all role + invitation writes.
+// ---------------------------------------------------------------------------
+
+function validatePermissionAllowlist(permissionKeys: string[]): void {
+  const known: Set<string> = new Set(SEED_PERMISSIONS.map((p) => p.key));
+  for (const key of permissionKeys) {
+    if (!known.has(key)) {
+      throw new AppError("VALIDATION_ERROR", `Unknown permission key '${key}'.`, 422);
+    }
+  }
+}
+
+export async function createRoleByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  rawInput: unknown,
+  requestId: string
+): Promise<RoleRecord> {
+  assertStaffPermission(actor, "users.manage");
+  const input = CreateRoleSchema.parse(rawInput);
+  if (input.key === "super_admin") {
+    throw new AppError("CONFLICT", "Role key 'super_admin' is reserved.", 409);
+  }
+  if (input.permissions.includes("users.manage") && !actor.roles.includes("super_admin")) {
+    throw new AppError(
+      "FORBIDDEN",
+      "Only a Super Admin can create a role with the users.manage permission.",
+      403
+    );
+  }
+  validatePermissionAllowlist(input.permissions);
+  return store.withTransaction((state) => {
+    if (state.roles.some((r) => r.key === input.key)) {
+      throw new AppError("CONFLICT", `Role key '${input.key}' already exists.`, 409);
+    }
+    const role: RoleRecord = {
+      id: randomUUID(),
+      key: input.key,
+      name: input.name,
+      description: input.description ?? "",
+      is_system: false,
+      permission_keys: [...input.permissions],
+      created_at: new Date().toISOString(),
+    };
+    state.roles.push(role);
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "identity.role.created",
+      resource_type: "role",
+      resource_id: role.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { key: role.key, permissions: role.permission_keys },
+    });
+    return role;
+  });
+}
+
+export async function updateRoleByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  roleId: string,
+  rawInput: unknown,
+  requestId: string
+): Promise<RoleRecord> {
+  assertStaffPermission(actor, "users.manage");
+  const input = UpdateRoleSchema.parse(rawInput);
+  return store.withTransaction((state) => {
+    const role = state.roles.find((r) => r.id === roleId);
+    if (!role) throw new AppError("NOT_FOUND", "Role not found.", 404);
+    if (role.key === "super_admin") {
+      throw new AppError("FORBIDDEN", "The super_admin role cannot be modified.", 403);
+    }
+    if (input.permissions !== undefined) {
+      if (role.is_system) {
+        throw new AppError(
+          "CONFLICT",
+          "System role permissions cannot be changed. Create a custom role instead.",
+          409
+        );
+      }
+      if (input.permissions.includes("users.manage") && !actor.roles.includes("super_admin")) {
+        throw new AppError(
+          "FORBIDDEN",
+          "Only a Super Admin can grant the users.manage permission.",
+          403
+        );
+      }
+      validatePermissionAllowlist(input.permissions);
+      role.permission_keys = [...input.permissions];
+    }
+    if (input.name !== undefined) role.name = input.name;
+    if (input.description !== undefined) role.description = input.description ?? "";
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "identity.role.updated",
+      resource_type: "role",
+      resource_id: role.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: input as Record<string, unknown>,
+    });
+    return role;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Staff invitations (API Spec §8, Batch 1). No email system exists, so the
+// invitation token is returned ONCE to the creating admin, who shares it
+// with the invitee out of band. Only the SHA-256 hash is stored.
+// ---------------------------------------------------------------------------
+
+export const STAFF_INVITATION_TTL_MS = 7 * 24 * 3600 * 1000;
+
+/**
+ * Fail-closed persistence check for staff_invitations. The DrizzleStore
+ * load/sync wiring for the new table lives in
+ * batch1-invitations-drizzle-wiring.patch (NOT applied yet — it touches
+ * drizzle-store.ts, owned by the in-flight perf fix). Until it lands, a
+ * DrizzleStore would silently drop invitation rows (persistStateDiff only
+ * syncs tables it has a spec for), so invitation writes 503 instead of
+ * returning 201 for data that would vanish on the next reload. The
+ * in-memory base store persists in its own state, so it reports true.
+ */
+export function storePersistsStaffInvitations(store: StackMateDataStore): boolean {
+  const probe = store as unknown as {
+    drizzleDb?: unknown;
+    supportsStaffInvitations?: boolean;
+  };
+  if (probe.supportsStaffInvitations === true) return true;
+  if (probe.drizzleDb !== undefined) return false;
+  return true;
+}
+
+function assertInvitationPersistence(store: StackMateDataStore): void {
+  if (!storePersistsStaffInvitations(store)) {
+    throw new AppError(
+      "INTERNAL_ERROR",
+      "Staff invitations are unavailable until the Batch 1 DrizzleStore wiring for staff_invitations is applied (see batch1-invitations-drizzle-wiring.patch).",
+      503
+    );
+  }
+}
+
+function stripInvitationToken(
+  invitation: StaffInvitationRecord
+): Omit<StaffInvitationRecord, "token_hash"> {
+  const { token_hash: _h, ...safe } = invitation;
+  return safe;
+}
+
+export async function createStaffInvitationByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  rawInput: unknown,
+  requestId: string
+): Promise<{
+  invitation: Omit<StaffInvitationRecord, "token_hash">;
+  token_once: string;
+}> {
+  assertStaffPermission(actor, "users.manage");
+  assertInvitationPersistence(store);
+  const input = CreateStaffInvitationSchema.parse(rawInput);
+  return store.withTransaction((state) => {
+    const email = input.email.trim().toLowerCase();
+    if (state.users.some((u) => u.email === email)) {
+      throw new AppError(
+        "CONFLICT",
+        `A staff user with email '${email}' already exists.`,
+        409
+      );
+    }
+    if (
+      (state.staff_invitations ?? []).some((i) => i.email === email && i.status === "pending")
+    ) {
+      throw new AppError(
+        "CONFLICT",
+        `A pending invitation for '${email}' already exists. Revoke it before inviting again.`,
+        409
+      );
+    }
+    if (input.role_keys.includes("super_admin") && !actor.roles.includes("super_admin")) {
+      throw new AppError(
+        "FORBIDDEN",
+        "Only a Super Admin can invite someone as super_admin.",
+        403
+      );
+    }
+    for (const rk of input.role_keys) {
+      if (!state.roles.some((r) => r.key === rk)) {
+        throw new AppError("VALIDATION_ERROR", `Unknown role key '${rk}'.`, 422);
+      }
+    }
+
+    const rawToken = randomOpaqueToken("inv", 32);
+    const now = new Date();
+    const invitation: StaffInvitationRecord = {
+      id: randomUUID(),
+      email,
+      name: input.name.trim(),
+      role_keys: [...input.role_keys],
+      token_hash: sha256Hex(rawToken),
+      status: "pending",
+      expires_at: new Date(now.getTime() + STAFF_INVITATION_TTL_MS).toISOString(),
+      invited_by_user_id: actor.user.id,
+      accepted_user_id: null,
+      accepted_at: null,
+      revoked_at: null,
+      created_at: now.toISOString(),
+      updated_at: now.toISOString(),
+    };
+    (state.staff_invitations ??= []).push(invitation);
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "identity.invitation.created",
+      resource_type: "staff_invitation",
+      resource_id: invitation.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { email: invitation.email, roles: invitation.role_keys },
+    });
+    return { invitation: stripInvitationToken(invitation), token_once: rawToken };
+  });
+}
+
+export async function revokeStaffInvitationByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  invitationId: string,
+  requestId: string
+): Promise<Omit<StaffInvitationRecord, "token_hash">> {
+  assertStaffPermission(actor, "users.manage");
+  assertInvitationPersistence(store);
+  return store.withTransaction((state) => {
+    const invitation = (state.staff_invitations ?? []).find((i) => i.id === invitationId);
+    if (!invitation) throw new AppError("NOT_FOUND", "Invitation not found.", 404);
+    if (invitation.status !== "pending") {
+      throw new AppError(
+        "CONFLICT",
+        `Invitation is already '${invitation.status}'.`,
+        409
+      );
+    }
+    const nowIso = new Date().toISOString();
+    invitation.status = "revoked";
+    invitation.revoked_at = nowIso;
+    invitation.updated_at = nowIso;
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "identity.invitation.revoked",
+      resource_type: "staff_invitation",
+      resource_id: invitation.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { email: invitation.email },
+    });
+    return stripInvitationToken(invitation);
+  });
+}
+
+export async function acceptStaffInvitation(
+  store: StackMateDataStore,
+  rawInput: unknown,
+  requestId: string
+): Promise<{ user: Omit<UserRecord, "password_hash">; roles: string[] }> {
+  const input = AcceptStaffInvitationSchema.parse(rawInput);
+  assertInvitationPersistence(store);
+  const tokenHash = sha256Hex(input.token);
+
+  // Expire a stale pending invitation in its OWN transaction first: a
+  // flip followed by a throw in the same transaction would be rolled
+  // back and the row would stay 'pending' forever (same trap as the
+  // license-expiry flip in STATUS.md gap #2).
+  await store.withTransaction((state) => {
+    const stale = (state.staff_invitations ?? []).find((i) => i.token_hash === tokenHash);
+    if (
+      stale &&
+      stale.status === "pending" &&
+      new Date(stale.expires_at).getTime() <= Date.now()
+    ) {
+      stale.status = "expired";
+      stale.updated_at = new Date().toISOString();
+      appendAuditLog(state, {
+        actor_type: "system",
+        action: "identity.invitation.expired",
+        resource_type: "staff_invitation",
+        resource_id: stale.id,
+        outcome: "success",
+        request_id: requestId,
+        changes: { email: stale.email },
+      });
+    }
+  });
+
+  return store.withTransaction((state) => {
+    const invitation = (state.staff_invitations ?? []).find((i) => i.token_hash === tokenHash);
+    if (!invitation) {
+      throw new AppError("UNAUTHORIZED", "Invitation token is invalid.", 401);
+    }
+    if (invitation.status === "expired") {
+      throw new AppError("GONE", "This invitation has expired. Ask an admin for a new one.", 410);
+    }
+    if (invitation.status !== "pending") {
+      throw new AppError(
+        "CONFLICT",
+        `Invitation is already '${invitation.status}'.`,
+        409
+      );
+    }
+    if (state.users.some((u) => u.email === invitation.email)) {
+      throw new AppError(
+        "CONFLICT",
+        `A staff user with email '${invitation.email}' already exists.`,
+        409
+      );
+    }
+    const matchedRoles = invitation.role_keys.map((rk) => {
+      const found = state.roles.find((r) => r.key === rk);
+      if (!found) {
+        throw new AppError(
+          "VALIDATION_ERROR",
+          `Invited role '${rk}' no longer exists. Ask an admin for a new invitation.`,
+          422
+        );
+      }
+      return found;
+    });
+
+    const now = new Date().toISOString();
+    const user: UserRecord = {
+      id: randomUUID(),
+      name: input.name.trim(),
+      email: invitation.email,
+      email_verified: true,
+      password_hash: hashPasswordScrypt(input.password),
+      status: "active",
+      created_at: now,
+      updated_at: now,
+    };
+    state.users.push(user);
+    for (const r of matchedRoles) {
+      state.user_roles.push({ user_id: user.id, role_id: r.id, assigned_at: now });
+    }
+    invitation.status = "accepted";
+    invitation.accepted_user_id = user.id;
+    invitation.accepted_at = now;
+    invitation.updated_at = now;
+
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: user.id,
+      action: "identity.invitation.accepted",
+      resource_type: "staff_invitation",
+      resource_id: invitation.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { email: invitation.email, roles: invitation.role_keys },
+    });
+
+    const { password_hash: _, ...safeUser } = user;
+    return { user: safeUser, roles: invitation.role_keys };
+  });
 }

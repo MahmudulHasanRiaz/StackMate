@@ -170,6 +170,7 @@ import {
   type RoleRecord,
   type SessionRecord,
   type SiteCredentialRecord,
+  type StaffInvitationRecord,
   type SubscriptionPeriodRecord,
   type SubscriptionRecord,
   type TrackingConfigRecord,
@@ -521,8 +522,9 @@ const NO_MIGRATION_0002: StoreCapabilities = {
 };
 
 /**
- * Tables that MUST exist (migrations 0000/0001). sequence_counters is
- * deliberately excluded — it is migration 0002 and handled as a capability.
+ * Tables that MUST exist (migrations 0000/0001; staff_invitations is
+ * migration 0005). sequence_counters is deliberately excluded — it is
+ * migration 0002 and handled as a capability.
  */
 const REQUIRED_TABLES: readonly string[] = [
   "users",
@@ -530,6 +532,7 @@ const REQUIRED_TABLES: readonly string[] = [
   "roles",
   "permissions",
   "user_roles",
+  "staff_invitations",
   "role_permissions",
   "staff_profiles",
   "customers",
@@ -715,6 +718,14 @@ export class DrizzleStore extends StackMateDataStore {
    * env.R2_BUCKET and MUST check this flag before serving uploads.
    */
   public usesInMemoryBucket = false;
+  /**
+   * True: this store loads + persists staff_invitations (migration 0005
+   * wiring). The identity service probes this flag
+   * (storePersistsStaffInvitations) and fail-closes with 503 on a
+   * DrizzleStore that predates the wiring, instead of returning 201 for
+   * rows that would vanish on the next reload.
+   */
+  public readonly supportsStaffInvitations = true;
 
   private closed = false;
   /**
@@ -1510,6 +1521,10 @@ function buildLoadStateQuery(caps: StoreCapabilities): string {
        FROM role_permissions rp
        JOIN permissions p ON p.id = rp.permission_id` },
     { key: "userRoles", orderBy: "t.created_at ASC, t.user_id ASC, t.role_id ASC", sql: `SELECT user_id, role_id, created_at FROM user_roles` },
+    { key: "staffInvitations", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, email, name, role_keys, token_hash, status,
+            expires_at, invited_by_user_id, accepted_user_id, accepted_at,
+            revoked_at, created_at, updated_at
+       FROM staff_invitations` },
     { key: "currencies", orderBy: null, sql: `SELECT code FROM currencies` },
     { key: "assets", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, object_key, bucket_name, original_filename, content_type,
             byte_size, checksum_sha256, visibility, uploaded_by_user_id,
@@ -1757,6 +1772,27 @@ async function loadStateInternalImpl(
     user_id: reqStr(row, "user_id", "user_roles"),
     role_id: reqStr(row, "role_id", "user_roles"),
     assigned_at: reqIso(row, "created_at", "user_roles"),
+  }));
+
+  const invitationRows = loadRows(combined, "staffInvitations");
+  const staff_invitations: StaffInvitationRecord[] = invitationRows.map((row) => ({
+    id: reqStr(row, "id", "staff_invitations"),
+    email: reqStr(row, "email", "staff_invitations"),
+    name: reqStr(row, "name", "staff_invitations"),
+    role_keys: asJsonArray<string>(row, "role_keys"),
+    token_hash: reqStr(row, "token_hash", "staff_invitations"),
+    status: asEnum(
+      str(row, "status"),
+      ["pending", "accepted", "revoked", "expired"] as const,
+      "pending"
+    ),
+    expires_at: reqIso(row, "expires_at", "staff_invitations"),
+    invited_by_user_id: str(row, "invited_by_user_id"),
+    accepted_user_id: str(row, "accepted_user_id"),
+    accepted_at: iso(row, "accepted_at"),
+    revoked_at: iso(row, "revoked_at"),
+    created_at: reqIso(row, "created_at", "staff_invitations"),
+    updated_at: reqIso(row, "updated_at", "staff_invitations"),
   }));
 
   // Reference data must come from migration 0001 — never auto-seeded here.
@@ -2742,6 +2778,7 @@ async function loadStateInternalImpl(
     users,
     sessions,
     roles,
+    staff_invitations,
     user_roles,
     uploaded_assets,
     products,
@@ -3063,6 +3100,37 @@ async function persistStateDiff(
     },
     remove: async (c, r) => {
       await del("roles", idWhere(1), [r.id]);
+    },
+  };
+
+  const invitationSpec: SyncSpec<StaffInvitationRecord> = {
+    keyOf: (r) => r.id,
+    scalarOf: (r) => r,
+    insert: async (c, r) => {
+      await ins(
+        "staff_invitations",
+        ["id", "email", "name", "role_keys", "token_hash", "status", "expires_at",
+          "invited_by_user_id", "accepted_user_id", "accepted_at", "revoked_at",
+          "created_at", "updated_at"],
+        [r.id, r.email, r.name, json(r.role_keys), r.token_hash, r.status, r.expires_at,
+          r.invited_by_user_id, r.accepted_user_id, r.accepted_at, r.revoked_at,
+          r.created_at, r.updated_at]
+      );
+    },
+    update: async (c, _b, r) => {
+      const cols = ["email", "name", "role_keys", "token_hash", "status", "expires_at",
+        "invited_by_user_id", "accepted_user_id", "accepted_at", "revoked_at"];
+      await upd(
+        "staff_invitations",
+        cols,
+        [r.email, r.name, json(r.role_keys), r.token_hash, r.status, r.expires_at,
+          r.invited_by_user_id, r.accepted_user_id, r.accepted_at, r.revoked_at, r.id],
+        idWhere(cols.length + 1),
+        true
+      );
+    },
+    remove: async (c, r) => {
+      await del("staff_invitations", idWhere(1), [r.id]);
     },
   };
 
@@ -5565,6 +5633,7 @@ async function persistStateDiff(
   await syncDeletes(client, before.user_roles, after.user_roles, userRoleSpec, "user_roles");
   await deleteDerivedForMissing("role_permissions", "role_id", before.roles.map((r) => r.id), new Set(after.roles.map((r) => r.id)));
   await syncDeletes(client, before.roles, after.roles, roleSpec, "roles");
+  await syncDeletes(client, before.staff_invitations, after.staff_invitations, invitationSpec, "staff_invitations");
   await deleteDerivedForMissing("staff_profiles", "user_id", before.users.map((u) => u.id), new Set(after.users.map((u) => u.id)));
   await syncDeletes(client, before.users, after.users, userSpec, "users");
   await syncDeletes(client, before.orders, after.orders, orderSpec, "orders");
@@ -5574,6 +5643,7 @@ async function persistStateDiff(
   // -- Upsert pass: parents before children ----------------------------------
   await syncUpserts(client, before.users, after.users, userSpec, "users");
   await syncUpserts(client, before.roles, after.roles, roleSpec, "roles");
+  await syncUpserts(client, before.staff_invitations, after.staff_invitations, invitationSpec, "staff_invitations");
   await syncUpserts(client, before.user_roles, after.user_roles, userRoleSpec, "user_roles");
   await syncUpserts(client, before.sessions, after.sessions, sessionSpec, "sessions");
   await syncUpserts(client, before.customers, after.customers, customerSpec, "customers");

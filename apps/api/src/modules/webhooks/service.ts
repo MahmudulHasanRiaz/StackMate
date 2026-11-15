@@ -19,6 +19,7 @@ import type {
   StackMateDataStore,
   WebhookEndpointRecord,
 } from "../../platform/db/store.ts";
+import { AppError } from "../../shared/errors.ts";
 import { appendAuditLog } from "../audit/service.ts";
 import { assertStaffPermission, type StaffPrincipal } from "../identity/service.ts";
 
@@ -83,6 +84,185 @@ export async function registerWebhookEndpointByAdmin(
       endpoint: safeEndpoint,
       raw_signing_secret_once: rawSecret,
     };
+  });
+}
+
+export async function testWebhookEndpointByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  endpointId: string,
+  config: {
+    encryptionKey: string;
+    allowHttpLocal?: boolean;
+    requestId: string;
+  }
+): Promise<{
+  endpoint_id: string;
+  delivery_id: string;
+  event_type: string;
+  http_status: number | null;
+  delivered: boolean;
+  error: string | null;
+}> {
+  assertStaffPermission(actor, "integrations.manage");
+  const endpoint = store.state.webhook_endpoints.find((ep) => ep.id === endpointId);
+  if (!endpoint) throw new AppError("NOT_FOUND", "Webhook endpoint not found.", 404);
+  if (endpoint.status !== "active") {
+    throw new AppError("CONFLICT", `Webhook endpoint is '${endpoint.status}'.`, 409);
+  }
+  // SSRF validation at test time, same as registration/delivery.
+  validateSafeExternalUrl(endpoint.url, config.allowHttpLocal ?? false);
+  const secret = decryptSecretAtRest(
+    endpoint.secret_ciphertext,
+    config.encryptionKey,
+    `webhook_endpoints:${endpoint.id}`
+  );
+
+  const deliveryId = `whd_test_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+  const tsSec = Math.floor(Date.now() / 1000);
+  // webhook_deliveries.event_id is a UUID FK to outbox_events(id), so the
+  // test event needs a real outbox row. The UUID is generated up front
+  // (it goes into the delivered payload). The outbox row is written in
+  // its OWN transaction BEFORE the fetch: the store persists delivery
+  // rows before outbox rows inside a single diff, so a delivery recorded
+  // in the same transaction as its outbox row would violate the FK
+  // (found by the Batch 1 repro, 2026-11-15). The row is marked
+  // delivered up front: it represents the synthetic test event itself,
+  // whose outcome is recorded separately in webhook_deliveries; the
+  // dispatcher never picks it up again.
+  const testEventId = randomUUID();
+  const nowIso = new Date().toISOString();
+  const bodyObj = {
+    id: testEventId,
+    type: "webhook.test",
+    created_at: nowIso,
+    api_version: "v1",
+    delivery_id: deliveryId,
+    data: { endpoint_id: endpoint.id, message: "StackMate webhook test delivery." },
+  };
+  const rawBody = JSON.stringify(bodyObj);
+  await store.withTransaction((state) => {
+    state.outbox_events.push({
+      id: testEventId,
+      event_key: `webhook_test:${deliveryId}`,
+      event_type: "webhook.test",
+      aggregate_type: "webhook_endpoint",
+      aggregate_id: endpoint.id,
+      payload: bodyObj,
+      status: "delivered",
+      attempt_count: 1,
+      available_at: nowIso,
+      locked_until: null,
+      locked_by: null,
+      last_error_code: null,
+      processed_at: nowIso,
+      created_at: nowIso,
+    });
+  });
+  const { signatureHeader } = signOutboundWebhookPayload(tsSec, deliveryId, rawBody, secret);
+
+  let httpStatus: number | null = null;
+  let error: string | null = null;
+  try {
+    const res = await fetch(endpoint.url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-StackMate-Event": "webhook.test",
+        "X-StackMate-Delivery": deliveryId,
+        "X-StackMate-Timestamp": String(tsSec),
+        "X-StackMate-Key-Id": endpoint.secret_key_id,
+        "X-StackMate-Signature": signatureHeader,
+      },
+      body: rawBody,
+      signal: AbortSignal.timeout(10_000),
+    });
+    httpStatus = res.status;
+  } catch (err) {
+    error = (err as Error).message.slice(0, 200);
+  }
+
+  const delivered = httpStatus !== null && httpStatus >= 200 && httpStatus < 300;
+  const doneIso = new Date().toISOString();
+  await store.withTransaction((state) => {
+    // Record the failure reason on the synthetic test event, if any.
+    if (!delivered) {
+      const testEvent = state.outbox_events.find((e) => e.id === testEventId);
+      if (testEvent) testEvent.last_error_code = error;
+    }
+    state.webhook_deliveries.push({
+      id: randomUUID(),
+      webhook_endpoint_id: endpoint.id,
+      event_id: testEventId,
+      delivery_id: deliveryId,
+      status: delivered ? "delivered" : "failed",
+      attempt_count: 1,
+      last_http_status: httpStatus,
+      delivered_at: delivered ? doneIso : null,
+    });
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "webhooks.endpoint.tested",
+      resource_type: "webhook_endpoint",
+      resource_id: endpoint.id,
+      outcome: delivered ? "success" : "failed",
+      request_id: config.requestId,
+      changes: { delivery_id: deliveryId, http_status: httpStatus, delivered },
+    });
+  });
+
+  return {
+    endpoint_id: endpoint.id,
+    delivery_id: deliveryId,
+    event_type: "webhook.test",
+    http_status: httpStatus,
+    delivered,
+    error,
+  };
+}
+
+/**
+ * Manual replay of a dead-lettered outbox event (API Spec §18.4): the
+ * SAME event ID is re-queued for delivery with a fresh attempt budget.
+ * Only dead_letter events can be replayed — replaying a delivered or
+ * pending event would risk duplicate side effects at the receiver.
+ */
+export async function replayOutboxEventByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  eventId: string,
+  requestId: string
+): Promise<OutboxEventRecord> {
+  assertStaffPermission(actor, "integrations.manage");
+  return store.withTransaction((state) => {
+    const event = state.outbox_events.find((e) => e.id === eventId);
+    if (!event) throw new AppError("NOT_FOUND", "Outbox event not found.", 404);
+    if (event.status !== "dead_letter") {
+      throw new AppError(
+        "CONFLICT",
+        `Only dead-lettered events can be replayed (current status: '${event.status}').`,
+        409
+      );
+    }
+    event.status = "pending";
+    event.attempt_count = 0;
+    event.available_at = new Date().toISOString();
+    event.locked_until = null;
+    event.locked_by = null;
+    event.last_error_code = null;
+    event.processed_at = null;
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "webhooks.outbox_event.replayed",
+      resource_type: "outbox_event",
+      resource_id: event.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { event_type: event.event_type },
+    });
+    return event;
   });
 }
 

@@ -14,14 +14,19 @@ import { randomUUID } from "node:crypto";
 import {
   ApprovePaymentSubmissionSchema,
   CreatePaymentMethodSchema,
+  CreatePaymentProviderSchema,
   parseStrictDDMMYYYYToIsoDate,
   RejectPaymentSubmissionSchema,
   SubmitManualPaymentSchema,
+  UpdatePaymentMethodSchema,
+  UpdatePaymentProviderSchema,
 } from "../../../../../packages/contracts/src/index.ts";
 import { storeValidatedPrivateR2Object } from "../../platform/storage/r2.ts";
 import type {
   LicenseRecord,
+  OrderRecord,
   PaymentMethodRecord,
+  PaymentProviderRecord,
   PaymentSubmissionRecord,
   PaymentTransactionRecord,
   StackMateDataStore,
@@ -753,5 +758,350 @@ export async function rejectPaymentSubmissionByStaff(
     });
 
     return submission;
+  });
+}
+
+export async function createPaymentProviderByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  rawInput: unknown,
+  requestId: string
+): Promise<PaymentProviderRecord> {
+  assertStaffPermission(actor, "payments.methods.manage");
+  const input = CreatePaymentProviderSchema.parse(rawInput);
+  return store.withTransaction((state) => {
+    if (state.payment_providers.some((p) => p.provider_key === input.provider_key)) {
+      throw new AppError(
+        "CONFLICT",
+        `Payment provider key '${input.provider_key}' already exists.`,
+        409
+      );
+    }
+    const provider: PaymentProviderRecord = {
+      id: randomUUID(),
+      provider_key: input.provider_key,
+      display_name: input.display_name,
+      provider_type: input.provider_type,
+      adapter_key: input.adapter_key,
+      status: input.status,
+    };
+    state.payment_providers.push(provider);
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "payments.provider.created",
+      resource_type: "payment_provider",
+      resource_id: provider.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { provider_key: provider.provider_key, provider_type: provider.provider_type },
+    });
+    return provider;
+  });
+}
+
+export async function updatePaymentProviderByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  providerId: string,
+  rawInput: unknown,
+  requestId: string
+): Promise<PaymentProviderRecord> {
+  assertStaffPermission(actor, "payments.methods.manage");
+  const input = UpdatePaymentProviderSchema.parse(rawInput);
+  return store.withTransaction((state) => {
+    const provider = state.payment_providers.find((p) => p.id === providerId);
+    if (!provider) throw new AppError("NOT_FOUND", "Payment provider not found.", 404);
+    if (input.display_name !== undefined) provider.display_name = input.display_name;
+    if (input.adapter_key !== undefined) provider.adapter_key = input.adapter_key;
+    if (input.status !== undefined) provider.status = input.status;
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "payments.provider.updated",
+      resource_type: "payment_provider",
+      resource_id: provider.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: input as Record<string, unknown>,
+    });
+    return provider;
+  });
+}
+
+export async function updatePaymentMethodByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  methodId: string,
+  rawInput: unknown,
+  requestId: string
+): Promise<PaymentMethodRecord> {
+  assertStaffPermission(actor, "payments.methods.manage");
+  const input = UpdatePaymentMethodSchema.parse(rawInput);
+  return store.withTransaction((state) => {
+    const method = state.payment_methods.find((m) => m.id === methodId);
+    if (!method) throw new AppError("NOT_FOUND", "Payment method not found.", 404);
+    if (input.display_name !== undefined) method.display_name = input.display_name;
+    if (input.account_label !== undefined) method.account_label = input.account_label;
+    if (input.instructions !== undefined) method.instructions = input.instructions;
+    if (input.configuration !== undefined) {
+      const cfg = input.configuration;
+      // exactOptionalPropertyTypes: assign only present keys; an explicit
+      // null clears the optional field (delete), it is never assigned.
+      const nextConfig = { ...method.configuration };
+      if (cfg.account_number !== undefined) nextConfig.account_number = cfg.account_number;
+      if (cfg.account_holder_name !== undefined) {
+        if (cfg.account_holder_name === null) delete nextConfig.account_holder_name;
+        else nextConfig.account_holder_name = cfg.account_holder_name;
+      }
+      if (cfg.bank_name !== undefined) {
+        if (cfg.bank_name === null) delete nextConfig.bank_name;
+        else nextConfig.bank_name = cfg.bank_name;
+      }
+      if (cfg.branch_name !== undefined) {
+        if (cfg.branch_name === null) delete nextConfig.branch_name;
+        else nextConfig.branch_name = cfg.branch_name;
+      }
+      if (cfg.routing_number !== undefined) {
+        if (cfg.routing_number === null) delete nextConfig.routing_number;
+        else nextConfig.routing_number = cfg.routing_number;
+      }
+      if (cfg.transaction_id_requirement !== undefined)
+        nextConfig.transaction_id_requirement = cfg.transaction_id_requirement;
+      method.configuration = nextConfig;
+    }
+    if (input.transfer_rails !== undefined) {
+      if (method.method_kind === "bank_account" && input.transfer_rails.length === 0) {
+        throw new AppError(
+          "VALIDATION_ERROR",
+          "Bank transfer payment methods must configure at least one supported rail (npsb, beftn, rtgs).",
+          422
+        );
+      }
+      method.transfer_rails = [...input.transfer_rails];
+    }
+    if (input.sort_order !== undefined) method.sort_order = input.sort_order;
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "payments.method.updated",
+      resource_type: "payment_method",
+      resource_id: method.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: input as Record<string, unknown>,
+    });
+    return method;
+  });
+}
+
+export async function setPaymentMethodEnabledByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  methodId: string,
+  enabled: boolean,
+  requestId: string
+): Promise<PaymentMethodRecord> {
+  assertStaffPermission(actor, "payments.methods.manage");
+  return store.withTransaction((state) => {
+    const method = state.payment_methods.find((m) => m.id === methodId);
+    if (!method) throw new AppError("NOT_FOUND", "Payment method not found.", 404);
+    if (method.is_enabled === enabled) {
+      throw new AppError(
+        "CONFLICT",
+        `Payment method is already ${enabled ? "enabled" : "disabled"}.`,
+        409
+      );
+    }
+    method.is_enabled = enabled;
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: `payments.method.${enabled ? "enabled" : "disabled"}`,
+      resource_type: "payment_method",
+      resource_id: method.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { method_key: method.method_key, is_enabled: enabled },
+    });
+    return method;
+  });
+}
+
+/**
+ * Staff-recorded manual payment claim (Batch 1, admin-side companion to
+ * the customer-facing submitManualPaymentClaim). A customer who paid
+ * offline and reported it by phone/chat gets their claim recorded by
+ * staff with the same validations — full amount/currency match,
+ * transaction-ID policy, rail allowlist, duplicate-reference check —
+ * and the SAME consequence: status 'submitted', order
+ * 'pending_verification', NEVER paid. Verification/approval still goes
+ * through approvePaymentSubmissionByStaff.
+ */
+export async function recordManualPaymentClaimByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  orderId: string,
+  rawInput: unknown,
+  requestId: string
+): Promise<{ payment_submission: PaymentSubmissionRecord; order: OrderRecord }> {
+  assertStaffPermission(actor, "payments.approve");
+  const parsed = SubmitManualPaymentSchema.parse(rawInput);
+
+  return store.withTransaction((state) => {
+    const order = state.orders.find((o) => o.id === orderId);
+    if (!order) throw new AppError("NOT_FOUND", "Order not found.", 404);
+    if (order.payment_status === "paid") {
+      throw new AppError("CONFLICT", "This order has already been paid and verified.", 409);
+    }
+    if (order.status === "cancelled") {
+      throw new AppError("CONFLICT", "Cannot submit payment for a cancelled order.", 409);
+    }
+    const method = state.payment_methods.find(
+      (m) => m.id === parsed.payment_method_id && m.is_enabled
+    );
+    if (!method) {
+      throw new AppError("NOT_FOUND", "Selected payment method is not available.", 404);
+    }
+    if (parsed.currency_code.toUpperCase() !== order.currency_code) {
+      throw new AppError(
+        "PAYMENT_AMOUNT_MISMATCH",
+        `Payment currency '${parsed.currency_code}' does not match order currency '${order.currency_code}'.`,
+        422
+      );
+    }
+    if (parsed.amount_minor !== order.total_minor) {
+      throw new AppError(
+        "PAYMENT_AMOUNT_MISMATCH",
+        `Submitted payment amount (${parsed.amount_minor}) must match exact order total (${order.total_minor}).`,
+        422
+      );
+    }
+    const txnReq = method.configuration.transaction_id_requirement;
+    const rawTxn = parsed.transaction_id?.trim() || "";
+    if (txnReq === "required" && !rawTxn) {
+      throw new AppError(
+        "TRANSACTION_ID_REQUIRED",
+        "Transaction ID is required for the selected payment method.",
+        422
+      );
+    }
+    if (txnReq === "disabled" && rawTxn) {
+      throw new AppError(
+        "TRANSACTION_ID_DISABLED",
+        "Transaction ID field is disabled for the selected payment method.",
+        422
+      );
+    }
+    if (method.method_kind === "bank_account") {
+      if (!parsed.transfer_rail || !method.transfer_rails.includes(parsed.transfer_rail)) {
+        throw new AppError(
+          "TRANSFER_RAIL_NOT_SUPPORTED",
+          `Transfer rail '${String(parsed.transfer_rail)}' is not supported by '${method.display_name}'.`,
+          422
+        );
+      }
+    }
+    if (parsed.evidence_asset_id) {
+      const asset = state.uploaded_assets.find((a) => a.id === parsed.evidence_asset_id);
+      if (!asset || asset.owner_customer_id !== order.customer_id) {
+        throw new AppError(
+          "FORBIDDEN",
+          "Attached payment evidence asset does not belong to this order.",
+          403
+        );
+      }
+    }
+    let isoPaymentDate: string | null = null;
+    if (parsed.payment_date_display) {
+      try {
+        isoPaymentDate = parseStrictDDMMYYYYToIsoDate(parsed.payment_date_display);
+      } catch (err) {
+        throw new AppError("VALIDATION_ERROR", (err as Error).message, 422);
+      }
+    }
+    const normalizedTxn = rawTxn ? rawTxn.toUpperCase().replace(/\s+/g, "") : null;
+    let duplicateWarning = false;
+    if (normalizedTxn) {
+      const existingSubmissionWithRef = state.payment_submissions.find(
+        (s) =>
+          s.normalized_transaction_reference === normalizedTxn &&
+          s.status !== "rejected" &&
+          s.status !== "cancelled"
+      );
+      if (existingSubmissionWithRef) {
+        if (existingSubmissionWithRef.status === "approved") {
+          throw new AppError(
+            "DUPLICATE_TRANSACTION_REFERENCE",
+            "This transaction reference has already been verified and approved on another payment.",
+            409
+          );
+        }
+        duplicateWarning = true;
+      }
+    }
+
+    const nowIso = new Date().toISOString();
+    const submission: PaymentSubmissionRecord = {
+      id: randomUUID(),
+      order_id: order.id,
+      customer_id: order.customer_id,
+      payment_method_id: method.id,
+      amount_minor: parsed.amount_minor,
+      currency_code: order.currency_code,
+      sender_name: parsed.sender_name ?? null,
+      sender_phone: parsed.sender_phone ?? null,
+      sender_bank_name: parsed.sender_bank_name ?? null,
+      sender_account_reference: parsed.sender_account_reference ?? null,
+      transfer_rail_key: parsed.transfer_rail ?? null,
+      transaction_reference: rawTxn || null,
+      normalized_transaction_reference: normalizedTxn,
+      payment_date: isoPaymentDate,
+      proof_asset_id: parsed.evidence_asset_id ?? null,
+      duplicate_risk_Warning: duplicateWarning,
+      status: "submitted",
+      customer_note: parsed.customer_note ?? null,
+      submitted_at: nowIso,
+      reviewed_at: null,
+      reviewed_by_user_id: null,
+    };
+    state.payment_submissions.push(submission);
+    order.payment_status = "pending_verification";
+    order.updated_at = nowIso;
+
+    state.outbox_events.push({
+      id: randomUUID(),
+      event_key: `payment.submitted:${submission.id}`,
+      aggregate_type: "payment_submission",
+      aggregate_id: submission.id,
+      event_type: "payment.submitted",
+      payload: {
+        order_reference: order.public_reference,
+        payment_submission_id: submission.id,
+        amount_minor: submission.amount_minor,
+        currency_code: submission.currency_code,
+      },
+      status: "pending",
+      attempt_count: 0,
+      available_at: nowIso,
+      locked_until: null,
+      locked_by: null,
+      last_error_code: null,
+      created_at: nowIso,
+      processed_at: null,
+    });
+
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "payments.submission.recorded_by_staff",
+      resource_type: "payment_submission",
+      resource_id: submission.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { order_id: order.id, amount_minor: submission.amount_minor },
+    });
+
+    return { payment_submission: submission, order };
   });
 }

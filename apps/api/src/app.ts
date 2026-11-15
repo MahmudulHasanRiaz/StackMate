@@ -33,40 +33,61 @@ import { StackMateDataStore } from "./platform/db/store.ts";
 import { createBetterAuth } from "./modules/identity/better-auth.ts";
 import { AppError } from "./shared/errors.ts";
 import {
+  acceptStaffInvitation,
   assertStaffPermission,
   bootstrapInitialSuperAdmin,
   changeStaffPassword,
+  createRoleByAdmin,
+  createStaffInvitationByAdmin,
   createStaffUserByAdmin,
   ensureBetterAuthIdentity,
   isSuperAdminProvisioned,
   resolveStaffPrincipal,
+  revokeStaffInvitationByAdmin,
   signInStaffSession,
   signOutStaffSession,
   storeSupportsBetterAuth,
   type StaffPrincipal,
+  updateRoleByAdmin,
   updateStaffUserRoles,
 } from "./modules/identity/service.ts";
 import {
+  archiveProductFeatureByAdmin,
   createNewPackageVersion,
   createPackagePrice,
   createProduct,
   createProductFeature,
   createProductPackageWithDraftVersion,
+  disablePackagePriceByAdmin,
   publishPackageVersion,
+  retirePackageVersionByAdmin,
+  updatePackagePriceByAdmin,
+  updateProductFeatureByAdmin,
   updateProductMetadata,
+  updateProductPackageByAdmin,
   updateProductStatus,
 } from "./modules/catalog/service.ts";
-import { createCustomerByAdmin } from "./modules/customers/service.ts";
+import { createCustomerByAdmin, updateCustomerByAdmin } from "./modules/customers/service.ts";
 import {
+  cancelOrderByAdmin,
+  cancelOrderInTx,
+  completeOrderByAdmin,
+  createInvoiceForOrderByAdmin,
   createOrderByAdmin,
   createPublicCheckoutOrder,
+  voidInvoiceByAdmin,
 } from "./modules/commerce/service.ts";
 import {
   approvePaymentSubmissionByStaff,
   createPaymentMethodByAdmin,
+  createPaymentProviderByAdmin,
+  recordManualPaymentClaimByAdmin,
   rejectPaymentSubmissionByStaff,
+  setPaymentMethodEnabledByAdmin,
   submitManualPaymentClaim,
   toPublicPaymentMethodDto,
+  updatePaymentMethodByAdmin,
+  updatePaymentProviderByAdmin,
   uploadPrivatePaymentEvidence,
 } from "./modules/payments/service.ts";
 import {
@@ -77,14 +98,26 @@ import {
   activateLicenseInstallation,
   appendLicenseEntitlementSnapshotByAdmin,
   createManualLicenseGrantByAdmin,
+  deactivateLicenseActivationByAdmin,
   deactivateLicenseInstallation,
   transitionLicenseStatusByAdmin,
   validateLicenseInstallation,
 } from "./modules/licensing/service.ts";
 import {
+  assignProductToSiteByAdmin,
   authenticateSignedServerRequest,
+  createSiteCredentialByAdmin,
+  deleteSiteDomainByAdmin,
+  generateDomainVerificationChallengeByAdmin,
   registerIntegratedSiteByAdmin,
+  registerSiteDomainByAdmin,
+  removeProductFromSiteByAdmin,
+  revokeIntegratedSiteByAdmin,
+  revokeSiteCredentialByAdmin,
   rotateSiteServerCredentialByAdmin,
+  suspendIntegratedSiteByAdmin,
+  updateIntegratedSiteByAdmin,
+  verifySiteDomainByAdmin,
 } from "./modules/integrations/service.ts";
 import {
   configureSiteTrackingByAdmin,
@@ -93,6 +126,8 @@ import {
 import {
   processTransactionalOutboxBatch,
   registerWebhookEndpointByAdmin,
+  replayOutboxEventByAdmin,
+  testWebhookEndpointByAdmin,
 } from "./modules/webhooks/service.ts";
 
 interface RouteMatch {
@@ -549,6 +584,47 @@ export function createStackMateApp(
           return jsonResponse(changed, 200);
         }
 
+        if (method === "POST" && pathname === "/api/auth/accept-invitation") {
+          // Public invitation acceptance (Batch 1): no session required —
+          // the invitation token IS the credential. Rate-limited like
+          // sign-in (60/min per IP, checked at the top of this block).
+          // No email is sent anywhere in this flow: invitations are
+          // created by an admin who delivers the one-time link to the
+          // invitee out of band (there is no email system yet — Batch 5).
+          const body = (await request.json()) as {
+            token?: string;
+            name?: string;
+            password?: string;
+          };
+          if (!body.token || !body.name || !body.password) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              "token, name, and password are required.",
+              422
+            );
+          }
+          const accepted = await acceptStaffInvitation(
+            store,
+            {
+              token: body.token,
+              name: body.name,
+              password: body.password,
+            },
+            requestId
+          );
+          // Provision the Better Auth identity for the same email, so the
+          // invitee can sign in directly. Best-effort, as in bootstrap:
+          // if provisioning fails here, sign-in lazily migrates.
+          if (storeSupportsBetterAuth(store)) {
+            await ensureBetterAuthIdentity(store, {
+              userId: accepted.user.id,
+              email: accepted.user.email,
+              password: body.password,
+            }).catch(() => {});
+          }
+          return jsonResponse(accepted, 201);
+        }
+
         // Public self-registration is CLOSED: staff accounts are created
         // only by bootstrap / an administrator. The Better Auth sign-up
         // endpoint is reachable server-side only (see
@@ -733,6 +809,156 @@ export function createStackMateApp(
             .filter((item): item is NonNullable<typeof item> => item !== null);
 
           return collectionResponse(packages);
+        }
+
+        // Batch 1: single-product detail for a site's public catalogue —
+        // same authorization as the product list (active site, active
+        // product, product assigned to the site), plus its published
+        // packages with active prices.
+        const mProductPublic = matchPath(
+          "/api/v1/public/sites/:siteKey/products/:productSlug",
+          pathname
+        );
+        if (method === "GET" && mProductPublic) {
+          const { siteKey, productSlug } = mProductPublic.params as {
+            siteKey: string;
+            productSlug: string;
+          };
+          if (siteKeyHeader && siteKeyHeader !== siteKey) {
+            throw new AppError("FORBIDDEN", "X-StackMate-Site-Key mismatch.", 403);
+          }
+          const site = store.state.integrated_sites.find(
+            (s) => s.site_key === siteKey && s.status === "active"
+          );
+          if (!site) throw new AppError("UNAUTHORIZED", "Invalid or inactive site key.", 401);
+          const product = store.state.products.find(
+            (p) => p.slug === productSlug && p.status === "active"
+          );
+          if (!product || !site.product_ids.includes(product.id)) {
+            throw new AppError("NOT_FOUND", "Published product not found for this site.", 404);
+          }
+          store.queryMetrics.cachedQueries += 1;
+          const packages = store.state.product_packages
+            .filter((pkg) => pkg.product_id === product.id && pkg.status === "active")
+            .map((pkg) => {
+              const publishedVer = store.state.package_versions.find(
+                (v) => v.id === pkg.current_version_id && v.status === "published"
+              );
+              if (!publishedVer) return null;
+              return {
+                package_key: pkg.package_key,
+                name: pkg.name,
+                description: pkg.description,
+                package_version_id: publishedVer.id,
+                version_number: publishedVer.version_number,
+                features: publishedVer.features.map((f) => ({
+                  feature_key: f.feature_key_snapshot,
+                  value_type: f.value_type_snapshot,
+                  entitlement_value: f.entitlement_value,
+                  unit: f.unit_snapshot,
+                })),
+                prices: store.state.package_prices
+                  .filter(
+                    (pr) => pr.package_version_id === publishedVer.id && pr.status === "active"
+                  )
+                  .map((pr) => ({
+                    id: pr.id,
+                    price_key: pr.price_key,
+                    price_kind: pr.price_kind,
+                    amount_minor: pr.amount_minor,
+                    currency_code: pr.currency_code,
+                    interval_unit: pr.interval_unit,
+                    interval_count: pr.interval_count,
+                    trial_days: pr.trial_days,
+                    setup_fee_minor: pr.setup_fee_minor,
+                  })),
+              };
+            })
+            .filter((item): item is NonNullable<typeof item> => item !== null);
+          return jsonResponse({
+            slug: product.slug,
+            code: product.code,
+            name: product.name,
+            description: product.description,
+            product_type: product.product_type,
+            website_url: product.website_url,
+            documentation_url: product.documentation_url,
+            features: store.state.product_features
+              .filter((f) => f.product_id === product.id && f.status === "active")
+              .map((f) => ({
+                feature_key: f.feature_key,
+                name: f.name,
+                description: f.description,
+                value_type: f.value_type,
+                unit: f.unit,
+                default_value: f.default_value,
+              })),
+            packages,
+          });
+        }
+
+        // Batch 1: single published package-version detail for a site.
+        // Only published versions of active packages of active, assigned
+        // products are visible — anything else is 404, never a leak.
+        const mPackagePublic = matchPath(
+          "/api/v1/public/sites/:siteKey/packages/:packageVersionId",
+          pathname
+        );
+        if (method === "GET" && mPackagePublic) {
+          const { siteKey, packageVersionId } = mPackagePublic.params as {
+            siteKey: string;
+            packageVersionId: string;
+          };
+          if (siteKeyHeader && siteKeyHeader !== siteKey) {
+            throw new AppError("FORBIDDEN", "X-StackMate-Site-Key mismatch.", 403);
+          }
+          const site = store.state.integrated_sites.find(
+            (s) => s.site_key === siteKey && s.status === "active"
+          );
+          if (!site) throw new AppError("UNAUTHORIZED", "Invalid or inactive site key.", 401);
+          const version = store.state.package_versions.find(
+            (v) => v.id === packageVersionId && v.status === "published"
+          );
+          if (!version) throw new AppError("NOT_FOUND", "Published package version not found.", 404);
+          const pkg = store.state.product_packages.find(
+            (p) => p.id === version.package_id && p.status === "active"
+          );
+          if (!pkg) throw new AppError("NOT_FOUND", "Published package version not found.", 404);
+          const product = store.state.products.find(
+            (p) => p.id === pkg.product_id && p.status === "active"
+          );
+          if (!product || !site.product_ids.includes(product.id)) {
+            throw new AppError("NOT_FOUND", "Published package version not found for this site.", 404);
+          }
+          store.queryMetrics.cachedQueries += 1;
+          return jsonResponse({
+            package_key: pkg.package_key,
+            name: pkg.name,
+            description: pkg.description,
+            package_version_id: version.id,
+            version_number: version.version_number,
+            product_slug: product.slug,
+            product_code: product.code,
+            features: version.features.map((f) => ({
+              feature_key: f.feature_key_snapshot,
+              value_type: f.value_type_snapshot,
+              entitlement_value: f.entitlement_value,
+              unit: f.unit_snapshot,
+            })),
+            prices: store.state.package_prices
+              .filter((pr) => pr.package_version_id === version.id && pr.status === "active")
+              .map((pr) => ({
+                id: pr.id,
+                price_key: pr.price_key,
+                price_kind: pr.price_kind,
+                amount_minor: pr.amount_minor,
+                currency_code: pr.currency_code,
+                interval_unit: pr.interval_unit,
+                interval_count: pr.interval_count,
+                trial_days: pr.trial_days,
+                setup_fee_minor: pr.setup_fee_minor,
+              })),
+          });
         }
 
         const mCheckoutCreate = matchPath(
@@ -1078,6 +1304,129 @@ export function createStackMateApp(
           });
         }
 
+        // Batch 1: signed server-side packages read for a site's own
+        // product (scope catalog.read). Same published-only projection as
+        // the public packages list, behind HMAC authentication.
+        const mServerPackages = matchPath(
+          "/api/v1/integrations/sites/:siteKey/products/:productSlug/packages",
+          pathname
+        );
+        if (method === "GET" && mServerPackages) {
+          const { siteKey, productSlug } = mServerPackages.params as {
+            siteKey: string;
+            productSlug: string;
+          };
+          const { site } = await authenticateSignedServerRequest(store, {
+            siteKey,
+            requiredScope: "catalog.read",
+            keyIdHeader: request.headers.get("X-StackMate-Key-Id") ?? undefined,
+            timestampHeader: request.headers.get("X-StackMate-Timestamp") ?? undefined,
+            nonceHeader: request.headers.get("X-StackMate-Nonce") ?? undefined,
+            contentSha256Header: request.headers.get("X-StackMate-Content-SHA256") ?? undefined,
+            signatureHeader: request.headers.get("X-StackMate-Signature") ?? undefined,
+            method,
+            host: url.host,
+            rawPathAndQuery: `${url.pathname}${url.search}`,
+            rawBody: "",
+            encryptionKey: env.ENCRYPTION_KEY_V1,
+          });
+          const product = store.state.products.find(
+            (p) => p.slug === productSlug && p.status === "active"
+          );
+          if (!product || !site.product_ids.includes(product.id)) {
+            throw new AppError("NOT_FOUND", "Published product not found for this site.", 404);
+          }
+          const packages = store.state.product_packages
+            .filter((pkg) => pkg.product_id === product.id && pkg.status === "active")
+            .map((pkg) => {
+              const publishedVer = store.state.package_versions.find(
+                (v) => v.id === pkg.current_version_id && v.status === "published"
+              );
+              if (!publishedVer) return null;
+              return {
+                package_key: pkg.package_key,
+                name: pkg.name,
+                description: pkg.description,
+                package_version_id: publishedVer.id,
+                version_number: publishedVer.version_number,
+                features: publishedVer.features.map((f) => ({
+                  feature_key: f.feature_key_snapshot,
+                  value_type: f.value_type_snapshot,
+                  entitlement_value: f.entitlement_value,
+                  unit: f.unit_snapshot,
+                })),
+                prices: store.state.package_prices
+                  .filter(
+                    (pr) => pr.package_version_id === publishedVer.id && pr.status === "active"
+                  )
+                  .map((pr) => ({
+                    id: pr.id,
+                    price_key: pr.price_key,
+                    price_kind: pr.price_kind,
+                    amount_minor: pr.amount_minor,
+                    currency_code: pr.currency_code,
+                    interval_unit: pr.interval_unit,
+                    interval_count: pr.interval_count,
+                    trial_days: pr.trial_days,
+                    setup_fee_minor: pr.setup_fee_minor,
+                  })),
+              };
+            })
+            .filter((item): item is NonNullable<typeof item> => item !== null);
+          return collectionResponse(packages);
+        }
+
+        // Batch 1: signed server-side order cancel (scope orders.cancel:own).
+        // BOLA: the site can only cancel its own orders. Uses the same
+        // transactional core as the admin cancel, so the guards (paid /
+        // completed / under-verification) apply identically.
+        const mServerOrderCancel = matchPath(
+          "/api/v1/integrations/sites/:siteKey/orders/:publicReference/cancel",
+          pathname
+        );
+        if (method === "POST" && mServerOrderCancel) {
+          const { siteKey, publicReference } = mServerOrderCancel.params as {
+            siteKey: string;
+            publicReference: string;
+          };
+          const rawBodyText = await request.text();
+          const { site } = await authenticateSignedServerRequest(store, {
+            siteKey,
+            requiredScope: "orders.cancel:own",
+            keyIdHeader: request.headers.get("X-StackMate-Key-Id") ?? undefined,
+            timestampHeader: request.headers.get("X-StackMate-Timestamp") ?? undefined,
+            nonceHeader: request.headers.get("X-StackMate-Nonce") ?? undefined,
+            contentSha256Header: request.headers.get("X-StackMate-Content-SHA256") ?? undefined,
+            signatureHeader: request.headers.get("X-StackMate-Signature") ?? undefined,
+            method,
+            host: url.host,
+            rawPathAndQuery: `${url.pathname}${url.search}`,
+            rawBody: rawBodyText,
+            encryptionKey: env.ENCRYPTION_KEY_V1,
+          });
+          const body = (JSON.parse(rawBodyText || "{}")) as { reason?: string };
+          const cancelled = await store.withTransaction((state) => {
+            const order = state.orders.find(
+              (o) => o.public_reference === publicReference && o.integrated_site_id === site.id
+            );
+            if (!order) {
+              throw new AppError("NOT_FOUND", "Order not found for this integrated site.", 404);
+            }
+            return cancelOrderInTx(state, order, {
+              actorType: "integration",
+              integratedSiteId: site.id,
+              reason: body.reason ?? "Cancelled by integrated site.",
+              requestId,
+            });
+          });
+          return jsonResponse({
+            public_reference: cancelled.public_reference,
+            order_number: cancelled.order_number,
+            status: cancelled.status,
+            cancelled_at: cancelled.cancelled_at,
+          });
+        }
+
         const mServerTracking = matchPath(
           "/api/v1/integrations/sites/:siteKey/tracking/events",
           pathname
@@ -1223,6 +1572,85 @@ export function createStackMateApp(
 
         if (method === "GET" && pathname === "/api/v1/admin/permissions") {
           return collectionResponse([...store.allPermissions]);
+        }
+
+        // Batch 1: Roles & staff invitations.
+        // NOTE (API Spec §8 vs seed catalogue): the spec names
+        // users.invite / roles.create / roles.update, but those keys do
+        // NOT exist in the seeded permission catalogue — the existing
+        // users.manage key ("Manage staff users, roles, and permissions")
+        // is the equivalent gate and is used for all role + invitation
+        // writes. No email is sent for invitations (there is no email
+        // system yet — Batch 5); the one-time token is returned once so
+        // an admin can deliver the accept link out of band.
+        if (method === "POST" && pathname === "/api/v1/admin/roles") {
+          const body = await request.json();
+          const created = await createRoleByAdmin(store, principal, body, requestId);
+          return jsonResponse(created, 201);
+        }
+
+        const mRoleDetail = matchPath("/api/v1/admin/roles/:roleId", pathname);
+        if (method === "PATCH" && mRoleDetail) {
+          const body = await request.json();
+          const updated = await updateRoleByAdmin(
+            store,
+            principal,
+            mRoleDetail.params.roleId!,
+            body,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+
+        if (method === "GET" && pathname === "/api/v1/admin/users/invitations") {
+          assertStaffPermission(principal, "users.manage");
+          const items = (store.state.staff_invitations ?? []).map((inv) => {
+            const { token_hash: _h, ...safe } = inv;
+            return safe;
+          });
+          return collectionResponse(items);
+        }
+
+        if (method === "POST" && pathname === "/api/v1/admin/users/invitations") {
+          const body = await request.json();
+          const created = await createStaffInvitationByAdmin(store, principal, body, requestId);
+          return jsonResponse(created, 201);
+        }
+
+        const mInvitationRevoke = matchPath(
+          "/api/v1/admin/users/invitations/:invitationId/revoke",
+          pathname
+        );
+        if (method === "POST" && mInvitationRevoke) {
+          const revoked = await revokeStaffInvitationByAdmin(
+            store,
+            principal,
+            mInvitationRevoke.params.invitationId!,
+            requestId
+          );
+          return jsonResponse(revoked);
+        }
+
+        const mUserDetail = matchPath("/api/v1/admin/users/:userId", pathname);
+        if (method === "GET" && mUserDetail) {
+          assertStaffPermission(principal, "users.manage");
+          const user = store.state.users.find((u) => u.id === mUserDetail.params.userId);
+          if (!user) throw new AppError("NOT_FOUND", "User not found.", 404);
+          const roleIds = new Set(
+            store.state.user_roles.filter((ur) => ur.user_id === user.id).map((ur) => ur.role_id)
+          );
+          const roleKeys = store.state.roles
+            .filter((r) => roleIds.has(r.id))
+            .map((r) => r.key);
+          return jsonResponse({
+            id: user.id,
+            name: user.name,
+            email: user.email,
+            status: user.status,
+            roles: roleKeys,
+            created_at: user.created_at,
+            created_date_display: formatDisplayDateDDMMYYYY(user.created_at, env.DEFAULT_TIMEZONE),
+          });
         }
 
         // Products, Features, Packages & Prices
@@ -1414,6 +1842,129 @@ export function createStackMateApp(
           return jsonResponse(created, 201);
         }
 
+        // Batch 1: feature / package / price detail + lifecycle writes.
+        const mFeatureDetail = matchPath(
+          "/api/v1/admin/products/:productId/features/:featureId",
+          pathname
+        );
+        if (method === "GET" && mFeatureDetail) {
+          assertStaffPermission(principal, "products.read");
+          const feature = store.state.product_features.find(
+            (f) =>
+              f.id === mFeatureDetail.params.featureId &&
+              f.product_id === mFeatureDetail.params.productId
+          );
+          if (!feature) throw new AppError("NOT_FOUND", "Product feature not found.", 404);
+          return jsonResponse(feature);
+        }
+
+        if (method === "PATCH" && mFeatureDetail) {
+          const body = await request.json();
+          const updated = await updateProductFeatureByAdmin(
+            store,
+            principal,
+            mFeatureDetail.params.productId!,
+            mFeatureDetail.params.featureId!,
+            body,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+
+        const mFeatureArchive = matchPath(
+          "/api/v1/admin/products/:productId/features/:featureId/archive",
+          pathname
+        );
+        if (method === "POST" && mFeatureArchive) {
+          const archived = await archiveProductFeatureByAdmin(
+            store,
+            principal,
+            mFeatureArchive.params.productId!,
+            mFeatureArchive.params.featureId!,
+            requestId
+          );
+          return jsonResponse(archived);
+        }
+
+        const mPackageDetail = matchPath("/api/v1/admin/packages/:packageId", pathname);
+        if (method === "GET" && mPackageDetail) {
+          assertStaffPermission(principal, "products.read");
+          const pkg = store.state.product_packages.find(
+            (p) => p.id === mPackageDetail.params.packageId
+          );
+          if (!pkg) throw new AppError("NOT_FOUND", "Package not found.", 404);
+          return jsonResponse({
+            ...pkg,
+            versions: store.state.package_versions
+              .filter((v) => v.package_id === pkg.id)
+              .map((v) => ({
+                ...v,
+                prices: store.state.package_prices.filter(
+                  (pr) => pr.package_version_id === v.id
+                ),
+              })),
+          });
+        }
+
+        if (method === "PATCH" && mPackageDetail) {
+          const body = await request.json();
+          const updated = await updateProductPackageByAdmin(
+            store,
+            principal,
+            mPackageDetail.params.packageId!,
+            body,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+
+        const mVerRetire = matchPath(
+          "/api/v1/admin/package-versions/:versionId/retire",
+          pathname
+        );
+        if (method === "POST" && mVerRetire) {
+          const retired = await retirePackageVersionByAdmin(
+            store,
+            principal,
+            mVerRetire.params.versionId!,
+            requestId
+          );
+          return jsonResponse(retired);
+        }
+
+        const mPriceDetail = matchPath("/api/v1/admin/prices/:priceId", pathname);
+        if (method === "GET" && mPriceDetail) {
+          assertStaffPermission(principal, "products.read");
+          const price = store.state.package_prices.find(
+            (pr) => pr.id === mPriceDetail.params.priceId
+          );
+          if (!price) throw new AppError("NOT_FOUND", "Package price not found.", 404);
+          return jsonResponse(price);
+        }
+
+        if (method === "PATCH" && mPriceDetail) {
+          const body = await request.json();
+          const updated = await updatePackagePriceByAdmin(
+            store,
+            principal,
+            mPriceDetail.params.priceId!,
+            body,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+
+        const mPriceDisable = matchPath("/api/v1/admin/prices/:priceId/disable", pathname);
+        if (method === "POST" && mPriceDisable) {
+          const disabled = await disablePackagePriceByAdmin(
+            store,
+            principal,
+            mPriceDisable.params.priceId!,
+            requestId
+          );
+          return jsonResponse(disabled);
+        }
+
         // Customers, Orders & Invoices
         if (method === "GET" && pathname === "/api/v1/admin/customers") {
           assertStaffPermission(principal, "customers.read");
@@ -1484,6 +2035,195 @@ export function createStackMateApp(
           return collectionResponse(store.state.invoices);
         }
 
+        // Batch 1: customer update + per-customer collections.
+        // (Customer detail already embeds orders/subscriptions/licenses;
+        // these filtered collections are the list views the SPA needs.)
+        if (method === "PATCH" && mCustDetail) {
+          const body = await request.json();
+          const updated = await updateCustomerByAdmin(
+            store,
+            principal,
+            mCustDetail.params.customerId!,
+            body,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+
+        const mCustOrders = matchPath("/api/v1/admin/customers/:customerId/orders", pathname);
+        if (method === "GET" && mCustOrders) {
+          assertStaffPermission(principal, "customers.read");
+          const customer = store.state.customers.find(
+            (c) => c.id === mCustOrders.params.customerId
+          );
+          if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
+          return collectionResponse(
+            store.state.orders.filter((o) => o.customer_id === customer.id)
+          );
+        }
+
+        const mCustSubs = matchPath(
+          "/api/v1/admin/customers/:customerId/subscriptions",
+          pathname
+        );
+        if (method === "GET" && mCustSubs) {
+          assertStaffPermission(principal, "customers.read");
+          const customer = store.state.customers.find(
+            (c) => c.id === mCustSubs.params.customerId
+          );
+          if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
+          return collectionResponse(
+            store.state.subscriptions.filter((s) => s.customer_id === customer.id)
+          );
+        }
+
+        const mCustLicenses = matchPath(
+          "/api/v1/admin/customers/:customerId/licenses",
+          pathname
+        );
+        if (method === "GET" && mCustLicenses) {
+          assertStaffPermission(principal, "customers.read");
+          const customer = store.state.customers.find(
+            (c) => c.id === mCustLicenses.params.customerId
+          );
+          if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
+          return collectionResponse(
+            store.state.licenses
+              .filter((l) => l.customer_id === customer.id)
+              .map(({ license_key_hash: _h, issued_raw_key_once: _r, ...safe }) => safe)
+          );
+        }
+
+        // Batch 1: order lifecycle + invoice writes.
+        const mOrderCancel = matchPath("/api/v1/admin/orders/:orderId/cancel", pathname);
+        if (method === "POST" && mOrderCancel) {
+          const body = (await request.json().catch(() => ({}))) as { reason?: string };
+          const cancelled = await cancelOrderByAdmin(
+            store,
+            principal,
+            mOrderCancel.params.orderId!,
+            body.reason,
+            requestId
+          );
+          return jsonResponse(cancelled);
+        }
+
+        const mOrderComplete = matchPath("/api/v1/admin/orders/:orderId/complete", pathname);
+        if (method === "POST" && mOrderComplete) {
+          const completed = await completeOrderByAdmin(
+            store,
+            principal,
+            mOrderComplete.params.orderId!,
+            requestId
+          );
+          return jsonResponse(completed);
+        }
+
+        const mOrderInvoices = matchPath("/api/v1/admin/orders/:orderId/invoices", pathname);
+        if (method === "GET" && mOrderInvoices) {
+          assertStaffPermission(principal, "orders.read");
+          const order = store.state.orders.find(
+            (o) => o.id === mOrderInvoices.params.orderId
+          );
+          if (!order) throw new AppError("NOT_FOUND", "Order not found.", 404);
+          return collectionResponse(
+            store.state.invoices.filter((i) => i.order_id === order.id)
+          );
+        }
+
+        if (method === "POST" && mOrderInvoices) {
+          const invoice = await createInvoiceForOrderByAdmin(
+            store,
+            principal,
+            mOrderInvoices.params.orderId!,
+            requestId
+          );
+          return jsonResponse(invoice, 201);
+        }
+
+        const mInvoiceDetail = matchPath("/api/v1/admin/invoices/:invoiceId", pathname);
+        if (method === "GET" && mInvoiceDetail) {
+          assertStaffPermission(principal, "orders.read");
+          const invoice = store.state.invoices.find(
+            (i) => i.id === mInvoiceDetail.params.invoiceId
+          );
+          if (!invoice) throw new AppError("NOT_FOUND", "Invoice not found.", 404);
+          const order = store.state.orders.find((o) => o.id === invoice.order_id) ?? null;
+          return jsonResponse({
+            ...invoice,
+            order,
+            customer: order
+              ? (store.state.customers.find((c) => c.id === order.customer_id) ?? null)
+              : null,
+          });
+        }
+
+        const mInvoiceVoid = matchPath("/api/v1/admin/invoices/:invoiceId/void", pathname);
+        if (method === "POST" && mInvoiceVoid) {
+          const body = (await request.json().catch(() => ({}))) as { reason?: string };
+          const voided = await voidInvoiceByAdmin(
+            store,
+            principal,
+            mInvoiceVoid.params.invoiceId!,
+            body.reason,
+            requestId
+          );
+          return jsonResponse(voided);
+        }
+
+        // Batch 1: staff-recorded manual payment claim + staff evidence
+        // upload for an order (Payment Review action). The claim goes
+        // through the same validation as a customer claim and lands as
+        // pending_verification — it NEVER marks the order paid.
+        const mOrderPaySub = matchPath(
+          "/api/v1/admin/orders/:orderId/payment-submissions",
+          pathname
+        );
+        if (method === "POST" && mOrderPaySub) {
+          const body = await request.json();
+          const created = await recordManualPaymentClaimByAdmin(
+            store,
+            principal,
+            mOrderPaySub.params.orderId!,
+            body,
+            requestId
+          );
+          return jsonResponse(created, 201);
+        }
+
+        const mOrderPayEvidence = matchPath(
+          "/api/v1/admin/orders/:orderId/payment-evidence",
+          pathname
+        );
+        if (method === "POST" && mOrderPayEvidence) {
+          const body = (await request.json()) as {
+            filename: string;
+            content_type: string;
+            file_base64: string;
+          };
+          const order = store.state.orders.find(
+            (o) => o.id === mOrderPayEvidence.params.orderId
+          );
+          if (!order) throw new AppError("NOT_FOUND", "Order not found.", 404);
+          if (!body.filename || !body.content_type || !body.file_base64) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              "filename, content_type, and file_base64 are required.",
+              422
+            );
+          }
+          const bytes = Uint8Array.from(Buffer.from(body.file_base64, "base64"));
+          const asset = await uploadPrivatePaymentEvidence(store, {
+            orderId: order.id,
+            customerId: order.customer_id,
+            filename: body.filename,
+            contentType: body.content_type,
+            bytes,
+            bucketName: env.R2_BUCKET_NAME,
+          });
+          return jsonResponse(asset, 201);
+        }
+
         // Payment Providers, Methods, Submissions & Verification
         if (method === "GET" && pathname === "/api/v1/admin/payment-providers") {
           assertStaffPermission(principal, "payments.read");
@@ -1499,6 +2239,130 @@ export function createStackMateApp(
           const body = await request.json();
           const created = await createPaymentMethodByAdmin(store, principal, body, requestId);
           return jsonResponse(created, 201);
+        }
+
+        // Batch 1: payment provider + method lifecycle writes.
+        if (method === "POST" && pathname === "/api/v1/admin/payment-providers") {
+          const body = await request.json();
+          const created = await createPaymentProviderByAdmin(store, principal, body, requestId);
+          return jsonResponse(created, 201);
+        }
+
+        const mProviderDetail = matchPath(
+          "/api/v1/admin/payment-providers/:providerId",
+          pathname
+        );
+        if (method === "PATCH" && mProviderDetail) {
+          const body = await request.json();
+          const updated = await updatePaymentProviderByAdmin(
+            store,
+            principal,
+            mProviderDetail.params.providerId!,
+            body,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+
+        const mMethodDetail = matchPath("/api/v1/admin/payment-methods/:methodId", pathname);
+        if (method === "GET" && mMethodDetail) {
+          assertStaffPermission(principal, "payments.read");
+          const methodRec = store.state.payment_methods.find(
+            (m) => m.id === mMethodDetail.params.methodId
+          );
+          if (!methodRec) throw new AppError("NOT_FOUND", "Payment method not found.", 404);
+          return jsonResponse(methodRec);
+        }
+
+        if (method === "PATCH" && mMethodDetail) {
+          const body = await request.json();
+          const updated = await updatePaymentMethodByAdmin(
+            store,
+            principal,
+            mMethodDetail.params.methodId!,
+            body,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+
+        const mMethodEnable = matchPath(
+          "/api/v1/admin/payment-methods/:methodId/enable",
+          pathname
+        );
+        if (method === "POST" && mMethodEnable) {
+          const updated = await setPaymentMethodEnabledByAdmin(
+            store,
+            principal,
+            mMethodEnable.params.methodId!,
+            true,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+
+        const mMethodDisable = matchPath(
+          "/api/v1/admin/payment-methods/:methodId/disable",
+          pathname
+        );
+        if (method === "POST" && mMethodDisable) {
+          const updated = await setPaymentMethodEnabledByAdmin(
+            store,
+            principal,
+            mMethodDisable.params.methodId!,
+            false,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+
+        // Batch 1: single submission detail + verification history.
+        const mSubmissionDetail = matchPath(
+          "/api/v1/admin/payment-submissions/:submissionId",
+          pathname
+        );
+        if (method === "GET" && mSubmissionDetail) {
+          assertStaffPermission(principal, "payments.read");
+          const sub = store.state.payment_submissions.find(
+            (s) => s.id === mSubmissionDetail.params.submissionId
+          );
+          if (!sub) throw new AppError("NOT_FOUND", "Payment submission not found.", 404);
+          const order = store.state.orders.find((o) => o.id === sub.order_id);
+          const customer = store.state.customers.find((c) => c.id === sub.customer_id);
+          const methodRec = store.state.payment_methods.find(
+            (m) => m.id === sub.payment_method_id
+          );
+          return jsonResponse({
+            ...sub,
+            order_number: order?.order_number ?? null,
+            order_total_minor: order?.total_minor ?? null,
+            customer_name: customer?.name ?? null,
+            payment_method_name: methodRec?.display_name ?? null,
+            submitted_date_display: formatDisplayDateTimeDDMMYYYY(
+              sub.submitted_at,
+              env.DEFAULT_TIMEZONE
+            ),
+            verification_logs: store.state.payment_verification_logs.filter(
+              (l) => l.payment_submission_id === sub.id
+            ),
+          });
+        }
+
+        const mSubmissionHistory = matchPath(
+          "/api/v1/admin/payment-submissions/:submissionId/history",
+          pathname
+        );
+        if (method === "GET" && mSubmissionHistory) {
+          assertStaffPermission(principal, "payments.read");
+          const sub = store.state.payment_submissions.find(
+            (s) => s.id === mSubmissionHistory.params.submissionId
+          );
+          if (!sub) throw new AppError("NOT_FOUND", "Payment submission not found.", 404);
+          return collectionResponse(
+            store.state.payment_verification_logs.filter(
+              (l) => l.payment_submission_id === sub.id
+            )
+          );
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/payment-submissions") {
@@ -1599,6 +2463,27 @@ export function createStackMateApp(
           return collectionResponse(items);
         }
 
+        // Batch 1: subscription detail.
+        const mSubDetail = matchPath("/api/v1/admin/subscriptions/:subscriptionId", pathname);
+        if (method === "GET" && mSubDetail) {
+          assertStaffPermission(principal, "subscriptions.read");
+          const sub = store.state.subscriptions.find(
+            (s) => s.id === mSubDetail.params.subscriptionId
+          );
+          if (!sub) throw new AppError("NOT_FOUND", "Subscription not found.", 404);
+          return jsonResponse({
+            ...sub,
+            customer: store.state.customers.find((c) => c.id === sub.customer_id) ?? null,
+            product: store.state.products.find((p) => p.id === sub.product_id) ?? null,
+            renewal_invoices: store.state.invoices.filter(
+              (i) => i.subscription_id === sub.id
+            ),
+            next_renewal_display: sub.next_renewal_at
+              ? formatDisplayDateDDMMYYYY(sub.next_renewal_at, env.DEFAULT_TIMEZONE)
+              : null,
+          });
+        }
+
         const mSubRenewal = matchPath(
           "/api/v1/admin/subscriptions/:subscriptionId/renewal-invoices",
           pathname
@@ -1668,6 +2553,65 @@ export function createStackMateApp(
             requestId
           );
           return jsonResponse(granted, 201);
+        }
+
+        // Batch 1: license detail + activations.
+        // NOTE: GET /api/v1/admin/licenses/manual-grants would also match
+        // this pattern with licenseId="manual-grants" — but that path has
+        // no GET route, so a 404 here is correct; the POST above runs first.
+        const mLicenseDetail = matchPath("/api/v1/admin/licenses/:licenseId", pathname);
+        if (method === "GET" && mLicenseDetail) {
+          assertStaffPermission(principal, "licenses.read");
+          const lic = store.state.licenses.find(
+            (l) => l.id === mLicenseDetail.params.licenseId
+          );
+          if (!lic) throw new AppError("NOT_FOUND", "License not found.", 404);
+          const { license_key_hash: _h, issued_raw_key_once: _r, ...safe } = lic;
+          const customer = store.state.customers.find((c) => c.id === lic.customer_id);
+          const product = store.state.products.find((p) => p.id === lic.product_id);
+          return jsonResponse({
+            ...safe,
+            customer_name: customer?.name ?? null,
+            customer_email: customer?.email ?? null,
+            product_code: product?.code ?? null,
+            product_name: product?.name ?? null,
+            active_activations_count: lic.activations.filter((a) => a.status === "active")
+              .length,
+            expires_date_display: lic.expires_at
+              ? formatDisplayDateDDMMYYYY(lic.expires_at, env.DEFAULT_TIMEZONE)
+              : "Lifetime",
+            entitlement_snapshots: lic.snapshots,
+          });
+        }
+
+        const mLicenseActivations = matchPath(
+          "/api/v1/admin/licenses/:licenseId/activations",
+          pathname
+        );
+        if (method === "GET" && mLicenseActivations) {
+          assertStaffPermission(principal, "licenses.read");
+          const lic = store.state.licenses.find(
+            (l) => l.id === mLicenseActivations.params.licenseId
+          );
+          if (!lic) throw new AppError("NOT_FOUND", "License not found.", 404);
+          return collectionResponse(lic.activations);
+        }
+
+        const mActivationDeactivate = matchPath(
+          "/api/v1/admin/licenses/:licenseId/activations/:activationId/deactivate",
+          pathname
+        );
+        if (method === "POST" && mActivationDeactivate) {
+          const body = (await request.json().catch(() => ({}))) as { reason?: string };
+          const result = await deactivateLicenseActivationByAdmin(
+            store,
+            principal,
+            mActivationDeactivate.params.licenseId!,
+            mActivationDeactivate.params.activationId!,
+            body,
+            requestId
+          );
+          return jsonResponse(result);
         }
 
         const mLicenseAction = matchPath(
@@ -1741,6 +2685,215 @@ export function createStackMateApp(
           return jsonResponse(created, 201);
         }
 
+        // Batch 1: site detail + lifecycle + products + credentials + domains.
+        const mSiteDetail = matchPath("/api/v1/admin/integrated-sites/:siteId", pathname);
+        if (method === "GET" && mSiteDetail) {
+          assertStaffPermission(principal, "integrations.manage");
+          const site = store.state.integrated_sites.find(
+            (s) => s.id === mSiteDetail.params.siteId
+          );
+          if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
+          return jsonResponse({
+            ...site,
+            credentials: store.state.site_credentials
+              .filter((c) => c.integrated_site_id === site.id)
+              .map(({ secret_ciphertext: _c, secret_hash: _h, ...safeCred }) => safeCred),
+            tracking: store.state.tracking_configurations
+              .filter((tc) => tc.integrated_site_id === site.id)
+              .map(({ access_token_ciphertext: _a, ...safeTc }) => safeTc),
+          });
+        }
+
+        if (method === "PATCH" && mSiteDetail) {
+          const body = await request.json();
+          const updated = await updateIntegratedSiteByAdmin(
+            store,
+            principal,
+            mSiteDetail.params.siteId!,
+            body,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+
+        const mSiteSuspend = matchPath(
+          "/api/v1/admin/integrated-sites/:siteId/suspend",
+          pathname
+        );
+        if (method === "POST" && mSiteSuspend) {
+          const suspended = await suspendIntegratedSiteByAdmin(
+            store,
+            principal,
+            mSiteSuspend.params.siteId!,
+            requestId
+          );
+          return jsonResponse(suspended);
+        }
+
+        const mSiteRevoke = matchPath(
+          "/api/v1/admin/integrated-sites/:siteId/revoke",
+          pathname
+        );
+        if (method === "POST" && mSiteRevoke) {
+          const revoked = await revokeIntegratedSiteByAdmin(
+            store,
+            principal,
+            mSiteRevoke.params.siteId!,
+            requestId
+          );
+          return jsonResponse(revoked);
+        }
+
+        const mSiteProducts = matchPath(
+          "/api/v1/admin/integrated-sites/:siteId/products",
+          pathname
+        );
+        if (method === "POST" && mSiteProducts) {
+          const body = (await request.json()) as { product_id: string };
+          if (!body.product_id) {
+            throw new AppError("VALIDATION_ERROR", "product_id is required.", 422);
+          }
+          const updated = await assignProductToSiteByAdmin(
+            store,
+            principal,
+            mSiteProducts.params.siteId!,
+            body.product_id,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+
+        const mSiteProductRemove = matchPath(
+          "/api/v1/admin/integrated-sites/:siteId/products/:productId",
+          pathname
+        );
+        if (method === "DELETE" && mSiteProductRemove) {
+          const updated = await removeProductFromSiteByAdmin(
+            store,
+            principal,
+            mSiteProductRemove.params.siteId!,
+            mSiteProductRemove.params.productId!,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+
+        const mSiteCredentials = matchPath(
+          "/api/v1/admin/integrated-sites/:siteId/credentials",
+          pathname
+        );
+        if (method === "GET" && mSiteCredentials) {
+          assertStaffPermission(principal, "integrations.manage");
+          const site = store.state.integrated_sites.find(
+            (s) => s.id === mSiteCredentials.params.siteId
+          );
+          if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
+          return collectionResponse(
+            store.state.site_credentials
+              .filter((c) => c.integrated_site_id === site.id)
+              .map(({ secret_ciphertext: _c, secret_hash: _h, ...safeCred }) => safeCred)
+          );
+        }
+
+        if (method === "POST" && mSiteCredentials) {
+          const body = await request.json();
+          const created = await createSiteCredentialByAdmin(
+            store,
+            principal,
+            mSiteCredentials.params.siteId!,
+            body,
+            {
+              encryptionKey: env.ENCRYPTION_KEY_V1,
+              keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION,
+              requestId,
+            }
+          );
+          return jsonResponse(created, 201);
+        }
+
+        const mSiteCredRevoke = matchPath(
+          "/api/v1/admin/integrated-sites/:siteId/credentials/:credentialId/revoke",
+          pathname
+        );
+        if (method === "POST" && mSiteCredRevoke) {
+          const revoked = await revokeSiteCredentialByAdmin(
+            store,
+            principal,
+            mSiteCredRevoke.params.siteId!,
+            mSiteCredRevoke.params.credentialId!,
+            requestId
+          );
+          return jsonResponse(revoked);
+        }
+
+        // Batch 1: site domains. Registration NEVER auto-verifies — new
+        // domains start "pending" (Batch 2 adds real DNS/HTTP checks).
+        const mSiteDomains = matchPath(
+          "/api/v1/admin/integrated-sites/:siteId/domains",
+          pathname
+        );
+        if (method === "POST" && mSiteDomains) {
+          const body = await request.json();
+          const updated = await registerSiteDomainByAdmin(
+            store,
+            principal,
+            mSiteDomains.params.siteId!,
+            body,
+            requestId
+          );
+          return jsonResponse(updated, 201);
+        }
+
+        const mDomainChallenge = matchPath(
+          "/api/v1/admin/integrated-sites/:siteId/domains/:domainId/verification-challenge",
+          pathname
+        );
+        if (method === "POST" && mDomainChallenge) {
+          const updated = await generateDomainVerificationChallengeByAdmin(
+            store,
+            principal,
+            mDomainChallenge.params.siteId!,
+            mDomainChallenge.params.domainId!,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+
+        const mDomainVerify = matchPath(
+          "/api/v1/admin/integrated-sites/:siteId/domains/:domainId/verify",
+          pathname
+        );
+        if (method === "POST" && mDomainVerify) {
+          const body = (await request.json().catch(() => ({}))) as {
+            method?: string;
+            reviewer_note?: string;
+          };
+          const updated = await verifySiteDomainByAdmin(
+            store,
+            principal,
+            mDomainVerify.params.siteId!,
+            mDomainVerify.params.domainId!,
+            body,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+
+        const mDomainDelete = matchPath(
+          "/api/v1/admin/integrated-sites/:siteId/domains/:domainId",
+          pathname
+        );
+        if (method === "DELETE" && mDomainDelete) {
+          const updated = await deleteSiteDomainByAdmin(
+            store,
+            principal,
+            mDomainDelete.params.siteId!,
+            mDomainDelete.params.domainId!,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+
         const mRotateCred = matchPath(
           "/api/v1/admin/integrated-sites/:siteId/credentials/:credentialId/rotate",
           pathname
@@ -1802,6 +2955,60 @@ export function createStackMateApp(
             requestId,
           });
           return jsonResponse(created, 201);
+        }
+
+        // Batch 1: webhook test delivery + delivery history + outbox reads/replay.
+        const mWebhookTest = matchPath(
+          "/api/v1/admin/webhooks/:webhookId/test",
+          pathname
+        );
+        if (method === "POST" && mWebhookTest) {
+          const result = await testWebhookEndpointByAdmin(store, principal, mWebhookTest.params.webhookId!, {
+            encryptionKey: env.ENCRYPTION_KEY_V1,
+            allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
+            requestId,
+          });
+          return jsonResponse(result);
+        }
+
+        const mWebhookDeliveries = matchPath(
+          "/api/v1/admin/webhooks/:webhookId/deliveries",
+          pathname
+        );
+        if (method === "GET" && mWebhookDeliveries) {
+          assertStaffPermission(principal, "integrations.manage");
+          const endpoint = store.state.webhook_endpoints.find(
+            (ep) => ep.id === mWebhookDeliveries.params.webhookId
+          );
+          if (!endpoint) throw new AppError("NOT_FOUND", "Webhook endpoint not found.", 404);
+          return collectionResponse(
+            store.state.webhook_deliveries.filter(
+              (d) => d.webhook_endpoint_id === endpoint.id
+            )
+          );
+        }
+
+        if (method === "GET" && pathname === "/api/v1/admin/outbox-events") {
+          assertStaffPermission(principal, "integrations.manage");
+          const statusFilter = url.searchParams.get("status");
+          const items = store.state.outbox_events.filter((e) =>
+            !statusFilter ? true : e.status === statusFilter
+          );
+          return collectionResponse(items);
+        }
+
+        const mOutboxReplay = matchPath(
+          "/api/v1/admin/outbox-events/:eventId/replay",
+          pathname
+        );
+        if (method === "POST" && mOutboxReplay) {
+          const replayed = await replayOutboxEventByAdmin(
+            store,
+            principal,
+            mOutboxReplay.params.eventId!,
+            requestId
+          );
+          return jsonResponse(replayed);
         }
 
         if (method === "POST" && pathname === "/api/v1/admin/outbox/dispatch") {

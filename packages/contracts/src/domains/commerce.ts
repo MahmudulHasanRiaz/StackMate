@@ -109,6 +109,19 @@ export interface SnapshotItemToHash {
   unit?: string | null;
 }
 
+export const CUSTOMER_STATUSES = ["active", "inactive", "blocked"] as const;
+export type CustomerStatus = (typeof CUSTOMER_STATUSES)[number];
+
+export const UpdateCustomerSchema = v.object({
+  name: v.string().trim().min(2).max(200).optional(),
+  email: v.string().trim().email().nullable().optional(),
+  phone: v.string().trim().min(6).max(40).nullable().optional(),
+  company_name: v.string().trim().max(200).nullable().optional(),
+  country_code: v.string().trim().min(2).max(2).optional(),
+  status: v.enum(CUSTOMER_STATUSES).optional(),
+  notes: v.string().trim().max(2000).nullable().optional(),
+});
+
 /**
  * Computes a deterministic SHA-256 hex digest of an entitlement set for immutable snapshots.
  */

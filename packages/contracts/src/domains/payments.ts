@@ -83,3 +83,41 @@ export const RejectPaymentSubmissionSchema = v.object({
   customer_message: v.string().trim().min(5).max(1000),
   internal_note: v.string().trim().max(2000).optional(),
 });
+
+export const CreatePaymentProviderSchema = v.object({
+  provider_key: v
+    .string()
+    .trim()
+    .toLowerCase()
+    .min(2)
+    .max(100)
+    .regex(/^[a-z0-9_-]+$/),
+  display_name: v.string().trim().min(2).max(160),
+  provider_type: v.enum(PAYMENT_PROVIDER_TYPES),
+  adapter_key: v.string().trim().min(2).max(100),
+  status: v.enum(["enabled", "disabled"] as const).default("enabled"),
+});
+
+export const UpdatePaymentProviderSchema = v.object({
+  display_name: v.string().trim().min(2).max(160).optional(),
+  adapter_key: v.string().trim().min(2).max(100).optional(),
+  status: v.enum(["enabled", "disabled"] as const).optional(),
+});
+
+export const UpdatePaymentMethodSchema = v.object({
+  display_name: v.string().trim().min(2).max(160).optional(),
+  account_label: v.string().trim().max(160).nullable().optional(),
+  instructions: v.string().trim().max(1000).nullable().optional(),
+  configuration: v
+    .object({
+      account_number: v.string().trim().min(4).max(60).optional(),
+      account_holder_name: v.string().trim().max(160).nullable().optional(),
+      bank_name: v.string().trim().max(160).nullable().optional(),
+      branch_name: v.string().trim().max(160).nullable().optional(),
+      routing_number: v.string().trim().max(60).nullable().optional(),
+      transaction_id_requirement: v.enum(TRANSACTION_ID_REQUIREMENTS).optional(),
+    })
+    .optional(),
+  transfer_rails: v.array(v.enum(BANK_TRANSFER_RAILS)).optional(),
+  sort_order: v.number().int().min(0).max(10000).optional(),
+});

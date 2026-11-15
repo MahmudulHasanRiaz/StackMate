@@ -1,10 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { CreateCustomerSchema } from "../../../../../packages/contracts/src/index.ts";
+import {
+  CreateCustomerSchema,
+  UpdateCustomerSchema,
+} from "../../../../../packages/contracts/src/index.ts";
 import type {
   CustomerRecord,
   DatabaseState,
   StackMateDataStore,
 } from "../../platform/db/store.ts";
+import { AppError } from "../../shared/errors.ts";
 import { appendAuditLog } from "../audit/service.ts";
 import { assertStaffPermission, type StaffPrincipal } from "../identity/service.ts";
 
@@ -89,6 +93,67 @@ export async function createCustomerByAdmin(
       changes: { customer_number: customer.customer_number, country_code: customer.country_code },
     });
 
+    return customer;
+  });
+}
+
+export async function updateCustomerByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  customerId: string,
+  rawInput: unknown,
+  requestId: string
+): Promise<CustomerRecord> {
+  assertStaffPermission(actor, "customers.manage");
+  const input = UpdateCustomerSchema.parse(rawInput);
+
+  return store.withTransaction((state) => {
+    const customer = state.customers.find((c) => c.id === customerId);
+    if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
+    const changes: Record<string, unknown> = {};
+
+    if (input.name !== undefined) {
+      customer.name = input.name.trim();
+      changes.name = customer.name;
+    }
+    if (input.email !== undefined) {
+      customer.email = input.email ? input.email.trim() : null;
+      customer.normalized_email = input.email ? input.email.trim().toLowerCase() : null;
+      changes.email = customer.email;
+    }
+    if (input.phone !== undefined) {
+      customer.phone = input.phone ? input.phone.trim() : null;
+      customer.normalized_phone = normalizePhoneE164(input.phone);
+      changes.phone = customer.phone;
+    }
+    if (input.company_name !== undefined) {
+      customer.company_name = input.company_name ? input.company_name.trim() : null;
+      changes.company_name = customer.company_name;
+    }
+    if (input.country_code !== undefined) {
+      customer.country_code = input.country_code.toUpperCase();
+      changes.country_code = customer.country_code;
+    }
+    if (input.status !== undefined) {
+      customer.status = input.status;
+      changes.status = input.status;
+    }
+    if (input.notes !== undefined) {
+      customer.notes = input.notes;
+      changes.notes = customer.notes;
+    }
+    customer.updated_at = new Date().toISOString();
+
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "customers.customer.updated",
+      resource_type: "customer",
+      resource_id: customer.id,
+      outcome: "success",
+      request_id: requestId,
+      changes,
+    });
     return customer;
   });
 }
