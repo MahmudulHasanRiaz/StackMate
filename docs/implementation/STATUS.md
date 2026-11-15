@@ -1,21 +1,12 @@
 # StackMate Implementation Status
 
-**Status date:** 2026-11-15  
-**Current stage:** Foundation and repository preparation  
-**Application status:** No application source scaffold has been verified.
+**Status date:** 15 November 2026  
+**Current stage:** Stage 0 — repository and delivery foundation  
+**Application status:** No runnable application source scaffold has been verified.
 
 ## Foundation documents
 
-- Product Requirements Document (PRD)
-- Technical Architecture Document (TAD)
-- Database Design & Data Model Specification
-- API & Integration Specification
-- Security & Threat Model
-- UI/UX & Design System Specification
-- Implementation Roadmap & Delivery Plan
-- Repository Structure & Engineering Conventions
-
-See docs/README.md for links.
+See docs/README.md for the eight foundation specifications and architecture decisions.
 
 ## Stage 0 checklist
 
@@ -25,28 +16,33 @@ See docs/README.md for links.
 - [x] Database workspace placeholder.
 - [x] Environment template and gitignore.
 - [x] Workspace package manifests for admin, API, and contracts.
-- [ ] Runnable admin/API source entry points and dependency/toolchain selection.
-- [ ] Drizzle configuration after database connectivity spike.
-- [ ] CI checks.
-- [ ] Clean install, typecheck, lint, tests, and build evidence.
-
-- [x] AI agent handoff prompt and ADR template.
+- [x] Date/time display and storage policy (DD/MM/YYYY UI; ISO 8601 API; UTC instants).
+- [x] Migration safety and release-order policy.
+- [x] Future digital-services marketplace extensibility constraint.
+- [x] Repository validation script and initial GitHub Actions CI workflow.
+- [ ] Runnable React/Vite admin and Hono Worker source entry points.
+- [ ] Dependency/toolchain selection and committed pnpm lockfile.
+- [ ] Drizzle configuration, migration scripts, and PostgreSQL migration proof.
+- [ ] Full lint, typecheck, test, and production build scripts.
+- [ ] Cloudflare Worker/Pages deployment configuration and smoke checks.
+- [ ] GitHub staging/production environments and least-privilege secrets.
+- [ ] Successful end-to-end deployment from main.
 
 ## Technical spikes
 
-- [ ] Neon driver vs Hyperdrive decision, with measured evidence.
+- [ ] Neon driver/Hyperdrive decision with measured evidence.
 - [ ] Better Auth + Drizzle + Worker runtime.
 - [ ] SPA/API origin, cookie, CORS, and CSRF topology.
-- [ ] Drizzle migration and transaction proof.
+- [ ] Drizzle migration generation/apply/drift proof.
 - [ ] R2 private upload/download proof.
 - [ ] Signing-key and request-signing proof.
 
-## Blockers and open decisions
+## Release readiness
 
-Provider credentials and deployment environments have not been committed. Technical spikes require controlled local/staging configuration; never place production secrets in the repository.
+**Production deployment is intentionally not enabled yet.** Runnable application builds, migration runner/configuration, Cloudflare deployment configuration, and environment secrets are outstanding. The production workflow must remain disabled until those are verified. The current CI validates repository structure and manifests only; it is not a substitute for application build/test checks.
 
 ## Next priorities
 
-1. Review the four original foundation documents together and resolve cross-document conflicts.
-2. Create the minimal Stage 0 workspace scaffold.
-3. Run clean install, typecheck, lint, tests, and build; record actual evidence.
+1. Build runnable admin/API/contracts workspace scaffold and commit a reproducible lockfile.
+2. Prove database driver and Drizzle migration behavior, then add migration checks to CI.
+3. Configure Cloudflare staging deployment, smoke checks, then production deployment.
