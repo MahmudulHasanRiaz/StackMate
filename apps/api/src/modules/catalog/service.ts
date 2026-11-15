@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   CreatePackagePriceSchema,
   CreateProductFeatureSchema,
+  BulkCreateProductFeaturesSchema,
   CreateProductPackageSchema,
   CreateProductSchema,
   UpdatePackagePriceSchema,
@@ -11,6 +12,7 @@ import {
   validateFeatureEntitlementValue,
 } from "../../../../../packages/contracts/src/index.ts";
 import type {
+  DatabaseState,
   PackagePriceRecord,
   PackageVersionFeatureGrant,
   PackageVersionRecord,
@@ -211,6 +213,196 @@ export async function createProductFeature(
     });
     return feature;
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* Feature → package usage (E7: which packages use a feature)         */
+/* ------------------------------------------------------------------ */
+
+/** One package that references a feature, at the highest version that does. */
+export interface FeatureUsage {
+  package_id: string;
+  package_key: string;
+  package_name: string;
+  version_number: number;
+  version_status: "draft" | "published" | "retired";
+}
+
+/**
+ * Real associations only, read from package-version grants. A feature is
+ * "used by" a package when any version of that package grants it; the
+ * entry reports the highest such version. Never invented — an unused
+ * feature returns [].
+ */
+export function featureUsageByPackages(
+  state: DatabaseState,
+  productId: string,
+  featureId: string,
+): FeatureUsage[] {
+  const byPackage = new Map<string, FeatureUsage>();
+  for (const version of state.package_versions) {
+    if (version.product_id !== productId) continue;
+    if (!version.features.some((g) => g.product_feature_id === featureId)) continue;
+    const pkg = state.product_packages.find((p) => p.id === version.package_id);
+    if (!pkg) continue;
+    const prev = byPackage.get(pkg.id);
+    if (!prev || version.version_number > prev.version_number) {
+      byPackage.set(pkg.id, {
+        package_id: pkg.id,
+        package_key: pkg.package_key,
+        package_name: pkg.name,
+        version_number: version.version_number,
+        version_status: version.status,
+      });
+    }
+  }
+  return [...byPackage.values()].sort((a, b) => a.package_name.localeCompare(b.package_name));
+}
+
+/** A feature record with its real package usage attached (list + detail). */
+export function withFeatureUsage(
+  state: DatabaseState,
+  feature: ProductFeatureRecord,
+): ProductFeatureRecord & { used_by_packages: FeatureUsage[] } {
+  return {
+    ...feature,
+    used_by_packages: featureUsageByPackages(state, feature.product_id, feature.id),
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Bulk feature create (product-first flow: add several at once)       */
+/* ------------------------------------------------------------------ */
+
+export interface BulkFeatureCreateResult {
+  created: Array<ProductFeatureRecord & { used_by_packages: FeatureUsage[] }>;
+  errors: Array<{ index: number; feature_key: string | null; error: string }>;
+}
+
+/**
+ * Creates one or more features under one product in a single request.
+ * Each row is validated on its own (shape via CreateProductFeatureSchema,
+ * key uniqueness against the product AND earlier rows of this batch,
+ * entitlement value via validateFeatureEntitlementValue); a bad row is
+ * reported per-row in `errors` and does NOT block the good rows. Rows
+ * that pass are created in one transaction. A request that creates
+ * nothing is a 422 (never a silent empty 201) and the per-row errors
+ * travel in `details.errors`.
+ */
+export async function createProductFeaturesBulk(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  productId: string,
+  rawInput: unknown,
+  requestId: string,
+): Promise<BulkFeatureCreateResult> {
+  assertStaffPermission(actor, "features.manage");
+  const input = BulkCreateProductFeaturesSchema.parse(rawInput);
+
+  const result = await store.withTransaction((state) => {
+    const product = state.products.find((p) => p.id === productId);
+    if (!product) throw new AppError("NOT_FOUND", "Product not found.", 404);
+
+    const created: ProductFeatureRecord[] = [];
+    const errors: BulkFeatureCreateResult["errors"] = [];
+    const seenKeys = new Set<string>();
+
+    input.features.forEach((rawRow, index) => {
+      const parsed = CreateProductFeatureSchema.safeParse(rawRow);
+      if (!parsed.success) {
+        const first = parsed.issues[0];
+        const keyCandidate =
+          typeof rawRow === "object" && rawRow !== null
+            ? (rawRow as Record<string, unknown>).feature_key
+            : undefined;
+        errors.push({
+          index,
+          feature_key: typeof keyCandidate === "string" ? keyCandidate : null,
+          error: first
+            ? `${first.path ? `${first.path}: ` : ""}${first.message}`
+            : "Invalid feature.",
+        });
+        return;
+      }
+      const row = parsed.data;
+      if (
+        state.product_features.some(
+          (f) => f.product_id === productId && f.feature_key === row.feature_key,
+        ) ||
+        seenKeys.has(row.feature_key)
+      ) {
+        errors.push({
+          index,
+          feature_key: row.feature_key,
+          error: `Feature key '${row.feature_key}' already exists for product '${product.code}'.`,
+        });
+        return;
+      }
+      let validatedDefault: unknown = null;
+      if (row.default_value !== undefined) {
+        try {
+          validatedDefault = validateFeatureEntitlementValue(row.value_type, row.default_value);
+        } catch (err) {
+          errors.push({
+            index,
+            feature_key: row.feature_key,
+            error: (err as Error).message,
+          });
+          return;
+        }
+      }
+      const now = new Date().toISOString();
+      const feature: ProductFeatureRecord = {
+        id: randomUUID(),
+        product_id: productId,
+        feature_key: row.feature_key,
+        name: row.name,
+        description: row.description ?? null,
+        value_type: row.value_type,
+        unit: row.unit ?? null,
+        default_value: validatedDefault,
+        status: "active",
+        created_at: now,
+        updated_at: now,
+      };
+      state.product_features.push(feature);
+      seenKeys.add(row.feature_key);
+      created.push(feature);
+    });
+
+    if (created.length > 0) {
+      appendAuditLog(state, {
+        actor_type: "staff",
+        actor_user_id: actor.user.id,
+        action: "catalog.feature.bulk_created",
+        resource_type: "product_feature",
+        resource_id: productId,
+        outcome: "success",
+        request_id: requestId,
+        changes: {
+          product_id: productId,
+          created_count: created.length,
+          failed_count: errors.length,
+          feature_keys: created.map((f) => f.feature_key),
+        },
+      });
+    }
+    return { created, errors };
+  });
+
+  if (result.created.length === 0) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      `No features were created. ${result.errors.length} row(s) failed validation.`,
+      422,
+      { errors: result.errors },
+    );
+  }
+  return {
+    // Freshly created features are used by no package yet.
+    created: result.created.map((f) => ({ ...f, used_by_packages: [] as FeatureUsage[] })),
+    errors: result.errors,
+  };
 }
 
 export async function createProductPackageWithDraftVersion(

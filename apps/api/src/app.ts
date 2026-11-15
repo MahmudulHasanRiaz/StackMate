@@ -58,6 +58,7 @@ import {
   createPackagePrice,
   createProduct,
   createProductFeature,
+  createProductFeaturesBulk,
   createProductPackageWithDraftVersion,
   disablePackagePriceByAdmin,
   publishPackageVersion,
@@ -67,6 +68,7 @@ import {
   updateProductMetadata,
   updateProductPackageByAdmin,
   updateProductStatus,
+  withFeatureUsage,
 } from "./modules/catalog/service.ts";
 import { createCustomerByAdmin, updateCustomerByAdmin } from "./modules/customers/service.ts";
 import {
@@ -1759,9 +1761,9 @@ export function createStackMateApp(
         const mProductFeatures = matchPath("/api/v1/admin/products/:productId/features", pathname);
         if (method === "GET" && mProductFeatures) {
           assertStaffPermission(principal, "products.read");
-          const items = store.state.product_features.filter(
-            (f) => f.product_id === mProductFeatures.params.productId
-          );
+          const items = store.state.product_features
+            .filter((f) => f.product_id === mProductFeatures.params.productId)
+            .map((f) => withFeatureUsage(store.state, f));
           return collectionResponse(items);
         }
 
@@ -1774,7 +1776,27 @@ export function createStackMateApp(
             body,
             requestId
           );
-          return jsonResponse(created, 201);
+          return jsonResponse(withFeatureUsage(store.state, created), 201);
+        }
+
+        // Bulk create — one or more features at once under one product.
+        // Registered before the :featureId detail routes: matchPath is
+        // exact-segment, so POST /features/bulk would otherwise fall
+        // through to the detail matcher (featureId = "bulk").
+        const mProductFeaturesBulk = matchPath(
+          "/api/v1/admin/products/:productId/features/bulk",
+          pathname,
+        );
+        if (method === "POST" && mProductFeaturesBulk) {
+          const body = await request.json();
+          const result = await createProductFeaturesBulk(
+            store,
+            principal,
+            mProductFeaturesBulk.params.productId!,
+            body,
+            requestId,
+          );
+          return jsonResponse(result, 201);
         }
 
         const mProductPackages = matchPath("/api/v1/admin/products/:productId/packages", pathname);
@@ -1888,7 +1910,7 @@ export function createStackMateApp(
               f.product_id === mFeatureDetail.params.productId
           );
           if (!feature) throw new AppError("NOT_FOUND", "Product feature not found.", 404);
-          return jsonResponse(feature);
+          return jsonResponse(withFeatureUsage(store.state, feature));
         }
 
         if (method === "PATCH" && mFeatureDetail) {

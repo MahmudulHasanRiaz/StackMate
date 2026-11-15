@@ -175,6 +175,16 @@ export const CreateProductFeatureSchema = v.object({
   default_value: v.unknown().optional(),
 });
 
+/**
+ * Bulk feature create — envelope only. Each row is validated
+ * individually against CreateProductFeatureSchema by the service
+ * (safeParse per row), so one bad row is reported per-row instead of
+ * failing the whole request. Cap 100 rows per request.
+ */
+export const BulkCreateProductFeaturesSchema = v.object({
+  features: v.array(v.unknown(), { min: 1, max: 100 }),
+});
+
 export const PackageFeatureGrantInputSchema = v.object({
   product_feature_id: v.string().uuid(),
   entitlement_value: v.unknown(),

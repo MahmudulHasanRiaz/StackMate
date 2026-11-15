@@ -22,14 +22,14 @@
  * Archive is refused with 409 while a published package version
  * references the feature (service message is surfaced verbatim).
  */
-import { useEffect, useState, type FormEvent } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useRef, useState, type FormEvent } from "react";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
 import { ListChecks, Plus } from "lucide-react";
 import { FEATURE_VALUE_TYPES } from "../../../../packages/contracts/src/index.ts";
-import { apiRequest } from "../lib/api-client";
-import { detailKey } from "../lib/query";
+import { ApiClientError, apiRequest } from "../lib/api-client";
+import { detailKey, queryClient } from "../lib/query";
 import {
   apiErrorMessage,
   DetailFacts,
@@ -42,6 +42,7 @@ import {
 import {
   Alert,
   Button,
+  Card,
   Checkbox,
   CopyButton,
   DateCell,
@@ -52,14 +53,25 @@ import {
   Input,
   Select,
   StatusBadge,
+  Tabs,
   Textarea,
   useConfirm,
+  useToast,
 } from "../components/primitives";
 import type { ProductListItem } from "./products";
 
 /* ------------------------------------------------------------------ */
 /* DTOs                                                                */
 /* ------------------------------------------------------------------ */
+/** One package that references a feature, at the highest version that does. */
+export interface FeatureUsage {
+  package_id: string;
+  package_key: string;
+  package_name: string;
+  version_number: number;
+  version_status: "draft" | "published" | "retired";
+}
+
 export interface FeatureDto {
   id: string;
   product_id: string;
@@ -72,6 +84,8 @@ export interface FeatureDto {
   status: "active" | "archived";
   created_at: string;
   updated_at: string;
+  /** Real package associations, computed server-side from version grants. */
+  used_by_packages?: FeatureUsage[];
 }
 
 type FeatureValueType = FeatureDto["value_type"];
@@ -258,17 +272,60 @@ function EntitlementInputs({
 const FEATURE_KEY_RE = /^[a-z][a-z0-9_.]*$/;
 
 /* ------------------------------------------------------------------ */
-/* Create feature form (CreateProductFeatureSchema)                     */
+/* Create feature form (CreateProductFeatureSchema) — single + bulk    */
 /* ------------------------------------------------------------------ */
+
+interface BulkRowState {
+  localId: number;
+  featureKey: string;
+  name: string;
+  description: string;
+  valueType: FeatureValueType;
+  unit: string;
+  entitlement: EntitlementDraft;
+  errors: Record<string, string>;
+  serverError: string | null;
+}
+
+interface BulkCreateResponse {
+  created: FeatureDto[];
+  errors: Array<{ index: number; feature_key: string | null; error: string }>;
+}
+
+function emptyBulkRow(localId: number): BulkRowState {
+  return {
+    localId,
+    featureKey: "",
+    name: "",
+    description: "",
+    valueType: "boolean",
+    unit: "",
+    entitlement: emptyEntitlementDraft("boolean"),
+    errors: {},
+    serverError: null,
+  };
+}
+
 function CreateFeatureDialog({
   open,
   onClose,
   productId,
+  productName,
 }: {
   open: boolean;
   onClose: () => void;
   productId: string;
+  productName: string;
 }) {
+  const { toast } = useToast();
+  const [mode, setMode] = useState<"single" | "bulk">("single");
+  const [bulkRows, setBulkRows] = useState<BulkRowState[]>(() => [
+    emptyBulkRow(1),
+    emptyBulkRow(2),
+  ]);
+  const [nextRowId, setNextRowId] = useState(3);
+  const [bulkSummary, setBulkSummary] = useState<string | null>(null);
+  const submittedOrderRef = useRef<number[]>([]);
   const [featureKey, setFeatureKey] = useState("");
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -322,20 +379,144 @@ function CreateFeatureDialog({
     });
   }
 
+  function validateBulkRow(row: BulkRowState): Record<string, string> {
+    const next: Record<string, string> = {};
+    const key = row.featureKey.trim().toLowerCase();
+    if (key.length < 2 || key.length > 120 || !FEATURE_KEY_RE.test(key)) {
+      next.featureKey =
+        "snake_case, starts with a letter, e.g. b1_extra (no hyphens).";
+    }
+    if (row.name.trim().length < 2 || row.name.trim().length > 160) {
+      next.name = "Name is required (2–160 chars).";
+    }
+    const composed = composeEntitlement(row.valueType, row.entitlement);
+    if (composed.error) next.entitlement = composed.error;
+    return next;
+  }
+
+  /**
+   * Bulk create with per-row results. Partial success drops the rows
+   * that landed and keeps the failed rows with their server error
+   * attached — nothing is ever silent. An all-failed bulk arrives as
+   * a 422 whose per-row errors live in error.details.errors.
+   */
+  const bulkCreate = useMutation({
+    mutationFn: (body: Record<string, unknown>) =>
+      apiRequest<BulkCreateResponse>(
+        `/api/v1/admin/products/${productId}/features/bulk`,
+        { method: "POST", body: JSON.stringify(body) },
+      ),
+    onSuccess: (result) => {
+      void queryClient.invalidateQueries({
+        queryKey: ["admin", "features", "list", productId],
+      });
+      void queryClient.invalidateQueries({ queryKey: detailKey("products", productId) });
+      if (result.errors.length === 0) {
+        toast({
+          title: `${result.created.length} feature${result.created.length === 1 ? "" : "s"} created`,
+          variant: "success",
+        });
+        onClose();
+        return;
+      }
+      const createdKeys = new Set(result.created.map((f) => f.feature_key));
+      setBulkRows((rows) =>
+        rows
+          .filter((r) => !createdKeys.has(r.featureKey.trim().toLowerCase()))
+          .map((row) => {
+            const submittedIdx = submittedOrderRef.current.indexOf(row.localId);
+            const hit = result.errors.find((e) => e.index === submittedIdx);
+            return { ...row, serverError: hit ? hit.error : null };
+          }),
+      );
+      setBulkSummary(
+        `${result.created.length} created, ${result.errors.length} failed — the failed rows are still below; fix them and retry.`,
+      );
+    },
+    onError: (err) => attachBulkServerErrors(err),
+  });
+
+  function attachBulkServerErrors(err: unknown) {
+    const details =
+      err instanceof ApiClientError
+        ? (err.details as {
+            errors?: Array<{ index: number; feature_key: string | null; error: string }>;
+          } | null)
+        : null;
+    const serverErrors = details?.errors;
+    if (!serverErrors || serverErrors.length === 0) {
+      setSubmitError(apiErrorMessage(err));
+      return;
+    }
+    setBulkRows((rows) =>
+      rows.map((row) => {
+        const submittedIdx = submittedOrderRef.current.indexOf(row.localId);
+        const hit = serverErrors.find((e) => e.index === submittedIdx);
+        return hit ? { ...row, serverError: hit.error } : row;
+      }),
+    );
+    setBulkSummary(
+      `${serverErrors.length} row(s) failed — fix them below and retry. Nothing was created.`,
+    );
+  }
+
+  function submitBulk() {
+    setBulkSummary(null);
+    setSubmitError(null);
+    let hasErrors = false;
+    const validated = bulkRows.map((row) => {
+      const errors = validateBulkRow(row);
+      if (Object.keys(errors).length > 0) hasErrors = true;
+      return { ...row, errors, serverError: null };
+    });
+    setBulkRows(validated);
+    if (hasErrors) return;
+    const features = validated.map((row) => {
+      const composed = composeEntitlement(row.valueType, row.entitlement);
+      const body: Record<string, unknown> = {
+        feature_key: row.featureKey.trim().toLowerCase(),
+        name: row.name.trim(),
+        value_type: row.valueType,
+        default_value: composed.value,
+      };
+      if (row.description.trim()) body.description = row.description.trim();
+      if (row.unit.trim()) body.unit = row.unit.trim();
+      return body;
+    });
+    submittedOrderRef.current = validated.map((r) => r.localId);
+    bulkCreate.mutate({ features });
+  }
+
   return (
     <Dialog
       open={open}
       onClose={onClose}
-      title="Create feature"
+      title={`Create feature — ${productName}`}
+      size={mode === "bulk" ? "md" : "sm"}
       footer={
-        <>
-          <Button variant="secondary" onClick={onClose}>
-            Cancel
-          </Button>
-          <Button variant="primary" loading={create.isPending} onClick={submitForm}>
-            Create feature
-          </Button>
-        </>
+        mode === "single" ? (
+          <>
+            <Button variant="secondary" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button variant="primary" loading={create.isPending} onClick={submitForm}>
+              Create feature
+            </Button>
+          </>
+        ) : (
+          <>
+            <Button variant="secondary" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              loading={bulkCreate.isPending}
+              onClick={submitBulk}
+            >
+              {`Create ${bulkRows.length} feature${bulkRows.length === 1 ? "" : "s"}`}
+            </Button>
+          </>
+        )
       }
     >
       {submitError ? (
@@ -343,6 +524,23 @@ function CreateFeatureDialog({
           {submitError}
         </Alert>
       ) : null}
+      <Tabs
+        tabs={[
+          { key: "single", label: "One feature" },
+          { key: "bulk", label: "Several at once" },
+        ]}
+        active={mode}
+        onChange={(key) => setMode(key as "single" | "bulk")}
+      />
+      {bulkSummary ? (
+        <Alert variant="warning" role="status">
+          {bulkSummary}
+        </Alert>
+      ) : null}
+      <Field label="Product" htmlFor="cf-product">
+        <Input id="cf-product" value={productName} disabled />
+      </Field>
+      {mode === "single" ? (
       <form
         onSubmit={(e: FormEvent) => {
           e.preventDefault();
@@ -425,6 +623,171 @@ function CreateFeatureDialog({
           </Field>
         </div>
       </form>
+      ) : (
+      <form
+        onSubmit={(e: FormEvent) => {
+          e.preventDefault();
+          submitBulk();
+        }}
+      >
+        {bulkRows.map((row, i) => (
+          <Card
+            key={row.localId}
+            title={`Feature ${i + 1}`}
+            actions={
+              bulkRows.length > 1 ? (
+                <Button
+                  variant="danger-ghost"
+                  size="sm"
+                  onClick={() =>
+                    setBulkRows((rows) =>
+                      rows.filter((r) => r.localId !== row.localId),
+                    )
+                  }
+                >
+                  Remove
+                </Button>
+              ) : undefined
+            }
+          >
+            <div className="sm-form-grid">
+              <Field
+                label="Feature key"
+                required
+                {...(row.errors.featureKey ? { error: row.errors.featureKey } : {})}
+                htmlFor={`bf-key-${row.localId}`}
+              >
+                <Input
+                  id={`bf-key-${row.localId}`}
+                  value={row.featureKey}
+                  aria-invalid={row.errors.featureKey ? true : undefined}
+                  onChange={(e) =>
+                    setBulkRows((rows) =>
+                      rows.map((r) =>
+                        r.localId === row.localId
+                          ? { ...r, featureKey: e.target.value.toLowerCase() }
+                          : r,
+                      ),
+                    )
+                  }
+                  placeholder="b1_extra"
+                />
+              </Field>
+              <Field
+                label="Name"
+                required
+                {...(row.errors.name ? { error: row.errors.name } : {})}
+                htmlFor={`bf-name-${row.localId}`}
+              >
+                <Input
+                  id={`bf-name-${row.localId}`}
+                  value={row.name}
+                  aria-invalid={row.errors.name ? true : undefined}
+                  onChange={(e) =>
+                    setBulkRows((rows) =>
+                      rows.map((r) =>
+                        r.localId === row.localId ? { ...r, name: e.target.value } : r,
+                      ),
+                    )
+                  }
+                  placeholder="Feature name"
+                />
+              </Field>
+              <Field label="Value type" required htmlFor={`bf-type-${row.localId}`}>
+                <Select
+                  id={`bf-type-${row.localId}`}
+                  value={row.valueType}
+                  onChange={(e) => {
+                    const next = e.target.value as FeatureValueType;
+                    setBulkRows((rows) =>
+                      rows.map((r) =>
+                        r.localId === row.localId
+                          ? {
+                              ...r,
+                              valueType: next,
+                              entitlement: emptyEntitlementDraft(next),
+                            }
+                          : r,
+                      ),
+                    );
+                  }}
+                >
+                  {FEATURE_VALUE_TYPES.map((t) => (
+                    <option key={t} value={t}>
+                      {sentenceCase(t)}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              <Field label="Unit" hint="e.g. seats, GB" htmlFor={`bf-unit-${row.localId}`}>
+                <Input
+                  id={`bf-unit-${row.localId}`}
+                  value={row.unit}
+                  onChange={(e) =>
+                    setBulkRows((rows) =>
+                      rows.map((r) =>
+                        r.localId === row.localId ? { ...r, unit: e.target.value } : r,
+                      ),
+                    )
+                  }
+                  placeholder="seats"
+                />
+              </Field>
+              <Field
+                label="Default value"
+                hint="Used when a package does not set its own value"
+                {...(row.errors.entitlement ? { error: row.errors.entitlement } : {})}
+              >
+                <EntitlementInputs
+                  valueType={row.valueType}
+                  draft={row.entitlement}
+                  onChange={(next) =>
+                    setBulkRows((rows) =>
+                      rows.map((r) =>
+                        r.localId === row.localId ? { ...r, entitlement: next } : r,
+                      ),
+                    )
+                  }
+                  {...(row.errors.entitlement ? { error: row.errors.entitlement } : {})}
+                  idPrefix={`bf-default-${row.localId}`}
+                />
+              </Field>
+              <Field label="Description" htmlFor={`bf-description-${row.localId}`}>
+                <Input
+                  id={`bf-description-${row.localId}`}
+                  value={row.description}
+                  onChange={(e) =>
+                    setBulkRows((rows) =>
+                      rows.map((r) =>
+                        r.localId === row.localId
+                          ? { ...r, description: e.target.value }
+                          : r,
+                      ),
+                    )
+                  }
+                  placeholder="Optional"
+                />
+              </Field>
+            </div>
+            {row.serverError ? (
+              <Alert variant="danger" role="alert">
+                {row.serverError}
+              </Alert>
+            ) : null}
+          </Card>
+        ))}
+        <Button
+          variant="secondary"
+          icon={Plus}
+          onClick={() => {
+            setBulkRows((rows) => [...rows, emptyBulkRow(nextRowId)]);
+            setNextRowId((n) => n + 1);
+          }}
+        >
+          Add another feature
+        </Button>
+      </form>
+      )}
     </Dialog>
   );
 }
@@ -452,18 +815,10 @@ export function FeaturesSection() {
       ? raw.product
       : undefined;
 
-  // Default to the first product so the page is never a dead end; the
-  // choice is written back to the URL (product=…).
-  useEffect(() => {
-    if (!productParam && products.length > 0) {
-      const first = products[0];
-      if (first) updateSearch({ product: first.id });
-    }
-    // Run only when the product list first arrives.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [products.length === 0, productParam]);
-
-  const productId = productParam ?? products[0]?.id;
+  // Explicit product-first: no silent default. Landing here without a
+  // product in the URL shows the picker below; a product=… that names
+  // nothing is treated the same way.
+  const productId = productParam;
   const selectedProduct = products.find((p) => p.id === productId);
 
   const featuresQuery = useQuery({
@@ -564,6 +919,25 @@ export function FeaturesSection() {
       cell: ({ row }) => formatEntitlement(row.original.default_value),
     },
     {
+      accessorKey: "used_by_packages",
+      header: "Used by",
+      cell: ({ row }) => {
+        const used = row.original.used_by_packages ?? [];
+        if (used.length === 0) return "Not used in any package";
+        return (
+          <span>
+            {used.map((u, i) => (
+              <span key={u.package_id}>
+                {i > 0 ? ", " : null}
+                <a href={`/packages/${u.package_id}`}>{u.package_name}</a>
+                {` v${u.version_number} · ${u.version_status}`}
+              </span>
+            ))}
+          </span>
+        );
+      },
+    },
+    {
       accessorKey: "status",
       header: "Status",
       cell: ({ row }) => <StatusBadge status={row.original.status} />,
@@ -601,14 +975,11 @@ export function FeaturesSection() {
             : "Features live under a product — pick one"
         }
         action={
-          <Button
-            variant="primary"
-            icon={Plus}
-            disabled={!productId}
-            onClick={() => setCreateOpen(true)}
-          >
-            Create feature
-          </Button>
+          selectedProduct ? (
+            <Button variant="primary" icon={Plus} onClick={() => setCreateOpen(true)}>
+              Create feature
+            </Button>
+          ) : undefined
         }
       />
       {productsQuery.isPending ? (
@@ -638,6 +1009,50 @@ export function FeaturesSection() {
             }}
           />
         </div>
+      ) : !selectedProduct ? (
+        <Card title="Choose a product">
+          <p className="sm-hint">
+            Features live under a product — pick one to see its features.
+          </p>
+          <div className="sm-table-wrap">
+            <table className="sm-table">
+              <thead>
+                <tr>
+                  <th>Product</th>
+                  <th>Code</th>
+                  <th>Features</th>
+                  <th>Packages</th>
+                  <th>Select</th>
+                </tr>
+              </thead>
+              <tbody>
+                {products.map((p) => (
+                  <tr key={p.id}>
+                    <td>{p.name}</td>
+                    <td>
+                      <span className="sm-mono">{p.code}</span>
+                    </td>
+                    <td>
+                      <span className="sm-tabular">{p.features_count}</span>
+                    </td>
+                    <td>
+                      <span className="sm-tabular">{p.packages_count}</span>
+                    </td>
+                    <td>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => updateSearch({ product: p.id, page: 1 })}
+                      >
+                        Select
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
       ) : (
         <ListTable
           columns={columns}
@@ -691,11 +1106,12 @@ export function FeaturesSection() {
           }
         />
       )}
-      {productId ? (
+      {selectedProduct ? (
         <CreateFeatureDialog
           open={createOpen}
           onClose={() => setCreateOpen(false)}
-          productId={productId}
+          productId={selectedProduct.id}
+          productName={selectedProduct.name}
         />
       ) : null}
     </section>
@@ -1039,6 +1455,41 @@ export function FeatureDetailSection({ id }: { id: string }) {
           { label: "Updated", value: <DateCell value={feature.updated_at} /> },
         ]}
       />
+      <Card title={`Used by packages (${(feature.used_by_packages ?? []).length})`}>
+        {(feature.used_by_packages ?? []).length === 0 ? (
+          <p className="sm-hint">
+            Not used in any package yet. Add this feature to a package
+            version to grant it to customers.
+          </p>
+        ) : (
+          <div className="sm-table-wrap">
+            <table className="sm-table">
+              <thead>
+                <tr>
+                  <th>Package</th>
+                  <th>Version</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(feature.used_by_packages ?? []).map((u) => (
+                  <tr key={u.package_id}>
+                    <td>
+                      <a href={`/packages/${u.package_id}`}>{u.package_name}</a>
+                    </td>
+                    <td>
+                      <span className="sm-tabular">v{u.version_number}</span>
+                    </td>
+                    <td>
+                      <StatusBadge status={u.version_status} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card>
       <EditFeatureDialog
         open={editOpen}
         onClose={() => setEditOpen(false)}
