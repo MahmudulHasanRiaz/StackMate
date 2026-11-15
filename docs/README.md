@@ -4,24 +4,22 @@ Documentation is the product and engineering source of truth.
 
 ## Foundation specifications
 
-1. Product Requirements Document (PRD)
-2. Technical Architecture Document (TAD)
-3. Database Design & Data Model Specification
-4. API & Integration Specification
-5. Security & Threat Model
-6. UI/UX & Design System Specification
-7. Implementation Roadmap & Delivery Plan
-8. Repository Structure & Engineering Conventions
-
-All eight documents are maintained in docs/plan/.
+1. [Product Requirements Document (PRD)](./plan/Product%20Requirements%20Document%20(PRD).md)
+2. [Technical Architecture Document (TAD)](./plan/Technical%20Architecture%20Document%20(TAD).md)
+3. [Database Design & Data Model Specification](./plan/Database%20Design%20%26%20Data%20Model%20Specification.md)
+4. [API & Integration Specification](./plan/API%20%26%20Integration%20Specification.md)
+5. [Security & Threat Model](./plan/Security%20%26%20Threat%20Model.md)
+6. [UI/UX & Design System Specification](./plan/UI%20UX%20%26%20Design%20System%20Specification.md)
+7. [Implementation Roadmap & Delivery Plan](./plan/Implementation%20Roadmap%20%26%20Delivery%20Plan.md)
+8. [Repository Structure & Engineering Conventions](./plan/Repository%20Structure%20%26%20Engineering%20Conventions.md)
 
 ## Execution
 
-- docs/implementation/STATUS.md tracks current stage, blockers, evidence, and priorities.
-- docs/implementation/PLAN.md will contain the active implementation plan.
-- docs/decisions/ stores Architecture Decision Records.
-- docs/integration/ stores external client/site integration guides.
-- docs/operations/ stores deployment and operations runbooks.
+- [Implementation plan](./implementation/PLAN.md)
+- [Implementation status](./implementation/STATUS.md)
+- Architecture Decision Records: [docs/decisions](./decisions/)
+- External integration guides: [docs/integration](./integration/)
+- Operations runbooks: [docs/operations](./operations/)
 
 ## Authority
 
