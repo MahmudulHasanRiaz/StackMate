@@ -594,6 +594,116 @@ describe("SMTP client raw transport errors (follow-up fix, 2026-11-16)", () => {
   });
 });
 
+describe("SMTP client startTls writer lifecycle (workerd flush rule, 2026-11-16)", () => {
+  /**
+   * PROVED mechanism (workerd source: sockets.c++ `Socket::startTls`
+   * calls `writable.flush(js)`; streams/writable.c++
+   * `WritableStream::flush` rejects with "This WritableStream is
+   * currently locked to a writer." while a writer holds the lock):
+   * startTls() flushes the CURRENT socket's writable, and that flush
+   * rejection becomes the new socket's stored stream error — so the
+   * first post-upgrade write fails with the exact live error
+   * 2026-11-16 ~22:53 +06 ("SMTP write failed (TypeError: This
+   * WritableStream is currently locked to a writer.)."). Reproduced
+   * under local workerd (wrangler dev): `startTls()` itself returns
+   * fine, then the post-upgrade EHLO write AND read both fail with
+   * that TypeError. The client used to call startTls() FIRST and
+   * release the old writer AFTER; the writer must be released BEFORE
+   * startTls() so the flush succeeds.
+   *
+   * The mock below models the real workerd semantics faithfully: its
+   * startTls() reads the live `writable.locked` flag (a real WHATWG
+   * property) — locked at upgrade time → the returned socket's
+   * streams are errored with the exact workerd TypeError; unlocked →
+   * a healthy socket. The older mocks return fresh streams
+   * unconditionally and so cannot see this bug.
+   */
+  const LOCK_ERROR = "This WritableStream is currently locked to a writer.";
+
+  function workerdLikeConnect(script: Script): SmtpConnectFn {
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    const makeSocket = (): SmtpSocketLike => {
+      const socket: SmtpSocketLike = {
+        readable: new ReadableStream<Uint8Array>(
+          {
+            pull(controller) {
+              const line = script.replies.shift();
+              if (line === undefined) {
+                controller.close();
+                return;
+              }
+              controller.enqueue(encoder.encode(`${line}\r\n`));
+            },
+          },
+          { highWaterMark: 0 }
+        ),
+        writable: new WritableStream<Uint8Array>({
+          write(chunk) {
+            script.commands.push(decoder.decode(chunk));
+          },
+        }),
+        close: () => Promise.resolve(),
+      };
+      socket.startTls = () => {
+        // Faithful workerd startTls: the upgrade flushes the current
+        // writable, and the flush rejects while a writer holds its
+        // lock — the rejection becomes the new socket's stored error.
+        if (socket.writable.locked) {
+          const err = () => new TypeError(LOCK_ERROR);
+          return {
+            readable: new ReadableStream<Uint8Array>({
+              pull(c) {
+                c.error(err());
+              },
+            }),
+            writable: new WritableStream<Uint8Array>({
+              write() {
+                return Promise.reject(err());
+              },
+            }),
+            close: () => Promise.resolve(),
+          };
+        }
+        return makeSocket();
+      };
+      return socket;
+    };
+    return () => makeSocket();
+  }
+
+  it("STARTTLS succeeds end to end when the writer is released before the upgrade", async () => {
+    const script = starttlsScript();
+    const connect = workerdLikeConnect(script);
+    const result = await sendMailViaSmtp(CONFIG, MESSAGE, connect);
+    expect(result).toEqual({ ok: true });
+    const joined = script.commands.join("");
+    expect(joined).toContain("EHLO stackmate");
+    expect(joined).toContain("STARTTLS");
+    expect(joined).toContain("AUTH LOGIN");
+    expect(joined).toContain("MAIL FROM:<noreply@example.com>");
+    expect(joined).toContain("RCPT TO:<admin@example.com>");
+    expect(joined).toContain("DATA");
+    expect(joined).toContain("QUIT");
+  });
+
+  it("regression guard: the workerd-like mock really errors a locked upgrade (proves the mock models the bug)", async () => {
+    // Drive the mock directly: lock the writable, then startTls —
+    // the returned socket must be errored with the exact workerd
+    // TypeError on write. If this ever stops failing, the mock no
+    // longer models the real runtime and the test above is vacuous.
+    const script = starttlsScript();
+    const socket = workerdLikeConnect(script)({ hostname: "smtp.example.com", port: 587 });
+    const writer = socket.writable.getWriter();
+    const upgraded = socket.startTls!();
+    const upgradedWriter = upgraded.writable.getWriter();
+    await expect(upgradedWriter.write(new TextEncoder().encode("EHLO stackmate\r\n"))).rejects.toThrow(
+      LOCK_ERROR
+    );
+    writer.releaseLock();
+  });
+});
+
 describe.skipIf(!DATABASE_URL)(
   "SMTP raw transport errors at the service level (follow-up fix, 2026-11-16)",
   () => {

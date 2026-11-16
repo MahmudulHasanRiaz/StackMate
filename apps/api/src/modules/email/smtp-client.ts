@@ -372,6 +372,25 @@ export async function sendMailViaSmtp(
         if (typeof socket.startTls !== "function") {
           throw new SmtpError("SMTP socket does not support STARTTLS upgrade.", null);
         }
+        // Release the old reader/writer BEFORE startTls(): workerd's
+        // startTls() flushes the current socket's writable
+        // (sockets.c++), and WritableStream.flush() rejects with
+        // "This WritableStream is currently locked to a writer."
+        // while a writer holds the lock (streams/writable.c++) —
+        // that rejection becomes the new socket's stored stream
+        // error, so the first post-upgrade write fails with it.
+        // Live 2026-11-16 ~22:53 +06, exact error reproduced under
+        // local workerd. All writes have been awaited by this point
+        // (every sendCommand awaits), so nothing is lost by
+        // releasing first; startTls flushes the (now unlocked)
+        // stream's queue itself. Releasing after startTls is too
+        // late — the flush already rejected.
+        reader.release();
+        try {
+          writer.releaseLock();
+        } catch {
+          /* already released */
+        }
         // startTls() is synchronous in the `cloudflare:sockets` API, so
         // there is no await to bound here; the bound is the try/catch
         // (a failed upgrade becomes an SmtpError, with the real cause
@@ -381,12 +400,6 @@ export async function sendMailViaSmtp(
           socket = socket.startTls();
         } catch (err) {
           throw asSmtpError(err, "starttls", "SMTP STARTTLS upgrade failed");
-        }
-        reader.release();
-        try {
-          writer.releaseLock();
-        } catch {
-          /* already released */
         }
         ({ reader, writer } = openStreams(socket));
         await expect("EHLO stackmate", [250]);
