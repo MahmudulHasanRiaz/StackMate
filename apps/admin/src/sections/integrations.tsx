@@ -283,7 +283,7 @@ export function IntegrationsSection() {
     {
       header: "Created",
       accessorKey: "created_at",
-      cell: ({ row }) => <DateCell value={row.original.created_at} />,
+      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
     },
     {
       header: "Actions",
@@ -581,6 +581,7 @@ export function IntegratedSiteDetailSection({ id }: { id: string }) {
       ),
       confirmLabel: "Suspend",
       danger: true,
+      warning: `${site?.name} will stop authenticating.`,
     });
     if (ok) suspend.mutate();
   };
@@ -600,6 +601,7 @@ export function IntegratedSiteDetailSection({ id }: { id: string }) {
       ),
       confirmLabel: "Revoke",
       danger: true,
+      warning: `${site?.name} will be permanently revoked.`,
     });
     if (ok) revoke.mutate();
   };
@@ -963,6 +965,7 @@ function SiteProductsTab({ site }: { site: IntegratedSite }) {
                             ),
                             confirmLabel: "Remove",
                             danger: true,
+                            warning: `${label} will no longer be sold through ${site.name}.`,
                           });
                           if (ok) remove.mutate(r.id);
                         })()
@@ -1158,7 +1161,7 @@ function SiteCredentialsTab({ siteId }: { siteId: string }) {
     {
       header: "Created",
       accessorKey: "created_at",
-      cell: ({ row }) => <DateCell value={row.original.created_at} />,
+      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
     },
     {
       header: "Actions",
@@ -1194,6 +1197,7 @@ function SiteCredentialsTab({ siteId }: { siteId: string }) {
                       ),
                       confirmLabel: "Rotate",
                       danger: true,
+                      warning: `${cred.key_id} is revoked and a new credential of the same type is issued.`,
                     });
                     if (ok) rotate.mutate(cred.id);
                   })(),
@@ -1216,6 +1220,7 @@ function SiteCredentialsTab({ siteId }: { siteId: string }) {
                       ),
                       confirmLabel: "Revoke",
                       danger: true,
+                      warning: `${cred.key_id} stops authenticating immediately.`,
                     });
                     if (ok) revoke.mutate(cred.id);
                   })(),
@@ -1462,7 +1467,7 @@ function SiteDomainsTab({ site }: { site: IntegratedSite }) {
       accessorKey: "verification_challenge",
       enableSorting: false,
       cell: ({ row }) => (
-        <span className="sm-mono">
+        <span className="sm-mono sm-break">
           {row.original.verification_challenge}
           <CopyButton
             value={row.original.verification_challenge}
@@ -1520,6 +1525,7 @@ function SiteDomainsTab({ site }: { site: IntegratedSite }) {
                       ),
                       confirmLabel: "Delete",
                       danger: true,
+                      warning: `${domain.domain} will be removed from ${site.name}.`,
                     });
                     if (ok) remove.mutate(domain.id);
                   })(),

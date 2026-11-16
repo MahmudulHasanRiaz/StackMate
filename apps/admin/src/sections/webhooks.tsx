@@ -266,7 +266,7 @@ export function WebhooksSection() {
     {
       header: "Created",
       accessorKey: "created_at",
-      cell: ({ row }) => <DateCell value={row.original.created_at} />,
+      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
     },
     {
       header: "Actions",
@@ -313,6 +313,8 @@ export function WebhooksSection() {
                         </div>
                       ),
                       confirmLabel: "Delete",
+                      danger: true,
+                      warning: `${ep.url} will stop receiving deliveries.`,
                     });
                     if (ok) deleteEndpoint.mutate(ep.id);
                   })(),

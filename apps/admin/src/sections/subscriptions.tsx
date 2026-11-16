@@ -40,6 +40,7 @@ import {
   Button,
   CopyButton,
   DateCell,
+  DateTimeCell,
   EmptyState,
   ErrorState,
   MoneyCell,
@@ -243,7 +244,7 @@ export function SubscriptionsSection() {
       {
         accessorKey: "next_renewal_at",
         header: "Next renewal",
-        cell: ({ row }) => <DateCell value={row.original.next_renewal_at} />,
+        cell: ({ row }) => <DateTimeCell value={row.original.next_renewal_at} />,
       },
       {
         id: "actions",
@@ -346,6 +347,10 @@ export function SubscriptionDetailSection({ id }: { id: string }) {
       confirmLabel:
         action === "cancel" ? "Cancel subscription" : sentenceCase(action),
       danger: action === "cancel",
+      warning:
+        action === "cancel"
+          ? "The subscription status becomes Cancelled."
+          : undefined,
     });
     if (ok) lifecycle.mutate(action);
   };
@@ -536,10 +541,10 @@ export function SubscriptionDetailSection({ id }: { id: string }) {
                         <MoneyCell currency={inv.currency_code} minor={inv.amount_due_minor} />
                       </td>
                       <td>
-                        <DateCell value={inv.issued_at} />
+                        <DateTimeCell value={inv.issued_at} />
                       </td>
                       <td>
-                        <DateCell value={inv.paid_at} />
+                        <DateTimeCell value={inv.paid_at} />
                       </td>
                     </tr>
                   ))}
@@ -573,10 +578,10 @@ export function SubscriptionDetailSection({ id }: { id: string }) {
                     <tr key={p.id}>
                       <td className="sm-tabular">{p.period_number}</td>
                       <td>
-                        <DateCell value={p.period_start} />
+                        <DateTimeCell value={p.period_start} />
                       </td>
                       <td>
-                        <DateCell value={p.period_end} />
+                        <DateTimeCell value={p.period_end} />
                       </td>
                       <td>
                         <StatusBadge status={p.status} />

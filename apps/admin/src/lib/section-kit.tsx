@@ -69,6 +69,15 @@ export function PageHeader({
   help?: string;
   action?: ReactNode;
 }) {
+  /* F7 (2026-11-16): the breadcrumb's last crumb repeats the page
+     title verbatim on most list pages ("Products" under "Products").
+     Drop it when it duplicates the title; the title itself is the
+     heading. Detail crumbs (an ID, "…", a different label) stay. */
+  const crumbs =
+    breadcrumb.length > 0 &&
+    breadcrumb[breadcrumb.length - 1]?.label === title
+      ? breadcrumb.slice(0, -1)
+      : breadcrumb;
   return (
     <div>
       <div className="sm-page-header">
@@ -81,9 +90,11 @@ export function PageHeader({
         </div>
         {action}
       </div>
-      <div className="sm-page-breadcrumb">
-        <Breadcrumb items={breadcrumb} />
-      </div>
+      {crumbs.length > 0 ? (
+        <div className="sm-page-breadcrumb">
+          <Breadcrumb items={crumbs} />
+        </div>
+      ) : null}
     </div>
   );
 }

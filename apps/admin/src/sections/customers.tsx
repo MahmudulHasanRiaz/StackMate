@@ -41,6 +41,7 @@ import {
   Card,
   CopyButton,
   DateCell,
+  DateTimeCell,
   Dialog,
   ErrorState,
   Field,
@@ -190,7 +191,7 @@ const customerColumns: ColumnDef<CustomerDto, unknown>[] = [
   {
     accessorKey: "created_at",
     header: "Created",
-    cell: ({ row }) => <DateCell value={row.original.created_at} />,
+    cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
   },
 ];
 
@@ -414,7 +415,7 @@ export function CustomerDetailSection({ id }: { id: string }) {
     {
       accessorKey: "created_at",
       header: "Created",
-      cell: ({ row }) => <DateCell value={row.original.created_at} />,
+      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
     },
     {
       id: "actions",
@@ -457,12 +458,12 @@ export function CustomerDetailSection({ id }: { id: string }) {
     {
       accessorKey: "next_renewal_at",
       header: "Next renewal",
-      cell: ({ row }) => <DateCell value={row.original.next_renewal_at} />,
+      cell: ({ row }) => <DateTimeCell value={row.original.next_renewal_at} />,
     },
     {
       accessorKey: "created_at",
       header: "Created",
-      cell: ({ row }) => <DateCell value={row.original.created_at} />,
+      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
     },
   ];
 
@@ -494,12 +495,12 @@ export function CustomerDetailSection({ id }: { id: string }) {
     {
       accessorKey: "expires_at",
       header: "Expires",
-      cell: ({ row }) => <DateCell value={row.original.expires_at} />,
+      cell: ({ row }) => <DateTimeCell value={row.original.expires_at} />,
     },
     {
       accessorKey: "issued_at",
       header: "Issued",
-      cell: ({ row }) => <DateCell value={row.original.issued_at} />,
+      cell: ({ row }) => <DateTimeCell value={row.original.issued_at} />,
     },
   ];
 

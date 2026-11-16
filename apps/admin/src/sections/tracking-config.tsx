@@ -40,6 +40,7 @@ import {
   Button,
   Checkbox,
   DateCell,
+  DateTimeCell,
   Dialog,
   EmptyState,
   ErrorState,
@@ -269,7 +270,7 @@ function TrackingGroups({ site }: { site: IntegratedSite }) {
                   </td>
                   <td>{g.enabled_events.join(", ")}</td>
                   <td>
-                    <DateCell value={g.updated_at} />
+                    <DateTimeCell value={g.updated_at} />
                   </td>
                   <td>
                     <RowMenu
@@ -299,6 +300,8 @@ function TrackingGroups({ site }: { site: IntegratedSite }) {
                                   </div>
                                 ),
                                 confirmLabel: "Delete",
+                                danger: true,
+                                warning: `${g.label ?? g.pixel_id} (${PROVIDER_LABELS[g.provider]}) will stop receiving events for ${site.name}.`,
                               });
                               if (ok) remove.mutate(g.id);
                             })(),

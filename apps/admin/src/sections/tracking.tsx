@@ -190,7 +190,7 @@ export function TrackingSection() {
     {
       header: "Received",
       accessorKey: "created_at",
-      cell: ({ row }) => <DateCell value={row.original.created_at} />,
+      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
     },
   ];
 
@@ -216,7 +216,7 @@ export function TrackingSection() {
               setSearch({ page: 1 });
             }}
           >
-            {f === "all" ? "All" : f === "processed" ? "Processed" : f}
+            {f === "all" ? "All" : f[0]!.toUpperCase() + f.slice(1)}
           </Chip>
         ))}
         {sitesQuery.isError ? (

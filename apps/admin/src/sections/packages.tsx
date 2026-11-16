@@ -57,6 +57,7 @@ import {
   Checkbox,
   CopyButton,
   DateCell,
+  DateTimeCell,
   Dialog,
   EmptyState,
   ErrorState,
@@ -861,7 +862,7 @@ export function PackagesSection() {
     {
       accessorKey: "created_at",
       header: "Created",
-      cell: ({ row }) => <DateCell value={row.original.created_at} />,
+      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
     },
   ];
 
@@ -912,10 +913,10 @@ export function PackagesSection() {
         </div>
       ) : !selectedProduct ? (
         <Card title="Choose a product">
-          <p className="sm-hint">
-            Packages live under a product — pick one to see its packages.
-          </p>
-          <div className="sm-table-wrap">
+          {/* F7 (2026-11-16): no description paragraph here — it repeated
+              the header help text ("Packages live under a product — pick
+              one"). The (i) button beside the title already carries it. */}
+          <div className="sm-table-flat">
             <table className="sm-table">
               <thead>
                 <tr>
@@ -1777,6 +1778,7 @@ export function PackageDetailSection({ id }: { id: string }) {
       ),
       confirmLabel: "Retire",
       danger: true,
+      warning: `Version ${version.version_number} stops being purchasable.`,
     });
     if (ok) retireVersion.mutate(version.id);
   }
@@ -1796,6 +1798,7 @@ export function PackageDetailSection({ id }: { id: string }) {
       ),
       confirmLabel: "Disable",
       danger: true,
+      warning: "This price stops being offered to new customers.",
     });
     if (ok) disablePrice.mutate(price.id);
   }
@@ -1901,7 +1904,7 @@ export function PackageDetailSection({ id }: { id: string }) {
                           <span className="sm-tabular">{(v.prices ?? []).length}</span>
                         </td>
                         <td>
-                          <DateCell value={v.published_at} />
+                          <DateTimeCell value={v.published_at} />
                         </td>
                         <td>
                           <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>

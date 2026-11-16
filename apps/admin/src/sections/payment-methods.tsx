@@ -43,6 +43,7 @@ import {
   Checkbox,
   CopyButton,
   DateCell,
+  DateTimeCell,
   Dialog,
   Field,
   Input,
@@ -218,7 +219,7 @@ export function PaymentMethodsSection() {
     {
       accessorKey: "created_at",
       header: "Created",
-      cell: ({ row }) => <DateCell value={row.original.created_at} />,
+      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
     },
     {
       id: "actions",
@@ -803,6 +804,9 @@ export function PaymentMethodDetailSection({ id }: { id: string }) {
         : "Customers will no longer see this method at checkout. Open payment submissions for it stay open.",
       confirmLabel: enabling ? "Enable" : "Disable",
       danger: !enabling,
+      warning: enabling
+        ? undefined
+        : "Customers will no longer see this method at checkout.",
     });
     if (ok) toggleMutation.mutate({ enabled: enabling });
   };

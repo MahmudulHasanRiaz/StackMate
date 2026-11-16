@@ -49,6 +49,7 @@ import {
   Checkbox,
   CopyButton,
   DateCell,
+  DateTimeCell,
   Dialog,
   EmptyState,
   ErrorState,
@@ -499,7 +500,7 @@ export function ProductsSection() {
     {
       accessorKey: "created_at",
       header: "Created",
-      cell: ({ row }) => <DateCell value={row.original.created_at} />,
+      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
     },
   ];
 
@@ -772,6 +773,7 @@ export function ProductDetailSection({ id }: { id: string }) {
       ),
       confirmLabel: "Archive",
       danger: true,
+      warning: `“${product.name}” will move to Archived and stop being sold.`,
     });
     if (ok) setStatus.mutate("archive");
   }

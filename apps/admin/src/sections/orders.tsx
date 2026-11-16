@@ -272,7 +272,7 @@ export function OrdersSection() {
     {
       accessorKey: "created_at",
       header: "Created",
-      cell: ({ row }) => <DateCell value={row.original.created_at} />,
+      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
     },
     {
       id: "actions",
@@ -465,6 +465,7 @@ export function OrderDetailSection({ id }: { id: string }) {
         ),
         confirmLabel: "Cancel order",
         danger: true,
+        warning: "The order will become Cancelled.",
       });
       if (ok) cancelMutation.mutate();
     })();
@@ -514,6 +515,7 @@ export function OrderDetailSection({ id }: { id: string }) {
         ),
         confirmLabel: "Void invoice",
         danger: true,
+        warning: "The invoice will become Void and can no longer be collected.",
       });
       if (ok) voidMutation.mutate(invoice.id);
     })();
@@ -731,7 +733,7 @@ export function OrderDetailSection({ id }: { id: string }) {
                         />
                       </td>
                       <td>
-                        <DateCell value={invoice.issued_at} />
+                        <DateTimeCell value={invoice.issued_at} />
                       </td>
                       <td>
                         <Button

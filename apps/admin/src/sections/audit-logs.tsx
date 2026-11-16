@@ -31,6 +31,13 @@ import {
   parseListSearch,
   useAdminList,
 } from "../lib/section-kit";
+import {
+  humanizeType,
+  resolveResourceName,
+  shortId,
+  useResourceMaps,
+  useStaffNameMap,
+} from "../lib/resolve-names";
 
 interface AuditLogRecord {
   id: string;
@@ -113,6 +120,13 @@ export function AuditLogsSection() {
     "/api/v1/admin/audit-logs",
   );
 
+  /* F3 (2026-11-16): the API returns raw UUIDs for actors and
+     resources — resolve human names client-side (staff list join;
+     sites / webhooks / invitations for resources). Unknown ids fall
+     back to a short id, never the full UUID. */
+  const staffNames = useStaffNameMap();
+  const resourceMaps = useResourceMaps();
+
   const actions = useMemo(
     () => distinctSorted((query.data ?? []).map((e) => e.action)),
     [query.data],
@@ -185,24 +199,44 @@ export function AuditLogsSection() {
       {
         accessorKey: "resource_type",
         header: "Resource",
-        cell: ({ row }) => (
-          <div>
-            <span className="sm-mono">{row.original.resource_type}</span>
-            <div className="sm-mono sm-hint">{row.original.resource_id}</div>
-          </div>
-        ),
+        cell: ({ row }) => {
+          const display = resolveResourceName(
+            row.original.resource_type,
+            row.original.resource_id,
+            resourceMaps,
+          );
+          return (
+            <div>
+              {display ? (
+                <span className="sm-break">{display}</span>
+              ) : (
+                <span className="sm-mono">{shortId(row.original.resource_id)}</span>
+              )}
+              <div className="sm-hint">
+                {humanizeType(row.original.resource_type)}
+              </div>
+            </div>
+          );
+        },
       },
       {
         accessorKey: "actor_type",
         header: "Actor",
-        cell: ({ row }) => (
-          <div>
-            {row.original.actor_type}
-            {row.original.actor_user_id ? (
-              <div className="sm-mono sm-hint">{row.original.actor_user_id}</div>
-            ) : null}
-          </div>
-        ),
+        cell: ({ row }) => {
+          const name = row.original.actor_user_id
+            ? staffNames.get(row.original.actor_user_id)
+            : undefined;
+          return (
+            <div>
+              {name ?? humanizeType(row.original.actor_type)}
+              {row.original.actor_user_id ? (
+                <div className="sm-mono sm-hint">
+                  {shortId(row.original.actor_user_id)}
+                </div>
+              ) : null}
+            </div>
+          );
+        },
       },
       {
         accessorKey: "outcome",
@@ -214,7 +248,7 @@ export function AuditLogsSection() {
         header: "Request ID",
         cell: ({ row }) => (
           <span>
-            <span className="sm-mono">{row.original.request_id}</span>
+            <span className="sm-mono">{shortId(row.original.request_id)}</span>
             <CopyButton value={row.original.request_id} label="Copy request ID" />
           </span>
         ),
@@ -232,7 +266,7 @@ export function AuditLogsSection() {
         ),
       },
     ],
-    [],
+    [resourceMaps, staffNames],
   );
 
   const changeEntries = selected ? Object.entries(selected.changes ?? {}) : [];
@@ -368,8 +402,15 @@ export function AuditLogsSection() {
                 {
                   label: "Resource",
                   value: (
-                    <span className="sm-mono">
-                      {selected.resource_type} / {selected.resource_id}
+                    <span className="sm-break">
+                      {resolveResourceName(
+                        selected.resource_type,
+                        selected.resource_id,
+                        resourceMaps,
+                      ) ?? shortId(selected.resource_id)}{" "}
+                      <span className="sm-hint">
+                        ({humanizeType(selected.resource_type)})
+                      </span>
                     </span>
                   ),
                 },
@@ -377,11 +418,14 @@ export function AuditLogsSection() {
                   label: "Actor",
                   value: selected.actor_user_id ? (
                     <span>
-                      {selected.actor_type}{" "}
-                      <span className="sm-mono">{selected.actor_user_id}</span>
+                      {staffNames.get(selected.actor_user_id) ??
+                        humanizeType(selected.actor_type)}{" "}
+                      <span className="sm-mono sm-hint">
+                        {shortId(selected.actor_user_id)}
+                      </span>
                     </span>
                   ) : (
-                    selected.actor_type
+                    humanizeType(selected.actor_type)
                   ),
                 },
                 ...(selected.integrated_site_id
@@ -389,8 +433,10 @@ export function AuditLogsSection() {
                       {
                         label: "Integrated site",
                         value: (
-                          <span className="sm-mono">
-                            {selected.integrated_site_id}
+                          <span className="sm-break">
+                            {resourceMaps.sites.get(
+                              selected.integrated_site_id,
+                            ) ?? shortId(selected.integrated_site_id)}
                           </span>
                         ),
                       },
@@ -404,7 +450,7 @@ export function AuditLogsSection() {
                   label: "Request ID",
                   value: (
                     <span>
-                      <span className="sm-mono">{selected.request_id}</span>
+                      <span className="sm-mono">{shortId(selected.request_id)}</span>
                       <CopyButton
                         value={selected.request_id}
                         label="Copy request ID"

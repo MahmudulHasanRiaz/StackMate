@@ -51,8 +51,6 @@ import {
   LogOut,
   Menu as MenuIcon,
   Package,
-  PanelLeftClose,
-  PanelLeftOpen,
   RefreshCw,
   ScrollText,
   Search,
@@ -239,6 +237,73 @@ function useNavCollapsed(
 }
 
 /* ------------------------------------------------------------------ */
+/* Sidebar expand/collapse icons — Neon's glyph (owner 2026-11-16,     */
+/* images 104 + 4b75079f): a panel rect with a narrow left divider     */
+/* strip and a FULL horizontal ARROW (shaft + head) — → to expand, ←   */
+/* to collapse. Lucide has no exact panel+arrow icon (PanelLeftOpen /  */
+/* PanelLeftClose are the same panel with a small CHEVRON ›/‹ instead  */
+/* of an arrow — the difference the owner noticed), so these two tiny   */
+/* local components match Lucide's construction exactly (24 viewBox,   */
+/* fill none, stroke currentColor, round caps/joins, 16px rendered)    */
+/* and are used ONLY on the nav collapse toggle.                       */
+/* ------------------------------------------------------------------ */
+function SidebarExpandIcon({
+  size = 16,
+  strokeWidth = 2,
+}: {
+  size?: number;
+  strokeWidth?: number;
+}) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={strokeWidth}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <line x1="9" y1="3" x2="9" y2="21" />
+      <line x1="12" y1="12" x2="17" y2="12" />
+      <polyline points="14,9 17,12 14,15" />
+    </svg>
+  );
+}
+
+function SidebarCollapseIcon({
+  size = 16,
+  strokeWidth = 2,
+}: {
+  size?: number;
+  strokeWidth?: number;
+}) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={strokeWidth}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+      <line x1="9" y1="3" x2="9" y2="21" />
+      <line x1="12" y1="12" x2="17" y2="12" />
+      <polyline points="15,9 12,12 15,15" />
+    </svg>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* MainNav — the operational nav, rendered as a full sidebar (MainShell) */
 /* or as the icon rail beside the Settings nav (SettingsShell).          */
 /* ------------------------------------------------------------------ */
@@ -310,9 +375,9 @@ function MainNav({
         title={collapsed ? "Expand menu" : "Collapse menu"}
       >
         {collapsed ? (
-          <PanelLeftOpen size={16} strokeWidth={2} />
+          <SidebarExpandIcon size={16} strokeWidth={2} />
         ) : (
-          <PanelLeftClose size={16} strokeWidth={2} />
+          <SidebarCollapseIcon size={16} strokeWidth={2} />
         )}
         <span className="sm-nav-label">
           {collapsed ? "Expand menu" : "Collapse menu"}

@@ -20,11 +20,17 @@ import { Webhook } from "lucide-react";
 import { apiRequest } from "../lib/api-client";
 import { PageHeader, useAdminMutation } from "../lib/section-kit";
 import {
+  humanizeType,
+  resolveResourceName,
+  shortId,
+  useResourceMaps,
+} from "../lib/resolve-names";
+import {
   Button,
   Chip,
-  DateCell,
   DateTimeCell,
   ErrorState,
+  Pagination,
   StatusBadge,
   TableSkeleton,
   Toolbar,
@@ -60,6 +66,15 @@ const OUTBOX_FILTERS = [
 ] as const;
 type OutboxFilter = (typeof OUTBOX_FILTERS)[number];
 
+/* F5 (2026-11-16): filter chips use ONE capitalisation everywhere —
+   first letter capitalised ("Pending", "Dead letter"), never a mix
+   of lower-case and capitalised labels. */
+function filterLabel(f: OutboxFilter): string {
+  if (f === "all") return "All";
+  if (f === "dead_letter") return "Dead letter";
+  return f[0]!.toUpperCase() + f.slice(1);
+}
+
 function useOutboxEvents(filter: OutboxFilter) {
   return useQuery({
     queryKey: ["admin", "outbox-events", "list", filter],
@@ -79,9 +94,15 @@ function useOutboxEvents(filter: OutboxFilter) {
 /* ------------------------------------------------------------------ */
 export function OutboxSection() {
   const [filter, setFilter] = useState<OutboxFilter>("all");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(25);
   const query = useOutboxEvents(filter);
   const confirm = useConfirm();
   const rows = query.data ?? [];
+  /* F6 (2026-11-16): the outbox had no pagination — client-side paging
+     over the loaded collection, like ListTable. */
+  const pageRows = rows.slice((page - 1) * pageSize, page * pageSize);
+  const resourceMaps = useResourceMaps();
 
   const replay = useAdminMutation<OutboxEvent, string>({
     mutationFn: (eventId) =>
@@ -115,15 +136,22 @@ export function OutboxSection() {
       />
       <Toolbar>
         {OUTBOX_FILTERS.map((f) => (
-          <Chip key={f} active={filter === f} onClick={() => setFilter(f)}>
-            {f === "all" ? "All" : f === "dead_letter" ? "Dead letter" : f}
+          <Chip
+            key={f}
+            active={filter === f}
+            onClick={() => {
+              setFilter(f);
+              setPage(1);
+            }}
+          >
+            {filterLabel(f)}
           </Chip>
         ))}
       </Toolbar>
       {query.isPending ? (
         <TableSkeleton rows={5} />
       ) : query.isError ? (
-        <div className="sm-table-wrap">
+        <div className="sm-table-flat">
           <ErrorState
             message={
               query.error instanceof Error
@@ -134,7 +162,7 @@ export function OutboxSection() {
           />
         </div>
       ) : rows.length === 0 ? (
-        <div className="sm-table-wrap">
+        <div className="sm-table-flat">
           <div className="sm-empty">
             <Webhook size={18} strokeWidth={2} className="sm-empty-icon" />
             <div className="sm-empty-title">No outbox events</div>
@@ -146,7 +174,7 @@ export function OutboxSection() {
           </div>
         </div>
       ) : (
-        <div className="sm-table-wrap">
+        <div className="sm-table-flat">
           <table className="sm-table">
             <thead>
               <tr>
@@ -162,15 +190,21 @@ export function OutboxSection() {
               </tr>
             </thead>
             <tbody>
-              {rows.map((e) => (
+              {pageRows.map((e) => (
                 <tr key={e.id}>
                   <td>
                     <span className="sm-mono">{e.event_key}</span>
                   </td>
                   <td>{e.event_type}</td>
                   <td>
-                    {e.aggregate_type} ·{" "}
-                    <span className="sm-mono">{e.aggregate_id}</span>
+                    {humanizeType(e.aggregate_type)} ·{" "}
+                    <span className="sm-break">
+                      {resolveResourceName(
+                        e.aggregate_type,
+                        e.aggregate_id,
+                        resourceMaps,
+                      ) ?? shortId(e.aggregate_id)}
+                    </span>
                   </td>
                   <td>
                     <StatusBadge status={e.status} />
@@ -180,7 +214,7 @@ export function OutboxSection() {
                   </td>
                   <td>{e.last_error_code ?? "—"}</td>
                   <td>
-                    <DateCell value={e.created_at} />
+                    <DateTimeCell value={e.created_at} />
                   </td>
                   <td>
                     <DateTimeCell value={e.processed_at} />
@@ -223,6 +257,16 @@ export function OutboxSection() {
               ))}
             </tbody>
           </table>
+          <Pagination
+            page={page}
+            pageSize={pageSize}
+            total={rows.length}
+            onPageChange={setPage}
+            onPageSizeChange={(size) => {
+              setPageSize(size);
+              setPage(1);
+            }}
+          />
         </div>
       )}
     </section>
