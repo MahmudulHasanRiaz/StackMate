@@ -57,6 +57,11 @@
   --sm-text: #f5f5f5;
   --sm-text-muted: #B0B1B2;
 
+  /* Tooltip (Neon images 85/95, dark): small dark box, white text —
+     NOT a card. The light theme inverts it (see [data-theme="light"]). */
+  --sm-tooltip-bg: #141414;
+  --sm-tooltip-text: #ffffff;
+
   /* The one accent — Neon green #00E599 (live neon.com CSS:          */
   /* .bg-green-45 / .text-green-45 / .border-primary-1). Text on      */
   /* accent is black. The green FILL is a LIGHT gradient, never flat */
@@ -181,6 +186,11 @@
   --sm-border-strong: #cbd5e1;
   --sm-text: #0f172a;
   --sm-text-muted: #475569;
+
+  /* Tooltip, light (Neon image c856b3f4): INVERTED — light-grey box,
+     dark text. Never a dark surface in light theme. */
+  --sm-tooltip-bg: #d9d9d9;
+  --sm-tooltip-text: #0f172a;
 
   --sm-accent: #007f55;
   --sm-accent-hover: #005f40;
@@ -536,6 +546,48 @@ a:hover {
   position: fixed;
   min-width: 200px;
 }
+/* Info popover — the (i) button beside a page title. The page
+   description lives here, hidden until opened (clean header rule,
+   2026-11-16). Styled as Neon's TOOLTIP (images 85/95 dark,
+   c856b3f4 light): small box, compact padding, a caret pointing up
+   at the button, positioned below it — NOT a card or dialog. The
+   colors invert per theme via --sm-tooltip-bg/text. Fixed + portaled
+   like .sm-row-menu so no scroll container clips it; width is
+   clamped to the viewport by the component (max 320px). */
+.sm-info-panel {
+  position: fixed;
+  z-index: var(--sm-z-dropdown);
+  background: var(--sm-tooltip-bg);
+  border-radius: var(--sm-radius-lg);
+  box-shadow: var(--sm-shadow-md);
+  padding: var(--sm-space-2) var(--sm-space-3);
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--sm-tooltip-text);
+}
+.sm-info-panel p {
+  margin: 0;
+}
+/* Caret — a triangle in the tooltip bg color, centered on the (i)
+   button (its `left` is set inline by the component). Points up when
+   the panel sits below the button; when the panel flips above the
+   button (near the viewport bottom) it points down instead. */
+.sm-info-caret {
+  position: absolute;
+  top: -5px;
+  width: 0;
+  height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-bottom: 5px solid var(--sm-tooltip-bg);
+  transform: translateX(-50%);
+}
+.sm-info-panel[data-flipped="true"] .sm-info-caret {
+  top: auto;
+  bottom: -5px;
+  border-bottom: none;
+  border-top: 5px solid var(--sm-tooltip-bg);
+}
 /* Row-menu items are ~32px (Neon menu rows), tighter than the account menu. */
 .sm-row-menu .sm-menu-item {
   padding: var(--sm-space-1-5) var(--sm-space-2-5);
@@ -800,6 +852,14 @@ a:hover {
   margin: var(--sm-space-1) 0 0;
   font-size: 13px;
   color: var(--sm-text-muted);
+}
+/* Title row: the (i) help button sits beside the title (clean header
+   rule, 2026-11-16 — prose lives behind the button, never under the
+   title). */
+.sm-page-title-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sm-space-2);
 }
 
 /* ------------------------------------------------------------------ */

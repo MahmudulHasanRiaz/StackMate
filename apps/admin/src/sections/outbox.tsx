@@ -111,7 +111,7 @@ export function OutboxSection() {
           { label: "Outbox & Deliveries" },
         ]}
         title="Outbox & Deliveries"
-        subtitle="Transactional outbox — every event the platform must deliver, and its retries"
+        help="Transactional outbox — every event the platform must deliver, and its retries"
       />
       <Toolbar>
         {OUTBOX_FILTERS.map((f) => (

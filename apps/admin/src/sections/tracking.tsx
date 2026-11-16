@@ -199,7 +199,7 @@ export function TrackingSection() {
       <PageHeader
         breadcrumb={[{ label: "Administration" }, { label: "Tracking Events" }]}
         title="Tracking Events"
-        subtitle="Events received from integrated sites"
+        help="Events received from integrated sites"
       />
       <Alert variant="warning">
         Meta delivery is not live yet. An event marked “Processed (recorded)”

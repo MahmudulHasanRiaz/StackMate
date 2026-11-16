@@ -601,7 +601,7 @@ export function StaffSection() {
       <PageHeader
         breadcrumb={[{ label: "Staff & Roles" }]}
         title="Staff & Roles"
-        subtitle="Staff users, roles, and invitations"
+        help="Staff users, roles, and invitations"
         action={headerAction}
       />
       <Tabs
@@ -1086,7 +1086,7 @@ export function StaffUserDetailSection({ id }: { id: string }) {
           { label: user ? user.name : id },
         ]}
         title={user ? user.name : "Staff user"}
-        subtitle="Staff user detail"
+        help="Staff user detail"
       />
       {detailQuery.isPending ? (
         <div className="sm-card">

@@ -268,7 +268,7 @@ export function SubscriptionsSection() {
       <PageHeader
         breadcrumb={[{ label: "Subscriptions" }]}
         title="Subscriptions"
-        subtitle="Recurring and lifetime subscriptions"
+        help="Recurring and lifetime subscriptions"
       />
       <ListTable
         columns={columns}
@@ -392,7 +392,7 @@ export function SubscriptionDetailSection({ id }: { id: string }) {
           { label: sub.subscription_number },
         ]}
         title={`Subscription ${sub.subscription_number}`}
-        subtitle="Subscription detail and renewal invoices"
+        help="Subscription detail and renewal invoices"
         action={
           <>
             <StatusBadge status={sub.status} />

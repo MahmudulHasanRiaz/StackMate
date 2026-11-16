@@ -508,7 +508,7 @@ export function ProductsSection() {
       <PageHeader
         breadcrumb={[{ label: "Products" }]}
         title="Products"
-        subtitle="Catalog products, their features and packages"
+        help="Catalog products, their features and packages"
         action={
           <Button variant="primary" icon={Plus} onClick={() => setCreateOpen(true)}>
             Create product

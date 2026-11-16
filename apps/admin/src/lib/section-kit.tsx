@@ -3,10 +3,15 @@
  *
  * Shared building blocks for every admin section route. Sections MUST use
  * these instead of inventing their own list/detail patterns:
- *  - PageHeader: breadcrumb + title + subtitle + ONE main action
+ *  - PageHeader: breadcrumb + title + ONE main action
  *    (usually the accent variant; `primary` — white — is reserved
  *    for the single most-important creation on its page, e.g.
- *    "Create product" on the Products list).
+ *    "Create product" on the Products list). A prose page
+ *    description goes in `help` — it renders ONLY behind the (i)
+ *    button beside the title (clean header rule, 2026-11-16), never
+ *    as visible text. `subtitle` is for one short line of DATA only
+ *    (detail-page identity/metadata, e.g. order ref · source) or a
+ *    money-safety warning; passing `help` suppresses `subtitle`.
  *  - useAdminList / useAdminDetail: TanStack Query over apiRequest.
  *  - useAdminMutation: mutation + toast + exact key invalidation.
  *  - ListTable: TanStack Table — client-side search/sort/pagination over
@@ -37,6 +42,7 @@ import {
   Breadcrumb,
   EmptyState,
   ErrorState,
+  InfoButton,
   Input,
   Pagination,
   TableSkeleton,
@@ -45,25 +51,33 @@ import {
 } from "../components/primitives";
 
 /* ------------------------------------------------------------------ */
-/* Page header (spec §4.1): breadcrumb, title, subtitle, ONE action    */
+/* Page header (spec §4.1): breadcrumb, title, ONE action. Prose      */
+/* goes in `help` (behind the (i) button, never visible by default);   */
+/* `subtitle` is data/metadata only — and never renders when `help`    */
+/* is present, so a header can never show prose again.                 */
 /* ------------------------------------------------------------------ */
 export function PageHeader({
   breadcrumb,
   title,
   subtitle,
+  help,
   action,
 }: {
   breadcrumb: { label: string; href?: string }[];
   title: string;
   subtitle?: string;
+  help?: string;
   action?: ReactNode;
 }) {
   return (
     <div>
       <div className="sm-page-header">
         <div>
-          <h1 className="sm-page-title">{title}</h1>
-          {subtitle ? <p className="sm-page-subtitle">{subtitle}</p> : null}
+          <div className="sm-page-title-row">
+            <h1 className="sm-page-title">{title}</h1>
+            {help ? <InfoButton text={help} /> : null}
+          </div>
+          {subtitle && !help ? <p className="sm-page-subtitle">{subtitle}</p> : null}
         </div>
         {action}
       </div>

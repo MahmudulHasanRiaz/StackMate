@@ -124,6 +124,140 @@ export function IconButton({
 }
 
 /* ------------------------------------------------------------------ */
+/* InfoButton — the (i) button beside a page title (clean header       */
+/* rule, 2026-11-16). Page descriptions live HERE, hidden until the    */
+/* user opens them — never visible by default, so headers stay clean   */
+/* and text-light. The panel is styled as Neon's TOOLTIP (images       */
+/* 85/95 dark, c856b3f4 light): small box, compact padding, caret      */
+/* pointing up at the button, positioned below it; colors invert per   */
+/* theme via --sm-tooltip-bg/text — NOT a card or dialog. Portaled +   */
+/* fixed-positioned like RowMenu (same open/close contract: click      */
+/* toggles, Esc closes and returns focus, outside pointerdown /       */
+/* scroll / resize close, flips above the trigger near the viewport    */
+/* bottom). The 26px icon button becomes 40px at <=640px via the      */
+/* shared .sm-btn-icon rule in tokens.css.                            */
+/* ------------------------------------------------------------------ */
+export function InfoButton({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{
+    top: number;
+    left: number;
+    width: number;
+    caretLeft: number;
+    flipped: boolean;
+  } | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const panelId = useId();
+
+  const close = useCallback(() => {
+    setOpen(false);
+    triggerRef.current?.focus();
+  }, []);
+
+  const openInfo = useCallback(() => {
+    const rect = triggerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const width = Math.min(320, window.innerWidth - 16);
+    const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+    // Caret sits on the trigger's horizontal center, clamped inside
+    // the panel so it never pokes past an edge.
+    const caretLeft = Math.max(
+      10,
+      Math.min(rect.left + rect.width / 2 - left, width - 10),
+    );
+    setPos({ top: rect.bottom + 4, left, width, caretLeft, flipped: false });
+    setOpen(true);
+  }, []);
+
+  // Flip above the trigger when the panel would overflow the viewport bottom.
+  useLayoutEffect(() => {
+    if (!open || !pos) return;
+    const panel = panelRef.current;
+    const rect = triggerRef.current?.getBoundingClientRect();
+    if (!panel || !rect) return;
+    const height = panel.getBoundingClientRect().height;
+    if (pos.top + height > window.innerHeight - 8) {
+      setPos({
+        top: Math.max(8, rect.top - height - 4),
+        left: pos.left,
+        width: pos.width,
+        caretLeft: pos.caretLeft,
+        flipped: true,
+      });
+    }
+    // Runs once per open on purpose: the position is set on open, then
+    // flipped at most once. Re-running on `pos` would loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const target = e.target as Node;
+      if (panelRef.current?.contains(target)) return;
+      if (triggerRef.current?.contains(target)) return;
+      setOpen(false);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        close();
+      }
+    };
+    const onScrollOrResize = () => setOpen(false);
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("scroll", onScrollOrResize, true);
+    window.addEventListener("resize", onScrollOrResize);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("scroll", onScrollOrResize, true);
+      window.removeEventListener("resize", onScrollOrResize);
+    };
+  }, [open, close]);
+
+  return (
+    <>
+      <button
+        type="button"
+        ref={triggerRef}
+        className="sm-btn sm-btn-ghost sm-btn-icon"
+        aria-expanded={open}
+        aria-controls={panelId}
+        aria-label="About this page"
+        title="About this page"
+        onClick={() => (open ? close() : openInfo())}
+      >
+        <Info size={16} strokeWidth={2} />
+      </button>
+      {open && pos
+        ? createPortal(
+            <div
+              ref={panelRef}
+              id={panelId}
+              className="sm-info-panel"
+              role="dialog"
+              aria-label="About this page"
+              data-flipped={pos.flipped || undefined}
+              style={{ top: pos.top, left: pos.left, width: pos.width }}
+            >
+              <span
+                className="sm-info-caret"
+                style={{ left: pos.caretLeft }}
+                aria-hidden="true"
+              />
+              <p>{text}</p>
+            </div>,
+            document.body,
+          )
+        : null}
+    </>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* Inputs                                                              */
 /* ------------------------------------------------------------------ */
 export function Input(props: InputHTMLAttributes<HTMLInputElement>) {

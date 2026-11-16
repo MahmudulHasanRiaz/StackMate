@@ -259,7 +259,7 @@ export function PaymentReviewSection() {
       <PageHeader
         breadcrumb={[{ label: "Commerce" }, { label: "Payment Review" }]}
         title="Payment Review"
-        subtitle={
+        help={
           pendingCount > 0
             ? `${pendingCount} submission${pendingCount === 1 ? "" : "s"} awaiting verification`
             : "No submissions awaiting verification"

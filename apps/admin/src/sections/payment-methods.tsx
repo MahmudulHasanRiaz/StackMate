@@ -237,7 +237,7 @@ export function PaymentMethodsSection() {
       <PageHeader
         breadcrumb={[{ label: "Settings" }, { label: "Payment Methods" }]}
         title="Payment Methods"
-        subtitle="Manual MFS / bank accounts and automated checkout methods"
+        help="Manual MFS / bank accounts and automated checkout methods"
         action={
           tab === "methods" ? (
             <Button variant="accent" icon={Plus} onClick={() => setCreateMethodOpen(true)}>

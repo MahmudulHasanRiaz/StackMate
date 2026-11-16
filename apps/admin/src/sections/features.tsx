@@ -969,7 +969,7 @@ export function FeaturesSection() {
       <PageHeader
         breadcrumb={[{ label: "Features" }]}
         title="Features"
-        subtitle={
+        help={
           selectedProduct
             ? `Features of ${selectedProduct.name}`
             : "Features live under a product — pick one"

@@ -227,7 +227,7 @@ export function CustomersSection() {
       <PageHeader
         breadcrumb={[{ label: "Commerce" }, { label: "Customers" }]}
         title="Customers"
-        subtitle="People and businesses who have ordered"
+        help="People and businesses who have ordered"
       />
       <ListTable<CustomerDto>
         columns={columns}

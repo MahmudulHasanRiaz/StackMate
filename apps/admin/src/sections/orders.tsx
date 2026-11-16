@@ -296,7 +296,7 @@ export function OrdersSection() {
       <PageHeader
         breadcrumb={[{ label: "Commerce" }, { label: "Orders & Invoices" }]}
         title="Orders & Invoices"
-        subtitle="Orders placed through admin, website, API, or import"
+        help="Orders placed through admin, website, API, or import"
       />
       <ListTable<OrderListDto>
         columns={columns}

@@ -312,7 +312,7 @@ export function IntegrationsSection() {
       <PageHeader
         breadcrumb={[{ label: "Settings" }, { label: "Websites & Credentials" }]}
         title="Websites & Credentials"
-        subtitle="Integrated sites, their credentials and domains"
+        help="Integrated sites, their credentials and domains"
         action={
           <Button variant="accent" icon={Plus} onClick={() => setRegisterOpen(true)}>
             Register site
