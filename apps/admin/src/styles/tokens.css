@@ -516,7 +516,12 @@ a:hover {
   border: none;
   padding: var(--sm-space-1-5) var(--sm-space-2-5);
   border-radius: var(--sm-radius-md);
-  color: var(--sm-text);
+  /* Neon nav: resting items are MUTED (dark #B0B1B2, light slate) — the
+     hover lift is text brightening + fill, not fill alone (fix batch
+     #2, item 4: a fill-only hover at 13px/32px reads as nothing live;
+     the global a:hover green also leaked onto nav text — excluded
+     below). Active stays full text + green icon. */
+  color: var(--sm-text-muted);
   font-size: 13px;
   font-weight: 500;
   cursor: pointer;
@@ -525,6 +530,10 @@ a:hover {
 }
 .sm-nav-btn:hover {
   background: var(--sm-nav-hover-bg);
+  /* Full text on hover (beats the global a:hover green: this rule is
+     (0,2,0) vs a:hover (0,1,1)). Neon nav hover brightens to white,
+     never green. */
+  color: var(--sm-text);
   text-decoration: none;
 }
 .sm-nav-btn[aria-current="page"] {
@@ -620,8 +629,13 @@ a:hover {
 /* and :focus-within would keep the peek open even though the pinned    */
 /* state is collapsed (live bug 2026-11-16: the rail only returned      */
 /* after a fresh navigation). MainNav therefore adds a transient        */
-/* `sm-peek-off` class on the unpin click, cleared on mouse-leave or    */
-/* when focus leaves the nav; every peek selector below is gated with   */
+/* `sm-peek-off` class on the unpin click, cleared ONLY on a fresh      */
+/* intent to use the nav — pointer ENTERS the aside, focus moves to a  */
+/* different element inside it, focus leaves it, or the toggle is      */
+/* clicked again (pin). NEVER cleared on mouse-leave: the first fix did */
+/* that, and moving the mouse to the main content re-armed the          */
+/* :focus-within peek while the toggle kept focus (live re-test fail,   */
+/* fix batch #2). Every peek selector below is gated with               */
 /* `:not(.sm-peek-off)` so the rail returns at once with focus still    */
 /* on the button, and hover/focus peek keep working afterwards.         */
 /* Desktop ≥900px only; the <900px drawer is untouched (its own rules   */

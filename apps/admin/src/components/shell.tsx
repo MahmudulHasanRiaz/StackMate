@@ -327,18 +327,32 @@ function MainNav({
     items: group.items.filter((item) => can(item.permission)),
   })).filter((group) => group.items.length > 0);
 
-  // Peek suppression (live bug 2026-11-16, follow-up fix): the
-  // hover/focus-within peek is CSS-only, so after clicking "Collapse
-  // menu" the pointer is still over the toggle AND the button keeps
-  // focus — both :hover and :focus-within keep matching and the nav
-  // stays expanded even though the pinned state is collapsed (only a
-  // fresh navigation cleared it). While suppressed, the `sm-peek-off`
-  // class gates the peek selectors in tokens.css. It clears itself the
-  // moment the pointer leaves the nav or focus leaves it, so hover-peek
-  // and focus-within peek keep working afterwards — the suppression is
-  // transient, never persisted, and cannot desync the pinned state.
-  // Focus is deliberately NOT moved: the button keeps focus and the
-  // rail still returns at once.
+  // Peek suppression (live bug 2026-11-16, follow-up fix; CORRECTED in
+  // fix batch #2): the hover/focus-within peek is CSS-only, so after
+  // clicking "Collapse menu" the pointer is still over the toggle AND
+  // the button keeps focus — both :hover and :focus-within keep
+  // matching and the nav stays expanded even though the pinned state
+  // is collapsed (only a fresh navigation cleared it). While
+  // suppressed, the `sm-peek-off` class gates the peek selectors in
+  // tokens.css. Focus is deliberately NOT moved: the button keeps
+  // focus and the rail still returns at once.
+  //
+  // RE-ARM RULES — the first fix cleared suppression on mouse-leave,
+  // which DEFEATED it live: moving the mouse to the main content
+  // fired mouse-leave, cleared the flag, and :focus-within (focus
+  // still on the toggle) re-opened the nav. Suppression now survives
+  // mouse-leave and clears ONLY on a FRESH intent to use the nav:
+  //   - the pointer ENTERS the aside from outside (mouse-enter), or
+  //   - keyboard focus moves to a DIFFERENT element inside the nav
+  //     (focus-in on a non-toggle element), or
+  //   - focus leaves the nav entirely (blur), or
+  //   - the toggle is clicked again (pin).
+  // Deliberate wart: moving the pointer WITHIN the aside (toggle →
+  // nav icon) without ever leaving does not re-arm the peek — any
+  // within-aside re-arm re-introduces the live bug, because a diagonal
+  // move toward the main content crosses the nav's box on its way out
+  // (pointer-path analysis, 2026-11-16). Moving the mouse out and
+  // back in — the normal re-hover — peeks as expected.
   const [peekSuppressed, setPeekSuppressed] = useState(false);
   const handleToggleCollapse = () => {
     // Unpinning (expanded → collapsed) suppresses the peek; pinning
@@ -351,7 +365,29 @@ function MainNav({
     <aside
       className={`${className ?? "sm-sidebar"}${peekSuppressed ? " sm-peek-off" : ""}`}
       aria-label="Primary navigation"
-      onMouseLeave={() => setPeekSuppressed(false)}
+      onMouseEnter={(e) => {
+        // Genuine entry ONLY: the collapse itself shifts the layout
+        // under a stationary pointer (the toggle's icon recenters as
+        // the rail shrinks), which fires a second mouse-enter with a
+        // relatedTarget INSIDE the nav — that is not fresh intent and
+        // must not clear the suppression (it re-introduced the live
+        // bug the first time this handler was written without the
+        // guard). A real re-entry comes from outside the aside.
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+          setPeekSuppressed(false);
+        }
+      }}
+      onFocus={(e) => {
+        // Keyboard re-arm: focus moving to a nav link (or any other
+        // element inside the nav) is fresh intent — the focus-within
+        // peek must work again. Focus landing back on the toggle
+        // itself does NOT re-arm: that is the stale focus left by the
+        // unpin click.
+        const t = e.target as HTMLElement | null;
+        if (t && !t.closest?.(".sm-nav-collapse-btn")) {
+          setPeekSuppressed(false);
+        }
+      }}
       onBlur={(e) => {
         if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
           setPeekSuppressed(false);

@@ -85,9 +85,21 @@ export function resolveAuditResourceDisplayName(
   resourceType: string,
   resourceId: string,
   actorUserId?: string | null,
+  // The row's own changes payload (fix batch #2): deleted resources
+  // are gone from state, but their identity is usually IN the row
+  // (the URL a webhook was registered/deleted with, the label a pixel
+  // group was created/deleted with, the feature keys a bulk create
+  // logged). The resolver prefers live state, then the row payload.
+  changes?: Record<string, unknown> | null,
 ): string | null {
   const userName = (id: string | null | undefined): string | null =>
     id ? (state.users.find((u) => u.id === id)?.name ?? null) : null;
+  // A changes value is usable as a display fragment only when it is a
+  // non-empty string — never a nested object, array, or secret.
+  const changeString = (key: string): string | null => {
+    const v = changes?.[key];
+    return typeof v === "string" && v.length > 0 ? v : null;
+  };
   switch (resourceType) {
     case "user":
     case "staff_user":
@@ -96,10 +108,19 @@ export function resolveAuditResourceDisplayName(
       return (
         state.integrated_sites.find((s) => s.id === resourceId)?.name ?? null
       );
-    case "webhook_endpoint":
-      return (
-        state.webhook_endpoints.find((w) => w.id === resourceId)?.url ?? null
-      );
+    case "webhook_endpoint": {
+      const live =
+        state.webhook_endpoints.find((w) => w.id === resourceId)?.url ?? null;
+      if (live) return live;
+      // Deleted endpoints: registered + deleted rows carry the URL in
+      // changes. Tested rows carry no URL — only the delivery outcome
+      // — so they read as a test event, never a bare UUID.
+      const url = changeString("url");
+      if (url) return url;
+      const status = changes?.http_status;
+      if (typeof status === "number") return `Webhook test · HTTP ${status}`;
+      return null;
+    }
     case "staff_invitation":
       return (
         state.staff_invitations.find((i) => i.id === resourceId)?.email ??
@@ -107,10 +128,28 @@ export function resolveAuditResourceDisplayName(
       );
     case "product":
       return state.products.find((p) => p.id === resourceId)?.name ?? null;
-    case "product_feature":
-      return (
-        state.product_features.find((f) => f.id === resourceId)?.name ?? null
-      );
+    case "product_feature": {
+      const live =
+        state.product_features.find((f) => f.id === resourceId)?.name ?? null;
+      if (live) return live;
+      // bulk_created rows log the PRODUCT id as the resource id (one
+      // summary row for N features) — resolve the parent product name.
+      // The row's changes carry created_count + feature_keys.
+      const product = state.products.find((p) => p.id === resourceId);
+      if (product) {
+        const count = changes?.created_count;
+        return typeof count === "number" && count > 0
+          ? `${product.name} · ${count} features`
+          : product.name;
+      }
+      const name = changeString("name");
+      if (name) return name;
+      const key = changeString("feature_key");
+      if (key) return key;
+      const keys = changes?.feature_keys;
+      if (Array.isArray(keys) && keys.length > 0) return `${keys.length} features`;
+      return null;
+    }
     case "product_package":
       return (
         state.product_packages.find((p) => p.id === resourceId)?.name ?? null
@@ -186,8 +225,24 @@ export function resolveAuditResourceDisplayName(
       const t = state.tracking_configurations.find(
         (x) => x.id === resourceId,
       );
-      if (!t) return null;
-      return t.label ?? `${t.provider} pixel ${t.pixel_id}`;
+      if (t) return t.label ?? `${t.provider} pixel ${t.pixel_id}`;
+      // Deleted groups: created/deleted rows carry label + pixel_id in
+      // changes. Updated (toggle) rows carry only site_id + the changed
+      // fields — the group's own identity is unrecoverable from the
+      // row, so they fall back to the site name (the update action now
+      // also writes the identity into changes, so future toggle rows
+      // resolve via the label branch above).
+      const label = changeString("label");
+      if (label) return label;
+      const provider = changeString("provider");
+      const pixelId = changeString("pixel_id");
+      if (provider && pixelId) return `${provider} pixel ${pixelId}`;
+      if (pixelId) return `Pixel ${pixelId}`;
+      const siteId = changeString("site_id");
+      const site = siteId
+        ? (state.integrated_sites.find((s) => s.id === siteId)?.name ?? null)
+        : null;
+      return site ? `${site} · Tracking` : null;
     }
     case "session": {
       // sign_in_failed rows carry the attempted email as the id;

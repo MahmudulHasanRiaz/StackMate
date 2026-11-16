@@ -73,6 +73,7 @@ const TEST_SETUP_TOKEN =
     resourceType: string,
     resourceId: string,
     actorUserId?: string | null,
+    changes?: Record<string, unknown>,
   ): void {
     appendAuditLog(store.state, {
       actor_type: "staff",
@@ -82,6 +83,9 @@ const TEST_SETUP_TOKEN =
       resource_id: resourceId,
       outcome: "success",
       request_id: "test-request",
+      // exactOptionalPropertyTypes: an explicit `changes: undefined`
+      // is a type error — spread it only when the caller passed one.
+      ...(changes ? { changes } : {}),
     });
   }
 
@@ -235,6 +239,91 @@ const TEST_SETUP_TOKEN =
     assert.equal(find("session", "sess-1"), "Audit Test Admin");
     assert.equal(find("session", "tok_abcdefgh"), "Audit Test Admin");
     assert.equal(find("session", "no-such-session"), "Audit Test Admin");
+  });
+
+  it("falls back to the row payload for deleted resources and bulk rows", async () => {
+    const cookie = await bootstrapAndLoginSuperAdmin();
+    // Live state holds the site + the product, but NOT the webhook
+    // endpoint, the pixel group, or any feature — exactly the staging
+    // shape after the test endpoint / pixel group were deleted.
+    store.state.integrated_sites.push({ id: "site-1", name: "Test site" } as never);
+    store.state.products.push({ id: "prod-1", name: "TEST Product" } as never);
+    // Webhook endpoint lifecycle: registered + tested + deleted, the
+    // endpoint itself gone from state.
+    audit("webhook_endpoint", "03782087-0000-4000-8000-000000000000", undefined, {
+      url: "https://example.com/stackmate-hook",
+      subscribed_events: ["order.created"],
+    });
+    audit("webhook_endpoint", "03782087-0000-4000-8000-000000000000", undefined, {
+      delivery_id: "del-1",
+      http_status: 405,
+      delivered: false,
+    });
+    audit("webhook_endpoint", "03782087-0000-4000-8000-000000000000", undefined, {
+      url: "https://example.com/stackmate-hook",
+      description: "RowMenu test",
+    });
+    // Pixel-group lifecycle: created + toggle off + toggle on +
+    // deleted. The toggle rows carry only site_id + status (the
+    // pre-enrichment shape still stored on staging).
+    audit("tracking_configuration", "b313bcae-0000-4000-8000-000000000000", undefined, {
+      site_id: "site-1",
+      provider: "meta",
+      label: "Test pixel",
+      pixel_id: "123456789012345",
+      enabled_events: ["purchase"],
+      status: "enabled",
+    });
+    audit("tracking_configuration", "b313bcae-0000-4000-8000-000000000000", undefined, {
+      site_id: "site-1",
+      status: "disabled",
+    });
+    audit("tracking_configuration", "b313bcae-0000-4000-8000-000000000000", undefined, {
+      site_id: "site-1",
+      status: "enabled",
+    });
+    audit("tracking_configuration", "b313bcae-0000-4000-8000-000000000000", undefined, {
+      site_id: "site-1",
+      provider: "meta",
+      label: "Test pixel",
+      pixel_id: "123456789012345",
+    });
+    // Bulk feature create: one summary row whose resource id IS the
+    // product id (not a feature id).
+    audit("product_feature", "prod-1", undefined, {
+      product_id: "prod-1",
+      created_count: 2,
+      failed_count: 0,
+      feature_keys: ["flow_test_a", "flow_test_b"],
+    });
+
+    const res = await apiRequest("/api/v1/admin/audit-logs", {}, cookie);
+    assert.equal(res.status, 200);
+    const items = res.body.data.items as Array<{
+      action: string;
+      resource_type: string;
+      resource_id: string;
+      resource_display_name: string | null;
+    }>;
+    const hooks = items.filter(
+      (i) => i.resource_id === "03782087-0000-4000-8000-000000000000",
+    );
+    assert.equal(hooks.length, 3);
+    assert.ok(hooks.every((h) => h.resource_display_name === "https://example.com/stackmate-hook" || h.resource_display_name === "Webhook test · HTTP 405"));
+    assert.ok(hooks.some((h) => h.resource_display_name === "Webhook test · HTTP 405"));
+    const trk = items.filter(
+      (i) => i.resource_id === "b313bcae-0000-4000-8000-000000000000",
+    );
+    assert.equal(trk.length, 4);
+    assert.ok(trk.some((t) => t.resource_display_name === "Test pixel"));
+    // The toggle rows cannot name the group from their own payload —
+    // they fall back to the site, never a bare UUID.
+    assert.ok(trk.some((t) => t.resource_display_name === "Test site · Tracking"));
+    assert.ok(trk.every((t) => t.resource_display_name !== null));
+    const bulk = items.find(
+      (i) => i.resource_type === "product_feature" && i.resource_id === "prod-1",
+    );
+    assert.equal(bulk?.resource_display_name, "TEST Product · 2 features");
   });
 
   it("returns null for deleted resources and unknown types", async () => {
