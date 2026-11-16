@@ -39,7 +39,7 @@ export function DashboardSection() {
       <PageHeader
         breadcrumb={[{ label: "Dashboard" }]}
         title="Operational Overview"
-        subtitle="Verified revenue and operational counts"
+        help="Verified revenue and operational counts"
       />
       {query.isPending ? (
         <div className="sm-kpi-grid">

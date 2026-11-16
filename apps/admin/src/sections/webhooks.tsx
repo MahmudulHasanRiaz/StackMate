@@ -329,7 +329,7 @@ export function WebhooksSection() {
       <PageHeader
         breadcrumb={[{ label: "Settings" }, { label: "Webhooks" }]}
         title="Webhooks"
-        subtitle="Outbound webhook endpoints"
+        help="Outbound webhook endpoints"
         action={
           <Button variant="accent" icon={Plus} onClick={() => setRegisterOpen(true)}>
             Register webhook

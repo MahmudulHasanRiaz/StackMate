@@ -249,7 +249,7 @@ export function LicensesSection() {
       <PageHeader
         breadcrumb={[{ label: "Licenses & Activations" }]}
         title="Licenses & Activations"
-        subtitle="Issued licenses, activation seats, and key checks"
+        help="Issued licenses, activation seats, and key checks"
       />
       <ListTable
         columns={columns}
@@ -532,7 +532,7 @@ export function LicenseDetailSection({ id }: { id: string }) {
       <PageHeader
         breadcrumb={[{ label: "Licenses", href: "/licenses" }, { label: lic.license_number }]}
         title={`License ${lic.license_number}`}
-        subtitle="License detail, activations, and entitlement snapshots"
+        help="License detail, activations, and entitlement snapshots"
         action={
           <>
             <StatusBadge status={lic.status} />

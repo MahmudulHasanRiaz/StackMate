@@ -242,7 +242,7 @@ export function AuditLogsSection() {
       <PageHeader
         breadcrumb={[{ label: "Administration" }, { label: "Audit Log" }]}
         title="Audit Log"
-        subtitle="Immutable record of staff, system, and integration actions"
+        help="Immutable record of staff, system, and integration actions"
       />
       <ListTable<AuditLogRecord>
         columns={columns}

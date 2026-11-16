@@ -91,7 +91,7 @@ export function TrackingConfigSection() {
       <PageHeader
         breadcrumb={[{ label: "Settings" }, { label: "Tracking" }]}
         title="Tracking"
-        subtitle="Pixel groups — Meta Pixel + Conversions API, TikTok, and more"
+        help="Pixel groups — Meta Pixel + Conversions API, TikTok, and more"
       />
       <Alert variant="warning">
         Meta delivery is not live yet. An event marked “Processed

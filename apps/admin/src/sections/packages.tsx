@@ -870,7 +870,7 @@ export function PackagesSection() {
       <PageHeader
         breadcrumb={[{ label: "Packages & Pricing" }]}
         title="Packages & Pricing"
-        subtitle={
+        help={
           selectedProduct
             ? `Packages of ${selectedProduct.name}`
             : "Packages live under a product — pick one"
