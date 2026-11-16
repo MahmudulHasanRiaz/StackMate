@@ -63,7 +63,43 @@ export class SmtpError extends Error {
 }
 
 const READ_TIMEOUT_MS = 10_000;
+/**
+ * Per-step bound for every other await in the send path (SMTP timeout
+ * fix, 2026-11-16): mirror of READ_TIMEOUT_MS. Before this fix ONLY
+ * reads were bounded — `connectImpl()` aside (it returns synchronously;
+ * a failed TCP handshake surfaces on the first bounded read), every
+ * `writer.write()`, `socket.startTls()` and the `socket.close()` in
+ * `finally` could wait forever. Live 2026-11-16 21:23 +06: "Send test
+ * email" stayed on "Sending…" for 90+s against Gmail (App Password —
+ * auth was not the suspect) while the Worker recorded NO invocation
+ * anywhere near 90s: the send hung in one of these unbounded awaits
+ * and the SPA had no client timeout either, so the button never
+ * settled. Every step below is now bounded; TOTAL_SEND_TIMEOUT_MS is
+ * the backstop for a pathologically slow (but under-step-timeout)
+ * server.
+ */
+const STEP_TIMEOUT_MS = READ_TIMEOUT_MS;
+/** Whole-send budget: no send may run longer than this, whatever the server does. */
+const TOTAL_SEND_TIMEOUT_MS = 60_000;
 const CRLF = "\r\n";
+
+/**
+ * Race a promise against a timer. The timer is cleared when the
+ * promise settles, so a fast success costs nothing; a slow promise
+ * loses to `makeError()`. The losing promise keeps running in the
+ * background (its rejection is still observed by the race, so no
+ * unhandled rejection) — callers must not depend on cancellation,
+ * only on the bound.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, makeError: () => Error): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(makeError()), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
 
 function base64(value: string): string {
   return Buffer.from(value, "utf8").toString("base64");
@@ -215,16 +251,31 @@ export async function sendMailViaSmtp(
 
   const secureTransport =
     config.tlsMode === "ssl" ? "on" : config.tlsMode === "starttls" ? "starttls" : "off";
-  let socket = connectImpl(
-    { hostname: config.host.trim(), port: config.port },
-    { secureTransport }
-  );
+  let socket: SmtpSocketLike;
+  try {
+    // connect() itself is synchronous in the `cloudflare:sockets` API:
+    // a failed TCP handshake surfaces on the first bounded read below
+    // (220 greeting, READ_TIMEOUT_MS). A synchronous throw here still
+    // becomes an SmtpError, never a raw throw.
+    socket = connectImpl(
+      { hostname: config.host.trim(), port: config.port },
+      { secureTransport }
+    );
+  } catch {
+    throw new SmtpError("Could not open a connection to the SMTP server.", null);
+  }
   let reader = new SmtpLineReader(socket.readable);
   let writer = socket.writable.getWriter();
   const encoder = new TextEncoder();
 
   const sendCommand = async (command: string): Promise<void> => {
-    await writer.write(encoder.encode(`${command}${CRLF}`));
+    // Bounded write (was unbounded): a stalled TCP connection used to
+    // leave writer.write() pending forever — the 2026-11-16 live hang.
+    await withTimeout(
+      Promise.resolve().then(() => writer.write(encoder.encode(`${command}${CRLF}`))),
+      STEP_TIMEOUT_MS,
+      () => new SmtpError("SMTP server did not accept the command in time.", null)
+    );
   };
   const expect = async (command: string | null, codes: number[]): Promise<{ code: number; text: string }> => {
     if (command !== null) await sendCommand(command);
@@ -238,61 +289,96 @@ export async function sendMailViaSmtp(
     return reply;
   };
 
-  try {
-    await expect(null, [220]);
+  // The whole send runs under the total budget: even a server that
+  // answers every step just under its step timeout cannot stall the
+  // call past TOTAL_SEND_TIMEOUT_MS. The inner finally still closes
+  // the socket (bounded) when the budget trips.
+  const run = async (): Promise<{ ok: true }> => {
+    try {
+      await expect(null, [220]);
 
-    const ehlo = await expect("EHLO stackmate", [250]);
-    if (config.tlsMode === "starttls") {
-      if (!/STARTTLS/i.test(ehlo.text)) {
-        throw new SmtpError("SMTP server does not advertise STARTTLS.", null);
+      const ehlo = await expect("EHLO stackmate", [250]);
+      if (config.tlsMode === "starttls") {
+        if (!/STARTTLS/i.test(ehlo.text)) {
+          throw new SmtpError("SMTP server does not advertise STARTTLS.", null);
+        }
+        await expect("STARTTLS", [220]);
+        if (typeof socket.startTls !== "function") {
+          throw new SmtpError("SMTP socket does not support STARTTLS upgrade.", null);
+        }
+        // startTls() is synchronous in the `cloudflare:sockets` API, so
+        // there is no await to bound here; the bound is the try/catch
+        // (a failed upgrade becomes an SmtpError) plus the bounded
+        // EHLO read that follows, plus the total budget above.
+        try {
+          socket = socket.startTls();
+        } catch {
+          throw new SmtpError("SMTP STARTTLS upgrade failed.", null);
+        }
+        reader.release();
+        try {
+          writer.releaseLock();
+        } catch {
+          /* already released */
+        }
+        reader = new SmtpLineReader(socket.readable);
+        writer = socket.writable.getWriter();
+        await expect("EHLO stackmate", [250]);
       }
-      await expect("STARTTLS", [220]);
-      if (typeof socket.startTls !== "function") {
-        throw new SmtpError("SMTP socket does not support STARTTLS upgrade.", null);
+
+      if (config.username) {
+        await expect("AUTH LOGIN", [334]);
+        // The AUTH exchange never appears in errors: only reply codes do.
+        await expect(base64(config.username), [334]);
+        await expect(base64(config.password), [235]);
       }
-      // startTls() closes the original socket and returns a NEW one —
-      // readers and writers must be recreated from it (Cloudflare docs).
-      socket = socket.startTls();
-      reader.release();
+
+      await expect(`MAIL FROM:<${message.from}>`, [250]);
+      await expect(`RCPT TO:<${message.to}>`, [250]);
+      await expect("DATA", [354]);
+      const data = `${dotStuff(buildMimeMessage(message))}${CRLF}.${CRLF}`;
+      // Bounded DATA write (was unbounded — same hang class as commands).
+      await withTimeout(
+        Promise.resolve().then(() => writer.write(encoder.encode(data))),
+        STEP_TIMEOUT_MS,
+        () => new SmtpError("SMTP server did not accept the message in time.", null)
+      );
+      const dataReply = await reader.readReply();
+      if (dataReply.code !== 250) {
+        throw new SmtpError(`SMTP server rejected the message (reply ${dataReply.code}).`, dataReply.code);
+      }
+      try {
+        await expect("QUIT", [221]);
+      } catch {
+        /* QUIT is best-effort — the message was accepted. */
+      }
+      return { ok: true };
+    } finally {
       try {
         writer.releaseLock();
       } catch {
         /* already released */
       }
-      reader = new SmtpLineReader(socket.readable);
-      writer = socket.writable.getWriter();
-      await expect("EHLO stackmate", [250]);
+      reader.release();
+      // Bounded close (was unbounded): a socket whose close() never
+      // resolves used to hold the whole send hostage even after the
+      // message was accepted. Close is cleanup — it must never mask
+      // the send result, so both timeout and close errors are swallowed.
+      try {
+        await withTimeout(
+          Promise.resolve().then(() => socket.close()),
+          STEP_TIMEOUT_MS,
+          () => new SmtpError("SMTP socket did not close in time.", null)
+        );
+      } catch {
+        /* close is best-effort cleanup */
+      }
     }
+  };
 
-    if (config.username) {
-      await expect("AUTH LOGIN", [334]);
-      // The AUTH exchange never appears in errors: only reply codes do.
-      await expect(base64(config.username), [334]);
-      await expect(base64(config.password), [235]);
-    }
-
-    await expect(`MAIL FROM:<${message.from}>`, [250]);
-    await expect(`RCPT TO:<${message.to}>`, [250]);
-    await expect("DATA", [354]);
-    const data = `${dotStuff(buildMimeMessage(message))}${CRLF}.${CRLF}`;
-    await writer.write(encoder.encode(data));
-    const dataReply = await reader.readReply();
-    if (dataReply.code !== 250) {
-      throw new SmtpError(`SMTP server rejected the message (reply ${dataReply.code}).`, dataReply.code);
-    }
-    try {
-      await expect("QUIT", [221]);
-    } catch {
-      /* QUIT is best-effort — the message was accepted. */
-    }
-    return { ok: true };
-  } finally {
-    try {
-      writer.releaseLock();
-    } catch {
-      /* already released */
-    }
-    reader.release();
-    await socket.close().catch(() => {});
-  }
+  return withTimeout(
+    run(),
+    TOTAL_SEND_TIMEOUT_MS,
+    () => new SmtpError("SMTP send did not complete in time.", null)
+  );
 }

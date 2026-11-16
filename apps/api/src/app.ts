@@ -405,7 +405,7 @@ export function createStackMateApp(
     if (!db) {
       return {
         sent: false,
-        error: "Email is not configured. Set up SMTP in Settings → Authentication → Email.",
+        error: "Email is not configured. Set up SMTP in Settings → Email.",
       };
     }
     return sendStackMateEmail(
@@ -3876,7 +3876,15 @@ export function createStackMateApp(
     const env = resolveRuntimeConfig(rawEnv);
     const store = await resolveRequestStore(env, ctx);
     try {
-      return processTransactionalOutboxBatch(store, {
+      // The await is LOAD-BEARING (cron bug 2026-11-16): `return
+      // <pending promise>` runs this finally block BEFORE the promise
+      // settles, so without it closeRequestStore ends the store's pg
+      // client while the drain is still running and the drain's first
+      // BEGIN throws "Client was closed and is not queryable" — every
+      // cron invocation errored (~1/min uncaught exceptions in the
+      // Cloudflare metrics) and the outbox never drained on schedule.
+      // fetchHandler already awaits for the same reason.
+      return await processTransactionalOutboxBatch(store, {
         encryptionKey: env.ENCRYPTION_KEY_V1,
         allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
       });

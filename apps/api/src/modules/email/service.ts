@@ -42,7 +42,7 @@ export interface SendResult {
   error?: string;
 }
 
-const NOT_CONFIGURED = "Email is not configured. Set up SMTP in Settings → Authentication → Email.";
+const NOT_CONFIGURED = "Email is not configured. Set up SMTP in Settings → Email.";
 
 async function resolveConnect(deps: EmailDeps): Promise<SmtpConnectFn> {
   if (deps.connectImpl) return deps.connectImpl;

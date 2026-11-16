@@ -67,6 +67,9 @@ const AuditLogsSection = lazy(() =>
 const AuthSettingsSection = lazy(() =>
   import("./sections/auth-settings").then((m) => ({ default: m.AuthSettingsSection })),
 );
+const EmailSettingsSection = lazy(() =>
+  import("./sections/email-settings").then((m) => ({ default: m.EmailSettingsSection })),
+);
 const CustomersSection = lazy(() =>
   import("./sections/customers").then((m) => ({ default: m.CustomersSection })),
 );
@@ -423,6 +426,7 @@ const settingsWebhookDetailRoute = makeSettingsDetailRoute(
 );
 const settingsTrackingRoute = makeSettingsListRoute("/tracking", TrackingConfigSection);
 const settingsAuthRoute = makeSettingsListRoute("/authentication", AuthSettingsSection);
+const settingsEmailRoute = makeSettingsListRoute("/email", EmailSettingsSection);
 const settingsGeneralRoute = makeSettingsListRoute("/general", GeneralSettingsSection);
 
 const settingsIndexRoute = createRoute({
@@ -466,6 +470,7 @@ const routeTree = rootRoute.addChildren([
     settingsWebhookDetailRoute,
     settingsTrackingRoute,
     settingsAuthRoute,
+    settingsEmailRoute,
     settingsGeneralRoute,
   ]),
 ]);

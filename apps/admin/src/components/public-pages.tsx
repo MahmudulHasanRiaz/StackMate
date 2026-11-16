@@ -302,7 +302,7 @@ export function TwoFactorRecoveryPage() {
         ) : emailConfigured === false ? (
           <Alert variant="warning" role="status">
             Email is not configured for this admin yet, so recovery emails cannot be sent.
-            Contact your administrator to set up SMTP in Settings → Authentication → Email.
+            Contact your administrator to set up SMTP in Settings → Email.
           </Alert>
         ) : (
           <form className="sm-auth-form" onSubmit={requestLink}>

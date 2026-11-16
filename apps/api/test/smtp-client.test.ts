@@ -8,7 +8,7 @@
  * local TCP server (node:net) — so the wire format is verified against
  * a real socket, not just the mock.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { createServer, connect as netConnect, type Server, type Socket } from "node:net";
 import { Readable, Writable } from "node:stream";
 import {
@@ -248,6 +248,190 @@ describe("SMTP client (mocked socket)", () => {
   });
 });
 
+describe("SMTP client timeouts (SMTP timeout fix, 2026-11-16)", () => {
+  /**
+   * Live 2026-11-16 21:23 +06: "Send test email" against Gmail stayed
+   * on "Sending…" for 90+s with no success and no error, while the
+   * Worker recorded no invocation near 90s. Before this fix ONLY reads
+   * were bounded (READ_TIMEOUT_MS); writer.write(), startTls() and
+   * socket.close() could wait forever. Each test below pins one bound
+   * with a mock socket that never settles that step: the send must
+   * reject (or, for close, resolve) with the real cause inside the
+   * budget instead of hanging. Real waits: the step bound is 10s, so
+   * each test takes ~10s wall-clock and asserts the elapsed time sits
+   * inside the budget — a hang fails the test's own 30s timeout.
+   */
+  const NONE_CONFIG = {
+    host: "smtp.example.com",
+    port: 587,
+    username: "",
+    password: "",
+    tlsMode: "none" as const,
+  };
+  const NONE_REPLIES = [
+    "220 smtp.example.com ESMTP",
+    "250 smtp.example.com Hello",
+    "250 OK",
+    "250 OK",
+    "354 End data with <CR><LF>.<CR><LF>",
+    "250 OK queued",
+    "221 Bye",
+  ];
+
+  function scriptedSocket(replies: string[], hooks: {
+    onWrite?: (chunk: string) => Promise<void> | void;
+    close?: () => Promise<void>;
+    startTls?: () => SmtpSocketLike;
+  } = {}): SmtpSocketLike {
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    const queue = [...replies];
+    // exactOptionalPropertyTypes: `startTls` must not be assigned
+    // `undefined` explicitly — add it only when the hook exists.
+    const socket: SmtpSocketLike = {
+      readable: new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            const line = queue.shift();
+            if (line === undefined) {
+              controller.close();
+              return;
+            }
+            controller.enqueue(encoder.encode(`${line}\r\n`));
+          },
+        },
+        { highWaterMark: 0 }
+      ),
+      writable: new WritableStream<Uint8Array>({
+        write(chunk) {
+          const text = decoder.decode(chunk);
+          const out = hooks.onWrite?.(text);
+          return out instanceof Promise ? out : Promise.resolve();
+        },
+      }),
+      close: hooks.close ?? (() => Promise.resolve()),
+    };
+    if (hooks.startTls) socket.startTls = hooks.startTls;
+    return socket;
+  }
+
+  it("write that never resolves: DATA write times out as SmtpError within budget", async () => {
+    const never = () => new Promise<void>(() => {});
+    const socket = scriptedSocket(NONE_REPLIES, {
+      // Hang ONLY the DATA payload (it contains the Subject header);
+      // the short commands resolve so the send reaches DATA.
+      onWrite: (chunk) => (chunk.includes("Subject: Test") ? never() : undefined),
+    });
+    const started = Date.now();
+    let caught: unknown;
+    try {
+      await sendMailViaSmtp(NONE_CONFIG, MESSAGE, () => socket);
+    } catch (err) {
+      caught = err;
+    }
+    const elapsed = Date.now() - started;
+    expect(caught).toBeInstanceOf(SmtpError);
+    expect((caught as Error).message).toMatch(/did not accept the message in time/);
+    expect(elapsed).toBeGreaterThanOrEqual(8000);
+    expect(elapsed).toBeLessThan(25000);
+  }, 30_000);
+
+  it("close that never resolves: send still succeeds (close is cleanup, bounded)", async () => {
+    const socket = scriptedSocket(NONE_REPLIES, {
+      close: () => new Promise<void>(() => {}),
+    });
+    const started = Date.now();
+    const result = await sendMailViaSmtp(NONE_CONFIG, MESSAGE, () => socket);
+    const elapsed = Date.now() - started;
+    expect(result).toEqual({ ok: true });
+    expect(elapsed).toBeGreaterThanOrEqual(8000);
+    expect(elapsed).toBeLessThan(25000);
+  }, 30_000);
+
+  it("socket that never connects (no greeting): read timeout surfaces within budget", async () => {
+    const socket: SmtpSocketLike = {
+      // pull() never enqueues and never closes: the greeting never comes.
+      readable: new ReadableStream<Uint8Array>({ pull() {} }, { highWaterMark: 0 }),
+      writable: new WritableStream<Uint8Array>({ write() {} }),
+      close: () => Promise.resolve(),
+    };
+    const started = Date.now();
+    let caught: unknown;
+    try {
+      await sendMailViaSmtp(NONE_CONFIG, MESSAGE, () => socket);
+    } catch (err) {
+      caught = err;
+    }
+    const elapsed = Date.now() - started;
+    expect(caught).toBeInstanceOf(SmtpError);
+    expect((caught as Error).message).toMatch(/did not reply in time/);
+    expect(elapsed).toBeGreaterThanOrEqual(8000);
+    expect(elapsed).toBeLessThan(25000);
+  }, 30_000);
+
+  it("connect that throws synchronously: SmtpError, never a raw throw", async () => {
+    const connect: SmtpConnectFn = () => {
+      throw new Error("ECONNREFUSED boom");
+    };
+    await expect(sendMailViaSmtp(NONE_CONFIG, MESSAGE, connect)).rejects.toThrow(
+      /Could not open a connection/
+    );
+  });
+
+  it("startTls that throws synchronously: SmtpError naming the upgrade", async () => {
+    const script = starttlsScript();
+    const socket = scriptedSocket(script.replies, {
+      startTls: () => {
+        throw new Error("TLS boom");
+      },
+    });
+    await expect(sendMailViaSmtp(CONFIG, MESSAGE, () => socket)).rejects.toThrow(
+      /STARTTLS upgrade failed/
+    );
+  });
+
+  it("total budget: a server answering every step just under its step timeout still trips the 60s budget", async () => {
+    // Fake timers: each scripted reply arrives 9s after it is asked
+    // for (just under the 10s per-step read bound), so no single step
+    // times out — but the conversation needs ~63s, past the 60s total
+    // budget. The send must reject with the total-budget error, not
+    // hang and not report success.
+    vi.useFakeTimers();
+    try {
+      const encoder = new TextEncoder();
+      const queue = [...starttlsScript().replies];
+      const makeSocket = (): SmtpSocketLike => ({
+        readable: new ReadableStream<Uint8Array>(
+          {
+            pull(controller) {
+              const line = queue.shift();
+              if (line === undefined) {
+                controller.close();
+                return;
+              }
+              // 9s per line, on the fake clock.
+              setTimeout(() => controller.enqueue(encoder.encode(`${line}\r\n`)), 9000);
+            },
+          },
+          { highWaterMark: 0 }
+        ),
+        writable: new WritableStream<Uint8Array>({ write() {} }),
+        close: () => Promise.resolve(),
+        startTls: () => makeSocket(),
+      });
+      const sendPromise = sendMailViaSmtp(CONFIG, MESSAGE, () => makeSocket());
+      // Attach the rejection handler BEFORE advancing the clock: the
+      // 60s timer rejects the send while time is being advanced, and
+      // a handler attached only afterwards is flagged as an unhandled
+      // (late-handled) rejection.
+      const assertion = expect(sendPromise).rejects.toThrow(/did not complete in time/);
+      await vi.advanceTimersByTimeAsync(61_000);
+      await assertion;
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 30_000);
+});
 describe("SMTP client (real local TCP server, TLS mode none)", () => {
   it("sends a message end to end over a real socket", async () => {
     const received: string[] = [];
