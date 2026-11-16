@@ -39,7 +39,7 @@ import { Eye, KeyRound } from "lucide-react";
 import { apiRequest, ApiClientError } from "../lib/api-client";
 import { detailKey, listKey } from "../lib/query";
 import {
-  DetailFacts,
+  DetailLayout,
   ListTable,
   PageHeader,
   apiErrorMessage,
@@ -414,7 +414,7 @@ function ValidateKeyCard() {
             </span>
           </Alert>
         ) : null}
-        <Button variant="primary" type="submit" loading={checking} disabled={checking}>
+        <Button variant="accent" type="submit" loading={checking} disabled={checking}>
           Validate key
         </Button>
       </form>
@@ -548,7 +548,7 @@ export function LicenseDetailSection({ id }: { id: string }) {
             ) : null}
             {lic.status === "suspended" ? (
               <Button
-                variant="primary"
+                variant="accent"
                 disabled={busy}
                 loading={lifecycle.isPending && lifecycle.variables === "resume"}
                 onClick={() => void askLifecycle("resume")}
@@ -569,7 +569,8 @@ export function LicenseDetailSection({ id }: { id: string }) {
           </>
         }
       />
-      <DetailFacts
+      <DetailLayout
+        title="License"
         facts={[
           {
             label: "License number",
@@ -602,119 +603,120 @@ export function LicenseDetailSection({ id }: { id: string }) {
           { label: "Grace until", value: <DateCell value={lic.grace_until} /> },
           { label: "Issued", value: <DateCell value={lic.issued_at} /> },
         ]}
-      />
+      >
 
-      <div className="sm-card">
-        <h2 className="sm-card-title">Activations</h2>
-        {activations.isPending ? (
-          <TableSkeleton rows={3} />
-        ) : activations.isError ? (
-          <ErrorState
-            message={apiErrorMessage(activations.error)}
-            onRetry={() => void activations.refetch()}
-          />
-        ) : (activations.data ?? []).length === 0 ? (
-          <EmptyState
-            icon={KeyRound}
-            title="No activations"
-            body="No installation has activated this license yet."
-          />
-        ) : (
-          <div className="sm-table-wrap">
-            <table className="sm-table">
-              <thead>
-                <tr>
-                  <th scope="col">Installation</th>
-                  <th scope="col">Environment</th>
-                  <th scope="col">Status</th>
-                  <th scope="col">Activated</th>
-                  <th scope="col">Last seen</th>
-                  <th scope="col">Deactivated</th>
-                  <th scope="col">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(activations.data ?? []).map((a) => (
-                  <tr key={a.id}>
-                    <td>
-                      <span className="sm-mono">
-                        {a.domain_normalized ?? a.id.slice(0, 8)}
-                        <CopyButton value={a.id} label="Copy activation ID" />
-                      </span>
-                    </td>
-                    <td>{sentenceCase(a.environment)}</td>
-                    <td>
-                      <StatusBadge status={a.status} />
-                    </td>
-                    <td>
-                      <DateTimeCell value={a.activated_at} />
-                    </td>
-                    <td>
-                      <DateTimeCell value={a.last_seen_at} />
-                    </td>
-                    <td>
-                      <DateCell value={a.deactivated_at} />
-                    </td>
-                    <td>
-                      {a.status === "active" ? (
-                        <Button
-                          variant="danger-ghost"
-                          size="sm"
-                          disabled={busy}
-                          loading={deactivate.isPending && deactivate.variables === a.id}
-                          onClick={() => void askDeactivate(a)}
-                        >
-                          Deactivate
-                        </Button>
-                      ) : (
-                        "—"
-                      )}
-                    </td>
+        <div className="sm-card">
+          <h2 className="sm-card-title">Activations</h2>
+          {activations.isPending ? (
+            <TableSkeleton rows={3} />
+          ) : activations.isError ? (
+            <ErrorState
+              message={apiErrorMessage(activations.error)}
+              onRetry={() => void activations.refetch()}
+            />
+          ) : (activations.data ?? []).length === 0 ? (
+            <EmptyState
+              icon={KeyRound}
+              title="No activations"
+              body="No installation has activated this license yet."
+            />
+          ) : (
+            <div className="sm-table-wrap">
+              <table className="sm-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Installation</th>
+                    <th scope="col">Environment</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">Activated</th>
+                    <th scope="col">Last seen</th>
+                    <th scope="col">Deactivated</th>
+                    <th scope="col">Actions</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
+                </thead>
+                <tbody>
+                  {(activations.data ?? []).map((a) => (
+                    <tr key={a.id}>
+                      <td>
+                        <span className="sm-mono">
+                          {a.domain_normalized ?? a.id.slice(0, 8)}
+                          <CopyButton value={a.id} label="Copy activation ID" />
+                        </span>
+                      </td>
+                      <td>{sentenceCase(a.environment)}</td>
+                      <td>
+                        <StatusBadge status={a.status} />
+                      </td>
+                      <td>
+                        <DateTimeCell value={a.activated_at} />
+                      </td>
+                      <td>
+                        <DateTimeCell value={a.last_seen_at} />
+                      </td>
+                      <td>
+                        <DateCell value={a.deactivated_at} />
+                      </td>
+                      <td>
+                        {a.status === "active" ? (
+                          <Button
+                            variant="danger-ghost"
+                            size="sm"
+                            disabled={busy}
+                            loading={deactivate.isPending && deactivate.variables === a.id}
+                            onClick={() => void askDeactivate(a)}
+                          >
+                            Deactivate
+                          </Button>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
 
-      <div className="sm-card">
-        <h2 className="sm-card-title">Entitlement snapshots</h2>
-        {lic.entitlement_snapshots.length === 0 ? (
-          <EmptyState
-            icon={KeyRound}
-            title="No entitlement snapshots"
-            body="This license has no entitlement snapshots recorded."
-          />
-        ) : (
-          <div className="sm-table-wrap">
-            <table className="sm-table">
-              <thead>
-                <tr>
-                  <th scope="col">Version</th>
-                  <th scope="col">Source</th>
-                  <th scope="col">Effective</th>
-                  <th scope="col">Reason</th>
-                  <th scope="col">Items</th>
-                </tr>
-              </thead>
-              <tbody>
-                {lic.entitlement_snapshots.map((s) => (
-                  <tr key={s.id}>
-                    <td className="sm-tabular">{s.version_number}</td>
-                    <td>{sentenceCase(s.source_type)}</td>
-                    <td>
-                      <DateTimeCell value={s.effective_at} />
-                    </td>
-                    <td>{s.reason ?? "—"}</td>
-                    <td className="sm-tabular">{s.items.length}</td>
+        <div className="sm-card">
+          <h2 className="sm-card-title">Entitlement snapshots</h2>
+          {lic.entitlement_snapshots.length === 0 ? (
+            <EmptyState
+              icon={KeyRound}
+              title="No entitlement snapshots"
+              body="This license has no entitlement snapshots recorded."
+            />
+          ) : (
+            <div className="sm-table-wrap">
+              <table className="sm-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Version</th>
+                    <th scope="col">Source</th>
+                    <th scope="col">Effective</th>
+                    <th scope="col">Reason</th>
+                    <th scope="col">Items</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
+                </thead>
+                <tbody>
+                  {lic.entitlement_snapshots.map((s) => (
+                    <tr key={s.id}>
+                      <td className="sm-tabular">{s.version_number}</td>
+                      <td>{sentenceCase(s.source_type)}</td>
+                      <td>
+                        <DateTimeCell value={s.effective_at} />
+                      </td>
+                      <td>{s.reason ?? "—"}</td>
+                      <td className="sm-tabular">{s.items.length}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </DetailLayout>
     </section>
   );
 }

@@ -42,6 +42,7 @@ import { apiRequest } from "../lib/api-client";
 import { detailKey, listKey } from "../lib/query";
 import {
   DetailFacts,
+  DetailLayout,
   ListTable,
   PageHeader,
   parseListSearch,
@@ -528,7 +529,7 @@ export function OrderDetailSection({ id }: { id: string }) {
           <>
             {canComplete ? (
               <Button
-                variant="primary"
+                variant="accent"
                 loading={completeMutation.isPending}
                 onClick={onComplete}
               >
@@ -547,17 +548,8 @@ export function OrderDetailSection({ id }: { id: string }) {
           </>
         }
       />
-      {order.payment_status !== "paid" && !TERMINAL_STATUSES.includes(order.status) ? (
-        <Alert variant="info">
-          This order cannot be completed yet — completion requires a verified
-          payment, and payment is {order.payment_status.replace(/_/g, " ")}.
-          Verify the payment in Payment Review first.
-        </Alert>
-      ) : null}
-      {cancelBlockReason && !canCancel ? (
-        <Alert variant="warning">{cancelBlockReason}</Alert>
-      ) : null}
-      <DetailFacts
+      <DetailLayout
+        title="Order"
         facts={[
           { label: "Status", value: <StatusBadge status={order.status} /> },
           { label: "Payment", value: <StatusBadge status={order.payment_status} /> },
@@ -589,267 +581,278 @@ export function OrderDetailSection({ id }: { id: string }) {
             ),
           },
         ]}
-      />
-      <Card title="Items">
-        {order.items.length === 0 ? (
-          <EmptyState
-            icon={ShoppingCart}
-            title="No items"
-            body="This order has no line items."
-          />
-        ) : (
-          <div className="sm-table-wrap">
-            <table className="sm-table">
-              <thead>
-                <tr>
-                  <th scope="col">Product</th>
-                  <th scope="col">Package</th>
-                  <th scope="col">Qty</th>
-                  <th scope="col">Unit</th>
-                  <th scope="col">Line total</th>
-                </tr>
-              </thead>
-              <tbody>
-                {order.items.map((item) => (
-                  <tr key={item.id}>
-                    <td>{item.product_name_snapshot}</td>
-                    <td>
-                      {item.package_name_snapshot ?? "—"}
-                      {item.package_version_snapshot !== null
-                        ? ` (v${item.package_version_snapshot})`
-                        : ""}
-                    </td>
-                    <td>{item.quantity}</td>
-                    <td>
-                      <MoneyCell
-                        currency={item.currency_code}
-                        minor={item.unit_amount_minor}
-                      />
-                    </td>
-                    <td>
-                      <MoneyCell
-                        currency={item.currency_code}
-                        minor={item.line_total_minor}
-                      />
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-        {(order.discount_minor > 0 || order.tax_minor > 0) ? (
-          <p className="sm-hint">
-            Subtotal{" "}
-            <MoneyCell currency={order.currency_code} minor={order.subtotal_minor} />
-            {order.discount_minor > 0 ? (
-              <>
-                {" · Discount "}
-                <MoneyCell currency={order.currency_code} minor={order.discount_minor} />
-              </>
-            ) : null}
-            {order.tax_minor > 0 ? (
-              <>
-                {" · Tax "}
-                <MoneyCell currency={order.currency_code} minor={order.tax_minor} />
-              </>
-            ) : null}
-          </p>
-        ) : null}
-      </Card>
-      <Card
-        title="Invoices"
-        actions={
-          liveInitial ? undefined : (
-            <Button
-              variant="secondary"
-              loading={createInvoiceMutation.isPending}
-              onClick={onCreateInvoice}
-            >
-              Create invoice
-            </Button>
-          )
-        }
       >
-        {liveInitial ? (
-          <p className="sm-hint">
-            Live initial invoice: {liveInitial.invoice_number} (
-            {liveInitial.status}). A second live initial invoice cannot be
-            created.
-          </p>
+        {order.payment_status !== "paid" && !TERMINAL_STATUSES.includes(order.status) ? (
+          <Alert variant="info">
+            This order cannot be completed yet — completion requires a verified
+            payment, and payment is {order.payment_status.replace(/_/g, " ")}.
+            Verify the payment in Payment Review first.
+          </Alert>
         ) : null}
-        {order.invoices.length === 0 ? (
-          <EmptyState
-            icon={Receipt}
-            title="No invoices yet"
-            body="This order has no invoices. Order creation normally creates an initial invoice."
-            actionLabel="Create invoice"
-            onAction={onCreateInvoice}
-          />
-        ) : (
-          <div className="sm-table-wrap">
-            <table className="sm-table">
-              <thead>
-                <tr>
-                  <th scope="col">Invoice</th>
-                  <th scope="col">Type</th>
-                  <th scope="col">Status</th>
-                  <th scope="col">Total</th>
-                  <th scope="col">Due</th>
-                  <th scope="col">Issued</th>
-                  <th scope="col">
-                    <span className="sm-hint">Actions</span>
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {order.invoices.map((invoice) => (
-                  <tr key={invoice.id}>
-                    <td>
-                      <span className="sm-mono">{invoice.invoice_number}</span>
-                      <CopyButton
-                        value={invoice.invoice_number}
-                        label="Copy invoice number"
-                      />
-                    </td>
-                    <td>{invoice.invoice_type.replace(/_/g, " ")}</td>
-                    <td>
-                      <StatusBadge status={invoice.status} />
-                    </td>
-                    <td>
-                      <MoneyCell
-                        currency={invoice.currency_code}
-                        minor={invoice.total_minor}
-                      />
-                    </td>
-                    <td>
-                      <MoneyCell
-                        currency={invoice.currency_code}
-                        minor={invoice.amount_due_minor}
-                      />
-                    </td>
-                    <td>
-                      <DateCell value={invoice.issued_at} />
-                    </td>
-                    <td>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => setInvoiceId(invoice.id)}
-                      >
-                        View
-                      </Button>{" "}
-                      {invoice.status === "draft" || invoice.status === "open" ? (
+        {cancelBlockReason && !canCancel ? (
+          <Alert variant="warning">{cancelBlockReason}</Alert>
+        ) : null}
+        <Card title="Items">
+          {order.items.length === 0 ? (
+            <EmptyState
+              icon={ShoppingCart}
+              title="No items"
+              body="This order has no line items."
+            />
+          ) : (
+            <div className="sm-table-wrap">
+              <table className="sm-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Product</th>
+                    <th scope="col">Package</th>
+                    <th scope="col">Qty</th>
+                    <th scope="col">Unit</th>
+                    <th scope="col">Line total</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {order.items.map((item) => (
+                    <tr key={item.id}>
+                      <td>{item.product_name_snapshot}</td>
+                      <td>
+                        {item.package_name_snapshot ?? "—"}
+                        {item.package_version_snapshot !== null
+                          ? ` (v${item.package_version_snapshot})`
+                          : ""}
+                      </td>
+                      <td>{item.quantity}</td>
+                      <td>
+                        <MoneyCell
+                          currency={item.currency_code}
+                          minor={item.unit_amount_minor}
+                        />
+                      </td>
+                      <td>
+                        <MoneyCell
+                          currency={item.currency_code}
+                          minor={item.line_total_minor}
+                        />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {(order.discount_minor > 0 || order.tax_minor > 0) ? (
+            <p className="sm-hint">
+              Subtotal{" "}
+              <MoneyCell currency={order.currency_code} minor={order.subtotal_minor} />
+              {order.discount_minor > 0 ? (
+                <>
+                  {" · Discount "}
+                  <MoneyCell currency={order.currency_code} minor={order.discount_minor} />
+                </>
+              ) : null}
+              {order.tax_minor > 0 ? (
+                <>
+                  {" · Tax "}
+                  <MoneyCell currency={order.currency_code} minor={order.tax_minor} />
+                </>
+              ) : null}
+            </p>
+          ) : null}
+        </Card>
+        <Card
+          title="Invoices"
+          actions={
+            liveInitial ? undefined : (
+              <Button
+                variant="secondary"
+                loading={createInvoiceMutation.isPending}
+                onClick={onCreateInvoice}
+              >
+                Create invoice
+              </Button>
+            )
+          }
+        >
+          {liveInitial ? (
+            <p className="sm-hint">
+              Live initial invoice: {liveInitial.invoice_number} (
+              {liveInitial.status}). A second live initial invoice cannot be
+              created.
+            </p>
+          ) : null}
+          {order.invoices.length === 0 ? (
+            <EmptyState
+              icon={Receipt}
+              title="No invoices yet"
+              body="This order has no invoices. Order creation normally creates an initial invoice."
+              actionLabel="Create invoice"
+              onAction={onCreateInvoice}
+            />
+          ) : (
+            <div className="sm-table-wrap">
+              <table className="sm-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Invoice</th>
+                    <th scope="col">Type</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">Total</th>
+                    <th scope="col">Due</th>
+                    <th scope="col">Issued</th>
+                    <th scope="col">
+                      <span className="sm-hint">Actions</span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {order.invoices.map((invoice) => (
+                    <tr key={invoice.id}>
+                      <td>
+                        <span className="sm-mono">{invoice.invoice_number}</span>
+                        <CopyButton
+                          value={invoice.invoice_number}
+                          label="Copy invoice number"
+                        />
+                      </td>
+                      <td>{invoice.invoice_type.replace(/_/g, " ")}</td>
+                      <td>
+                        <StatusBadge status={invoice.status} />
+                      </td>
+                      <td>
+                        <MoneyCell
+                          currency={invoice.currency_code}
+                          minor={invoice.total_minor}
+                        />
+                      </td>
+                      <td>
+                        <MoneyCell
+                          currency={invoice.currency_code}
+                          minor={invoice.amount_due_minor}
+                        />
+                      </td>
+                      <td>
+                        <DateCell value={invoice.issued_at} />
+                      </td>
+                      <td>
                         <Button
-                          variant="danger-ghost"
+                          variant="ghost"
                           size="sm"
-                          loading={
-                            voidMutation.isPending &&
-                            voidMutation.variables === invoice.id
-                          }
-                          onClick={() => onVoidInvoice(invoice)}
+                          onClick={() => setInvoiceId(invoice.id)}
                         >
-                          Void
-                        </Button>
-                      ) : null}
-                    </td>
+                          View
+                        </Button>{" "}
+                        {invoice.status === "draft" || invoice.status === "open" ? (
+                          <Button
+                            variant="danger-ghost"
+                            size="sm"
+                            loading={
+                              voidMutation.isPending &&
+                              voidMutation.variables === invoice.id
+                            }
+                            onClick={() => onVoidInvoice(invoice)}
+                          >
+                            Void
+                          </Button>
+                        ) : null}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {hasPaidInvoice ? (
+            <p className="sm-hint">
+              Paid invoices cannot be voided — a credit-note workflow does not
+              exist yet.
+            </p>
+          ) : null}
+        </Card>
+        <Card
+          title="Payment submissions"
+          actions={
+            <Button variant="secondary" onClick={() => goTo("/payment-review")}>
+              Payment Review
+            </Button>
+          }
+        >
+          {order.payment_submissions.length === 0 ? (
+            <EmptyState
+              icon={Receipt}
+              title="No payment submissions"
+              body="No manual payment claim has been submitted for this order. Staff record claims from Payment Review."
+              actionLabel="Open Payment Review"
+              onAction={() => goTo("/payment-review")}
+            />
+          ) : (
+            <div className="sm-table-wrap">
+              <table className="sm-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Submitted</th>
+                    <th scope="col">Amount</th>
+                    <th scope="col">Sender</th>
+                    <th scope="col">Transaction ref</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">Flags</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-        {hasPaidInvoice ? (
+                </thead>
+                <tbody>
+                  {order.payment_submissions.map((s) => (
+                    <tr key={s.id}>
+                      <td>
+                        <DateTimeCell value={s.submitted_at} />
+                      </td>
+                      <td>
+                        <MoneyCell currency={s.currency_code} minor={s.amount_minor} />
+                      </td>
+                      <td>
+                        {s.sender_name ?? "—"}
+                        {s.sender_phone ? (
+                          <div className="sm-hint">{s.sender_phone}</div>
+                        ) : null}
+                      </td>
+                      <td>
+                        {s.transaction_reference ? (
+                          <span>
+                            <span className="sm-mono">{s.transaction_reference}</span>
+                            <CopyButton
+                              value={s.transaction_reference}
+                              label="Copy transaction reference"
+                            />
+                          </span>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                      <td>
+                        <StatusBadge status={s.status} />
+                      </td>
+                      <td>
+                        {s.duplicate_risk_Warning ? (
+                          <StatusBadge status="warning" label="Duplicate risk" />
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
           <p className="sm-hint">
-            Paid invoices cannot be voided — a credit-note workflow does not
-            exist yet.
+            A submission is a claim, not a payment — it is never shown as paid
+            until staff verify it in Payment Review.
           </p>
-        ) : null}
-      </Card>
-      <Card
-        title="Payment submissions"
-        actions={
-          <Button variant="secondary" onClick={() => goTo("/payment-review")}>
-            Payment Review
-          </Button>
-        }
-      >
-        {order.payment_submissions.length === 0 ? (
-          <EmptyState
-            icon={Receipt}
-            title="No payment submissions"
-            body="No manual payment claim has been submitted for this order. Staff record claims from Payment Review."
-            actionLabel="Open Payment Review"
-            onAction={() => goTo("/payment-review")}
+        </Card>
+        {invoiceId ? (
+          <InvoiceDetailDialog
+            invoiceId={invoiceId}
+            onClose={() => setInvoiceId(null)}
           />
-        ) : (
-          <div className="sm-table-wrap">
-            <table className="sm-table">
-              <thead>
-                <tr>
-                  <th scope="col">Submitted</th>
-                  <th scope="col">Amount</th>
-                  <th scope="col">Sender</th>
-                  <th scope="col">Transaction ref</th>
-                  <th scope="col">Status</th>
-                  <th scope="col">Flags</th>
-                </tr>
-              </thead>
-              <tbody>
-                {order.payment_submissions.map((s) => (
-                  <tr key={s.id}>
-                    <td>
-                      <DateTimeCell value={s.submitted_at} />
-                    </td>
-                    <td>
-                      <MoneyCell currency={s.currency_code} minor={s.amount_minor} />
-                    </td>
-                    <td>
-                      {s.sender_name ?? "—"}
-                      {s.sender_phone ? (
-                        <div className="sm-hint">{s.sender_phone}</div>
-                      ) : null}
-                    </td>
-                    <td>
-                      {s.transaction_reference ? (
-                        <span>
-                          <span className="sm-mono">{s.transaction_reference}</span>
-                          <CopyButton
-                            value={s.transaction_reference}
-                            label="Copy transaction reference"
-                          />
-                        </span>
-                      ) : (
-                        "—"
-                      )}
-                    </td>
-                    <td>
-                      <StatusBadge status={s.status} />
-                    </td>
-                    <td>
-                      {s.duplicate_risk_Warning ? (
-                        <StatusBadge status="warning" label="Duplicate risk" />
-                      ) : (
-                        "—"
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-        <p className="sm-hint">
-          A submission is a claim, not a payment — it is never shown as paid
-          until staff verify it in Payment Review.
-        </p>
-      </Card>
-      {invoiceId ? (
-        <InvoiceDetailDialog
-          invoiceId={invoiceId}
-          onClose={() => setInvoiceId(null)}
-        />
-      ) : null}
+        ) : null}
+      </DetailLayout>
     </section>
   );
 }

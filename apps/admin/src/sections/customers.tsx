@@ -26,7 +26,7 @@ import { Pencil, UserRound, Users } from "lucide-react";
 import { apiRequest } from "../lib/api-client";
 import { detailKey, listKey } from "../lib/query";
 import {
-  DetailFacts,
+  DetailLayout,
   ListTable,
   PageHeader,
   parseListSearch,
@@ -510,12 +510,13 @@ export function CustomerDetailSection({ id }: { id: string }) {
         title={customer.name}
         subtitle={`${customer.customer_number} · ${customer.customer_type === "business" ? "Business" : "Person"}`}
         action={
-          <Button variant="primary" icon={Pencil} onClick={() => setEditOpen(true)}>
+          <Button variant="accent" icon={Pencil} onClick={() => setEditOpen(true)}>
             Edit customer
           </Button>
         }
       />
-      <DetailFacts
+      <DetailLayout
+        title="Customer"
         facts={[
           { label: "Status", value: <StatusBadge status={customer.status} /> },
           { label: "Email", value: customer.email ?? "—" },
@@ -527,63 +528,64 @@ export function CustomerDetailSection({ id }: { id: string }) {
           { label: "Country", value: customer.country_code },
           { label: "Registered", value: <DateCell value={customer.created_at} /> },
         ]}
-      />
-      {customer.notes ? (
-        <Card title="Notes">
-          <p className="sm-hint">{customer.notes}</p>
-        </Card>
-      ) : null}
-      <Tabs
-        tabs={[
-          { key: "orders", label: `Orders (${orderCount})` },
-          { key: "subscriptions", label: `Subscriptions (${subCount})` },
-          { key: "licenses", label: `Licenses (${licenseCount})` },
-        ]}
-        active={tab}
-        onChange={setTab}
-      />
-      {tab === "orders" ? (
-        <RelatedList<CustomerOrderDto>
-          columns={orderColumns}
-          data={ordersQuery.data}
-          isLoading={ordersQuery.isPending}
-          isError={ordersQuery.isError}
-          error={ordersQuery.error}
-          onRetry={() => void ordersQuery.refetch()}
-          emptyTitle="No orders yet"
-          emptyBody="This customer has not placed an order."
-          getRowId={(row) => row.id}
+      >
+        {customer.notes ? (
+          <Card title="Notes">
+            <p className="sm-hint">{customer.notes}</p>
+          </Card>
+        ) : null}
+        <Tabs
+          tabs={[
+            { key: "orders", label: `Orders (${orderCount})` },
+            { key: "subscriptions", label: `Subscriptions (${subCount})` },
+            { key: "licenses", label: `Licenses (${licenseCount})` },
+          ]}
+          active={tab}
+          onChange={setTab}
         />
-      ) : null}
-      {tab === "subscriptions" ? (
-        <RelatedList<CustomerSubscriptionDto>
-          columns={subscriptionColumns}
-          data={subsQuery.data}
-          isLoading={subsQuery.isPending}
-          isError={subsQuery.isError}
-          error={subsQuery.error}
-          onRetry={() => void subsQuery.refetch()}
-          emptyTitle="No subscriptions yet"
-          emptyBody="This customer has no subscriptions."
-          getRowId={(row) => row.id}
-        />
-      ) : null}
-      {tab === "licenses" ? (
-        <RelatedList<CustomerLicenseDto>
-          columns={licenseColumns}
-          data={licensesQuery.data}
-          isLoading={licensesQuery.isPending}
-          isError={licensesQuery.isError}
-          error={licensesQuery.error}
-          onRetry={() => void licensesQuery.refetch()}
-          emptyTitle="No licenses yet"
-          emptyBody="This customer has no licenses. License keys are never shown here — only the key hint."
-          getRowId={(row) => row.id}
-        />
-      ) : null}
-      {editOpen ? (
-        <EditCustomerDialog customer={customer} onClose={() => setEditOpen(false)} />
-      ) : null}
+        {tab === "orders" ? (
+          <RelatedList<CustomerOrderDto>
+            columns={orderColumns}
+            data={ordersQuery.data}
+            isLoading={ordersQuery.isPending}
+            isError={ordersQuery.isError}
+            error={ordersQuery.error}
+            onRetry={() => void ordersQuery.refetch()}
+            emptyTitle="No orders yet"
+            emptyBody="This customer has not placed an order."
+            getRowId={(row) => row.id}
+          />
+        ) : null}
+        {tab === "subscriptions" ? (
+          <RelatedList<CustomerSubscriptionDto>
+            columns={subscriptionColumns}
+            data={subsQuery.data}
+            isLoading={subsQuery.isPending}
+            isError={subsQuery.isError}
+            error={subsQuery.error}
+            onRetry={() => void subsQuery.refetch()}
+            emptyTitle="No subscriptions yet"
+            emptyBody="This customer has no subscriptions."
+            getRowId={(row) => row.id}
+          />
+        ) : null}
+        {tab === "licenses" ? (
+          <RelatedList<CustomerLicenseDto>
+            columns={licenseColumns}
+            data={licensesQuery.data}
+            isLoading={licensesQuery.isPending}
+            isError={licensesQuery.isError}
+            error={licensesQuery.error}
+            onRetry={() => void licensesQuery.refetch()}
+            emptyTitle="No licenses yet"
+            emptyBody="This customer has no licenses. License keys are never shown here — only the key hint."
+            getRowId={(row) => row.id}
+          />
+        ) : null}
+        {editOpen ? (
+          <EditCustomerDialog customer={customer} onClose={() => setEditOpen(false)} />
+        ) : null}
+      </DetailLayout>
     </section>
   );
 }
@@ -665,7 +667,7 @@ function EditCustomerDialog({
             Cancel
           </Button>
           <Button
-            variant="primary"
+            variant="accent"
             type="submit"
             form="edit-customer-form"
             loading={mutation.isPending}

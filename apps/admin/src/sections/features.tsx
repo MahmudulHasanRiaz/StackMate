@@ -32,7 +32,7 @@ import { ApiClientError, apiRequest } from "../lib/api-client";
 import { detailKey, queryClient } from "../lib/query";
 import {
   apiErrorMessage,
-  DetailFacts,
+  DetailLayout,
   ListTable,
   PageHeader,
   parseListSearch,
@@ -499,7 +499,7 @@ function CreateFeatureDialog({
             <Button variant="secondary" onClick={onClose}>
               Cancel
             </Button>
-            <Button variant="primary" loading={create.isPending} onClick={submitForm}>
+            <Button variant="accent" loading={create.isPending} onClick={submitForm}>
               Create feature
             </Button>
           </>
@@ -509,7 +509,7 @@ function CreateFeatureDialog({
               Cancel
             </Button>
             <Button
-              variant="primary"
+              variant="accent"
               loading={bulkCreate.isPending}
               onClick={submitBulk}
             >
@@ -976,7 +976,7 @@ export function FeaturesSection() {
         }
         action={
           selectedProduct ? (
-            <Button variant="primary" icon={Plus} onClick={() => setCreateOpen(true)}>
+            <Button variant="accent" icon={Plus} onClick={() => setCreateOpen(true)}>
               Create feature
             </Button>
           ) : undefined
@@ -1184,7 +1184,7 @@ function EditFeatureDialog({
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={save.isPending} onClick={submitForm}>
+          <Button variant="accent" loading={save.isPending} onClick={submitForm}>
             Save changes
           </Button>
         </>
@@ -1422,7 +1422,8 @@ export function FeatureDetailSection({ id }: { id: string }) {
           </div>
         }
       />
-      <DetailFacts
+      <DetailLayout
+        title="Feature"
         facts={[
           {
             label: "Key",
@@ -1454,47 +1455,48 @@ export function FeatureDetailSection({ id }: { id: string }) {
           { label: "Created", value: <DateCell value={feature.created_at} /> },
           { label: "Updated", value: <DateCell value={feature.updated_at} /> },
         ]}
-      />
-      <Card title={`Used by packages (${(feature.used_by_packages ?? []).length})`}>
-        {(feature.used_by_packages ?? []).length === 0 ? (
-          <p className="sm-hint">
-            Not used in any package yet. Add this feature to a package
-            version to grant it to customers.
-          </p>
-        ) : (
-          <div className="sm-table-wrap">
-            <table className="sm-table">
-              <thead>
-                <tr>
-                  <th>Package</th>
-                  <th>Version</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(feature.used_by_packages ?? []).map((u) => (
-                  <tr key={u.package_id}>
-                    <td>
-                      <a href={`/packages/${u.package_id}`}>{u.package_name}</a>
-                    </td>
-                    <td>
-                      <span className="sm-tabular">v{u.version_number}</span>
-                    </td>
-                    <td>
-                      <StatusBadge status={u.version_status} />
-                    </td>
+      >
+        <Card title={`Used by packages (${(feature.used_by_packages ?? []).length})`}>
+          {(feature.used_by_packages ?? []).length === 0 ? (
+            <p className="sm-hint">
+              Not used in any package yet. Add this feature to a package
+              version to grant it to customers.
+            </p>
+          ) : (
+            <div className="sm-table-wrap">
+              <table className="sm-table">
+                <thead>
+                  <tr>
+                    <th>Package</th>
+                    <th>Version</th>
+                    <th>Status</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </Card>
-      <EditFeatureDialog
-        open={editOpen}
-        onClose={() => setEditOpen(false)}
-        feature={feature}
-      />
+                </thead>
+                <tbody>
+                  {(feature.used_by_packages ?? []).map((u) => (
+                    <tr key={u.package_id}>
+                      <td>
+                        <a href={`/packages/${u.package_id}`}>{u.package_name}</a>
+                      </td>
+                      <td>
+                        <span className="sm-tabular">v{u.version_number}</span>
+                      </td>
+                      <td>
+                        <StatusBadge status={u.version_status} />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
+        <EditFeatureDialog
+          open={editOpen}
+          onClose={() => setEditOpen(false)}
+          feature={feature}
+        />
+      </DetailLayout>
     </section>
   );
 }

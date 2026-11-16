@@ -226,14 +226,14 @@ export function ListTable<T>({
   if (isLoading) return <TableSkeleton rows={5} />;
   if (isError) {
     return (
-      <div className="sm-table-wrap">
+      <div className="sm-table-flat">
         <ErrorState message={apiErrorMessage(error)} onRetry={onRetry} />
       </div>
     );
   }
   if (rows.length === 0) {
     return (
-      <div className="sm-table-wrap">
+      <div className="sm-table-flat">
         <EmptyState
           icon={emptyIcon}
           title={emptyTitle}
@@ -263,7 +263,7 @@ export function ListTable<T>({
       </div>
       {toolbar ? <Toolbar>{toolbar}</Toolbar> : null}
       {filteredCount === 0 ? (
-        <div className="sm-table-wrap">
+        <div className="sm-table-flat">
           <EmptyState
             icon={emptyIcon}
             title="No results"
@@ -278,7 +278,7 @@ export function ListTable<T>({
           />
         </div>
       ) : (
-        <div className="sm-table-wrap">
+        <div className="sm-table-flat">
           <table className="sm-table">
             <thead>
               {table.getHeaderGroups().map((headerGroup) => (
@@ -362,6 +362,43 @@ export function DetailFacts({
           <div className="sm-fact-value">{f.value}</div>
         </div>
       ))}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* DetailLayout — detail page main column + right inspector rail       */
+/* (Neon image-77, audit G7). The key facts that used to render as a   */
+/* .sm-facts grid above the content now live in the rail, named for    */
+/* the entity ("Product", "Order", …); the main column holds           */
+/* everything else (status badge, alerts, cards, tabs, tables). Below  */
+/* 1280px the rail stacks under the main column (tokens.css).          */
+/* Dialogs, drawers, wizard review steps, and facts inside Cards keep  */
+/* the DetailFacts grid — the rail is for top-level detail pages only. */
+/* ------------------------------------------------------------------ */
+export function DetailLayout({
+  title,
+  facts,
+  children,
+}: {
+  title: string;
+  facts: { label: string; value: ReactNode }[];
+  children: ReactNode;
+}) {
+  return (
+    <div className="sm-detail-layout">
+      <div className="sm-detail-main">{children}</div>
+      <aside className="sm-inspector" aria-label={`${title} details`}>
+        <div className="sm-inspector-section">
+          <div className="sm-inspector-title">{title}</div>
+          {facts.map((f) => (
+            <div className="sm-inspector-row" key={f.label}>
+              <span className="sm-inspector-label">{f.label}</span>
+              <span className="sm-inspector-value">{f.value}</span>
+            </div>
+          ))}
+        </div>
+      </aside>
     </div>
   );
 }
