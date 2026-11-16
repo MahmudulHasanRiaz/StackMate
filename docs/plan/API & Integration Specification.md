@@ -1206,6 +1206,8 @@ Each row carries `resource_display_name` (additive, nullable): a human display n
 
 All authentication configuration lives in the database and is edited from Settings → Authentication — never via env vars, never in code. A Settings save takes effect without a redeploy (the Better Auth instance is built per request from the current DB settings, with a 30s module-level cache keyed by connection string, invalidated on save; other isolates converge within the TTL). Every config change is audit-logged (`auth.oauth.updated`, `auth.two_factor_policy.updated`, `auth.smtp.updated`, `general.settings.updated`) with actor + what changed — never secret values.
 
+**Origin check (Better Auth, all `POST /api/auth/*` through `auth.handler`):** the check is pinned ON in every environment via `advanced.disableOriginCheck: false` (Auth + Email fix batch, 2026-11-16). Better Auth defaults it to `isTest() ? true : false`, and `isTest()` is true under vitest (via `NODE_ENV=test` AND via `TEST=true`, which vitest sets) — so the check was silently OFF in every test while ON in production, which hid a live 403 on the 2FA setup password gate. Explicit `false` changes nothing in production (the check was already on there); it only makes tests exercise the real check. `trustedOrigins` always includes the app's own deployment origins (`API_URL` / `APP_URL` origins) in addition to `TRUSTED_ORIGINS` and the `BETTER_AUTH_URL` origin (auto-trusted), so a stale `BETTER_AUTH_URL` can never lock the same-origin SPA out of its own auth endpoints. Tests that POST to `/api/auth/*` with a session cookie must therefore send an `Origin` header, exactly like the real SPA does; a request with a cookie and no Origin/Referer is 403 `MISSING_OR_NULL_ORIGIN`, a non-matching Origin is 403 `INVALID_ORIGIN`.
+
 **Public config (no auth, no secrets, no user data):**
 
 | Method | Endpoint | Behavior |
@@ -1225,7 +1227,7 @@ All authentication configuration lives in the database and is edited from Settin
 
 | Method | Endpoint | Behavior |
 |---|---|---|
-| GET | /api/v1/admin/auth-config | Returns the full auth config view (OAuth providers, 2FA policy, SMTP) with secrets redacted (`users.manage`). |
+| GET | /api/v1/admin/auth-config | Returns the full auth config VIEW — `{ oauth: [{ provider, enabled, client_id, has_client_secret, updated_at }], two_factor_policy: { global, roles }, smtp: { host, port, username, has_password, tls_mode, from_address, from_name, enabled, updated_at } }` — snake_case, with defaults even when nothing is configured yet (`oauth: []`, policy `off`, SMTP disabled), and secrets (OAuth `clientSecret`, SMTP `password`) NEVER returned (`users.manage`). The raw `ResolvedAuthConfig` (camelCase + decrypted secrets) must never be serialized to a client. |
 | PUT | /api/v1/admin/auth-config/two-factor-policy | `{ scope, mode }` — scope `global` (default for every role) or one of the 8 role keys; mode `off` / `optional` / `required` (default OFF). Resolution is strictest-wins across global + the user's roles (required > optional > off). |
 | POST | /api/auth/two-factor/enable | Password → `{ totpURI, backupCodes }` (raw plugin response, not the app envelope). |
 | POST | /api/auth/two-factor/verify-totp | `{ code }` — verifies setup or a sign-in challenge. **Rotates the session** (creates a new one, deletes the old, sets the cookie): clients must use the response's `set-cookie` afterwards. |
@@ -1240,7 +1242,7 @@ Sign-in with 2FA on: the plugin deletes the just-created session and returns `{ 
 |---|---|---|
 | PUT | /api/v1/admin/auth-config/smtp | `{ host, port, username?, password?, tls_mode (starttls\|ssl\|none), from_address, from_name?, enabled? }` (`users.manage`). Password encrypted at rest (AAD `auth:smtp`), never returned. Enabling requires host + from address. |
 | POST | /api/v1/admin/auth-config/smtp/test | Sends a real test mail **only to the admin's own address** (never an open relay); failure returns 502 with the real error, never a fake success. |
-| POST | /api/auth/forgot-password | `{ email }` — always the same generic 200 (never says whether the email exists or whether email is configured). A reset token is created + emailed only for an active user when SMTP is configured. |
+| POST | /api/auth/forgot-password | `{ email }` — always the same generic 200 (never says whether the email exists or whether email is configured). A reset token is created + emailed only for an active user when SMTP is configured. The forgot-password PAGE reads the public `email_configured` flag and says plainly when email is not configured (no fake "a reset link has been sent"); the endpoint itself stays generic-200 either way. |
 | POST | /api/auth/reset-password | `{ token, password }` — 422 for an invalid/expired/used token. Password ≥10 chars. **Reset alone never disables 2FA** (email compromise must not defeat 2FA). |
 | POST | /api/auth/two-factor/recover | `{ email }` — generic 200; a recovery token is emailed only when the user has 2FA on and SMTP is configured. |
 | POST | /api/auth/two-factor/recover/confirm | `{ token, password }` — verifies the password, disables 2FA (sets `users.two_factor_enabled=false`, deletes the `two_factor` row), consumes the token. |

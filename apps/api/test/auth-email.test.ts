@@ -103,12 +103,16 @@ describe.skipIf(!DATABASE_URL)("Auth + Email batch (Postgres)", () => {
 
   async function apiRequest(
     path: string,
-    options: { method?: string; body?: unknown; cookie?: string; token?: string } = {}
+    options: { method?: string; body?: unknown; cookie?: string; token?: string; origin?: string } = {}
   ): Promise<{ status: number; headers: Headers; body: any }> {
     const headers = new Headers();
     if (options.body !== undefined) headers.set("Content-Type", "application/json");
     if (options.cookie) headers.set("Cookie", options.cookie);
     if (options.token) headers.set("Authorization", `Bearer ${options.token}`);
+    // The origin check is pinned ON in the product (disableOriginCheck:
+    // false) — requests through Better Auth's handler with a session
+    // cookie must carry an Origin, exactly like the real SPA does.
+    if (options.origin) headers.set("Origin", options.origin);
     const init: RequestInit = { method: options.method ?? "GET", headers };
     if (options.body !== undefined) init.body = JSON.stringify(options.body);
     const res = await app.fetch(new Request(`http://localhost:8787${path}`, init), env);
@@ -278,6 +282,33 @@ describe.skipIf(!DATABASE_URL)("Auth + Email batch (Postgres)", () => {
     await setPolicy("global", "off");
   });
 
+  it("admin auth-config: snake_case view with defaults on an empty DB; no secrets ever (fix batch)", async () => {
+    // Live bug: the endpoint returned the raw ResolvedAuthConfig —
+    // camelCase `twoFactorPolicy` (the Settings page reads
+    // `two_factor_policy.global` and crashed to the error boundary)
+    // and the DECRYPTED OAuth clientSecret / SMTP password. The
+    // endpoint must always return the full view shape, even with
+    // nothing configured yet.
+    const res = await apiRequest("/api/v1/admin/auth-config", { cookie: superCookie });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    const data = res.body.data as Record<string, unknown>;
+    const raw = JSON.stringify(res.body);
+    // The exact crash site: these reads must work on the empty shape.
+    const policy = data.two_factor_policy as { global?: unknown; roles?: unknown };
+    assert.equal(typeof policy?.global, "string", "two_factor_policy.global must exist");
+    assert.equal(typeof policy?.roles, "object", "two_factor_policy.roles must exist");
+    assert.ok(Array.isArray(data.oauth), "oauth must be an array");
+    const smtp = data.smtp as Record<string, unknown>;
+    assert.equal(smtp?.enabled, false, "smtp must default to disabled");
+    assert.equal(typeof smtp?.host, "string");
+    assert.equal(typeof smtp?.from_address, "string");
+    assert.equal(typeof smtp?.has_password, "boolean");
+    // No camelCase internals and no secrets anywhere in the payload.
+    assert.ok(!("twoFactorPolicy" in data), "no camelCase twoFactorPolicy");
+    assert.ok(!("clientSecret" in data) && !raw.includes("clientSecret"), "no clientSecret");
+    assert.ok(!raw.includes('"password"'), "no password field");
+  });
+
   it("OAuth config gating: public endpoint lists only enabled providers; secrets never leak", async () => {
     const pub0 = await apiRequest("/api/v1/auth-config");
     assert.equal(pub0.status, 200);
@@ -332,13 +363,48 @@ describe.skipIf(!DATABASE_URL)("Auth + Email batch (Postgres)", () => {
     assert.deepEqual(pub2.body.data.oauth_providers, []);
   });
 
-  it("forgot / reset: generic 200, token row created, reset works once, expiry + reuse fail", async () => {
+  it("forgot / reset: SMTP off mints no token, SMTP on mints one; generic 200 either way; reset works once, expiry + reuse fail", async () => {
     const unknown = await apiRequest("/api/auth/forgot-password", {
       method: "POST",
       body: { email: "nobody@example.com" },
     });
     assert.equal(unknown.status, 200);
     assert.match(unknown.body.data.message, /If an account exists/);
+
+    // SMTP OFF (nothing configured yet in this file): the generic 200
+    // is the same, but NO token row is minted — an undeliverable
+    // token must never be created (fix batch: the page used to claim
+    // "a reset link has been sent" when nothing could be sent).
+    const knownOff = await apiRequest("/api/auth/forgot-password", {
+      method: "POST",
+      body: { email: testUserEmail },
+    });
+    assert.equal(knownOff.status, 200);
+    assert.equal(knownOff.body.data.message, unknown.body.data.message, "responses must not differ");
+    const rowsOff = await adminClient.query(
+      "SELECT COUNT(*) AS count FROM password_reset_tokens WHERE user_id = $1 AND purpose = 'password_reset' AND used_at IS NULL",
+      [testUserId]
+    );
+    assert.equal(Number(rowsOff.rows[0].count), 0, "SMTP off must mint no token row");
+
+    // Configure SMTP (no real server behind it in Node) — the token is
+    // minted before the send is attempted, so the row appears even
+    // though the send itself cannot succeed here.
+    const smtp = await apiRequest("/api/v1/admin/auth-config/smtp", {
+      method: "PUT",
+      body: {
+        host: "localhost",
+        port: 587,
+        username: "smtp-user",
+        password: "smtp-pass-TEST-ONLY",
+        tls_mode: "starttls",
+        from_address: "noreply@example.com",
+        from_name: "StackMate",
+        enabled: true,
+      },
+      cookie: superCookie,
+    });
+    assert.equal(smtp.status, 200, JSON.stringify(smtp.body));
     const known = await apiRequest("/api/auth/forgot-password", {
       method: "POST",
       body: { email: testUserEmail },
@@ -388,6 +454,14 @@ describe.skipIf(!DATABASE_URL)("Auth + Email batch (Postgres)", () => {
       body: { token: expired.rawToken, new_password: "AnotherPass789!" },
     });
     assert.equal(expiredRes.status, 422, "an expired token must fail");
+    // Back to disabled: this test configured SMTP for its "on" half,
+    // and later tests assume the SMTP-off state.
+    const offAgain = await apiRequest("/api/v1/admin/auth-config/smtp", {
+      method: "PUT",
+      body: { enabled: false },
+      cookie: superCookie,
+    });
+    assert.equal(offAgain.status, 200, JSON.stringify(offAgain.body));
   });
 
   it("invitation email: SMTP off keeps token_once + honest email_error; SMTP on-but-unreachable fails honestly", async () => {
@@ -457,6 +531,7 @@ describe.skipIf(!DATABASE_URL)("Auth + Email batch (Postgres)", () => {
       method: "POST",
       body: { password: testUserPassword },
       cookie,
+      origin: "http://localhost:8787",
     });
     assert.equal(enabled.status, 200, JSON.stringify(enabled.body));
     // NOTE: the twoFactor plugin returns the raw body, not the app envelope.
@@ -471,6 +546,7 @@ describe.skipIf(!DATABASE_URL)("Auth + Email batch (Postgres)", () => {
       method: "POST",
       body: { code: totp(secret) },
       cookie,
+      origin: "http://localhost:8787",
     });
     assert.equal(verify.status, 200, JSON.stringify(verify.body));
     // verify-totp rotates the session: the old cookie is dead, the
@@ -489,6 +565,7 @@ describe.skipIf(!DATABASE_URL)("Auth + Email batch (Postgres)", () => {
       method: "POST",
       body: { code: totp(secret) },
       cookie: challengeCookie,
+      origin: "http://localhost:8787",
     });
     assert.equal(verified.status, 200, JSON.stringify(verified.body));
     const me2 = await apiRequest("/api/v1/admin/me", {
@@ -506,6 +583,7 @@ describe.skipIf(!DATABASE_URL)("Auth + Email batch (Postgres)", () => {
       method: "POST",
       body: { code: backupCodes[0] },
       cookie: cookiePairs(challenged2.headers),
+      origin: "http://localhost:8787",
     });
     assert.equal(backupVerified.status, 200, JSON.stringify(backupVerified.body));
     const me3 = await apiRequest("/api/v1/admin/me", {
@@ -579,6 +657,7 @@ describe.skipIf(!DATABASE_URL)("Auth + Email batch (Postgres)", () => {
       method: "POST",
       body: { password: testUserPassword },
       cookie,
+      origin: "http://localhost:8787",
     });
     assert.equal(enabled.status, 200, JSON.stringify(enabled.body));
     const secret = new URL(enabled.body.totpURI as string).searchParams.get("secret")!;
@@ -586,6 +665,7 @@ describe.skipIf(!DATABASE_URL)("Auth + Email batch (Postgres)", () => {
       method: "POST",
       body: { code: totp(secret) },
       cookie,
+      origin: "http://localhost:8787",
     });
     assert.equal(verify.status, 200, JSON.stringify(verify.body));
     const cookieAfterVerify = cookiePairs(verify.headers) || cookie;
@@ -593,6 +673,7 @@ describe.skipIf(!DATABASE_URL)("Auth + Email batch (Postgres)", () => {
       method: "POST",
       body: { password: testUserPassword },
       cookie: cookieAfterVerify,
+      origin: "http://localhost:8787",
     });
     assert.equal(disabled.status, 200, JSON.stringify(disabled.body));
     // disable rotates the session as well.

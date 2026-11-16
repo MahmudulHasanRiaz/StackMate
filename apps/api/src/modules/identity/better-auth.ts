@@ -189,6 +189,18 @@ export function createBetterAuth(
       // (@better-auth/core BetterAuthAdvancedOptions): the supported way to
       // name the client-IP header is advanced.ipAddress.ipAddressHeaders.
       ipAddress: { ipAddressHeaders: ["cf-connecting-ip"] },
+      // Pin the origin check ON in every environment (Auth + Email fix
+      // batch). Better Auth defaults it to `isTest() ? true : false`,
+      // and isTest() is true under vitest — via NODE_ENV=test AND via
+      // TEST=true, which vitest sets — so the check was silently OFF
+      // in every test while ON in production (Workers). That gap hid
+      // the live 2FA 403: the suite never saw the origin check at all.
+      // Explicit `false` changes nothing in production (isTest() is
+      // already false there) — it only makes tests exercise the real
+      // check, as a browser SPA would. Tests that POST to /api/auth/*
+      // with a session cookie must therefore send an Origin header,
+      // exactly like the real SPA does.
+      disableOriginCheck: false,
       useSecureCookies: isProd,
       defaultCookieAttributes: {
         httpOnly: true,
@@ -198,6 +210,18 @@ export function createBetterAuth(
       },
     },
   });
+}
+
+/**
+ * Origin of a configured URL, or null when it does not parse (a bad
+ * env value must never crash auth construction).
+ */
+function originOf(url: string): string | null {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -214,9 +238,29 @@ export function buildBetterAuthWorkerConfig(
     baseURL: env.BETTER_AUTH_URL,
     basePath: "/api/auth",
     secret: env.BETTER_AUTH_SECRET,
-    trustedOrigins: env.TRUSTED_ORIGINS.split(",")
-      .map((s) => s.trim())
-      .filter(Boolean),
+    // The same-origin admin SPA POSTs to /api/auth/* (two-factor
+    // setup/verify/disable, OAuth) through Better Auth's router, whose
+    // originCheckMiddleware 403s any POST whose Origin is not trusted
+    // (Auth + Email fix batch: the live 2FA password gate 403'd with
+    // the correct password — in vitest the check is skipped, isTest(),
+    // so the suite never saw it). Better Auth auto-trusts the baseURL
+    // origin, but BETTER_AUTH_URL can go stale; the app's own
+    // deployment origins (API_URL / APP_URL — the Worker URL the SPA
+    // is served from) are always trusted too, so a stale baseURL can
+    // never lock the same-origin SPA out of its own auth endpoints.
+    // These are the app's own deployment URLs, not user input — no
+    // cross-site origin is trusted by this.
+    trustedOrigins: Array.from(
+      new Set(
+        [
+          ...env.TRUSTED_ORIGINS.split(",")
+            .map((s) => s.trim())
+            .filter(Boolean),
+          originOf(env.API_URL),
+          originOf(env.APP_URL),
+        ].filter((o): o is string => o !== null)
+      )
+    ),
     // Always use the cache-disabled Hyperdrive binding for auth & session consistency
     databaseConnectionString: env.HYPERDRIVE_NO_CACHE.connectionString,
     usePluralTables: true,

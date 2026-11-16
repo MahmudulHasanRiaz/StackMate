@@ -17,9 +17,12 @@
  *    After the callback the app reloads and RootComponent loads /me;
  *    a failed OAuth lands back with ?error=… and is shown here.
  *  - Forgot password: public form → POST /api/auth/forgot-password.
- *    The response is always the same generic message, and the UI
- *    repeats it — it never says whether the email exists or whether
- *    email is configured.
+ *    When SMTP is configured the response is the same generic message
+ *    and the UI repeats it — it never says whether the email exists.
+ *    When SMTP is NOT configured (GET /api/v1/auth-config says
+ *    email_configured: false) the form says so plainly instead of
+ *    the fake "a reset link has been sent" — the configured state is
+ *    public, the account's existence never is.
  *  - 2FA: when sign-in returns { two_factor_redirect: true } the
  *    password was right but TOTP is on — the TOTP prompt replaces the
  *    sign-in form (code, or a backup code). Verify calls the Better
@@ -73,6 +76,12 @@ export function AuthScreen({
   const [forgotEmail, setForgotEmail] = useState("");
   const [forgotBusy, setForgotBusy] = useState(false);
   const [forgotSent, setForgotSent] = useState(false);
+  // Whether password-reset email can be sent at all (Auth + Email fix
+  // batch): when SMTP is not configured the forgot form must say so
+  // plainly instead of the fake "a reset link has been sent". null =
+  // not known yet (config fetch pending/failed) — the form behaves as
+  // before, and the endpoint stays generic-200 either way.
+  const [emailConfigured, setEmailConfigured] = useState<boolean | null>(null);
 
   // Two-factor challenge (after a password-correct sign-in)
   const [twoFactorPending, setTwoFactorPending] = useState(false);
@@ -89,11 +98,18 @@ export function AuthScreen({
       .catch(() => {
         if (!cancelled) setSetupStatus("not-required");
       });
-    // Public login config: which OAuth providers to show. Any failure
-    // fails closed to email/password only.
-    apiRequest<{ oauth_providers: string[] }>("/api/v1/auth-config")
+    // Public login config: which OAuth providers to show, and whether
+    // email is configured. Any failure fails closed to email/password
+    // only (emailConfigured stays null — the forgot form keeps its
+    // generic behaviour).
+    apiRequest<{ oauth_providers: string[]; email_configured?: boolean }>("/api/v1/auth-config")
       .then((res) => {
-        if (!cancelled) setOauthProviders(res.oauth_providers ?? []);
+        if (!cancelled) {
+          setOauthProviders(res.oauth_providers ?? []);
+          if (typeof res.email_configured === "boolean") {
+            setEmailConfigured(res.email_configured);
+          }
+        }
       })
       .catch(() => {});
     // An OAuth callback failure lands back here with ?error=… — show it
@@ -365,6 +381,14 @@ export function AuthScreen({
               <Alert variant="success" role="status">
                 If an account exists for that email, a reset link has been sent. Check your inbox.
               </Alert>
+            ) : emailConfigured === false ? (
+              <>
+                <Alert variant="warning" role="status">
+                  Email is not configured for this admin yet, so password-reset emails cannot be
+                  sent. Contact your administrator to set up SMTP in Settings → Authentication →
+                  Email, or to reset your password.
+                </Alert>
+              </>
             ) : (
               <>
                 <Field label="Email" required htmlFor="sm-forgot-email">

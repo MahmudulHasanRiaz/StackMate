@@ -390,7 +390,30 @@ export function AuthSettingsSection() {
       />
     );
   }
-  const config = query.data;
+  // Defensive normalization (Auth + Email fix batch): the endpoint
+  // always returns the full view (see toAuthConfigView), but the page
+  // must never crash on a partial shape — the live page fell to the
+  // error boundary on `config.two_factor_policy.global` when the
+  // endpoint returned camelCase `twoFactorPolicy`. Every section
+  // below reads from this normalized object.
+  const config: AuthConfig = {
+    oauth: query.data.oauth ?? [],
+    two_factor_policy: {
+      global: query.data.two_factor_policy?.global ?? "off",
+      roles: query.data.two_factor_policy?.roles ?? {},
+    },
+    smtp: query.data.smtp ?? {
+      host: "",
+      port: 587,
+      username: "",
+      has_password: false,
+      tls_mode: "starttls",
+      from_address: "",
+      from_name: "StackMate",
+      enabled: false,
+      updated_at: null,
+    },
+  };
   const refetch = () => void query.refetch();
   return (
     <div className="sm-page">

@@ -224,6 +224,30 @@ export function toOAuthProviderView(p: ResolvedOAuthProvider): OAuthProviderView
   };
 }
 
+/**
+ * The full admin auth-config view (Auth + Email fix batch): the exact
+ * snake_case shape the Settings → Authentication page reads
+ * (`oauth[]`, `two_factor_policy`, `smtp`). The GET endpoint used to
+ * return the raw ResolvedAuthConfig — camelCase `twoFactorPolicy`
+ * (which crashed the page: `config.two_factor_policy` was undefined)
+ * and, worse, the DECRYPTED `clientSecret` / SMTP `password`. Always
+ * serialize through this mapper; never return a Resolved* object to
+ * a client.
+ */
+export interface AuthConfigView {
+  oauth: OAuthProviderView[];
+  two_factor_policy: TwoFactorPolicyDoc;
+  smtp: SmtpSettingsView;
+}
+
+export function toAuthConfigView(config: ResolvedAuthConfig): AuthConfigView {
+  return {
+    oauth: config.oauth.map(toOAuthProviderView),
+    two_factor_policy: config.twoFactorPolicy,
+    smtp: toSmtpSettingsView(config.smtp),
+  };
+}
+
 export function toSmtpSettingsView(s: ResolvedSmtpSettings): SmtpSettingsView {
   const { password: _password, ...view } = s;
   return view;

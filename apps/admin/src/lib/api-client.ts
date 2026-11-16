@@ -97,14 +97,27 @@ export async function rawApiRequest<T>(
   });
 
   const json = (await res.json().catch(() => null)) as
-    | { error?: { code: string; message: string; details: Record<string, unknown> | null; request_id: string } }
+    | { error?: { code: string; message: string; details: Record<string, unknown> | null; request_id: string }; code?: string; message?: string }
     | null;
 
   if (!res.ok || !json || json.error) {
     const err = json?.error;
+    // Better Auth's own endpoints return the error FLAT ({ code,
+    // message }) instead of the app envelope — surface that message
+    // instead of the generic "Request failed with status …" (the live
+    // 2FA 403 hid the real "Invalid origin" message behind the
+    // generic text, which is why the failure looked password-related).
+    const code =
+      err?.code ??
+      (typeof json?.code === "string" ? json.code : undefined) ??
+      "HTTP_ERROR";
+    const message =
+      err?.message ??
+      (typeof json?.message === "string" ? json.message : undefined) ??
+      `Request failed with status ${res.status}`;
     throw new ApiClientError(
-      err?.code ?? "HTTP_ERROR",
-      err?.message ?? `Request failed with status ${res.status}`,
+      code,
+      message,
       err?.request_id ?? "unknown",
       res.status,
       err?.details ?? null

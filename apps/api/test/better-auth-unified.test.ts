@@ -59,12 +59,16 @@ describe.skipIf(!DATABASE_URL)("Better Auth unified staff auth (Postgres)", () =
 
   async function apiRequest(
     path: string,
-    options: { method?: string; body?: unknown; cookie?: string; token?: string } = {}
+    options: { method?: string; body?: unknown; cookie?: string; token?: string; origin?: string } = {}
   ): Promise<{ status: number; headers: Headers; body: any }> {
     const headers = new Headers();
     if (options.body !== undefined) headers.set("Content-Type", "application/json");
     if (options.cookie) headers.set("Cookie", options.cookie);
     if (options.token) headers.set("Authorization", `Bearer ${options.token}`);
+    // The origin check is pinned ON in the product (disableOriginCheck:
+    // false) — requests through Better Auth's handler with a session
+    // cookie must carry an Origin, exactly like the real SPA does.
+    if (options.origin) headers.set("Origin", options.origin);
     const init: RequestInit = {
       method: options.method ?? "GET",
       headers,
@@ -556,6 +560,7 @@ describe.skipIf(!DATABASE_URL)("Better Auth unified staff auth (Postgres)", () =
       method: "POST",
       cookie: session.cookie,
       body: { name: "BA Renamed" },
+      origin: "http://localhost:8787",
     });
     assert.equal(updated.status, 200, JSON.stringify(updated.body));
 
