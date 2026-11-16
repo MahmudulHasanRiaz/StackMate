@@ -73,6 +73,7 @@ import {
   useAdminList,
   useAdminMutation,
 } from "../lib/section-kit";
+import { humanizeType } from "../lib/resolve-names";
 
 /* Field's `error?: string` is under exactOptionalPropertyTypes, so an
  * explicitly-undefined error must be omitted, not passed. */
@@ -373,7 +374,7 @@ export function StaffSection() {
         <div>
           <p>
             The invitation for {inv.name} ({inv.email}) stops working
-            immediately.
+            permanently.
           </p>
           <p>
             The invitee cannot use it to create an account. You can invite
@@ -383,7 +384,7 @@ export function StaffSection() {
       ),
       confirmLabel: "Revoke",
       danger: true,
-      warning: `The invitation for ${inv.name} (${inv.email}) stops working immediately.`,
+      warning: `The invitation for ${inv.name} (${inv.email}) stops working permanently.`,
     });
     if (ok) revokeInvitation.mutate({ id: inv.id, name: inv.name, email: inv.email });
   };
@@ -1065,7 +1066,7 @@ export function StaffUserDetailSection({ id }: { id: string }) {
         <div>
           <p>
             {user.name}&apos;s roles change to:{" "}
-            {currentRoles.length > 0 ? currentRoles.join(", ") : "no roles"}.
+            {currentRoles.length > 0 ? currentRoles.map((r) => humanizeType(r)).join(", ") : "no roles"}.
           </p>
           <p>
             Saving signs {user.name} out of all active sessions immediately.

@@ -1194,6 +1194,14 @@ Support overlapping active/retiring endpoint secrets for a planned rotation wind
 
 There is no `GET /api/v1/admin/webhooks/{webhookId}` — the admin detail page reads the endpoint from the list. Webhook endpoints are configuration and live under Settings in the admin panel; the outbox lives under Administration as its own section.
 
+### 18.8 Admin API — audit log
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/audit-logs | List audit events (permission `audit_logs.read`); newest first |
+
+Each row carries `resource_display_name` (additive, nullable): a human display name for the affected resource, resolved server-side from the live state — user/site/product/feature/package names, order/subscription/license/invoice numbers, webhook endpoint URL, invitation email, credential `key_id`, tracking group label (or `"{provider} pixel {pixel_id}"`), payment submission `"{amount} · Order {order_number}"`, package version `"v{N} · {package name}"`, package price `"{amount} [/ {n} {unit}] · {package} v{N}"`, session rows the actor's name (sign-in rows carry the attempted email or a 12-char session-token prefix, so the name is resolved from those when possible). `null` means the resource no longer exists (or the type has no display name) — the admin UI then falls back to its client-side name maps and, last, the short id; a bare raw id is never the primary display. No secrets are ever returned in a display name (only names, numbers, URLs, and public ids). The field is display-only: it changes no audit behaviour, no filtering, and no contract — clients that ignore it see the same rows as before.
+
 ---
 
 ## 19. Inbound Payment Provider Callbacks
