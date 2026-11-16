@@ -47,6 +47,14 @@
  * Rate limit note: the two-factor plugin allows 3 calls per 10s on
  * /two-factor/*, so the enable attempts sleep 11s apart.
  *
+ * UPDATE (ADR-0008 decision 10, follow-up batch 2026-11-16): the
+ * blind-gate finding below is FIXED — `parseSessionCookie` now
+ * recognises `__Secure-better-auth.session_token`, so the staging
+ * test's PATCH assertion is 403 (gate enforces), not 200. The
+ * dedicated enforcement suite is `csrf-gate-secure-cookie.test.ts`
+ * (same-origin 200 / cross-origin 403 / 2FA 200 + QR, staging env
+ * with all four URL vars set).
+ *
  * Requires DATABASE_URL to a LOCAL test Postgres (same pattern as
  * two-factor-origin.test.ts); creates its own fresh database
  * `stackmate_test_two_factor_origin_diag` and drops it afterwards.
@@ -384,16 +392,22 @@ SETUP_TOKEN: TEST_SETUP_TOKEN,
   // Better Auth sets the session cookie as
   // `__Secure-better-auth.session_token` (useSecureCookies, verified
   // against dist/cookies/index.mjs:23), but parseSessionCookie
-  // (app.ts:190) recognises only `stackmate_session`,
+  // (app.ts:190) recognised only `stackmate_session`,
   // `__Host-stackmate_session` and the bare
   // `better-auth.session_token`. The app CSRF gate therefore NEVER
-  // fires live — admin POSTs pass whatever env.TRUSTED_ORIGINS
-  // holds, so they prove NOTHING about the dashboard vars. Better
+  // fired live — admin POSTs passed whatever env.TRUSTED_ORIGINS
+  // held, so they proved NOTHING about the dashboard vars. Better
   // Auth's own cookie parser DOES check the `__Secure-` name first
   // (dist/cookies/index.mjs:269), so its origin check fires normally.
-  // Under the all-localhost (S3) env shape the live combination is
+  // Under the all-localhost (S3) env shape the live combination was
   // exactly: admin POST passes, 2FA enable 403s INVALID_ORIGIN.
-  it("staging cookie is __Secure- prefixed and the app CSRF gate is blind to it (S3 env)", async () => {
+  // FIXED (ADR-0008 decision 10, follow-up batch): parseSessionCookie
+  // now recognises `__Secure-better-auth.session_token`, so the gate
+  // enforces — the PATCH below now 403s under S3 env instead of
+  // passing. The 2FA 403 INVALID_ORIGIN is unchanged (the vars are
+  // still missing in this shape); the dedicated enforcement suite is
+  // `csrf-gate-secure-cookie.test.ts`.
+  it("staging cookie is __Secure- prefixed and the app CSRF gate now enforces it (S3 env, decision 10)", async () => {
     const originUrl = new URL(DATABASE_URL!);
     originUrl.pathname = `/${ORIGIN_DB_NAME}`;
     const dbUrl = originUrl.toString();
@@ -446,15 +460,21 @@ SETUP_TOKEN: TEST_SETUP_TOKEN,
       stagingCookie.startsWith("__Secure-better-auth.session_token="),
       `staging session cookie must be __Secure- prefixed, got ${stagingCookie}`
     );
-    // Same Origin, same cookie, S3 env: the app gate MUST see the
-    // cookie to enforce — it does not, so the PATCH passes live.
+    // Same Origin, same cookie, S3 env: the app gate now sees the
+    // __Secure- cookie and enforces — the staging Origin is NOT in
+    // this env's TRUSTED_ORIGINS (localhost only), so the PATCH 403s.
+    // Before decision 10 this returned 200 (blind gate).
     const patched = await stagingFetch("/api/v1/admin/me", {
       method: "PATCH",
       body: { name: "Two Factor Diagnosis" },
       cookie: stagingCookie,
       origin: STAGING_ORIGIN,
     });
-    assert.equal(patched.status, 200, `expected 200, got ${patched.status}: ${JSON.stringify(patched.body)}`);
+    assert.equal(patched.status, 403, `expected 403, got ${patched.status}: ${JSON.stringify(patched.body)}`);
+    assert.ok(
+      JSON.stringify(patched.body).includes("blocked by CSRF policy"),
+      `403 must be the app CSRF gate, got ${JSON.stringify(patched.body)}`
+    );
     // And the 2FA gate on the same app, same cookie, same Origin:
     // Better Auth's check fires — the live symptom, reproduced.
     await sleep(11_000);
