@@ -62,6 +62,34 @@ export class SmtpError extends Error {
   }
 }
 
+/**
+ * Normalize any throw into an SmtpError carrying the real transport
+ * cause (error name + message). Follow-up fix 2026-11-16 ~22:16 +06:
+ * the live test email settled (hang fixed) but failed with the
+ * generic "Email could not be sent." — that string is the service's
+ * non-SmtpError fallback (service.ts), so the throw was a raw stream
+ * TypeError / writer rejection, not an SmtpError. The owner confirmed
+ * the mail never arrived, so the failure is pre-DATA (connect →
+ * DATA), not post-accept — one of the unwrapped stream paths below.
+ * Every throw is converted before it leaves this client, so the next
+ * live test shows what actually failed. Credentials can never appear
+ * here: stream errors carry runtime state only (we never send
+ * credentials except as base64 AUTH lines, which never surface in a
+ * stream error), and the AUTH exchange itself still only ever yields
+ * reply codes. An existing SmtpError passes through untouched, so the
+ * specific timeout / reply-code messages are never rewritten.
+ */
+function asSmtpError(err: unknown, step: string, prefix?: string): SmtpError {
+  if (err instanceof SmtpError) return err;
+  const name = err instanceof Error ? err.name : "Error";
+  const detail = err instanceof Error ? err.message : String(err);
+  const cause = `${name}: ${detail || "unknown error"}`;
+  return new SmtpError(
+    prefix ? `${prefix} (${cause}).` : `SMTP ${step} failed (${cause}).`,
+    null
+  );
+}
+
 const READ_TIMEOUT_MS = 10_000;
 /**
  * Per-step bound for every other await in the send path (SMTP timeout
@@ -157,7 +185,15 @@ class SmtpLineReader {
       setTimeout(() => resolve(null), READ_TIMEOUT_MS)
     );
     const result = await Promise.race([
-      this.reader.read().then((r) => (r.done ? null : r.value)),
+      this.reader.read()
+        .then((r) => (r.done ? null : r.value))
+        .catch((err: unknown) => {
+          // A stream error rejects the read with a raw TypeError /
+          // DOMException, not an SmtpError — convert it here so the
+          // real cause survives instead of the service's generic
+          // "Email could not be sent." (follow-up fix 2026-11-16).
+          throw asSmtpError(err, "read");
+        }),
       timeout.then(() => {
         throw new SmtpError("SMTP server did not reply in time.", null);
       }),
@@ -227,9 +263,33 @@ function dotStuff(data: string): string {
 }
 
 /**
+ * Open the reader + writer for a socket. Both `getReader()` and
+ * `getWriter()` can throw synchronously (locked / errored stream) —
+ * convert before the raw throw leaves the client (follow-up fix
+ * 2026-11-16). A reader opened before a failing getWriter is released
+ * again so a half-opened pair never leaks a lock.
+ */
+function openStreams(socket: SmtpSocketLike): {
+  reader: SmtpLineReader;
+  writer: WritableStreamDefaultWriter<Uint8Array>;
+} {
+  let reader: SmtpLineReader | undefined;
+  try {
+    reader = new SmtpLineReader(socket.readable);
+    const writer = socket.writable.getWriter();
+    return { reader, writer };
+  } catch (err) {
+    reader?.release();
+    throw asSmtpError(err, "stream setup");
+  }
+}
+
+/**
  * Send one message over SMTP. Throws SmtpError on any protocol failure;
  * returns on success (after QUIT, best-effort). The socket is always
- * closed, even on failure.
+ * closed, even on failure. Every throw is an SmtpError — raw stream
+ * errors are normalized with their real cause (see asSmtpError), so the
+ * service never falls back to the generic "Email could not be sent."
  */
 export async function sendMailViaSmtp(
   config: SmtpConfig,
@@ -256,23 +316,29 @@ export async function sendMailViaSmtp(
     // connect() itself is synchronous in the `cloudflare:sockets` API:
     // a failed TCP handshake surfaces on the first bounded read below
     // (220 greeting, READ_TIMEOUT_MS). A synchronous throw here still
-    // becomes an SmtpError, never a raw throw.
+    // becomes an SmtpError, never a raw throw — with the real cause
+    // attached (follow-up fix 2026-11-16).
     socket = connectImpl(
       { hostname: config.host.trim(), port: config.port },
       { secureTransport }
     );
-  } catch {
-    throw new SmtpError("Could not open a connection to the SMTP server.", null);
+  } catch (err) {
+    throw asSmtpError(err, "connect", "Could not open a connection to the SMTP server");
   }
-  let reader = new SmtpLineReader(socket.readable);
-  let writer = socket.writable.getWriter();
+  let { reader, writer } = openStreams(socket);
   const encoder = new TextEncoder();
 
   const sendCommand = async (command: string): Promise<void> => {
     // Bounded write (was unbounded): a stalled TCP connection used to
     // leave writer.write() pending forever — the 2026-11-16 live hang.
+    // withTimeout only wraps the timeout: a rejected write reaches the
+    // race raw, so convert it here (follow-up fix 2026-11-16).
     await withTimeout(
-      Promise.resolve().then(() => writer.write(encoder.encode(`${command}${CRLF}`))),
+      Promise.resolve()
+        .then(() => writer.write(encoder.encode(`${command}${CRLF}`)))
+        .catch((err: unknown) => {
+          throw asSmtpError(err, "write");
+        }),
       STEP_TIMEOUT_MS,
       () => new SmtpError("SMTP server did not accept the command in time.", null)
     );
@@ -308,12 +374,13 @@ export async function sendMailViaSmtp(
         }
         // startTls() is synchronous in the `cloudflare:sockets` API, so
         // there is no await to bound here; the bound is the try/catch
-        // (a failed upgrade becomes an SmtpError) plus the bounded
-        // EHLO read that follows, plus the total budget above.
+        // (a failed upgrade becomes an SmtpError, with the real cause
+        // attached) plus the bounded EHLO read that follows, plus the
+        // total budget above.
         try {
           socket = socket.startTls();
-        } catch {
-          throw new SmtpError("SMTP STARTTLS upgrade failed.", null);
+        } catch (err) {
+          throw asSmtpError(err, "starttls", "SMTP STARTTLS upgrade failed");
         }
         reader.release();
         try {
@@ -321,8 +388,7 @@ export async function sendMailViaSmtp(
         } catch {
           /* already released */
         }
-        reader = new SmtpLineReader(socket.readable);
-        writer = socket.writable.getWriter();
+        ({ reader, writer } = openStreams(socket));
         await expect("EHLO stackmate", [250]);
       }
 
@@ -338,8 +404,13 @@ export async function sendMailViaSmtp(
       await expect("DATA", [354]);
       const data = `${dotStuff(buildMimeMessage(message))}${CRLF}.${CRLF}`;
       // Bounded DATA write (was unbounded — same hang class as commands).
+      // A rejected write is converted here, like commands above.
       await withTimeout(
-        Promise.resolve().then(() => writer.write(encoder.encode(data))),
+        Promise.resolve()
+          .then(() => writer.write(encoder.encode(data)))
+          .catch((err: unknown) => {
+            throw asSmtpError(err, "write");
+          }),
         STEP_TIMEOUT_MS,
         () => new SmtpError("SMTP server did not accept the message in time.", null)
       );
@@ -376,9 +447,18 @@ export async function sendMailViaSmtp(
     }
   };
 
-  return withTimeout(
-    run(),
-    TOTAL_SEND_TIMEOUT_MS,
-    () => new SmtpError("SMTP send did not complete in time.", null)
-  );
+  // Safety net: no raw throw may ever leave this client — anything
+  // missed by the targeted conversions above is normalized here with
+  // its real cause, so the service never falls back to the generic
+  // "Email could not be sent." (follow-up fix 2026-11-16). The run()
+  // finally still closes the socket before the rejection propagates.
+  try {
+    return await withTimeout(
+      run(),
+      TOTAL_SEND_TIMEOUT_MS,
+      () => new SmtpError("SMTP send did not complete in time.", null)
+    );
+  } catch (err) {
+    throw asSmtpError(err, "send");
+  }
 }

@@ -8,9 +8,22 @@
  * local TCP server (node:net) — so the wire format is verified against
  * a real socket, not just the mock.
  */
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
+import assert from "node:assert/strict";
 import { createServer, connect as netConnect, type Server, type Socket } from "node:net";
 import { Readable, Writable } from "node:stream";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
+import { Client, Pool } from "pg";
+import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
+import * as schema from "../../../db/schema/index.ts";
+import { resolveRuntimeConfig } from "../src/env.ts";
+import { saveSmtpSettings } from "../src/modules/auth-config/service.ts";
+import {
+  sendStackMateEmail,
+  type EmailDeps,
+} from "../src/modules/email/service.ts";
 import {
   sendMailViaSmtp,
   SmtpError,
@@ -18,6 +31,12 @@ import {
   type SmtpMessage,
   type SmtpSocketLike,
 } from "../src/modules/email/smtp-client.ts";
+
+const DATABASE_URL = process.env.DATABASE_URL;
+const MIGRATIONS_DIR = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../../../db/migrations"
+);
 
 const MESSAGE: SmtpMessage = {
   from: "noreply@example.com",
@@ -432,6 +451,271 @@ describe("SMTP client timeouts (SMTP timeout fix, 2026-11-16)", () => {
     }
   }, 30_000);
 });
+
+/**
+ * Mocked sockets that fail with RAW (non-SmtpError) throws — the
+ * follow-up fix's fault shapes. Shared by the client-level and
+ * service-level describes below.
+ */
+function readErrorSocket(): SmtpSocketLike {
+  return {
+    readable: new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.error(new TypeError("simulated stream failure"));
+      },
+    }),
+    writable: new WritableStream<Uint8Array>({ write() {} }),
+    close: () => Promise.resolve(),
+  };
+}
+
+function writeErrorSocket(): SmtpSocketLike {
+  const encoder = new TextEncoder();
+  return {
+    readable: new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          controller.enqueue(encoder.encode("220 smtp.example.com ESMTP\r\n"));
+          controller.close();
+        },
+      },
+      { highWaterMark: 0 }
+    ),
+    writable: new WritableStream<Uint8Array>({
+      write() {
+        return Promise.reject(new Error("simulated write failure"));
+      },
+    }),
+    close: () => Promise.resolve(),
+  };
+}
+
+function getWriterThrowSocket(): SmtpSocketLike {
+  return {
+    readable: new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.close();
+      },
+    }),
+    writable: {
+      getWriter() {
+        throw new TypeError("simulated getWriter failure");
+      },
+    } as unknown as WritableStream<Uint8Array>,
+    close: () => Promise.resolve(),
+  };
+}
+
+function getReaderThrowSocket(): SmtpSocketLike {
+  return {
+    readable: {
+      getReader() {
+        throw new TypeError("simulated getReader failure");
+      },
+    } as unknown as ReadableStream<Uint8Array>,
+    writable: new WritableStream<Uint8Array>({ write() {} }),
+    close: () => Promise.resolve(),
+  };
+}
+
+describe("SMTP client raw transport errors (follow-up fix, 2026-11-16)", () => {
+  /**
+   * Live 2026-11-16 ~22:16 +06: "Send test email" settled (hang fixed)
+   * but failed with the generic "Email could not be sent." — that
+   * string is the service's non-SmtpError fallback, so the throw was a
+   * raw stream TypeError / writer rejection, not an SmtpError. The
+   * owner confirmed the mail never arrived, so the failure is pre-DATA
+   * (connect → DATA), not post-accept. Every raw throw in the send
+   * path must become an SmtpError naming the real cause — never the
+   * generic string.
+   */
+  const NONE_CONFIG = {
+    host: "smtp.example.com",
+    port: 587,
+    username: "",
+    password: "",
+    tlsMode: "none" as const,
+  };
+
+  it("(a) readable stream erroring with a raw TypeError: SmtpError naming the cause", async () => {
+    let caught: unknown;
+    try {
+      await sendMailViaSmtp(NONE_CONFIG, MESSAGE, () => readErrorSocket());
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(SmtpError);
+    expect((caught as Error).message).toBe(
+      "SMTP read failed (TypeError: simulated stream failure)."
+    );
+    expect((caught as Error).message).not.toContain("Email could not be sent");
+  });
+
+  it("(b) writer.write rejecting with a raw Error: SmtpError naming the cause", async () => {
+    let caught: unknown;
+    try {
+      await sendMailViaSmtp(NONE_CONFIG, MESSAGE, () => writeErrorSocket());
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(SmtpError);
+    expect((caught as Error).message).toBe(
+      "SMTP write failed (Error: simulated write failure)."
+    );
+    expect((caught as Error).message).not.toContain("Email could not be sent");
+  });
+
+  it("(c1) getWriter throwing synchronously: SmtpError naming the cause", async () => {
+    let caught: unknown;
+    try {
+      await sendMailViaSmtp(NONE_CONFIG, MESSAGE, () => getWriterThrowSocket());
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(SmtpError);
+    expect((caught as Error).message).toBe(
+      "SMTP stream setup failed (TypeError: simulated getWriter failure)."
+    );
+    expect((caught as Error).message).not.toContain("Email could not be sent");
+  });
+
+  it("(c2) getReader throwing synchronously: SmtpError naming the cause", async () => {
+    let caught: unknown;
+    try {
+      await sendMailViaSmtp(NONE_CONFIG, MESSAGE, () => getReaderThrowSocket());
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(SmtpError);
+    expect((caught as Error).message).toBe(
+      "SMTP stream setup failed (TypeError: simulated getReader failure)."
+    );
+    expect((caught as Error).message).not.toContain("Email could not be sent");
+  });
+});
+
+describe.skipIf(!DATABASE_URL)(
+  "SMTP raw transport errors at the service level (follow-up fix, 2026-11-16)",
+  () => {
+    /**
+     * The generic string "Email could not be sent." lives in
+     * sendStackMateEmail's catch (service.ts) — it fires for any
+     * non-SmtpError. These tests prove the mapping end to end: the
+     * same three raw faults must surface as SmtpError messages naming
+     * the real cause, never the generic string. Own fresh database
+     * (pattern from auth-email.test.ts); SMTP is seeded via
+     * saveSmtpSettings with test-only values, never real credentials.
+     */
+    const SMTP_ERRORS_DB_NAME = "stackmate_test_smtp_errors";
+    let pool: Pool;
+    let db: NodePgDatabase<typeof schema>;
+    let deps: EmailDeps;
+    let adminClient: Client;
+
+    beforeAll(async () => {
+      assert.ok(DATABASE_URL, "DATABASE_URL must be set inside this suite");
+      const url = new URL(DATABASE_URL);
+      assert.ok(
+        url.pathname.replace(/^\//, "").includes("test"),
+        "Refusing to run: DATABASE_URL database name must contain 'test'."
+      );
+      const env = resolveRuntimeConfig({ APP_ENV: "test" });
+
+      const maintenanceUrl = new URL(DATABASE_URL);
+      maintenanceUrl.pathname = "/postgres";
+      const maintenanceClient = new Client({ connectionString: maintenanceUrl.toString() });
+      await maintenanceClient.connect();
+      await maintenanceClient.query(`DROP DATABASE IF EXISTS "${SMTP_ERRORS_DB_NAME}"`);
+      await maintenanceClient.query(`CREATE DATABASE "${SMTP_ERRORS_DB_NAME}"`);
+      await maintenanceClient.end();
+
+      const dbUrl = new URL(DATABASE_URL);
+      dbUrl.pathname = `/${SMTP_ERRORS_DB_NAME}`;
+      const connectionString = dbUrl.toString();
+      adminClient = new Client({ connectionString });
+      await adminClient.connect();
+      const journal = JSON.parse(
+        await readFile(path.join(MIGRATIONS_DIR, "meta", "_journal.json"), "utf8")
+      ) as { entries: Array<{ tag: string }> };
+      for (const entry of journal.entries) {
+        const sql = await readFile(path.join(MIGRATIONS_DIR, `${entry.tag}.sql`), "utf8");
+        await adminClient.query(sql);
+      }
+
+      pool = new Pool({ connectionString });
+      db = drizzle(pool, { schema });
+      deps = {
+        encryptionKey: env.ENCRYPTION_KEY_V1,
+        keyVersion: "v1",
+        appUrl: "http://localhost:8787",
+      };
+      await saveSmtpSettings(db, deps, {
+        host: "smtp.example.com",
+        port: 587,
+        username: "",
+        password: "smtp-pass-TEST-ONLY",
+        tls_mode: "none",
+        from_address: "noreply@example.com",
+        from_name: "StackMate",
+        enabled: true,
+      });
+    }, 120_000);
+
+    afterAll(async () => {
+      try {
+        await pool?.end();
+      } catch {}
+      try {
+        await adminClient?.end();
+      } catch {}
+      try {
+        const maintenanceUrl = new URL(DATABASE_URL!);
+        maintenanceUrl.pathname = "/postgres";
+        const mc = new Client({ connectionString: maintenanceUrl.toString() });
+        await mc.connect();
+        await mc.query(`DROP DATABASE IF EXISTS "${SMTP_ERRORS_DB_NAME}"`);
+        await mc.end();
+      } catch {}
+    });
+
+    const TEST_MESSAGE = { to: "admin@example.com", subject: "Test", text: "Hello." };
+
+    it("(a) stream erroring with a raw TypeError: service reports the real cause", async () => {
+      const result = await sendStackMateEmail(
+        db,
+        { ...deps, connectImpl: () => readErrorSocket() },
+        TEST_MESSAGE
+      );
+      expect(result.sent).toBe(false);
+      expect(result.error).toBe("SMTP read failed (TypeError: simulated stream failure).");
+      expect(result.error).not.toBe("Email could not be sent.");
+    });
+
+    it("(b) writer.write rejecting with a raw Error: service reports the real cause", async () => {
+      const result = await sendStackMateEmail(
+        db,
+        { ...deps, connectImpl: () => writeErrorSocket() },
+        TEST_MESSAGE
+      );
+      expect(result.sent).toBe(false);
+      expect(result.error).toBe("SMTP write failed (Error: simulated write failure).");
+      expect(result.error).not.toBe("Email could not be sent.");
+    });
+
+    it("(c) getWriter throwing synchronously: service reports the real cause", async () => {
+      const result = await sendStackMateEmail(
+        db,
+        { ...deps, connectImpl: () => getWriterThrowSocket() },
+        TEST_MESSAGE
+      );
+      expect(result.sent).toBe(false);
+      expect(result.error).toBe(
+        "SMTP stream setup failed (TypeError: simulated getWriter failure)."
+      );
+      expect(result.error).not.toBe("Email could not be sent.");
+    });
+  }
+);
 describe("SMTP client (real local TCP server, TLS mode none)", () => {
   it("sends a message end to end over a real socket", async () => {
     const received: string[] = [];
