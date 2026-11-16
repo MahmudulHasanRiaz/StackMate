@@ -1136,6 +1136,17 @@ a:hover {
   flex: 1;
   min-width: 0;
 }
+/* SMTP timeout fix batch (2026-11-16): `.sm-select` is width:100% by
+   default, which inside the flex policy row sized the select to the
+   whole row and squeezed the label to a few characters live ("All/ro/
+   (default)", "Su/Ad"). Same F3 pattern as the toolbar fix
+   (`.sm-toolbar .sm-select { width: auto }`): the select sizes to its
+   content ("Off"/"Optional"/"Required"), the label takes the rest.
+   At 390px the label still gets ~170px — "Finance Manager" fits. */
+.sm-policy-row .sm-select {
+  width: auto;
+  flex: none;
+}
 .sm-form-actions {
   display: flex;
   gap: 8px;

@@ -14,7 +14,7 @@
  * /settings (e.g. /settings/websites) with its own detail routes;
  * the settings index redirects to the first category.
  */
-import { BarChart3, CreditCard, Globe, Settings2, ShieldCheck, Webhook, type LucideIcon } from "lucide-react";
+import { BarChart3, CreditCard, Globe, Mail, Settings2, ShieldCheck, Webhook, type LucideIcon } from "lucide-react";
 
 export interface SettingsCategory {
   slug: string;
@@ -34,6 +34,18 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
     label: "General",
     icon: Settings2,
     to: "/settings/general",
+    group: "General",
+    permission: "users.manage",
+  },
+  {
+    // SMTP timeout fix batch (2026-11-16, owner order): email delivery
+    // is not authentication — SMTP gets its own Settings menu item.
+    // Same `users.manage` gate as Authentication (the SMTP endpoints
+    // require it); API paths unchanged.
+    slug: "email",
+    label: "Email",
+    icon: Mail,
+    to: "/settings/email",
     group: "General",
     permission: "users.manage",
   },

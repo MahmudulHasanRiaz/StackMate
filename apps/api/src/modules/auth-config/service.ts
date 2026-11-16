@@ -227,7 +227,8 @@ export function toOAuthProviderView(p: ResolvedOAuthProvider): OAuthProviderView
 /**
  * The full admin auth-config view (Auth + Email fix batch): the exact
  * snake_case shape the Settings → Authentication page reads
- * (`oauth[]`, `two_factor_policy`, `smtp`). The GET endpoint used to
+ * (`oauth[]`, `two_factor_policy`) and the Settings → Email page reads
+ * (`smtp`). The GET endpoint used to
  * return the raw ResolvedAuthConfig — camelCase `twoFactorPolicy`
  * (which crashed the page: `config.two_factor_policy` was undefined)
  * and, worse, the DECRYPTED `clientSecret` / SMTP `password`. Always

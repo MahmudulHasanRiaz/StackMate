@@ -33,6 +33,44 @@ export class ApiClientError extends Error {
   }
 }
 
+/**
+ * Client-side request bound (SMTP timeout fix, 2026-11-16): no admin
+ * request may hang forever. Live 2026-11-16 21:23 +06: "Send test
+ * email" stayed on "Sending…" for 90+s while the Worker recorded no
+ * invocation anywhere near 90s — the fetch never settled and the
+ * button had no timeout to settle it. Every request now aborts at
+ * 30s (generous: live p99 is ~2–3s) and the abort surfaces as an
+ * ApiClientError with the real cause, so the caller shows the honest
+ * error instead of spinning forever. No caller passes its own signal
+ * (verified 2026-11-16), so the timeout signal is applied
+ * unconditionally. Applied to BOTH helpers — rawApiRequest serves the
+ * 2FA flows and would hang identically.
+ */
+const API_REQUEST_TIMEOUT_MS = 30_000;
+
+async function fetchWithTimeout(path: string, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(path, {
+      ...init,
+      signal: init.signal ?? AbortSignal.timeout(API_REQUEST_TIMEOUT_MS),
+    });
+  } catch (err) {
+    // AbortSignal.timeout rejects with a DOMException named
+    // "TimeoutError" — surface it as the real cause instead of the
+    // generic "Request failed" text, so e.g. the test-email button
+    // shows why it stopped.
+    if (err instanceof DOMException && err.name === "TimeoutError") {
+      throw new ApiClientError(
+        "REQUEST_TIMEOUT",
+        "Request timed out — the server did not respond in time. Please retry.",
+        "unknown",
+        0
+      );
+    }
+    throw err;
+  }
+}
+
 export async function apiRequest<T>(
   path: string,
   options: RequestInit & { idempotencyKey?: string } = {}
@@ -45,7 +83,7 @@ export async function apiRequest<T>(
     headers.set("Idempotency-Key", options.idempotencyKey);
   }
 
-  const res = await fetch(path, {
+  const res = await fetchWithTimeout(path, {
     ...options,
     credentials: "include",
     headers,
@@ -90,7 +128,7 @@ export async function rawApiRequest<T>(
     headers.set("Idempotency-Key", options.idempotencyKey);
   }
 
-  const res = await fetch(path, {
+  const res = await fetchWithTimeout(path, {
     ...options,
     credentials: "include",
     headers,
