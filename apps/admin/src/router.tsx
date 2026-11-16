@@ -35,6 +35,7 @@ import {
 } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { apiRequest } from "./lib/api-client";
+import { queryClient } from "./lib/query";
 import { parseListSearch, type ListSearch } from "./lib/section-kit";
 import {
   AuthProvider,
@@ -43,6 +44,12 @@ import {
   type StaffPrincipalDto,
 } from "./components/shell";
 import { AuthScreen } from "./components/auth";
+import { TwoFactorSetup } from "./components/two-factor-setup";
+import {
+  AcceptInvitationPage,
+  ResetPasswordPage,
+  TwoFactorRecoveryPage,
+} from "./components/public-pages";
 import { DashboardSection } from "./sections/dashboard";
 import { Skeleton, TableSkeleton } from "./components/primitives";
 
@@ -51,8 +58,14 @@ import { Skeleton, TableSkeleton } from "./components/primitives";
  * demand; the dashboard (index) and auth stay in the initial bundle.
  * Sections export named components, so each lazy() maps to a default.
  */
+const GeneralSettingsSection = lazy(() =>
+  import("./sections/general-settings").then((m) => ({ default: m.GeneralSettingsSection })),
+);
 const AuditLogsSection = lazy(() =>
   import("./sections/audit-logs").then((m) => ({ default: m.AuditLogsSection })),
+);
+const AuthSettingsSection = lazy(() =>
+  import("./sections/auth-settings").then((m) => ({ default: m.AuthSettingsSection })),
 );
 const CustomersSection = lazy(() =>
   import("./sections/customers").then((m) => ({ default: m.CustomersSection })),
@@ -164,6 +177,15 @@ function RootComponent() {
     if (session.data) setPrincipal(session.data);
   }, [session.data]);
 
+  // Public pages (Auth + Email batch): /reset-password, /accept-invitation
+  // and /two-factor-recovery render OUTSIDE the principal gate — they are
+  // reached from email links by signed-out users. The pathname check runs
+  // before any principal logic, so the AuthScreen never flashes here.
+  const publicPath = window.location.pathname.replace(/\/+$/, "") || "/";
+  if (publicPath === "/reset-password") return <ResetPasswordPage />;
+  if (publicPath === "/accept-invitation") return <AcceptInvitationPage />;
+  if (publicPath === "/two-factor-recovery") return <TwoFactorRecoveryPage />;
+
   if (session.isPending && !principal) {
     return (
       <main className="sm-auth">
@@ -181,6 +203,30 @@ function RootComponent() {
 
   if (!principal) {
     return <AuthScreen onSignedIn={setPrincipal} />;
+  }
+
+  // Forced 2FA setup (Auth + Email batch): the policy requires 2FA for
+  // one of the user's roles and it is not set up yet. The session is
+  // restricted server-side (every admin endpoint returns 403
+  // TWO_FACTOR_SETUP_REQUIRED), so the app shell must not render — the
+  // wizard is the whole screen. On done, /me is reloaded; the flag
+  // clears and the shell renders.
+  if (principal.two_factor_setup_required) {
+    return (
+      <main className="sm-auth">
+        <section className="sm-auth-card" aria-labelledby="forced-2fa-heading">
+          <h1 id="forced-2fa-heading" className="sm-page-title">
+            Set up two-factor authentication
+          </h1>
+          <TwoFactorSetup
+            forced
+            onDone={() => {
+              void queryClient.invalidateQueries({ queryKey: ["admin", "me"] });
+            }}
+          />
+        </section>
+      </main>
+    );
   }
 
   return (
@@ -376,11 +422,13 @@ const settingsWebhookDetailRoute = makeSettingsDetailRoute(
   WebhookDetailSection,
 );
 const settingsTrackingRoute = makeSettingsListRoute("/tracking", TrackingConfigSection);
+const settingsAuthRoute = makeSettingsListRoute("/authentication", AuthSettingsSection);
+const settingsGeneralRoute = makeSettingsListRoute("/general", GeneralSettingsSection);
 
 const settingsIndexRoute = createRoute({
   getParentRoute: () => settingsRoute,
   path: "/",
-  component: () => <Navigate to="/settings/websites" />,
+  component: () => <Navigate to="/settings/general" />,
 });
 
 const routeTree = rootRoute.addChildren([
@@ -417,6 +465,8 @@ const routeTree = rootRoute.addChildren([
     settingsWebhooksRoute,
     settingsWebhookDetailRoute,
     settingsTrackingRoute,
+    settingsAuthRoute,
+    settingsGeneralRoute,
   ]),
 ]);
 

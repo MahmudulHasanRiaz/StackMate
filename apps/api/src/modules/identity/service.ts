@@ -6,8 +6,10 @@ import type * as schema from "../../../../../db/schema/index.ts";
 import {
   accounts as baAccounts,
   sessions as baSessions,
+  twoFactor as baTwoFactor,
   users as baUsers,
 } from "../../../../../db/schema/auth.ts";
+import { passwordResetTokens as baPasswordResetTokens } from "../../../../../db/schema/auth-config.ts";
 import { SEED_PERMISSIONS } from "../../../../../db/seeds/seed-reference.ts";
 import {
   AcceptStaffInvitationSchema,
@@ -25,6 +27,7 @@ import type {
 } from "../../platform/db/store.ts";
 import { AppError } from "../../shared/errors.ts";
 import { appendAuditLog } from "../audit/service.ts";
+import { resolveTwoFactorModeForRoles, type TwoFactorPolicyDoc } from "../auth-config/service.ts";
 import type { createBetterAuth } from "./better-auth.ts";
 
 /** A real Better Auth instance (see modules/identity/better-auth.ts). */
@@ -106,6 +109,18 @@ export interface StaffPrincipal {
   session_id: string;
   roles: string[];
   permissions: string[];
+  /** Whether TOTP is enabled for this user (the plugin's flag). */
+  two_factor_enabled: boolean;
+  /**
+   * True when the 2FA policy REQUIRES two-factor for one of the user's
+   * roles and the user has not enabled it yet. The session exists but
+   * is RESTRICTED: the admin API returns 403 TWO_FACTOR_SETUP_REQUIRED
+   * for every endpoint until setup completes (the /api/auth/* two-factor
+   * endpoints stay open, so setup itself works). Computed at sign-in
+   * AND on every session resolution, so a policy change or a completed
+   * setup takes effect without re-login.
+   */
+  two_factor_setup_required: boolean;
 }
 
 export function hashPasswordScrypt(password: string): string {
@@ -183,6 +198,7 @@ export async function bootstrapInitialSuperAdmin(
       name: input.name.trim(),
       email: emailNormalized,
       email_verified: true,
+      two_factor_enabled: false,
       password_hash: hashPasswordScrypt(input.password),
       status: "active",
       created_at: now,
@@ -262,6 +278,7 @@ export async function createStaffUserByAdmin(
       name: input.name.trim(),
       email: emailNormalized,
       email_verified: true,
+      two_factor_enabled: false,
       password_hash: hashPasswordScrypt(input.password),
       status: "active",
       created_at: now,
@@ -387,7 +404,35 @@ function buildPrincipal(state: DatabaseState, user: UserRecord): StaffPrincipal 
     session_id: "",
     roles,
     permissions,
+    two_factor_enabled: user.two_factor_enabled,
+    two_factor_setup_required: resolveTwoFactorSetupRequired(state, user, roles),
   };
+}
+
+/**
+ * 2FA setup requirement (Auth + Email batch, ADR-0008): required when
+ * the policy (global default + the user's roles, strictest wins) says
+ * `required` and the user has not enabled TOTP. The policy rows live in
+ * store.state (loaded read-only in the combined state query), so this
+ * is a pure function of already-loaded state — no extra query per
+ * request. The in-memory store has no policy rows, so it reads `off`.
+ */
+export function resolveTwoFactorSetupRequired(
+  state: DatabaseState,
+  user: UserRecord,
+  roleKeys: string[]
+): boolean {
+  if (user.two_factor_enabled) return false;
+  const doc: TwoFactorPolicyDoc = {
+    global: "off",
+    roles: {},
+  };
+  for (const row of state.two_factor_policy ?? []) {
+    if (row.mode !== "off" && row.mode !== "optional" && row.mode !== "required") continue;
+    if (row.scope === "global") doc.global = row.mode;
+    else doc.roles[row.scope] = row.mode;
+  }
+  return resolveTwoFactorModeForRoles(doc, roleKeys) === "required";
 }
 
 /**
@@ -422,6 +467,9 @@ export async function signInStaffSession(
   expires_at: string;
   principal: StaffPrincipal;
   set_cookie: string[];
+  /** True when the password was right but 2FA is on: no session exists
+   * yet — the caller must show the TOTP prompt instead of signing in. */
+  two_factor_redirect: boolean;
 }> {
   if (auth && storeSupportsBetterAuth(store)) {
     return signInStaffSessionViaBetterAuth(store, input, auth);
@@ -444,6 +492,7 @@ async function signInStaffSessionViaBetterAuth(
   expires_at: string;
   principal: StaffPrincipal;
   set_cookie: string[];
+  two_factor_redirect: boolean;
 }> {
   const emailNormalized = input.email.trim().toLowerCase();
   await reloadStateIfPossible(store);
@@ -510,7 +559,37 @@ async function signInStaffSessionViaBetterAuth(
   const body = (await response!.json()) as {
     token?: unknown;
     user?: { id?: unknown };
+    twoFactorRedirect?: unknown;
   };
+  // 2FA challenge (Auth + Email batch): the plugin deletes the session
+  // it just created and returns { twoFactorRedirect: true } with NO
+  // token. That is a successful password check, not an error — the
+  // caller shows the TOTP prompt. The set_cookie array carries the
+  // plugin's signed twoFactor verification cookie, which the browser
+  // must store for /two-factor/verify-totp.
+  if (body.twoFactorRedirect === true) {
+    const principal = buildPrincipal(store.state, user!);
+    await store
+      .withTransaction((state) => {
+        appendAuditLog(state, {
+          actor_type: "staff",
+          actor_user_id: user!.id,
+          action: "identity.auth.sign_in_two_factor",
+          resource_type: "session",
+          resource_id: emailNormalized,
+          outcome: "success",
+          request_id: input.requestId,
+        });
+      })
+      .catch(() => {});
+    return {
+      session_token: "",
+      expires_at: "",
+      principal,
+      set_cookie: setCookie,
+      two_factor_redirect: true,
+    };
+  }
   const token = typeof body.token === "string" ? body.token : "";
   if (!token) {
     throw new AppError("INTERNAL_ERROR", "Better Auth sign-in returned no session token.", 500);
@@ -533,7 +612,13 @@ async function signInStaffSessionViaBetterAuth(
       request_id: input.requestId,
     });
   });
-  return { session_token: token, expires_at: expiresAt, principal, set_cookie: setCookie };
+  return {
+    session_token: token,
+    expires_at: expiresAt,
+    principal,
+    set_cookie: setCookie,
+    two_factor_redirect: false,
+  };
 }
 
 /**
@@ -555,6 +640,7 @@ async function signInStaffSessionTestAdapter(
   expires_at: string;
   principal: StaffPrincipal;
   set_cookie: string[];
+  two_factor_redirect: boolean;
 }> {
   return store.withTransaction((state) => {
     const emailNormalized = input.email.trim().toLowerCase();
@@ -606,6 +692,7 @@ async function signInStaffSessionTestAdapter(
       expires_at: expiresAt,
       principal,
       set_cookie: [],
+      two_factor_redirect: false,
     };
   });
 }
@@ -1319,6 +1406,7 @@ export async function acceptStaffInvitation(
       name: input.name.trim(),
       email: invitation.email,
       email_verified: true,
+      two_factor_enabled: false,
       password_hash: hashPasswordScrypt(input.password),
       status: "active",
       created_at: now,
@@ -1347,4 +1435,245 @@ export async function acceptStaffInvitation(
     const { password_hash: _, ...safeUser } = user;
     return { user: safeUser, roles: invitation.role_keys };
   });
+}
+
+/**
+ * Password-reset / 2FA-recovery tokens (Auth + Email batch, ADR-0008).
+ *
+ * Only the SHA-256 hash is stored; the raw token is emailed once and
+ * never persisted. TTL 1 hour, single-use (used_at). `purpose` keeps
+ * the two flows apart: a password-reset token cannot disable 2FA, and
+ * a recovery token cannot reset a password — email compromise alone
+ * must never defeat 2FA. These functions need a Drizzle-backed store
+ * (the tokens table is not in store.state); on the in-memory test
+ * adapter they throw a 503-style INTERNAL_ERROR and the app.ts handlers
+ * fail closed (forgot → generic 200, reset/recover → 422).
+ */
+export type PasswordResetPurpose = "password_reset" | "two_factor_recovery";
+
+const RESET_TOKEN_TTL_MS = 60 * 60 * 1000;
+
+export function createPasswordResetToken(
+  store: StackMateDataStore,
+  userId: string,
+  purpose: PasswordResetPurpose
+): { rawToken: string; tokenHash: string; expiresAt: Date } {
+  const rawToken = randomOpaqueToken("smreset", 24);
+  return {
+    rawToken,
+    tokenHash: sha256Hex(rawToken),
+    expiresAt: new Date(Date.now() + RESET_TOKEN_TTL_MS),
+  };
+}
+
+export async function storePasswordResetToken(
+  store: StackMateDataStore,
+  userId: string,
+  purpose: PasswordResetPurpose,
+  tokenHash: string,
+  expiresAt: Date
+): Promise<void> {
+  const db = drizzleDbOf(store);
+  await db.insert(baPasswordResetTokens).values({
+    id: randomUUID(),
+    userId,
+    tokenHash,
+    purpose,
+    expiresAt,
+    createdAt: new Date(),
+  });
+}
+
+async function findValidResetToken(
+  store: StackMateDataStore,
+  rawToken: string,
+  purpose: PasswordResetPurpose
+): Promise<{ id: string; userId: string } | null> {
+  const db = drizzleDbOf(store);
+  const tokenHash = sha256Hex(rawToken);
+  const rows = await db
+    .select()
+    .from(baPasswordResetTokens)
+    .where(
+      and(
+        eq(baPasswordResetTokens.tokenHash, tokenHash),
+        eq(baPasswordResetTokens.purpose, purpose)
+      )
+    )
+    .limit(1);
+  const row = rows[0];
+  if (!row) return null;
+  if (row.usedAt) return null;
+  if (row.expiresAt.getTime() < Date.now()) return null;
+  return { id: row.id, userId: row.userId };
+}
+
+/**
+ * Reset a staff password with a forgot-password token. Sets BOTH the
+ * Better Auth credential hash and the staff scrypt hash (the lazy
+ * migration provisions from the scrypt hash when no credential exists
+ * yet), revokes ALL sessions for the user, and marks the token used —
+ * all in one Drizzle transaction for the credential side. The audit
+ * entry goes through the store afterwards (best-effort, like sign-in).
+ */
+export async function resetStaffPasswordByToken(
+  store: StackMateDataStore,
+  input: { token: string; newPassword: string; requestId: string }
+): Promise<{ user_id: string; email: string }> {
+  if (!input.newPassword || input.newPassword.length < 10) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "Password must be at least 10 characters.",
+      422
+    );
+  }
+  const found = await findValidResetToken(store, input.token, "password_reset").catch(
+    () => null
+  );
+  if (!found) {
+    throw new AppError("VALIDATION_ERROR", "Reset link is invalid or expired.", 422);
+  }
+  const db = drizzleDbOf(store);
+  const user = store.state.users.find((u) => u.id === found.userId);
+  if (!user || user.status !== "active") {
+    throw new AppError("VALIDATION_ERROR", "Reset link is invalid or expired.", 422);
+  }
+  const baHash = await hashPasswordBetterAuth(input.newPassword);
+  const scryptHash = hashPasswordScrypt(input.newPassword);
+  const now = new Date();
+  await db.transaction(async (tx) => {
+    // Better Auth credential (upsert — an old account may have none).
+    const existing = await tx
+      .select({ id: baAccounts.id })
+      .from(baAccounts)
+      .where(
+        and(eq(baAccounts.userId, user.id), eq(baAccounts.providerId, "credential"))
+      )
+      .limit(1);
+    if (existing[0]) {
+      await tx
+        .update(baAccounts)
+        .set({ password: baHash, updatedAt: now })
+        .where(eq(baAccounts.id, existing[0].id));
+    } else {
+      await tx.insert(baAccounts).values({
+        id: randomUUID(),
+        accountId: user.id,
+        providerId: "credential",
+        userId: user.id,
+        password: baHash,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    // Revoke every session (the reset is unauthenticated — no session
+    // survives it) and consume the token, atomically with the password.
+    await tx.delete(baSessions).where(eq(baSessions.userId, user.id));
+    await tx
+      .update(baPasswordResetTokens)
+      .set({ usedAt: now })
+      .where(eq(baPasswordResetTokens.id, found.id));
+  });
+  // Staff scrypt hash via the store (synced by userSpec) so the state
+  // copy stays consistent for the rest of this request's lifetime.
+  await store
+    .withTransaction((state) => {
+      const row = state.users.find((u) => u.id === user.id);
+      if (row) {
+        row.password_hash = scryptHash;
+        row.updated_at = now.toISOString();
+      }
+      appendAuditLog(state, {
+        actor_type: "staff",
+        actor_user_id: user.id,
+        action: "identity.auth.password_reset",
+        resource_type: "session",
+        resource_id: user.id,
+        outcome: "success",
+        request_id: input.requestId,
+        changes: { via: "forgot_password" },
+      });
+    })
+    .catch(() => {});
+  return { user_id: user.id, email: user.email };
+}
+
+/**
+ * Disable 2FA with a recovery token + the account password (Auth + Email
+ * batch). The password is verified through Better Auth's own sign-in
+ * (asResponse): a correct password for a 2FA-enabled user returns
+ * `{ twoFactorRedirect: true }` and NO session (the plugin deletes it),
+ * so there is nothing to revoke. A wrong password returns non-OK.
+ * A missing credential falls back to the stored scrypt hash (legacy
+ * accounts). Disabling writes `users.two_factor_enabled = false` and
+ * deletes the `two_factor` row via direct Drizzle — the store's userSpec
+ * does not sync that column (the plugin owns it) — and consumes the
+ * token. Password reset alone NEVER disables 2FA.
+ */
+export async function recoverTwoFactorByToken(
+  store: StackMateDataStore,
+  input: { token: string; password: string; requestId: string },
+  auth?: BetterAuthInstance | null
+): Promise<{ user_id: string; email: string }> {
+  const found = await findValidResetToken(store, input.token, "two_factor_recovery").catch(
+    () => null
+  );
+  if (!found) {
+    throw new AppError("VALIDATION_ERROR", "Recovery link is invalid or expired.", 422);
+  }
+  await reloadStateIfPossible(store);
+  const user = store.state.users.find((u) => u.id === found.userId);
+  if (!user || user.status !== "active") {
+    throw new AppError("VALIDATION_ERROR", "Recovery link is invalid or expired.", 422);
+  }
+  let passwordOk = false;
+  if (auth && storeSupportsBetterAuth(store)) {
+    const response = (await (
+      auth.api.signInEmail as unknown as (opts: unknown) => Promise<unknown>
+    )({
+      body: { email: user.email, password: input.password },
+      headers: new Headers(),
+      asResponse: true,
+    }).catch(() => null)) as Response | null;
+    if (response?.ok) {
+      passwordOk = true;
+      // No session to clean up: the 2FA plugin deletes the session it
+      // created and returns { twoFactorRedirect: true } instead.
+    }
+  }
+  if (!passwordOk) {
+    const hasCredential = await betterAuthCredentialExists(store, user.id).catch(() => true);
+    if (!hasCredential && verifyPasswordScrypt(input.password, user.password_hash)) {
+      passwordOk = true;
+    }
+  }
+  if (!passwordOk) {
+    throw new AppError("UNAUTHORIZED", "Invalid email or password.", 401);
+  }
+  const db = drizzleDbOf(store);
+  await db.transaction(async (tx) => {
+    await tx.update(baUsers).set({ twoFactorEnabled: false }).where(eq(baUsers.id, user.id));
+    await tx.delete(baTwoFactor).where(eq(baTwoFactor.userId, user.id));
+    await tx
+      .update(baPasswordResetTokens)
+      .set({ usedAt: new Date() })
+      .where(eq(baPasswordResetTokens.id, found.id));
+  });
+  await store
+    .withTransaction((state) => {
+      const row = state.users.find((u) => u.id === user.id);
+      if (row) row.two_factor_enabled = false;
+      appendAuditLog(state, {
+        actor_type: "staff",
+        actor_user_id: user.id,
+        action: "identity.auth.two_factor_recovered",
+        resource_type: "session",
+        resource_id: user.id,
+        outcome: "success",
+        request_id: input.requestId,
+        changes: { via: "email_recovery" },
+      });
+    })
+    .catch(() => {});
+  return { user_id: user.id, email: user.email };
 }

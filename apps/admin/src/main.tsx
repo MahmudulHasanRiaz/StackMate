@@ -6,6 +6,7 @@ import "@fontsource-variable/inter";
 import "./styles/tokens.css";
 import { queryClient } from "./lib/query";
 import { applyTheme, resolveThemeChoice } from "./lib/theme";
+import { GeneralConfigApplier } from "./lib/general-config";
 import { router } from "./router";
 import { ConfirmProvider, ToastProvider } from "./components/primitives";
 
@@ -20,6 +21,7 @@ if (rootEl) {
   createRoot(rootEl).render(
     <StrictMode>
       <QueryClientProvider client={queryClient}>
+        <GeneralConfigApplier />
         <ToastProvider>
           <ConfirmProvider>
             <RouterProvider router={router} />

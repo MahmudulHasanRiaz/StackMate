@@ -14,7 +14,7 @@
  * /settings (e.g. /settings/websites) with its own detail routes;
  * the settings index redirects to the first category.
  */
-import { BarChart3, CreditCard, Globe, Webhook, type LucideIcon } from "lucide-react";
+import { BarChart3, CreditCard, Globe, Settings2, ShieldCheck, Webhook, type LucideIcon } from "lucide-react";
 
 export interface SettingsCategory {
   slug: string;
@@ -29,6 +29,14 @@ export interface SettingsCategory {
 }
 
 export const SETTINGS_CATEGORIES: SettingsCategory[] = [
+  {
+    slug: "general",
+    label: "General",
+    icon: Settings2,
+    to: "/settings/general",
+    group: "General",
+    permission: "users.manage",
+  },
   {
     slug: "websites",
     label: "Websites & Credentials",
@@ -60,5 +68,13 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
     to: "/settings/payment-methods",
     group: "Commerce",
     permission: "payments.read",
+  },
+  {
+    slug: "authentication",
+    label: "Authentication",
+    icon: ShieldCheck,
+    to: "/settings/authentication",
+    group: "Security",
+    permission: "users.manage",
   },
 ];

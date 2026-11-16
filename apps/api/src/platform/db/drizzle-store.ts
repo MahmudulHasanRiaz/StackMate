@@ -191,6 +191,7 @@ import {
   type SubscriptionRecord,
   type TrackingConfigRecord,
   type TrackingEventRecord,
+  type TwoFactorPolicyRecord,
   type UploadedAssetRecord,
   type UserRecord,
   type WebhookEndpointRecord,
@@ -501,6 +502,8 @@ function groupBy<T>(items: T[], keyOf: (item: T) => string): Map<string, T[]> {
 interface StoreCapabilities {
   sequenceCounters: boolean;
   usersPasswordHash: boolean;
+  usersTwoFactorEnabled: boolean;
+  authEmailTables: boolean;
   productsDefaults: boolean;
   packagesCurrentVersion: boolean;
   packageVersionFeaturesUnit: boolean;
@@ -516,6 +519,8 @@ interface StoreCapabilities {
 const NO_MIGRATION_0002: StoreCapabilities = {
   sequenceCounters: false,
   usersPasswordHash: false,
+  usersTwoFactorEnabled: false,
+  authEmailTables: false,
   productsDefaults: false,
   packagesCurrentVersion: false,
   packageVersionFeaturesUnit: false,
@@ -585,6 +590,14 @@ const REQUIRED_TABLES: readonly string[] = [
   "outbox_events",
   "idempotency_records",
   "audit_logs",
+  // Migration 0007 (auth + email): the store fails closed at boot when
+  // these are missing — migrations deploy before code, so a store
+  // booting without them means the deploy did not apply 0007.
+  "two_factor",
+  "auth_oauth_providers",
+  "auth_two_factor_policy",
+  "smtp_settings",
+  "password_reset_tokens",
 ];
 
 /**
@@ -638,6 +651,8 @@ async function detectCapabilities(client: Client): Promise<StoreCapabilities> {
       WHERE table_schema = current_schema()
         AND ((table_name = 'sequence_counters')
           OR (table_name = 'users' AND column_name = 'password_hash')
+          OR (table_name = 'users' AND column_name = 'two_factor_enabled')
+          OR (table_name IN ('two_factor', 'auth_oauth_providers', 'auth_two_factor_policy', 'smtp_settings', 'password_reset_tokens'))
           OR (table_name = 'products' AND column_name IN ('default_activation_limit', 'offline_grace_hours'))
           OR (table_name = 'product_packages' AND column_name = 'current_version_id')
           OR (table_name = 'package_version_features' AND column_name = 'unit_snapshot')
@@ -658,6 +673,16 @@ async function detectCapabilities(client: Client): Promise<StoreCapabilities> {
   return {
     sequenceCounters: present.has("sequence_counters.counter_key"),
     usersPasswordHash: present.has("users.password_hash"),
+    usersTwoFactorEnabled: present.has("users.two_factor_enabled"),
+    // The auth-email tables are detected as a group: the combined load
+    // only selects auth_two_factor_policy when ALL of them exist
+    // (migration 0007 creates them together).
+    authEmailTables:
+      present.has("two_factor.id") &&
+      present.has("auth_oauth_providers.id") &&
+      present.has("auth_two_factor_policy.id") &&
+      present.has("smtp_settings.id") &&
+      present.has("password_reset_tokens.id"),
     productsDefaults:
       present.has("products.default_activation_limit") &&
       present.has("products.offline_grace_hours"),
@@ -1535,6 +1560,7 @@ function buildLoadStateQuery(caps: StoreCapabilities): string {
     { key: "users", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT u.id, u.name, u.email, u.email_verified, u.created_at, u.updated_at,
             sp.status AS staff_status
             ${caps.usersPasswordHash ? ", u.password_hash" : ""}
+            ${caps.usersTwoFactorEnabled ? ", u.two_factor_enabled" : ""}
        FROM users u
        LEFT JOIN staff_profiles sp ON sp.user_id = u.id` },
     { key: "sessions", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, token, user_id, ip_address, user_agent, expires_at, created_at
@@ -1704,6 +1730,13 @@ function buildLoadStateQuery(caps: StoreCapabilities): string {
             resource_type, resource_id, outcome, request_id, changes, created_at
        FROM audit_logs` },
   ];
+  // Migration 0007 (auth + email): the policy table only exists on a
+  // migrated database — selecting it unconditionally would break a
+  // pre-0007 store. Same conditional pattern as sequence_counters.
+  if (caps.authEmailTables) {
+    queries.push({ key: "twoFactorPolicy", orderBy: "t.scope ASC", sql: `SELECT id, scope, mode, updated_at
+       FROM auth_two_factor_policy` });
+  }
   if (caps.sequenceCounters) {
     queries.push({ key: "counters", orderBy: null, sql: `SELECT counter_key, counter_value FROM sequence_counters` });
   }
@@ -1756,6 +1789,7 @@ async function loadStateInternalImpl(
     // Users created by Better Auth have no password_hash (NULL) and cannot
     // use staff password sign-in; verifyPasswordScrypt fails closed on "".
     password_hash: caps.usersPasswordHash ? (str(row, "password_hash") ?? "") : "",
+    two_factor_enabled: bool(row, "two_factor_enabled"),
     status: asEnum(str(row, "staff_status"), ["active", "suspended"] as const, "active"),
     created_at: reqIso(row, "created_at", "users"),
     updated_at: reqIso(row, "updated_at", "users"),
@@ -2798,6 +2832,23 @@ async function loadStateInternalImpl(
     created_at: reqIso(row, "created_at", "audit_logs"),
   }));
 
+  // 2FA policy rows (migration 0007, read-only state — no SyncSpec, so
+  // persistStateDiff never writes them; the auth-config service writes
+  // via direct Drizzle). Empty on a pre-0007 database (the combined
+  // query only selects the table when caps.authEmailTables is true).
+  const two_factor_policy: TwoFactorPolicyRecord[] = caps.authEmailTables
+    ? loadRows(combined, "twoFactorPolicy").map((row) => ({
+        id: reqStr(row, "id", "auth_two_factor_policy"),
+        scope: reqStr(row, "scope", "auth_two_factor_policy"),
+        mode: asEnum(
+          str(row, "mode"),
+          ["off", "optional", "required"] as const,
+          "off"
+        ),
+        updated_at: reqIso(row, "updated_at", "auth_two_factor_policy"),
+      }))
+    : [];
+
   // -- Sequence counters --------------------------------------------------------
   const state: DatabaseState = {
     users,
@@ -2831,6 +2882,7 @@ async function loadStateInternalImpl(
     outbox_events,
     idempotency_records,
     audit_logs,
+    two_factor_policy,
     sequence_counters: { ...COUNTER_BASE_VALUES },
   };
 

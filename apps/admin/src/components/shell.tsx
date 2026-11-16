@@ -34,6 +34,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { useGeneralConfig } from "../lib/general-config";
 import {
   Link,
   Outlet,
@@ -69,6 +70,7 @@ import { ApiClientError, apiRequest } from "../lib/api-client";
 import { queryClient } from "../lib/query";
 import { humanizeType } from "../lib/resolve-names";
 import { applyTheme, resolveThemeChoice, type ThemeChoice } from "../lib/theme";
+import { TwoFactorDisable, TwoFactorSetup } from "./two-factor-setup";
 import {
   Alert,
   Avatar,
@@ -95,13 +97,21 @@ export interface StaffPrincipalDto {
   user: { id: string; name: string; email: string; status: string };
   roles: string[];
   permissions: string[];
+  two_factor_enabled: boolean;
+  two_factor_setup_required: boolean;
 }
 
 const AuthContext = createContext<{
   principal: StaffPrincipalDto;
   signOut: () => Promise<void>;
 }>({
-  principal: { user: { id: "", name: "", email: "", status: "" }, roles: [], permissions: [] },
+  principal: {
+    user: { id: "", name: "", email: "", status: "" },
+    roles: [],
+    permissions: [],
+    two_factor_enabled: false,
+    two_factor_setup_required: false,
+  },
   signOut: async () => undefined,
 });
 
@@ -199,12 +209,23 @@ export const NAVIGATION_GROUPS: ReadonlyArray<{
 /* collapses the main menu; the toggle can expand it again within      */
 /* Settings). Once the user toggles, the stored value wins in both     */
 /* shells.                                                              */
+/*                                                                      */
+/* PIN SURVIVES SETTINGS (owner decision 2026-11-16): the entry         */
+/* collapse is VISUAL ONLY — it must NOT overwrite the stored pin.     */
+/* `setCollapsedVisual` changes state without touching localStorage,    */
+/* so returning to Dashboard/MainShell reads the preserved value and    */
+/* restores the pinned state. Only an explicit toggle persists.         */
 /* ------------------------------------------------------------------ */
 const NAV_COLLAPSED_KEY = "sm-nav-collapsed";
 
 function useNavCollapsed(
   defaultCollapsed: boolean,
-): [boolean, () => void, (next: boolean) => void] {
+): [
+  boolean,
+  () => void,
+  (next: boolean) => void,
+  (next: boolean) => void,
+] {
   const [collapsed, setCollapsedState] = useState<boolean>(() => {
     try {
       const stored = window.localStorage.getItem(NAV_COLLAPSED_KEY);
@@ -223,6 +244,11 @@ function useNavCollapsed(
       /* storage unavailable — the state still applies for this load */
     }
   }, []);
+  // State-only collapse/expand: the visual state changes, the stored
+  // pin is untouched (pin-survives-Settings, owner 2026-11-16).
+  const setCollapsedVisual = useCallback((next: boolean) => {
+    setCollapsedState(next);
+  }, []);
   const toggle = useCallback(() => {
     setCollapsedState((prev) => {
       const next = !prev;
@@ -234,7 +260,7 @@ function useNavCollapsed(
       return next;
     });
   }, []);
-  return [collapsed, toggle, setCollapsed];
+  return [collapsed, toggle, setCollapsed, setCollapsedVisual];
 }
 
 /* ------------------------------------------------------------------ */
@@ -318,6 +344,9 @@ function MainNav({
   className?: string;
 }) {
   const { principal } = useAuth();
+  // General Settings (Auth + Email batch): the brand shows the configured
+  // App Name, falling back to StackMate before the config loads.
+  const { data: generalConfig } = useGeneralConfig();
   const can = (permission?: string) =>
     !permission || principal.permissions.includes(permission);
   // Groups with no visible item are dropped; a 1px divider separates the
@@ -398,7 +427,7 @@ function MainNav({
         <span className="sm-brand-mark">
           <Package size={20} strokeWidth={2} />
         </span>
-        <span className="sm-brand-name">StackMate</span>
+        <span className="sm-brand-name">{generalConfig?.app_name ?? "StackMate"}</span>
       </div>
       <nav className="sm-flex-1">
         {visibleGroups.map((group, i) => (
@@ -616,6 +645,8 @@ function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fieldError, setFieldError] = useState<string | undefined>(undefined);
+  // Two-factor setup/disable opens as a second dialog from here.
+  const [twoFactorMode, setTwoFactorMode] = useState<"none" | "setup" | "disable">("none");
 
   useEffect(() => {
     if (open) {
@@ -654,7 +685,13 @@ function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }
     }
   };
 
+  const refreshPrincipal = async () => {
+    await queryClient.invalidateQueries({ queryKey: ["admin", "me"] });
+    setTwoFactorMode("none");
+  };
+
   return (
+    <>
     <Dialog
       open={open}
       onClose={onClose}
@@ -698,8 +735,57 @@ function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }
         >
           <Input id="profile-roles" value={principal.roles.map((r) => humanizeType(r)).join(", ")} disabled />
         </Field>
+        <Field
+          label="Two-factor authentication"
+          hint={
+            principal.two_factor_enabled
+              ? "On — sign-in asks for a code from your authenticator app."
+              : "Off — sign-in needs only your password."
+          }
+        >
+          <div className="sm-inline-row">
+            <StatusBadge status={principal.two_factor_enabled ? "enabled" : "disabled"} />
+            {principal.two_factor_enabled ? (
+              <Button variant="secondary" onClick={() => setTwoFactorMode("disable")}>
+                Turn off
+              </Button>
+            ) : (
+              <Button variant="secondary" onClick={() => setTwoFactorMode("setup")}>
+                Set up
+              </Button>
+            )}
+          </div>
+        </Field>
       </div>
     </Dialog>
+    <Dialog
+      open={twoFactorMode !== "none"}
+      onClose={() => setTwoFactorMode("none")}
+      title={
+        twoFactorMode === "disable"
+          ? "Turn off two-factor authentication"
+          : "Set up two-factor authentication"
+      }
+    >
+      {twoFactorMode === "setup" ? (
+        <TwoFactorSetup
+          onDone={() => {
+            toast({ title: "Two-factor authentication is on" });
+            void refreshPrincipal();
+          }}
+          onCancel={() => setTwoFactorMode("none")}
+        />
+      ) : twoFactorMode === "disable" ? (
+        <TwoFactorDisable
+          onDone={() => {
+            toast({ title: "Two-factor authentication is off" });
+            void refreshPrincipal();
+          }}
+          onCancel={() => setTwoFactorMode("none")}
+        />
+      ) : null}
+    </Dialog>
+    </>
   );
 }
 
@@ -1014,7 +1100,8 @@ export function MainShell() {
 export function SettingsShell() {
   const { principal } = useAuth();
   const [navOpen, setNavOpen] = useState(false);
-  const [navCollapsed, toggleNavCollapsed, setNavCollapsed] = useNavCollapsed(true);
+  const [navCollapsed, toggleNavCollapsed, , setNavCollapsedVisual] =
+    useNavCollapsed(true);
   const pathname = useRouterState({ select: (s) => s.location.pathname });
 
   // Settings categories, permission-filtered like the main nav and
@@ -1056,8 +1143,11 @@ export function SettingsShell() {
   // 2026-11-15): the rail is collapsed on entry — never expanded.
   // The toggle can expand it again within Settings. Once per mount;
   // navigating between Settings categories does not re-collapse.
+  // VISUAL ONLY (pin survives Settings, owner 2026-11-16): the stored
+  // `sm-nav-collapsed` pin is NOT overwritten, so returning to the
+  // Dashboard restores the pinned state from storage.
   useEffect(() => {
-    setNavCollapsed(true);
+    setNavCollapsedVisual(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

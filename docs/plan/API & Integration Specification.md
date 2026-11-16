@@ -1202,6 +1202,63 @@ There is no `GET /api/v1/admin/webhooks/{webhookId}` — the admin detail page r
 
 Each row carries `resource_display_name` (additive, nullable): a human display name for the affected resource, resolved server-side from the live state — user/site/product/feature/package names, order/subscription/license/invoice numbers, webhook endpoint URL, invitation email, credential `key_id`, tracking group label (or `"{provider} pixel {pixel_id}"`), payment submission `"{amount} · Order {order_number}"`, package version `"v{N} · {package name}"`, package price `"{amount} [/ {n} {unit}] · {package} v{N}"`, session rows the actor's name (sign-in rows carry the attempted email or a 12-char session-token prefix, so the name is resolved from those when possible). `null` means the resource no longer exists (or the type has no display name) — the admin UI then falls back to its client-side name maps and, last, the short id; a bare raw id is never the primary display. No secrets are ever returned in a display name (only names, numbers, URLs, and public ids). The field is display-only: it changes no audit behaviour, no filtering, and no contract — clients that ignore it see the same rows as before.
 
+### 18.9 Admin API — authentication & email configuration (Auth + Email batch, 2026-11-16)
+
+All authentication configuration lives in the database and is edited from Settings → Authentication — never via env vars, never in code. A Settings save takes effect without a redeploy (the Better Auth instance is built per request from the current DB settings, with a 30s module-level cache keyed by connection string, invalidated on save; other isolates converge within the TTL). Every config change is audit-logged (`auth.oauth.updated`, `auth.two_factor_policy.updated`, `auth.smtp.updated`, `general.settings.updated`) with actor + what changed — never secret values.
+
+**Public config (no auth, no secrets, no user data):**
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/auth-config | `{ oauth_providers: string[] (enabled AND has a stored client id), email_configured: boolean }` — the login page renders OAuth buttons only for the listed providers. |
+| GET | /api/v1/general-config | `{ app_name, app_title, app_description, support_email, favicon_url }` — the SPA applies it at boot (brand, tab title, favicon, login-page tagline + support contact). |
+| GET | /api/v1/favicon | Streams the R2 favicon object (content type from storage, `Cache-Control: public, max-age=86400`); 404 when no favicon is uploaded. |
+
+**OAuth providers (Google, GitHub only — the only providers shipped; the same mechanism adds more, never invent one):**
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| PUT | /api/v1/admin/auth-config/oauth | `{ provider, enabled, client_id?, client_secret? }` (permission `users.manage`). Client secrets are encrypted at rest (AES-256-GCM, AAD `auth:oauth:<provider>`) and never returned — GET views expose only `has_client_secret`. Enabling requires a client id + secret (unless one is already stored); omitting the secret keeps the stored one. |
+| POST | /api/auth/sign-in/social | Better Auth social sign-in (exempt from the `sign-in/*` block). On callback, Better Auth links the OAuth account to an EXISTING staff user only when the provider email matches a staff record with a verified email (all three staff-provisioning paths set `email_verified: true`); `user.create.before` always returns false, so a non-staff Google/GitHub login can never mint a user, and `session.create.before` returns false for suspended staff, so OAuth can never mint a session for them. |
+
+**Two-factor authentication (TOTP, better-auth 1.7.23 `twoFactor` plugin; backup codes stored encrypted — the plugin default is plaintext JSON, so `storeBackupCodes: "encrypted"` is load-bearing):**
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/auth-config | Returns the full auth config view (OAuth providers, 2FA policy, SMTP) with secrets redacted (`users.manage`). |
+| PUT | /api/v1/admin/auth-config/two-factor-policy | `{ scope, mode }` — scope `global` (default for every role) or one of the 8 role keys; mode `off` / `optional` / `required` (default OFF). Resolution is strictest-wins across global + the user's roles (required > optional > off). |
+| POST | /api/auth/two-factor/enable | Password → `{ totpURI, backupCodes }` (raw plugin response, not the app envelope). |
+| POST | /api/auth/two-factor/verify-totp | `{ code }` — verifies setup or a sign-in challenge. **Rotates the session** (creates a new one, deletes the old, sets the cookie): clients must use the response's `set-cookie` afterwards. |
+| POST | /api/auth/two-factor/verify-backup-code | `{ code }` — one backup code, consumed on use. |
+| POST | /api/auth/two-factor/disable | Password → disables 2FA. Also rotates the session. |
+
+Sign-in with 2FA on: the plugin deletes the just-created session and returns `{ two_factor_redirect: true, twoFactorMethods: ["totp"] }` with a signed `twoFactor` verification cookie — no session exists until `/two-factor/verify-totp` succeeds. When the policy REQUIRES 2FA and the user has not set it up, the sign-in succeeds but the principal carries `two_factor_setup_required: true` and the session is restricted: every admin endpoint except `GET /api/v1/admin/me` returns 403 `TWO_FACTOR_SETUP_REQUIRED` until setup completes (the SPA shows the forced-setup wizard instead of the shell).
+
+**SMTP + email (provider-agnostic; the Worker sends via `cloudflare:sockets` — EHLO → STARTTLS → AUTH LOGIN → MAIL/RCPT/DATA/QUIT; port 25 is blocked by the platform, so the settings UI rejects it):**
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| PUT | /api/v1/admin/auth-config/smtp | `{ host, port, username?, password?, tls_mode (starttls\|ssl\|none), from_address, from_name?, enabled? }` (`users.manage`). Password encrypted at rest (AAD `auth:smtp`), never returned. Enabling requires host + from address. |
+| POST | /api/v1/admin/auth-config/smtp/test | Sends a real test mail **only to the admin's own address** (never an open relay); failure returns 502 with the real error, never a fake success. |
+| POST | /api/auth/forgot-password | `{ email }` — always the same generic 200 (never says whether the email exists or whether email is configured). A reset token is created + emailed only for an active user when SMTP is configured. |
+| POST | /api/auth/reset-password | `{ token, password }` — 422 for an invalid/expired/used token. Password ≥10 chars. **Reset alone never disables 2FA** (email compromise must not defeat 2FA). |
+| POST | /api/auth/two-factor/recover | `{ email }` — generic 200; a recovery token is emailed only when the user has 2FA on and SMTP is configured. |
+| POST | /api/auth/two-factor/recover/confirm | `{ token, password }` — verifies the password, disables 2FA (sets `users.two_factor_enabled=false`, deletes the `two_factor` row), consumes the token. |
+
+Reset/recovery tokens: raw token `smreset` + random bytes (emailed once, never persisted); only the SHA-256 hash is stored, 1-hour TTL, single-use, `purpose` separates `password_reset` from `two_factor_recovery` so a token from one flow cannot be used in the other. Staff invitations send the accept link by email when SMTP is configured (`email_sent` / `email_error` in the response); when it is not configured the current `token_once` return is kept and the UI says plainly that email is not configured.
+
+### 18.10 Admin API — general settings (Auth + Email batch, 2026-11-16)
+
+App-wide configuration from Settings → General (category group `General`, permission `users.manage`). Runtime-applied: a save reaches the UI immediately, no redeploy. Storage is the singleton `general_settings` row (migration 0008, id `default`); no seed writes it, so admin edits are never overwritten. Every value renders somewhere visible — no dead stored values.
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/general-settings | Full view: `app_name`, `app_title`, `app_description`, `support_email`, `favicon_url`, `favicon_content_type`, `favicon_byte_size`. |
+| PUT | /api/v1/admin/general-settings | Partial update (absent fields keep their value). Validation: name/title 1–120 chars, description ≤500 chars, support email empty or a valid address; `clear_favicon: true` removes the stored favicon. Audit-logged `general.settings.updated` (resource_type `general_settings`, resource_id `general-settings`). |
+| POST | /api/v1/admin/general-settings/favicon | `{ filename, content_type, content_base64 }` — PNG/ICO/SVG only, ≤256 KB, magic-byte checked (SVG must not contain `<script>`). Stored in R2 under the server-side key `branding/favicon-<sha256>.<ext>` (reusing the validated-private-object pattern); returns `{ favicon_url: "/api/v1/favicon", content_type, byte_size }`. Fail-closed in staging/production without a real R2 bucket (same rule as payment evidence). |
+
+Rendering: App Name → sidebar/topbar brand + document-title fallback; App Title → `document.title`; Favicon → the tab icon (via the public `/api/v1/favicon` endpoint); App Description → meta description + the login page tagline; Support Email → the login page contact for staff who cannot sign in (hidden when empty). Currency/timezone/language are NOT settings — BDT + Asia/Dhaka are fixed by spec and the admin is English-only.
+
 ---
 
 ## 19. Inbound Payment Provider Callbacks
