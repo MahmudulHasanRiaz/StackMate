@@ -36,6 +36,7 @@ import {
   buildPasswordResetEmail,
   buildTestEmail,
   buildTwoFactorRecoveryEmail,
+  isSmtpConfigured,
   sendStackMateEmail,
   type SendResult,
 } from "./modules/email/service.ts";
@@ -44,6 +45,7 @@ import {
   saveOAuthProvider,
   saveSmtpSettings,
   saveTwoFactorPolicy,
+  toAuthConfigView,
   type ResolvedAuthConfig,
 } from "./modules/auth-config/service.ts";
 import {
@@ -826,14 +828,28 @@ export function createStackMateApp(
             );
             if (user && maybeDrizzle.drizzleDb) {
               try {
-                const token = createPasswordResetToken(store, user.id, "password_reset");
-                await storePasswordResetToken(
-                  store, user.id, "password_reset", token.tokenHash, token.expiresAt
-                );
-                await sendEmailViaSmtp(store, env, {
-                  to: user.email,
-                  ...buildPasswordResetEmail(env.APP_URL, token.rawToken),
-                }).catch(() => {});
+                // Auth + Email fix batch: when SMTP is not configured
+                // no token is minted and nothing is sent — an
+                // undeliverable token row is never created. The
+                // generic 200 below is the only answer either way, so
+                // the endpoint still reveals nothing about the account.
+                const emailReady = await isSmtpConfigured(
+                  maybeDrizzle.drizzleDb as Parameters<typeof isSmtpConfigured>[0],
+                  {
+                    encryptionKey: env.ENCRYPTION_KEY_V1,
+                    keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION,
+                  }
+                ).catch(() => false);
+                if (emailReady) {
+                  const token = createPasswordResetToken(store, user.id, "password_reset");
+                  await storePasswordResetToken(
+                    store, user.id, "password_reset", token.tokenHash, token.expiresAt
+                  );
+                  await sendEmailViaSmtp(store, env, {
+                    to: user.email,
+                    ...buildPasswordResetEmail(env.APP_URL, token.rawToken),
+                  }).catch(() => {});
+                }
               } catch {
                 // Fail closed + silent: the generic 200 below is the only
                 // answer, whatever happened inside.
@@ -882,14 +898,26 @@ export function createStackMateApp(
             );
             if (user && user.two_factor_enabled && maybeDrizzle.drizzleDb) {
               try {
-                const token = createPasswordResetToken(store, user.id, "two_factor_recovery");
-                await storePasswordResetToken(
-                  store, user.id, "two_factor_recovery", token.tokenHash, token.expiresAt
-                );
-                await sendEmailViaSmtp(store, env, {
-                  to: user.email,
-                  ...buildTwoFactorRecoveryEmail(env.APP_URL, token.rawToken),
-                }).catch(() => {});
+                // Same rule as forgot-password (fix batch): no token is
+                // minted when SMTP is not configured. Generic 200 below
+                // either way.
+                const emailReady = await isSmtpConfigured(
+                  maybeDrizzle.drizzleDb as Parameters<typeof isSmtpConfigured>[0],
+                  {
+                    encryptionKey: env.ENCRYPTION_KEY_V1,
+                    keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION,
+                  }
+                ).catch(() => false);
+                if (emailReady) {
+                  const token = createPasswordResetToken(store, user.id, "two_factor_recovery");
+                  await storePasswordResetToken(
+                    store, user.id, "two_factor_recovery", token.tokenHash, token.expiresAt
+                  );
+                  await sendEmailViaSmtp(store, env, {
+                    to: user.email,
+                    ...buildTwoFactorRecoveryEmail(env.APP_URL, token.rawToken),
+                  }).catch(() => {});
+                }
               } catch {
                 // Generic 200 below, whatever happened inside.
               }
@@ -1888,7 +1916,12 @@ export function createStackMateApp(
         if (method === "GET" && pathname === "/api/v1/admin/auth-config") {
           assertStaffPermission(principal, "users.manage");
           const config = await loadAuthConfig(requireAuthConfigDb(), authConfigDeps);
-          return jsonResponse(config);
+          // Serialize through the view mapper: the raw ResolvedAuthConfig
+          // is camelCase (twoFactorPolicy — the page reads
+          // two_factor_policy and crashed) and carries the DECRYPTED
+          // OAuth secrets / SMTP password. The view is snake_case and
+          // secret-free, with defaults even when nothing is configured.
+          return jsonResponse(toAuthConfigView(config));
         }
         if (method === "PUT" && pathname === "/api/v1/admin/auth-config/oauth") {
           assertStaffPermission(principal, "users.manage");

@@ -54,6 +54,19 @@ function smtpConfigured(smtp: ResolvedSmtpSettings): boolean {
   return Boolean(smtp.enabled && smtp.host && smtp.from_address);
 }
 
+/**
+ * Whether email can be sent at all (Auth + Email fix batch): SMTP
+ * enabled with a host and a from address. Endpoints that mint a
+ * token only to email it (forgot password, 2FA recovery) check this
+ * FIRST and skip token creation when it is false — an undeliverable
+ * token row is never created. The response stays the generic 200
+ * either way, so nothing about the account is revealed.
+ */
+export async function isSmtpConfigured(db: Db, deps: AuthConfigDeps): Promise<boolean> {
+  const smtp = await loadSmtpSettings(db, deps).catch(() => null);
+  return smtp !== null && smtpConfigured(smtp);
+}
+
 export async function sendStackMateEmail(
   db: Db,
   deps: EmailDeps,

@@ -14,9 +14,34 @@
  * The token is the credential here, so an invalid/expired token is a
  * plain 422 with the message — nothing to enumerate.
  */
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { apiRequest, ApiClientError } from "../lib/api-client";
 import { Alert, Button, Field, Input } from "./primitives";
+
+/**
+ * Whether password/2FA-recovery email can be sent at all (Auth +
+ * Email fix batch): the public auth-config says so, and the email
+ * forms must say plainly when it is not configured instead of the
+ * fake "a link has been sent". null = not known yet — the forms keep
+ * their generic behaviour.
+ */
+function useEmailConfigured(): boolean | null {
+  const [configured, setConfigured] = useState<boolean | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    apiRequest<{ email_configured?: boolean }>("/api/v1/auth-config")
+      .then((res) => {
+        if (!cancelled && typeof res.email_configured === "boolean") {
+          setConfigured(res.email_configured);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return configured;
+}
 
 function tokenFromUrl(): string {
   return new URLSearchParams(window.location.search).get("token") ?? "";
@@ -231,6 +256,7 @@ export function TwoFactorRecoveryPage() {
   const [error, setError] = useState<string | null>(null);
   const [sent, setSent] = useState(false);
   const [done, setDone] = useState(false);
+  const emailConfigured = useEmailConfigured();
 
   const requestLink = async (e: FormEvent) => {
     e.preventDefault();
@@ -272,6 +298,11 @@ export function TwoFactorRecoveryPage() {
         {sent ? (
           <Alert variant="success" role="status">
             If 2FA is enabled for that email, a recovery link has been sent. Check your inbox.
+          </Alert>
+        ) : emailConfigured === false ? (
+          <Alert variant="warning" role="status">
+            Email is not configured for this admin yet, so recovery emails cannot be sent.
+            Contact your administrator to set up SMTP in Settings → Authentication → Email.
           </Alert>
         ) : (
           <form className="sm-auth-form" onSubmit={requestLink}>
