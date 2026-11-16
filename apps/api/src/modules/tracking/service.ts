@@ -216,7 +216,20 @@ export async function updateTrackingConfigByAdmin(
       resource_id: record.id,
       outcome: "success",
       request_id: config.requestId,
-      changes: { site_id: siteId, ...changed },
+      // Write-time identity (fix batch #2): `changed` holds only the
+      // fields that changed, so a bare status toggle would leave a row
+      // with no group identity at all — after the group is deleted the
+      // audit resolver could never name it. The identity keys sit
+      // alongside site_id (the created action already mixes identity
+      // into changes the same way); `...changed` still wins for any
+      // field it carries, with the same new values.
+      changes: {
+        site_id: siteId,
+        provider: record.provider,
+        label: record.label,
+        pixel_id: record.pixel_id,
+        ...changed,
+      },
     });
 
     return stripToken(record);

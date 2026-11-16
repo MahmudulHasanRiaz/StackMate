@@ -3202,6 +3202,10 @@ export function createStackMateApp(
               a.resource_type,
               a.resource_id,
               a.actor_user_id,
+              // Fix batch #2: the row's own changes carry the identity
+              // of deleted resources (webhook URL, pixel-group label,
+              // bulk feature keys) — the resolver falls back to them.
+              a.changes,
             ),
             created_date_display: formatDisplayDateTimeDDMMYYYY(
               a.created_at,

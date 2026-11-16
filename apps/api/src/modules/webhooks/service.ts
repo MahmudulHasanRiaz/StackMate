@@ -252,7 +252,11 @@ export async function testWebhookEndpointByAdmin(
       resource_id: endpoint.id,
       outcome: delivered ? "success" : "failed",
       request_id: config.requestId,
-      changes: { delivery_id: deliveryId, http_status: httpStatus, delivered },
+      // Write-time identity (fix batch #2): the tested row carries no
+      // URL otherwise, so after the endpoint is deleted the audit
+      // resolver could never name it. The URL is public identifier
+      // data, never a secret.
+      changes: { url: endpoint.url, delivery_id: deliveryId, http_status: httpStatus, delivered },
     });
   });
 

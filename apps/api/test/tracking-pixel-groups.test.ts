@@ -227,6 +227,15 @@ describe("Tracking pixel groups (in-memory)", () => {
       (a) => a.resource_id === id && a.action === "tracking.configuration.updated",
     );
     assert.ok(audit.length >= 2, `expected update audit rows, got ${audit.length}`);
+    // Write-time identity (fix batch #2): updated rows carry the
+    // group's label/pixel_id/provider in changes, so the audit
+    // resolver can name the group even after it is deleted. The
+    // rename row's label is the NEW label; pixel/provider are the
+    // group's identity, not changed fields.
+    const renamedRow = audit.find((a) => a.changes.label === "Primary pixel");
+    assert.ok(renamedRow, "expected the rename audit row to carry the label");
+    assert.equal(renamedRow.changes.pixel_id, "111111111111111");
+    assert.equal(renamedRow.changes.provider, "meta");
   });
 
   it("409s moving a group onto another group's (provider, pixel_id)", async () => {
