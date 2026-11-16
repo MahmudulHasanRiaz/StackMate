@@ -14,8 +14,10 @@
  *     solid WHITE bg + black text (dark) / solid BLACK bg + white text
  *     (light); SECONDARY transparent bg + 1px light-grey border + white
  *     text; ACCENT transparent bg + 1px GREEN border + green text (brand
- *     CTAs only). NO solid green fill anywhere. Danger renders as
- *     secondary (Neon shows no danger button — noted in the audit).
+ *     CTAs only). NO solid green fill anywhere. DANGER is the solid red
+ *     confirm action (Defect B, Neon images 91-94 — the earlier "Neon
+ *     shows no danger button" note was wrong; the owner produced the
+ *     "Delete the branch?" dialog as evidence).
  * (2) RADIUS STRUCTURE — no more 999px except true status pills (dot +
  *     word, "Default"/"Active"), status dots, and the spinner. Avatar,
  *     account button, and chips are SQUARE (6px). Max 8px, dialogs only.
@@ -47,11 +49,17 @@
 :root {
   color-scheme: dark;
 
-  /* Surfaces & text (Neon: pure-black page, panels ~#101010) */
+  /* Surfaces & text (Neon: pure-black page, panels ~#101010).
+     --sm-surface-raised (#141414, Neon image-99 Monitoring: the
+     elevated panel reads lighter than the #000 page; metric cards
+     stay #000) is for ELEVATED PANELS only — cards, menus, drawers,
+     facts. Chrome (topbar/sidebar/inputs) keeps --sm-surface. */
   --sm-bg: #000000;
   --sm-surface: #101010;
+  --sm-surface-raised: #141414;
   --sm-surface-muted: #1a1a1a;
   --sm-surface-hover: #222222;
+  --sm-dialog-bg: #0b0b0b;
   --sm-border: #232323;
   --sm-border-strong: #333333;
   --sm-text: #f5f5f5;
@@ -84,10 +92,15 @@
   --sm-tab-active: #00e599;
 
   /* Primary button — Neon (image-81 "Copy prompt"): solid WHITE bg +
-     BLACK text in dark mode. Never a green fill. */
+     BLACK text in dark mode. Never a green fill. Hover is a SOLID
+     fill, NOT a gradient (sampled row-by-row, images 95/c856b3f4
+     2026-11-16 — the rows are uniform): dark #44E48C + black text,
+     light #257B4C + white text. The ACCENT hover gradient is a
+     different rule and is untouched. */
   --sm-btn-primary-bg: #ffffff;
   --sm-btn-primary-text: #000000;
-  --sm-btn-primary-hover: #e5e5e5;
+  --sm-btn-primary-hover: #44e48c;
+  --sm-btn-primary-hover-text: #000000;
 
   /* Status */
   --sm-success-bg: rgba(0, 229, 153, 0.12);
@@ -100,6 +113,16 @@
   --sm-info-text: #7dd3fc;
   --sm-danger: #dc2626;
   --sm-danger-hover: #b91c1c;
+  /* Danger CONFIRM (Defect B, owner-decided, Neon images 91-94):
+     solid red fill #D42122 + white text, BOTH themes; hover brighter
+     red #EF2E29; Cancel hover green #3CC87B (border + text). Warning
+     box bg dark #6D1A1A (sampled image-92); light #FEF7F6 (sampled
+     image-91). --sm-danger/--sm-danger-hover above are the OLD text/
+     badge reds — untouched, still used by badges and menu items. */
+  --sm-danger-solid: #d42122;
+  --sm-danger-solid-hover: #ef2e29;
+  --sm-danger-cancel-hover: #3cc87b;
+  --sm-danger-warning-bg: #6d1a1a;
 
   /* Alert borders — Neon banners are bordered panels, not tinted fills */
   --sm-success-border: rgba(0, 229, 153, 0.35);
@@ -180,8 +203,10 @@
 
   --sm-bg: #f8fafc;
   --sm-surface: #ffffff;
+  --sm-surface-raised: #ffffff;
   --sm-surface-muted: #f1f5f9;
   --sm-surface-hover: #e2e8f0;
+  --sm-dialog-bg: #ffffff;
   --sm-border: #e2e8f0;
   --sm-border-strong: #cbd5e1;
   --sm-text: #0f172a;
@@ -203,10 +228,13 @@
   --sm-btn-secondary-bg: #ffffff;
   --sm-tab-active: #0f172a;
 
-  /* Primary button, light mode — the inversion: solid BLACK bg + WHITE text. */
+  /* Primary button, light mode — the inversion: solid BLACK bg + WHITE text.
+     Hover is a SOLID #257B4C fill + white text (sampled c856b3f4) — same
+     rule as dark, different sampled value. */
   --sm-btn-primary-bg: #0f172a;
   --sm-btn-primary-text: #ffffff;
-  --sm-btn-primary-hover: #1e293b;
+  --sm-btn-primary-hover: #257b4c;
+  --sm-btn-primary-hover-text: #ffffff;
 
   /* Light success (Neon image-86 "Onboard your agent" banner, image-87
      "Active" pill): pale green tint bg + #007f55 text + soft green
@@ -222,6 +250,11 @@
   --sm-info-text: #1e40af;
   --sm-danger: #b91c1c;
   --sm-danger-hover: #991b1b;
+  /* Danger CONFIRM solids — same sampled values in both themes. */
+  --sm-danger-solid: #d42122;
+  --sm-danger-solid-hover: #ef2e29;
+  --sm-danger-cancel-hover: #3cc87b;
+  --sm-danger-warning-bg: #fef7f6;
 
   /* Alert borders (light) */
   --sm-success-border: rgba(0, 229, 153, 0.35);
@@ -357,12 +390,23 @@ a:hover {
 .sm-tabular {
   font-variant-numeric: tabular-nums;
   text-align: right;
+  /* F9 (2026-11-16): table timestamps ("16/11/2026 04:11") must stay
+     on ONE line — the table scrolls horizontally instead of wrapping
+     a timestamp over two lines. All tabular values are short. */
+  white-space: nowrap;
 }
 /* Mono is reserved for IDs, hashes, keys, tokens, references only. */
 .sm-mono {
   font-family: var(--sm-font-mono);
   font-size: 13px;
   line-height: 16px;
+}
+/* Long unbroken values (URLs, tokens, challenge strings) must wrap
+   inside their cell instead of forcing the column — or the table —
+   wider (F1 Domains challenge, F3/F6 UUIDs). */
+.sm-break {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 /* ------------------------------------------------------------------ */
@@ -388,6 +432,10 @@ a:hover {
   top: 0;
   height: 100vh;
   overflow-y: auto;
+  /* Width + shadow animate for the hover-peek (desktop rail → overlay
+     panel). The transition tokens are zeroed by the global
+     prefers-reduced-motion block, so reduced motion gets no slide. */
+  transition: width var(--sm-transition-slow), box-shadow var(--sm-transition-slow);
 }
 .sm-sidebar-brand {
   display: flex;
@@ -518,6 +566,109 @@ a:hover {
 }
 
 /* ------------------------------------------------------------------ */
+/* Smart hover-peek (owner 2026-11-16): when the nav is a pinned 64px  */
+/* rail, hovering (or keyboard-focusing) it TEMPORARILY expands it to   */
+/* full 248px WITH labels as an OVERLAY over the main content. The grid  */
+/* template never changes, so the main content does not reflow or       */
+/* shift. Mouse-leave / blur collapses it back. Click still PINS via    */
+/* the persisted sm-nav-collapsed state — the toggle keeps reading      */
+/* "Expand menu" mid-peek because the persisted state is untouched.     */
+/* CSS-only (:hover / :focus-within), so no JS state can desync.        */
+/* Desktop ≥900px only; the <900px drawer is untouched (its own rules   */
+/* below). The width transition uses --sm-transition-slow, which the    */
+/* global prefers-reduced-motion block already zeroes — no slide there. */
+/* ------------------------------------------------------------------ */
+@media (min-width: 901px) {
+  /* Pin the content columns: when the rail peeks it becomes
+     position: fixed (out of flow) — without an explicit column the
+     remaining grid items auto-place into the 64px first track and the
+     whole content collapses into it (caught by the headless audit:
+     main x 64→0, w 1376→64 mid-peek). With the columns pinned, the
+     empty 64px track stays put and nothing moves. */
+  .sm-shell .sm-main {
+    grid-column: 2;
+  }
+  .sm-settings-shell .sm-settings-nav {
+    grid-column: 2;
+  }
+  .sm-settings-shell .sm-main {
+    grid-column: 3;
+  }
+  /* MainShell, pinned-collapsed. */
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:hover,
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:focus-within {
+    position: fixed;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: var(--sm-sidebar-width);
+    z-index: var(--sm-z-drawer);
+    box-shadow: var(--sm-shadow-md);
+  }
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:hover .sm-nav-btn,
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:focus-within .sm-nav-btn {
+    justify-content: flex-start;
+    padding: var(--sm-space-1-5) var(--sm-space-2-5);
+  }
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:hover .sm-nav-btn .sm-nav-label,
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:focus-within .sm-nav-btn .sm-nav-label,
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:hover .sm-sidebar-brand .sm-brand-name,
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:focus-within .sm-sidebar-brand .sm-brand-name {
+    display: inline;
+  }
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:hover .sm-nav-group-label,
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:focus-within .sm-nav-group-label {
+    display: block;
+  }
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:hover .sm-nav-collapse-btn,
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:focus-within .sm-nav-collapse-btn {
+    justify-content: flex-start;
+    padding: var(--sm-space-1-5) var(--sm-space-2-5);
+  }
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:hover .sm-nav-collapse-btn .sm-nav-label,
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:focus-within .sm-nav-collapse-btn .sm-nav-label {
+    display: inline;
+  }
+  /* SettingsShell main rail, pinned-collapsed. Same treatment; the rail
+     overlays the settings nav's left 184px while the grid stays
+     64px 240px 1fr, so nothing shifts. */
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:hover,
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:focus-within {
+    position: fixed;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: var(--sm-sidebar-width);
+    z-index: var(--sm-z-drawer);
+    box-shadow: var(--sm-shadow-md);
+  }
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:hover .sm-nav-btn,
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:focus-within .sm-nav-btn {
+    justify-content: flex-start;
+    padding: var(--sm-space-1-5) var(--sm-space-2-5);
+  }
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:hover .sm-nav-btn .sm-nav-label,
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:focus-within .sm-nav-btn .sm-nav-label,
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:hover .sm-sidebar-brand .sm-brand-name,
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:focus-within .sm-sidebar-brand .sm-brand-name {
+    display: inline;
+  }
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:hover .sm-nav-group-label,
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:focus-within .sm-nav-group-label {
+    display: block;
+  }
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:hover .sm-nav-collapse-btn,
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:focus-within .sm-nav-collapse-btn {
+    justify-content: flex-start;
+    padding: var(--sm-space-1-5) var(--sm-space-2-5);
+  }
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:hover .sm-nav-collapse-btn .sm-nav-label,
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:focus-within .sm-nav-collapse-btn .sm-nav-label {
+    display: inline;
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Dropdown menu (account menu primitive) + avatar + QuickNav          */
 /* ------------------------------------------------------------------ */
 .sm-menu-wrap {
@@ -530,7 +681,7 @@ a:hover {
 .sm-row-menu {
   min-width: 264px;
   max-width: calc(100vw - 32px);
-  background: var(--sm-surface);
+  background: var(--sm-surface-raised);
   border: 1px solid var(--sm-border);
   border-radius: var(--sm-radius-lg);
   box-shadow: var(--sm-shadow-md);
@@ -571,22 +722,27 @@ a:hover {
 /* Caret — a triangle in the tooltip bg color, centered on the (i)
    button (its `left` is set inline by the component). Points up when
    the panel sits below the button; when the panel flips above the
-   button (near the viewport bottom) it points down instead. */
+   button (near the viewport bottom) it points down instead.
+   MEASURED from Neon's image-95 (2026-11-16): the caret is 14px wide
+   x 7px tall in an 11px gap (4px clear above the tip, base touching
+   the box). The 5px caret in a 4px gap rendered but was invisible at
+   3x zoom — a 10x5 #141414 triangle on #000 has no readable shape;
+   the 14x7 bump reads as a silhouette, exactly as in Neon's shot. */
 .sm-info-caret {
   position: absolute;
-  top: -5px;
+  top: -7px;
   width: 0;
   height: 0;
-  border-left: 5px solid transparent;
-  border-right: 5px solid transparent;
-  border-bottom: 5px solid var(--sm-tooltip-bg);
+  border-left: 7px solid transparent;
+  border-right: 7px solid transparent;
+  border-bottom: 7px solid var(--sm-tooltip-bg);
   transform: translateX(-50%);
 }
 .sm-info-panel[data-flipped="true"] .sm-info-caret {
   top: auto;
-  bottom: -5px;
+  bottom: -7px;
   border-bottom: none;
-  border-top: 5px solid var(--sm-tooltip-bg);
+  border-top: 7px solid var(--sm-tooltip-bg);
 }
 /* Row-menu items are ~32px (Neon menu rows), tighter than the account menu. */
 .sm-row-menu .sm-menu-item {
@@ -815,11 +971,20 @@ a:hover {
   min-width: 0;
 }
 /* Hamburger: only on small screens (sidebar is a drawer <900px). */
-.sm-hamburger {
+/* The topbar hamburger opens the nav drawer on mobile only — on
+   desktop the sidebar's own "Collapse menu" does that job (owner
+   2026-11-16, image-103). It MUST be `.sm-btn.sm-hamburger` (0,2,0),
+   not bare `.sm-hamburger`: IconButton renders
+   `sm-btn sm-btn-ghost sm-btn-icon sm-hamburger`, and `.sm-btn`
+   (display: inline-flex, line ~1044) comes LATER than the bare rule
+   at the same specificity — so the bare rule lost the cascade and the
+   hamburger showed on desktop in every build. The 1518px headless
+   screenshot caught it; the earlier "stale cache" theory was wrong. */
+.sm-btn.sm-hamburger {
   display: none;
 }
 @media (max-width: 900px) {
-  .sm-hamburger {
+  .sm-btn.sm-hamburger {
     display: inline-flex;
   }
 }
@@ -866,7 +1031,7 @@ a:hover {
 /* Cards, tables, KPI                                                  */
 /* ------------------------------------------------------------------ */
 .sm-card {
-  background: var(--sm-surface);
+  background: var(--sm-surface-raised);
   border: 1px solid var(--sm-border);
   border-radius: var(--sm-radius-lg);
   box-shadow: var(--sm-shadow-sm);
@@ -878,22 +1043,32 @@ a:hover {
 }
 .sm-kpi-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: var(--sm-space-4);
   margin-bottom: var(--sm-space-6);
 }
+/* KPI cards are Neon's flat Monitoring cards (image-99): pure-black
+   bg + 1px border only, SQUARE corners (radius 0, owner 2026-11-16),
+   no shadow. Only KPI cards are square — every other card keeps the
+   4px token. */
 .sm-kpi-card {
-  background: var(--sm-surface);
+  background: var(--sm-bg);
   border: 1px solid var(--sm-border);
-  border-radius: var(--sm-radius-lg);
+  border-radius: 0;
   padding: var(--sm-space-3) var(--sm-space-4);
+}
+/* Light mode: the page is #f8fafc and Neon's light metric cards are
+   white (images 87/88) — the var(--sm-bg) above would make them
+   page-grey and border-only, so light KPI cards are white. */
+[data-theme="light"] .sm-kpi-card {
+  background: #ffffff;
 }
 .sm-kpi-card .sm-label {
   color: var(--sm-text-muted);
 }
 
 .sm-table-wrap {
-  background: var(--sm-surface);
+  background: var(--sm-surface-raised);
   border: 1px solid var(--sm-border);
   border-radius: var(--sm-radius-lg);
   overflow-x: auto;
@@ -979,8 +1154,8 @@ a:hover {
 /* Buttons — three variants + ghost text forms (Neon, images 80/81/82). */
 /* PRIMARY is white/black, SECONDARY is a grey outline, ACCENT is a    */
 /* green outline for brand CTAs only. One primary per page. NO solid   */
-/* green fill anywhere. DANGER renders as secondary (Neon shows no     */
-/* danger button — see audit C1).                                      */
+/* green fill anywhere. DANGER is the solid red confirm action (Defect */
+/* B — see .sm-btn-danger).                                            */
 /* ------------------------------------------------------------------ */
 .sm-btn {
   display: inline-flex;
@@ -1017,8 +1192,10 @@ a:hover {
   background: var(--sm-btn-primary-bg);
   color: var(--sm-btn-primary-text);
 }
-.sm-btn-primary:hover:not(:disabled) {
+.sm-btn-primary:hover:not(:disabled),
+.sm-btn-primary:focus-visible:not(:disabled) {
   background: var(--sm-btn-primary-hover);
+  color: var(--sm-btn-primary-hover-text);
 }
 .sm-btn-secondary {
   background: var(--sm-btn-secondary-bg);
@@ -1046,14 +1223,19 @@ a:hover {
   border-color: transparent;
 }
 .sm-btn-danger {
-  /* Owner spec: Neon shows no danger button — danger renders as the
-     secondary outline; the label ("Delete") is the only distinction. */
-  background: transparent;
-  border-color: var(--sm-border-strong);
-  color: var(--sm-text);
+  /* Defect B (owner-decided 2026-11-16, Neon images 91-94): the danger
+     action is a SOLID red fill #D42122 + white text in BOTH themes;
+     hover brightens to #EF2E29. The old "Neon shows no danger button"
+     reading was WRONG — the owner produced the "Delete the branch?"
+     dialog as evidence; the audit C1 note is corrected, not deleted. */
+  background: var(--sm-danger-solid);
+  border-color: transparent;
+  color: #ffffff;
 }
-.sm-btn-danger:hover:not(:disabled) {
-  background: var(--sm-surface-muted);
+.sm-btn-danger:hover:not(:disabled),
+.sm-btn-danger:focus-visible:not(:disabled) {
+  background: var(--sm-danger-solid-hover);
+  color: #ffffff;
 }
 .sm-btn-ghost {
   background: transparent;
@@ -1221,6 +1403,14 @@ a:hover {
   flex-wrap: wrap;
   margin-bottom: var(--sm-space-4);
 }
+/* F3 (2026-11-16): filter selects are width:100% by default, which
+   stacks the audit-log filters one per row. Inside a toolbar they
+   size to content so all four sit in ONE row (wrapping only when
+   the viewport forces it). */
+.sm-toolbar .sm-select {
+  width: auto;
+  max-width: 100%;
+}
 .sm-toolbar .sm-toolbar-spacer {
   flex: 1;
 }
@@ -1365,7 +1555,7 @@ a:hover {
   animation: sm-fade-in var(--sm-transition-slow);
 }
 .sm-dialog {
-  background: var(--sm-surface);
+  background: var(--sm-dialog-bg);
   border: 1px solid var(--sm-border);
   border-radius: var(--sm-radius-xl);
   box-shadow: var(--sm-shadow-lg);
@@ -1375,6 +1565,35 @@ a:hover {
   display: flex;
   flex-direction: column;
   animation: sm-dialog-in var(--sm-transition-slow);
+}
+/* Danger confirm dialog (Defect B, Neon images 91-94): the warning
+   box (red border, triangle icon, permanence text) sits above the
+   body; the Cancel button hovers GREEN (border + text #3CC87B) and
+   the Delete/Archive button is the solid red .sm-btn-danger. The
+   dialog bg itself is #0B0B0B dark / white light (sampled). */
+.sm-confirm-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sm-space-2-5);
+  background: var(--sm-danger-warning-bg);
+  border: 1px solid var(--sm-danger-solid);
+  border-radius: var(--sm-radius-md);
+  padding: var(--sm-space-3);
+  margin-bottom: var(--sm-space-4);
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--sm-text);
+}
+.sm-confirm-warning svg {
+  flex: none;
+  color: var(--sm-danger-solid);
+  margin-top: 1px;
+}
+.sm-dialog-danger .sm-dialog-footer .sm-btn-secondary:hover:not(:disabled),
+.sm-dialog-danger .sm-dialog-footer .sm-btn-secondary:focus-visible:not(:disabled) {
+  background: transparent;
+  border-color: var(--sm-danger-cancel-hover);
+  color: var(--sm-danger-cancel-hover);
 }
 .sm-dialog-md {
   max-width: 640px;
@@ -1427,7 +1646,7 @@ a:hover {
   bottom: 0;
   width: 420px;
   max-width: 90vw;
-  background: var(--sm-surface);
+  background: var(--sm-surface-raised);
   border-left: 1px solid var(--sm-border);
   box-shadow: var(--sm-shadow-lg);
   z-index: var(--sm-z-drawer);
@@ -1657,10 +1876,13 @@ a:hover {
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
   gap: var(--sm-space-4);
   padding: var(--sm-space-4);
-  background: var(--sm-surface);
+  background: var(--sm-surface-raised);
   border: 1px solid var(--sm-border);
   border-radius: var(--sm-radius-lg);
   margin-bottom: var(--sm-space-6);
+}
+.sm-fact {
+  min-width: 0;
 }
 .sm-fact .sm-fact-label {
   font-size: 13px;
@@ -1670,6 +1892,8 @@ a:hover {
 .sm-fact .sm-fact-value {
   font-size: 14px;
   font-weight: 600;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1684,6 +1908,14 @@ a:hover {
   grid-template-columns: minmax(0, 1fr) 300px;
   gap: var(--sm-space-5);
   align-items: start;
+}
+/* F1 (2026-11-16): the main column MUST shrink below its content's
+   min-content width, or a wide detail table (website Credentials /
+   Domains) forces the grid track wider than the viewport and clips
+   at the rail instead of scrolling inside its own .sm-table-wrap.
+   Grid items default to min-width: auto — this overrides it. */
+.sm-detail-main {
+  min-width: 0;
 }
 .sm-inspector {
   border-left: 1px solid var(--sm-border);
@@ -1853,6 +2085,43 @@ a:hover {
   .sm-shell .sm-sidebar-brand .sm-brand-name {
     display: none;
   }
+  /* Smart hover-peek applies here too: the rail is FORCED at this width
+     whatever the persisted state is, so the peek is scoped to the
+     media query, not to data-nav-collapsed. */
+  .sm-shell .sm-sidebar:hover,
+  .sm-shell .sm-sidebar:focus-within {
+    position: fixed;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: var(--sm-sidebar-width);
+    z-index: var(--sm-z-drawer);
+    box-shadow: var(--sm-shadow-md);
+  }
+  .sm-shell .sm-sidebar:hover .sm-nav-btn,
+  .sm-shell .sm-sidebar:focus-within .sm-nav-btn {
+    justify-content: flex-start;
+    padding: var(--sm-space-1-5) var(--sm-space-2-5);
+  }
+  .sm-shell .sm-sidebar:hover .sm-nav-btn .sm-nav-label,
+  .sm-shell .sm-sidebar:focus-within .sm-nav-btn .sm-nav-label,
+  .sm-shell .sm-sidebar:hover .sm-sidebar-brand .sm-brand-name,
+  .sm-shell .sm-sidebar:focus-within .sm-sidebar-brand .sm-brand-name {
+    display: inline;
+  }
+  .sm-shell .sm-sidebar:hover .sm-nav-group-label,
+  .sm-shell .sm-sidebar:focus-within .sm-nav-group-label {
+    display: block;
+  }
+  .sm-shell .sm-sidebar:hover .sm-nav-collapse-btn,
+  .sm-shell .sm-sidebar:focus-within .sm-nav-collapse-btn {
+    justify-content: flex-start;
+    padding: var(--sm-space-1-5) var(--sm-space-2-5);
+  }
+  .sm-shell .sm-sidebar:hover .sm-nav-collapse-btn .sm-nav-label,
+  .sm-shell .sm-sidebar:focus-within .sm-nav-collapse-btn .sm-nav-label {
+    display: inline;
+  }
 }
 
 @media (max-width: 900px) {
@@ -1955,10 +2224,25 @@ a:hover {
   }
   /* Topbar search collapses to an icon (owner 2026-11-16): the label
      and the ⌘K hint hide; the 40px icon button keeps the topbar
-     fitting at 390px (hamburger + search icon + avatar). */
+     fitting at 390px (hamburger + search icon + avatar). It must read
+     as a clean SQUARE icon button like the hamburger — NOT as a
+     broken empty input field: no input border, no surface fill, 40x40
+     like .sm-btn-icon (owner 2026-11-16, image-102). */
   .sm-quicknav-btn {
-    width: auto;
-    min-width: 0;
+    width: 40px;
+    min-width: 40px;
+    height: 40px;
+    padding: 0;
+    border-color: transparent;
+    background: transparent;
+    justify-content: center;
+  }
+  /* The desktop :hover rule re-adds a visible border (higher
+     specificity) — the mobile icon button keeps the ghost hover
+     (surface fill, no border), exactly like the hamburger. */
+  .sm-quicknav-btn:hover {
+    border-color: transparent;
+    background: var(--sm-surface-hover);
   }
   .sm-quicknav-btn .sm-quicknav-label,
   .sm-quicknav-btn .sm-kbd {

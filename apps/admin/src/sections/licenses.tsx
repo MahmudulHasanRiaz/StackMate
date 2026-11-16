@@ -349,7 +349,7 @@ function ValidateKeyCard() {
 
   return (
     <Card title="Validate a key">
-      <form onSubmit={(e) => void onSubmit(e)} noValidate>
+      <form onSubmit={(e) => void onSubmit(e)} noValidate autoComplete="off">
         <Field
           label="License key"
           required
@@ -357,10 +357,16 @@ function ValidateKeyCard() {
           {...(fieldErrors.licenseKey ? { error: fieldErrors.licenseKey } : {})}
           htmlFor="validate-license-key"
         >
+          {/* F4 (2026-11-16): Chrome ignores autoComplete="off" on a
+              password field and autofills saved credentials (masked key
+              + email in Installation ID on first load). "new-password"
+              tells it this is not a login form; the text fields carry
+              non-autofillable names so no saved identity maps onto them. */}
           <Input
             id="validate-license-key"
+            name="validate-license-key"
             type="password"
-            autoComplete="off"
+            autoComplete="new-password"
             placeholder="Paste the full license key"
             value={licenseKey}
             onChange={(e) => setLicenseKey(e.target.value)}
@@ -376,6 +382,7 @@ function ValidateKeyCard() {
         >
           <Input
             id="validate-product-code"
+            name="validate-product-code"
             type="text"
             autoComplete="off"
             placeholder="e.g. STACKMATE-PRO"
@@ -393,6 +400,7 @@ function ValidateKeyCard() {
         >
           <Input
             id="validate-installation-id"
+            name="validate-installation-id"
             type="text"
             autoComplete="off"
             placeholder="Installation ID from the customer site"
@@ -481,6 +489,10 @@ export function LicenseDetailSection({ id }: { id: string }) {
       body: bodies[action],
       confirmLabel: sentenceCase(action),
       danger: action === "revoke",
+      warning:
+        action === "revoke"
+          ? "The license status becomes Revoked, the key stops validating permanently, and every active activation on this license is deactivated."
+          : undefined,
     });
     if (ok) lifecycle.mutate(action);
   };
@@ -491,6 +503,7 @@ export function LicenseDetailSection({ id }: { id: string }) {
       body: `This deactivates the ${activation.environment} installation at ${activation.domain_normalized ?? "unknown domain"}. The seat is freed for another installation. The installation stops validating.`,
       confirmLabel: "Deactivate",
       danger: true,
+      warning: `This deactivates the ${activation.environment} installation at ${activation.domain_normalized ?? "unknown domain"}.`,
     });
     if (ok) deactivate.mutate(activation.id);
   };
@@ -654,7 +667,7 @@ export function LicenseDetailSection({ id }: { id: string }) {
                         <DateTimeCell value={a.last_seen_at} />
                       </td>
                       <td>
-                        <DateCell value={a.deactivated_at} />
+                        <DateTimeCell value={a.deactivated_at} />
                       </td>
                       <td>
                         {a.status === "active" ? (

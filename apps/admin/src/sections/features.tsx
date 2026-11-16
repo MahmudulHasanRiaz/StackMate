@@ -46,6 +46,7 @@ import {
   Checkbox,
   CopyButton,
   DateCell,
+  DateTimeCell,
   Dialog,
   EmptyState,
   ErrorState,
@@ -872,6 +873,7 @@ export function FeaturesSection() {
       ),
       confirmLabel: "Archive",
       danger: true,
+      warning: `“${feature.name}” (${feature.feature_key}) will move to Archived.`,
     });
     if (ok) archive.mutate(feature);
   }
@@ -945,7 +947,7 @@ export function FeaturesSection() {
     {
       accessorKey: "created_at",
       header: "Created",
-      cell: ({ row }) => <DateCell value={row.original.created_at} />,
+      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
     },
     {
       id: "actions",
@@ -1011,10 +1013,10 @@ export function FeaturesSection() {
         </div>
       ) : !selectedProduct ? (
         <Card title="Choose a product">
-          <p className="sm-hint">
-            Features live under a product — pick one to see its features.
-          </p>
-          <div className="sm-table-wrap">
+          {/* F7 (2026-11-16): no description paragraph here — it repeated
+              the header help text ("Features live under a product — pick
+              one"). The (i) button beside the title already carries it. */}
+          <div className="sm-table-flat">
             <table className="sm-table">
               <thead>
                 <tr>
@@ -1392,6 +1394,7 @@ export function FeatureDetailSection({ id }: { id: string }) {
       ),
       confirmLabel: "Archive",
       danger: true,
+      warning: `“${feature.name}” (${feature.feature_key}) will move to Archived.`,
     });
     if (ok) archive.mutate();
   }

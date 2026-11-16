@@ -383,6 +383,7 @@ export function StaffSection() {
       ),
       confirmLabel: "Revoke",
       danger: true,
+      warning: `The invitation for ${inv.name} (${inv.email}) stops working immediately.`,
     });
     if (ok) revokeInvitation.mutate({ id: inv.id, name: inv.name, email: inv.email });
   };
@@ -450,7 +451,7 @@ export function StaffSection() {
         accessorKey: "created_at",
         header: "Created",
         cell: ({ row }: { row: { original: StaffUser } }) => (
-          <DateCell value={row.original.created_at} />
+          <DateTimeCell value={row.original.created_at} />
         ),
       },
       {
@@ -505,7 +506,7 @@ export function StaffSection() {
         accessorKey: "created_at",
         header: "Created",
         cell: ({ row }: { row: { original: Role } }) => (
-          <DateCell value={row.original.created_at} />
+          <DateTimeCell value={row.original.created_at} />
         ),
       },
       {
@@ -559,7 +560,7 @@ export function StaffSection() {
         accessorKey: "created_at",
         header: "Created",
         cell: ({ row }: { row: { original: StaffInvitation } }) => (
-          <DateCell value={row.original.created_at} />
+          <DateTimeCell value={row.original.created_at} />
         ),
       },
       {

@@ -103,7 +103,11 @@ export function DashboardSection() {
             </div>
           </div>
           <div className="sm-kpi-card">
-            <div className="sm-label">Expired / revoked licenses</div>
+            {/* F8 (2026-11-16): "Expired / revoked licenses" wrapped to two
+                lines while the other seven labels fit one — dropped the
+                spaces around the slash (same words, same meaning) and the
+                grid min rose 190px -> 200px. Font size untouched. */}
+            <div className="sm-label">Expired/revoked licenses</div>
             <div className="sm-kpi-value" style={{ marginTop: 6 }}>
               {query.data.expired_or_revoked_licenses}
             </div>

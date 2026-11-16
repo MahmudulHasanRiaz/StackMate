@@ -166,7 +166,7 @@ export function InfoButton({ text }: { text: string }) {
       10,
       Math.min(rect.left + rect.width / 2 - left, width - 10),
     );
-    setPos({ top: rect.bottom + 4, left, width, caretLeft, flipped: false });
+    setPos({ top: rect.bottom + 11, left, width, caretLeft, flipped: false });
     setOpen(true);
   }, []);
 
@@ -179,7 +179,7 @@ export function InfoButton({ text }: { text: string }) {
     const height = panel.getBoundingClientRect().height;
     if (pos.top + height > window.innerHeight - 8) {
       setPos({
-        top: Math.max(8, rect.top - height - 4),
+        top: Math.max(8, rect.top - height - 11),
         left: pos.left,
         width: pos.width,
         caretLeft: pos.caretLeft,
@@ -1132,6 +1132,7 @@ export function Dialog({
   children,
   footer,
   size = "sm",
+  className,
 }: {
   open: boolean;
   onClose: () => void;
@@ -1139,6 +1140,7 @@ export function Dialog({
   children: ReactNode;
   footer?: ReactNode;
   size?: "sm" | "md";
+  className?: string | undefined;
 }) {
   const ref = useFocusTrap(open, onClose);
   if (!open) return null;
@@ -1151,7 +1153,7 @@ export function Dialog({
       }}
     >
       <div
-        className={`sm-dialog${size === "md" ? " sm-dialog-md" : ""}`}
+        className={`sm-dialog${size === "md" ? " sm-dialog-md" : ""}${className ? ` ${className}` : ""}`}
         role="dialog"
         aria-modal="true"
         aria-label={title}
@@ -1211,6 +1213,12 @@ interface ConfirmRequest {
   body: ReactNode;
   confirmLabel?: string;
   danger?: boolean;
+  /* Headline permanence sentence for the danger warning box — the
+     body's first consequence sentence, naming the item (Defect B,
+     Neon images 91-94: "This will permanently delete the branch
+     staging. Are you sure you want to proceed?"). Falls back to a
+     generic line when a danger caller omits it. */
+  warning?: string | undefined;
   resolve: (value: boolean) => void;
 }
 
@@ -1244,6 +1252,7 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
           open
           onClose={() => close(false)}
           title={request.title}
+          className={request.danger ? "sm-dialog-danger" : undefined}
           footer={
             <>
               <Button variant="secondary" onClick={() => close(false)}>
@@ -1258,6 +1267,12 @@ export function ConfirmProvider({ children }: { children: ReactNode }) {
             </>
           }
         >
+          {request.danger ? (
+            <div className="sm-confirm-warning" role="alert">
+              <AlertTriangle size={16} strokeWidth={2} />
+              <span>{request.warning ?? "This action cannot be undone."}</span>
+            </div>
+          ) : null}
           {request.body}
         </Dialog>
       ) : null}
@@ -1410,8 +1425,10 @@ export function Skeleton({ height = 16, width }: { height?: number; width?: stri
 }
 
 export function TableSkeleton({ rows = 5 }: { rows?: number }) {
+  /* Flat like the list tables (review 2026-11-16: skeletons rendered
+     inside a bordered card) — no .sm-table-wrap panel. */
   return (
-    <div className="sm-table-wrap" aria-label="Loading">
+    <div className="sm-table-flat" aria-label="Loading">
       <div className="sm-table-skeleton">
         {Array.from({ length: rows }).map((_, i) => (
           <Skeleton key={i} height={20} />
