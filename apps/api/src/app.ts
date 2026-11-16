@@ -31,21 +31,47 @@ import {
 import { verifyCheckoutAccessToken } from "./platform/crypto/index.ts";
 import { StackMateDataStore } from "./platform/db/store.ts";
 import { createBetterAuth } from "./modules/identity/better-auth.ts";
+import {
+  buildInvitationEmail,
+  buildPasswordResetEmail,
+  buildTestEmail,
+  buildTwoFactorRecoveryEmail,
+  sendStackMateEmail,
+  type SendResult,
+} from "./modules/email/service.ts";
+import {
+  loadAuthConfig,
+  saveOAuthProvider,
+  saveSmtpSettings,
+  saveTwoFactorPolicy,
+  type ResolvedAuthConfig,
+} from "./modules/auth-config/service.ts";
+import {
+  DEFAULT_GENERAL_SETTINGS,
+  loadGeneralSettings,
+  publicViewOf,
+  saveGeneralSettings,
+  storeFavicon,
+} from "./modules/general-settings/service.ts";
 import { AppError } from "./shared/errors.ts";
 import {
   acceptStaffInvitation,
   assertStaffPermission,
   bootstrapInitialSuperAdmin,
   changeStaffPassword,
+  createPasswordResetToken,
   createRoleByAdmin,
   createStaffInvitationByAdmin,
   createStaffUserByAdmin,
   ensureBetterAuthIdentity,
   isSuperAdminProvisioned,
+  recoverTwoFactorByToken,
+  resetStaffPasswordByToken,
   resolveStaffPrincipal,
   revokeStaffInvitationByAdmin,
   signInStaffSession,
   signOutStaffSession,
+  storePasswordResetToken,
   storeSupportsBetterAuth,
   type StaffPrincipal,
   updateRoleByAdmin,
@@ -136,7 +162,7 @@ import {
   replayOutboxEventByAdmin,
   testWebhookEndpointByAdmin,
 } from "./modules/webhooks/service.ts";
-import { resolveAuditResourceDisplayName } from "./modules/audit/service.ts";
+import { appendAuditLog, resolveAuditResourceDisplayName } from "./modules/audit/service.ts";
 
 interface RouteMatch {
   params: Record<string, string>;
@@ -326,10 +352,23 @@ export function createStackMateApp(
    */
   async function getBetterAuth(env: StackMateBindings, store: StackMateDataStore) {
     const maybeDrizzle = store as unknown as { drizzleDb?: unknown };
+    // DB-driven auth config (ADR-0008): the Better Auth instance is
+    // built per request from the current Settings (OAuth providers +
+    // 2FA plugin), cached 30s and invalidated on Settings save. A
+    // Settings change takes effect without a redeploy.
+    let authConfig: ResolvedAuthConfig | undefined;
+    if (maybeDrizzle.drizzleDb) {
+      authConfig = await loadAuthConfig(
+        maybeDrizzle.drizzleDb as Parameters<typeof loadAuthConfig>[0],
+        { encryptionKey: env.ENCRYPTION_KEY_V1, keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION },
+        env.HYPERDRIVE_NO_CACHE.connectionString
+      ).catch(() => undefined);
+    }
     if (maybeDrizzle.drizzleDb) {
       return createBetterAuth(
         env,
-        maybeDrizzle.drizzleDb as Parameters<typeof createBetterAuth>[1]
+        maybeDrizzle.drizzleDb as Parameters<typeof createBetterAuth>[1],
+        authConfig
       );
     }
     const { Client } = await import("pg");
@@ -337,7 +376,40 @@ export function createStackMateApp(
     const client = new Client({
       connectionString: env.HYPERDRIVE_NO_CACHE.connectionString,
     });
-    return createBetterAuth(env, drizzle(client));
+    return createBetterAuth(env, drizzle(client), authConfig);
+  }
+
+  /**
+   * Send one StackMate email (forgot password, invitation, 2FA
+   * recovery, SMTP test). Adapts the store/env to the email service's
+   * (db, deps, message) shape. On a store without a database there is
+   * no SMTP config — returns the honest not-configured result instead
+   * of throwing, so callers can keep the token_once / generic-200
+   * paths. Never throws for a delivery failure.
+   */
+  async function sendEmailViaSmtp(
+    store: StackMateDataStore,
+    env: StackMateBindings,
+    message: { to: string; subject: string; text: string; html?: string }
+  ): Promise<SendResult> {
+    const db = (store as unknown as { drizzleDb?: unknown }).drizzleDb as
+      | Parameters<typeof sendStackMateEmail>[0]
+      | undefined;
+    if (!db) {
+      return {
+        sent: false,
+        error: "Email is not configured. Set up SMTP in Settings → Authentication → Email.",
+      };
+    }
+    return sendStackMateEmail(
+      db,
+      {
+        encryptionKey: env.ENCRYPTION_KEY_V1,
+        keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION,
+        appUrl: env.APP_URL,
+      },
+      message
+    );
   }
 
   async function handleRequest(
@@ -446,6 +518,73 @@ export function createStackMateApp(
         return jsonResponse({ setup_required: !provisioned });
       }
 
+      // Public login-page config (Auth + Email batch, ADR-0008): which
+      // OAuth providers the login page may show, and whether email
+      // (forgot password / invitations / 2FA recovery) is configured.
+      // No secrets, no user data — a provider is listed only when it is
+      // enabled AND has a stored client id; the secret never leaves the
+      // server. Same source of truth as the Better Auth instance.
+      if (method === "GET" && pathname === "/api/v1/auth-config") {
+        const maybeDrizzle = store as unknown as { drizzleDb?: unknown };
+        if (!maybeDrizzle.drizzleDb) {
+          return jsonResponse({ oauth_providers: [], email_configured: false });
+        }
+        const config = await loadAuthConfig(
+          maybeDrizzle.drizzleDb as Parameters<typeof loadAuthConfig>[0],
+          { encryptionKey: env.ENCRYPTION_KEY_V1, keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION },
+          env.HYPERDRIVE_NO_CACHE.connectionString
+        ).catch(() => undefined);
+        return jsonResponse({
+          oauth_providers: (config?.oauth ?? [])
+            .filter((p) => p.enabled && p.clientId)
+            .map((p) => p.provider),
+          email_configured: config?.smtp.enabled ?? false,
+        });
+      }
+
+      // Public general config (Auth + Email batch, General Settings):
+      // the app-wide settings the SPA applies at boot (brand, tab title,
+      // favicon, login-page tagline + support contact). No secrets, no
+      // user data — the same public-config pattern as /api/v1/auth-config.
+      if (method === "GET" && pathname === "/api/v1/general-config") {
+        const maybeDrizzle = store as unknown as { drizzleDb?: unknown };
+        if (!maybeDrizzle.drizzleDb) {
+          return jsonResponse({ ...DEFAULT_GENERAL_SETTINGS });
+        }
+        const row = await loadGeneralSettings(
+          maybeDrizzle.drizzleDb as Parameters<typeof loadGeneralSettings>[0]
+        ).catch(() => null);
+        return jsonResponse(publicViewOf(row));
+      }
+
+      // Public favicon: streams the R2 object the General Settings
+      // favicon points at. 404 when no favicon is uploaded (the SPA then
+      // keeps its built-in default). Cacheable — the object key contains
+      // the content hash, so a re-upload changes the key.
+      if (method === "GET" && pathname === "/api/v1/favicon") {
+        const maybeDrizzle = store as unknown as { drizzleDb?: unknown };
+        if (!maybeDrizzle.drizzleDb) throw new AppError("NOT_FOUND", "No favicon is configured.", 404);
+        const row = await loadGeneralSettings(
+          maybeDrizzle.drizzleDb as Parameters<typeof loadGeneralSettings>[0]
+        ).catch(() => null);
+        if (!row?.faviconObjectKey) {
+          throw new AppError("NOT_FOUND", "No favicon is configured.", 404);
+        }
+        const bucket = (store as unknown as { r2Bucket?: unknown }).r2Bucket as
+          | { get: (key: string) => Promise<{ arrayBuffer: () => Promise<ArrayBuffer>; httpMetadata?: { contentType?: string } } | null> }
+          | undefined;
+        const obj = await bucket?.get(row.faviconObjectKey);
+        if (!obj) throw new AppError("NOT_FOUND", "Favicon not found.", 404);
+        const bytes = await obj.arrayBuffer();
+        return new Response(bytes, {
+          status: 200,
+          headers: {
+            "Content-Type": row.faviconContentType ?? "image/png",
+            "Cache-Control": "public, max-age=86400",
+          },
+        });
+      }
+
       // 2. Authentication Routes (/api/auth/*)
       if (pathname.startsWith("/api/auth")) {
         checkRateLimit(`auth:${clientIp}`, 60);
@@ -537,6 +676,20 @@ export function createStackMateApp(
             expires_at: signedIn.expires_at,
             principal: signedIn.principal,
           };
+          // 2FA challenge (Auth + Email batch): the password was right
+          // but TOTP is on — no session exists yet, so the SPA shows the
+          // TOTP prompt instead of signing in. The plugin's verification
+          // cookie is forwarded in set_cookie, as in the normal path.
+          if (signedIn.two_factor_redirect) {
+            const challengePayload = {
+              two_factor_redirect: true,
+              principal: signedIn.principal,
+            };
+            if (auth) {
+              return jsonResponseWithCookies(challengePayload, 200, signedIn.set_cookie);
+            }
+            return jsonResponse(challengePayload, 200);
+          }
           if (auth) {
             // Better Auth path: forward the signed session cookie(s) it issued.
             return jsonResponseWithCookies(payload, 200, signedIn.set_cookie);
@@ -653,6 +806,117 @@ export function createStackMateApp(
           return jsonResponse(accepted, 201);
         }
 
+        // Forgot password (Auth + Email batch, ADR-0008): public, generic
+        // 200 for every outcome (unknown email, suspended account, no
+        // SMTP config) so the endpoint cannot enumerate staff. A token is
+        // created and an email sent ONLY when the account exists, is
+        // active, and SMTP is configured; the response never says which
+        // of those failed. Per-email 60s cooldown via the same in-memory
+        // rate-limit map (best-effort — an attacker learns nothing either
+        // way). On a store without a database (in-memory test adapter)
+        // there is no SMTP config and no token table — the generic 200
+        // is returned with nothing sent.
+        if (method === "POST" && pathname === "/api/auth/forgot-password") {
+          const body = (await request.json().catch(() => ({}))) as { email?: string };
+          const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+          if (email) {
+            const maybeDrizzle = store as unknown as { drizzleDb?: unknown };
+            const user = store.state.users.find(
+              (u) => u.email.toLowerCase() === email && u.status === "active"
+            );
+            if (user && maybeDrizzle.drizzleDb) {
+              try {
+                const token = createPasswordResetToken(store, user.id, "password_reset");
+                await storePasswordResetToken(
+                  store, user.id, "password_reset", token.tokenHash, token.expiresAt
+                );
+                await sendEmailViaSmtp(store, env, {
+                  to: user.email,
+                  ...buildPasswordResetEmail(env.APP_URL, token.rawToken),
+                }).catch(() => {});
+              } catch {
+                // Fail closed + silent: the generic 200 below is the only
+                // answer, whatever happened inside.
+              }
+            }
+          }
+          return jsonResponse({
+            message:
+              "If an account exists for that email, a reset link has been sent. Check your inbox.",
+          });
+        }
+
+        // Reset password with a forgot-password token (single-use, 1h).
+        // Returns 422 for an invalid/expired/used token — the token is
+        // the credential here, so a generic message would hide nothing.
+        // Does NOT disable 2FA: a compromised mailbox must not defeat it.
+        if (method === "POST" && pathname === "/api/auth/reset-password") {
+          const body = (await request.json().catch(() => ({}))) as {
+            token?: string;
+            new_password?: string;
+          };
+          if (!body.token || !body.new_password) {
+            throw new AppError("VALIDATION_ERROR", "token and new_password are required.", 422);
+          }
+          const result = await resetStaffPasswordByToken(store, {
+            token: body.token,
+            newPassword: body.new_password,
+            requestId,
+          });
+          return jsonResponse({ user_id: result.user_id, email: result.email });
+        }
+
+        // 2FA recovery (Auth + Email batch): two steps, same token shape
+        // as password reset but a different purpose (a reset token cannot
+        // disable 2FA and vice versa). Step 1 issues a recovery token by
+        // email; step 2 verifies the password and disables 2FA. Both
+        // steps are generic: step 1 always returns 200, step 2 returns
+        // 422 for a bad/expired token and 401 for a wrong password.
+        if (method === "POST" && pathname === "/api/auth/two-factor/recover") {
+          const body = (await request.json().catch(() => ({}))) as { email?: string };
+          const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+          if (email) {
+            const maybeDrizzle = store as unknown as { drizzleDb?: unknown };
+            const user = store.state.users.find(
+              (u) => u.email.toLowerCase() === email && u.status === "active"
+            );
+            if (user && user.two_factor_enabled && maybeDrizzle.drizzleDb) {
+              try {
+                const token = createPasswordResetToken(store, user.id, "two_factor_recovery");
+                await storePasswordResetToken(
+                  store, user.id, "two_factor_recovery", token.tokenHash, token.expiresAt
+                );
+                await sendEmailViaSmtp(store, env, {
+                  to: user.email,
+                  ...buildTwoFactorRecoveryEmail(env.APP_URL, token.rawToken),
+                }).catch(() => {});
+              } catch {
+                // Generic 200 below, whatever happened inside.
+              }
+            }
+          }
+          return jsonResponse({
+            message:
+              "If 2FA is enabled for that email, a recovery link has been sent. Check your inbox.",
+          });
+        }
+        if (method === "POST" && pathname === "/api/auth/two-factor/recover/confirm") {
+          const body = (await request.json().catch(() => ({}))) as {
+            token?: string;
+            password?: string;
+          };
+          if (!body.token || !body.password) {
+            throw new AppError("VALIDATION_ERROR", "token and password are required.", 422);
+          }
+          const auth = await getBetterAuth(env, store);
+          const result = await recoverTwoFactorByToken(
+            store,
+            { token: body.token, password: body.password, requestId },
+            auth
+          );
+          return jsonResponse({ user_id: result.user_id, email: result.email });
+        }
+
         // Public self-registration is CLOSED: staff accounts are created
         // only by bootstrap / an administrator. The Better Auth sign-up
         // endpoint is reachable server-side only (see
@@ -678,7 +942,17 @@ export function createStackMateApp(
         // the admin API — but the bypass is closed anyway, defence in
         // depth. Internal server-side calls use auth.api.signInEmail
         // directly and are unaffected.
-        if (pathname.startsWith("/api/auth/sign-in/")) {
+        //
+        // EXCEPTION (Auth + Email batch): /api/auth/sign-in/social is
+        // open — it is the OAuth entry point. The databaseHooks in
+        // better-auth.ts (user.create.before always false,
+        // session.create.before rejects suspended staff) are the gate
+        // there: a non-staff Google/GitHub login can never mint a user
+        // or a session.
+        if (
+          pathname.startsWith("/api/auth/sign-in/") &&
+          pathname !== "/api/auth/sign-in/social"
+        ) {
           throw new AppError(
             "FORBIDDEN",
             "Use POST /api/auth/sign-in. Direct Better Auth sign-in routes are disabled.",
@@ -1530,6 +1804,24 @@ export function createStackMateApp(
           throw new AppError("UNAUTHORIZED", "Valid staff authentication session required.", 401);
         }
 
+        // RESTRICTED SESSION (Auth + Email batch, ADR-0008): when the
+        // 2FA policy requires setup and the user has not set it up, the
+        // session exists but cannot use the admin API at all — every
+        // endpoint returns 403 TWO_FACTOR_SETUP_REQUIRED except
+        // GET /api/v1/admin/me (the SPA needs the principal to render the
+        // forced-setup wizard) and the /api/auth/* two-factor endpoints
+        // (handled above, outside this block). This is enforced here, in
+        // the dispatcher, so no route can forget it.
+        const isTwoFactorAllowedPath =
+          method === "GET" && pathname === "/api/v1/admin/me";
+        if (principal.two_factor_setup_required && !isTwoFactorAllowedPath) {
+          throw new AppError(
+            "TWO_FACTOR_SETUP_REQUIRED",
+            "Two-factor authentication setup is required for your role. Complete setup to continue.",
+            403
+          );
+        }
+
         // Identity & RBAC routes
         if (method === "GET" && pathname === "/api/v1/admin/me") {
           return jsonResponse(principal);
@@ -1545,6 +1837,265 @@ export function createStackMateApp(
             requestId,
           });
           return jsonResponse(updated, 200);
+        }
+
+        // Authentication configuration (Auth + Email batch, ADR-0008):
+        // OAuth providers, 2FA policy, SMTP — all in Settings, all
+        // `users.manage`. Secrets are never returned (only
+        // has_client_secret / has_password flags) and never logged;
+        // every change is audit-logged by the service layer. A save
+        // invalidates this isolate's config cache; other isolates
+        // converge within the 30s TTL.
+        const requireAuthConfigDb = () => {
+          const db = (store as unknown as { drizzleDb?: unknown }).drizzleDb;
+          if (!db) {
+            throw new AppError(
+              "STORE_UNAVAILABLE",
+              "Authentication configuration needs a database-backed store.",
+              503
+            );
+          }
+          return db as Parameters<typeof loadAuthConfig>[0];
+        };
+        const authConfigDeps = {
+          encryptionKey: env.ENCRYPTION_KEY_V1,
+          keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION,
+        };
+        const authConfigCacheKey = env.HYPERDRIVE_NO_CACHE.connectionString;
+        // Audit for config changes (the save functions do not audit
+        // themselves). `changes` records WHAT changed, never a secret
+        // value. Best-effort: a config save must not fail because the
+        // audit write did.
+        const auditAuthConfigChange = (
+          action: string,
+          changes: Record<string, unknown>
+        ) =>
+          store
+            .withTransaction((state) => {
+              appendAuditLog(state, {
+                actor_type: "staff",
+                actor_user_id: principal.user.id,
+                action,
+                resource_type: "auth_config",
+                resource_id: "auth-config",
+                outcome: "success",
+                request_id: requestId,
+                changes,
+              });
+            })
+            .catch(() => {});
+
+        if (method === "GET" && pathname === "/api/v1/admin/auth-config") {
+          assertStaffPermission(principal, "users.manage");
+          const config = await loadAuthConfig(requireAuthConfigDb(), authConfigDeps);
+          return jsonResponse(config);
+        }
+        if (method === "PUT" && pathname === "/api/v1/admin/auth-config/oauth") {
+          assertStaffPermission(principal, "users.manage");
+          const body = (await request.json().catch(() => ({}))) as {
+            provider?: string;
+            enabled?: boolean;
+            client_id?: string;
+            client_secret?: string;
+          };
+          const saved = await saveOAuthProvider(
+            requireAuthConfigDb(),
+            authConfigDeps,
+            {
+              provider: body.provider ?? "",
+              enabled: body.enabled ?? false,
+              client_id: body.client_id ?? null,
+              client_secret: body.client_secret ?? null,
+            },
+            authConfigCacheKey
+          );
+          await auditAuthConfigChange("auth.oauth.updated", {
+            provider: saved.provider,
+            enabled: saved.enabled,
+            client_id_changed: Boolean(body.client_id?.trim()),
+            client_secret_changed: Boolean(body.client_secret?.trim()),
+          });
+          return jsonResponse(saved);
+        }
+        if (
+          method === "PUT" &&
+          pathname === "/api/v1/admin/auth-config/two-factor-policy"
+        ) {
+          assertStaffPermission(principal, "users.manage");
+          const body = (await request.json().catch(() => ({}))) as {
+            scope?: string;
+            mode?: string;
+          };
+          const saved = await saveTwoFactorPolicy(
+            requireAuthConfigDb(),
+            { scope: body.scope ?? "", mode: body.mode ?? "" },
+            authConfigCacheKey
+          );
+          await auditAuthConfigChange("auth.two_factor_policy.updated", {
+            scope: body.scope,
+            mode: body.mode,
+          });
+          return jsonResponse(saved);
+        }
+        if (method === "PUT" && pathname === "/api/v1/admin/auth-config/smtp") {
+          assertStaffPermission(principal, "users.manage");
+          const body = (await request.json().catch(() => ({}))) as {
+            host?: string;
+            port?: number;
+            username?: string;
+            password?: string;
+            tls_mode?: string;
+            from_address?: string;
+            from_name?: string;
+            enabled?: boolean;
+          };
+          const saved = await saveSmtpSettings(
+            requireAuthConfigDb(),
+            authConfigDeps,
+            {
+              ...(body.host !== undefined ? { host: body.host } : {}),
+              ...(body.port !== undefined ? { port: body.port } : {}),
+              ...(body.username !== undefined ? { username: body.username } : {}),
+              password: body.password ?? null,
+              ...(body.tls_mode !== undefined ? { tls_mode: body.tls_mode } : {}),
+              ...(body.from_address !== undefined ? { from_address: body.from_address } : {}),
+              ...(body.from_name !== undefined ? { from_name: body.from_name } : {}),
+              ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
+            },
+            authConfigCacheKey
+          );
+          await auditAuthConfigChange("auth.smtp.updated", {
+            host: saved.host,
+            port: saved.port,
+            tls_mode: saved.tls_mode,
+            from_address: saved.from_address,
+            enabled: saved.enabled,
+            password_changed: Boolean(body.password?.trim()),
+          });
+          return jsonResponse(saved);
+        }
+        if (method === "POST" && pathname === "/api/v1/admin/auth-config/smtp/test") {
+          assertStaffPermission(principal, "users.manage");
+          const body = (await request.json().catch(() => ({}))) as { to?: string };
+          // Test mail goes ONLY to the admin's own address — the
+          // endpoint must never become an open mail relay.
+          const to = (body.to ?? principal.user.email).trim().toLowerCase();
+          if (to !== principal.user.email.toLowerCase()) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              "Test email can only be sent to your own address.",
+              422
+            );
+          }
+          const result = await sendEmailViaSmtp(store, env, {
+            to,
+            ...buildTestEmail(),
+          });
+          if (!result.sent) {
+            throw new AppError(
+              "INTERNAL_ERROR",
+              result.error ?? "Test email could not be sent.",
+              502
+            );
+          }
+          return jsonResponse({ sent: true, to });
+        }
+
+        // General Settings (Auth + Email batch, owner order 2026-11-16):
+        // the app-wide configuration from Settings → General. All
+        // runtime-applied — a save reaches the UI immediately, no
+        // redeploy. Audit-logged; the favicon upload reuses the R2
+        // validated-object pattern (server-side key, magic-byte check).
+        const requireGeneralSettingsDb = () => {
+          const maybeDrizzle = store as unknown as { drizzleDb?: unknown };
+          if (!maybeDrizzle.drizzleDb) {
+            throw new AppError("STORE_UNAVAILABLE", "General settings require a database.", 503);
+          }
+          return maybeDrizzle.drizzleDb as Parameters<typeof loadGeneralSettings>[0];
+        };
+        const auditGeneralSettingsChange = (changes: Record<string, unknown>) =>
+          store
+            .withTransaction((state) => {
+              appendAuditLog(state, {
+                actor_type: "staff",
+                actor_user_id: principal.user.id,
+                action: "general.settings.updated",
+                resource_type: "general_settings",
+                resource_id: "general-settings",
+                outcome: "success",
+                request_id: requestId,
+                changes,
+              });
+            })
+            .catch(() => {});
+        if (method === "GET" && pathname === "/api/v1/admin/general-settings") {
+          assertStaffPermission(principal, "users.manage");
+          const row = await loadGeneralSettings(requireGeneralSettingsDb());
+          return jsonResponse(row ? { ...publicViewOf(row), favicon_content_type: row.faviconContentType, favicon_byte_size: row.faviconByteSize } : { ...DEFAULT_GENERAL_SETTINGS, favicon_content_type: null, favicon_byte_size: null });
+        }
+        if (method === "PUT" && pathname === "/api/v1/admin/general-settings") {
+          assertStaffPermission(principal, "users.manage");
+          const body = (await request.json().catch(() => ({}))) as {
+            app_name?: string;
+            app_title?: string;
+            app_description?: string;
+            support_email?: string;
+            clear_favicon?: boolean;
+          };
+          const saved = await saveGeneralSettings(requireGeneralSettingsDb(), body);
+          const changes: Record<string, unknown> = {};
+          if (body.app_name !== undefined) changes.app_name = body.app_name.trim();
+          if (body.app_title !== undefined) changes.app_title = body.app_title.trim();
+          if (body.app_description !== undefined) changes.app_description = body.app_description;
+          if (body.support_email !== undefined) changes.support_email = body.support_email.trim();
+          if (body.clear_favicon === true) changes.favicon_cleared = true;
+          await auditGeneralSettingsChange(changes);
+          return jsonResponse(saved);
+        }
+        if (method === "POST" && pathname === "/api/v1/admin/general-settings/favicon") {
+          assertStaffPermission(principal, "users.manage");
+          const body = (await request.json()) as {
+            filename?: string;
+            content_type?: string;
+            content_base64?: string;
+          };
+          if (!body.filename || !body.content_type || !body.content_base64) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              "filename, content_type, and content_base64 are required.",
+              422
+            );
+          }
+          // Fail closed in staging/production: the favicon must land in
+          // the real R2 bucket, not the in-memory bucket (same rule as
+          // payment evidence — it would be lost on restart and invisible
+          // to every other instance).
+          const maybeBucket = store as unknown as { usesInMemoryBucket?: boolean };
+          if (
+            (env.APP_ENV === "production" || env.APP_ENV === "staging") &&
+            maybeBucket.usesInMemoryBucket
+          ) {
+            throw new AppError(
+              "INTERNAL_ERROR",
+              "Favicon upload is unavailable: no real R2 bucket is configured for this environment.",
+              503
+            );
+          }
+          const bucket = (store as unknown as { r2Bucket?: unknown }).r2Bucket as
+            | import("./env.ts").R2BucketBinding
+            | undefined;
+          if (!bucket) {
+            throw new AppError("INTERNAL_ERROR", "No R2 bucket is configured for this environment.", 503);
+          }
+          const bytes = new Uint8Array(Buffer.from(body.content_base64, "base64"));
+          const stored = await storeFavicon(requireGeneralSettingsDb(), bucket, {
+            filename: body.filename,
+            contentType: body.content_type,
+            bytes,
+            bucketName: env.R2_BUCKET_NAME,
+          });
+          await auditGeneralSettingsChange({ favicon_uploaded: true, content_type: stored.content_type });
+          return jsonResponse(stored, 201);
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/users") {
@@ -1654,7 +2205,26 @@ export function createStackMateApp(
         if (method === "POST" && pathname === "/api/v1/admin/users/invitations") {
           const body = await request.json();
           const created = await createStaffInvitationByAdmin(store, principal, body, requestId);
-          return jsonResponse(created, 201);
+          // Invitation email (Auth + Email batch): best-effort — the
+          // token_once return is unchanged and stays the delivery path
+          // when email is not configured. `email_sent` / `email_error`
+          // are honest: a failed send is reported, never hidden.
+          let emailSent = false;
+          let emailError: string | undefined;
+          try {
+            const result = await sendEmailViaSmtp(store, env, {
+              to: created.invitation.email,
+              ...buildInvitationEmail(env.APP_URL, created.token_once, created.invitation.role_keys),
+            });
+            emailSent = result.sent;
+            emailError = result.error;
+          } catch {
+            emailError = "Email is not configured. Copy the invitation link manually.";
+          }
+          return jsonResponse(
+            { ...created, email_sent: emailSent, email_error: emailError },
+            201
+          );
         }
 
         const mInvitationRevoke = matchPath(

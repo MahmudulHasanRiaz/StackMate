@@ -4,6 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>StackMate Admin</title>
+    <!-- Default favicon endpoint (General Settings): serves the uploaded
+         favicon when one exists, 404s otherwise — the runtime
+         GeneralConfigApplier replaces this link when a favicon is set. -->
+    <link rel="icon" href="/api/v1/favicon" />
     <script>
       // Theme bootstrap: apply the persisted theme choice (localStorage
       // `sm-theme`: "system" | "dark" | "light", default dark — Neon)

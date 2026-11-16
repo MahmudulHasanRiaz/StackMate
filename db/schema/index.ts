@@ -1,4 +1,6 @@
 export * from "./auth.ts";
+export * from "./auth-config.ts";
+export * from "./general-settings.ts";
 export * from "./access-control.ts";
 export * from "./customers.ts";
 export * from "./assets.ts";

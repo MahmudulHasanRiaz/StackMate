@@ -68,3 +68,48 @@ export async function apiRequest<T>(
 
   return json.data as T;
 }
+
+/**
+ * Raw variant of apiRequest: returns the parsed JSON body as-is, without
+ * unwrapping the app's `{ data }` envelope. Use it ONLY for Better Auth's
+ * own endpoints (the twoFactor plugin's /two-factor/* calls), which
+ * return raw plugin responses — e.g. enable returns `{ totpURI,
+ * backupCodes }` with no `data` key, so the enveloped helper returns
+ * `undefined` and setup breaks (caught by the headless auth-email audit,
+ * 2026-11-16). Error handling is identical to apiRequest.
+ */
+export async function rawApiRequest<T>(
+  path: string,
+  options: RequestInit & { idempotencyKey?: string } = {}
+): Promise<T> {
+  const headers = new Headers(options.headers);
+  if (options.body && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  if (options.idempotencyKey) {
+    headers.set("Idempotency-Key", options.idempotencyKey);
+  }
+
+  const res = await fetch(path, {
+    ...options,
+    credentials: "include",
+    headers,
+  });
+
+  const json = (await res.json().catch(() => null)) as
+    | { error?: { code: string; message: string; details: Record<string, unknown> | null; request_id: string } }
+    | null;
+
+  if (!res.ok || !json || json.error) {
+    const err = json?.error;
+    throw new ApiClientError(
+      err?.code ?? "HTTP_ERROR",
+      err?.message ?? `Request failed with status ${res.status}`,
+      err?.request_id ?? "unknown",
+      res.status,
+      err?.details ?? null
+    );
+  }
+
+  return json as T;
+}

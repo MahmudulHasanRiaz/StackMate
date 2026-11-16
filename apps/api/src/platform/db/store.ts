@@ -35,8 +35,21 @@ export interface UserRecord {
   email: string;
   email_verified: boolean;
   password_hash: string;
+  // Better Auth two-factor plugin state (migration 0007): the plugin
+  // sets this on the first successful TOTP verification. Readers treat
+  // a missing value as false only in test fixtures — the DrizzleStore
+  // always loads the column.
+  two_factor_enabled: boolean;
   status: "active" | "suspended";
   created_at: string;
+  updated_at: string;
+}
+
+export interface TwoFactorPolicyRecord {
+  id: string;
+  // `global` = default for every role; otherwise a role key.
+  scope: string;
+  mode: "off" | "optional" | "required";
   updated_at: string;
 }
 
@@ -632,6 +645,11 @@ export interface DatabaseState {
   outbox_events: OutboxEventRecord[];
   idempotency_records: IdempotencyRecord[];
   audit_logs: AuditLogRecord[];
+  // 2FA policy rows (migration 0007). Loaded read-only in the combined
+  // state query; written ONLY through the auth-config service's direct
+  // Drizzle calls (never via withTransaction — there is no SyncSpec for
+  // this collection, so persistStateDiff ignores it).
+  two_factor_policy: TwoFactorPolicyRecord[];
   sequence_counters: {
     customer: number;
     order: number;
@@ -708,6 +726,7 @@ export class StackMateDataStore {
       outbox_events: [],
       idempotency_records: [],
       audit_logs: [],
+      two_factor_policy: [],
       sequence_counters: {
         customer: 1000,
         order: 10000,

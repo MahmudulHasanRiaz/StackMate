@@ -1105,6 +1105,78 @@ a:hover {
 .sm-card + .sm-card {
   margin-top: var(--sm-space-4);
 }
+/* Auth settings (Auth + Email batch): two-column provider cards,
+   policy rows (label + select + save), form actions, muted text. */
+.sm-grid-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sm-space-4);
+  margin-bottom: var(--sm-space-6);
+}
+@media (max-width: 640px) {
+  .sm-grid-2 {
+    grid-template-columns: 1fr;
+  }
+}
+.sm-muted {
+  color: var(--sm-text-muted);
+}
+.sm-policy-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-top: 1px solid var(--sm-border);
+}
+.sm-policy-row:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+.sm-policy-label {
+  flex: 1;
+  min-width: 0;
+}
+.sm-form-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: var(--sm-space-4);
+}
+.sm-inline-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+/* Auth + Email batch: TOTP QR code (white card so dark-mode scanners
+   read it) + the one-time backup-code list. */
+.sm-qr {
+  background: #fff;
+  border-radius: var(--sm-radius-md);
+  padding: 16px;
+  width: fit-content;
+}
+.sm-qr svg {
+  display: block;
+  width: 180px;
+  height: 180px;
+}
+.sm-backup-codes {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.sm-backup-codes code {
+  display: block;
+  padding: 8px 10px;
+  border: 1px solid var(--sm-border);
+  border-radius: var(--sm-radius-sm);
+  font-size: 13px;
+  text-align: center;
+}
 .sm-kpi-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -1882,6 +1954,35 @@ a:hover {
   flex-direction: column;
   gap: var(--sm-space-4);
   margin-top: var(--sm-space-5);
+}
+/* Auth + Email batch: link-style buttons on the sign-in page (forgot
+   password, backup-code switch, back links) + the OAuth divider. */
+.sm-link-button {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--sm-accent);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.sm-link-button:hover {
+  text-decoration: underline;
+}
+.sm-auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--sm-text-muted);
+  font-size: 13px;
+}
+.sm-auth-divider::before,
+.sm-auth-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--sm-border);
 }
 
 /* ------------------------------------------------------------------ */

@@ -1,10 +1,16 @@
-import { pgTable, text, timestamp, boolean, varchar } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, boolean, varchar, integer } from "drizzle-orm/pg-core";
 
 export const users = pgTable("users", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
   email: varchar("email", { length: 320 }).notNull().unique(),
   emailVerified: boolean("email_verified").notNull().default(false),
+  // Better Auth two-factor plugin (Auth + Email batch, 2026-11-16):
+  // the plugin reads/writes `user.twoFactorEnabled`; the Drizzle
+  // adapter maps it to this column. Set true by the plugin itself on
+  // the first successful TOTP verification (verify-totp), false on
+  // disable. Never set it by hand — it is the plugin's state.
+  twoFactorEnabled: boolean("two_factor_enabled").notNull().default(false),
   // Staff password hash (scrypt, `scrypt:<salt>:<derived>`) for the custom
   // staff sign-in in apps/api/src/modules/identity/service.ts. Added by
   // migration 0002. NULL for users created by Better Auth, which keeps its
@@ -64,4 +70,31 @@ export const staffProfiles = pgTable("staff_profiles", {
   status: text("status").notNull().default("active"), // active | suspended
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/**
+ * Better Auth two-factor plugin table (Auth + Email batch, 2026-11-16).
+ *
+ * Shape mirrors the plugin's own schema (better-auth 1.7.23
+ * dist/plugins/two-factor/schema.mjs): `secret` is stored ENCRYPTED
+ * by the plugin itself (decryptTOTPSecret with BETTER_AUTH_SECRET),
+ * `backupCodes` is stored ENCRYPTED because the plugin is configured
+ * with `backupCodeOptions: { storeBackupCodes: "encrypted" }` — the
+ * plugin's DEFAULT is plaintext JSON, so that option is load-bearing.
+ * `verified` flips true on the first successful TOTP verification;
+ * the plugin sets `users.two_factor_enabled` at the same time.
+ * The Drizzle adapter resolves model `twoFactor` via
+ * `config.schema["twoFactor"]` (see better-auth.ts).
+ */
+export const twoFactor = pgTable("two_factor", {
+  id: text("id").primaryKey(),
+  userId: text("user_id")
+    .notNull()
+    .unique()
+    .references(() => users.id, { onDelete: "cascade" }),
+  secret: text("secret").notNull(),
+  backupCodes: text("backup_codes").notNull(),
+  verified: boolean("verified").notNull().default(false),
+  failedVerificationCount: integer("failed_verification_count").notNull().default(0),
+  lockedUntil: timestamp("locked_until", { withTimezone: true }),
 });

@@ -101,6 +101,13 @@ export function resolveAuditResourceDisplayName(
     return typeof v === "string" && v.length > 0 ? v : null;
   };
   switch (resourceType) {
+    case "auth_config":
+      // Authentication settings are a singleton (resource_id is the
+      // literal "auth-config"); the changes payload says what changed.
+      return "Authentication settings";
+    case "general_settings":
+      // General settings are a singleton (resource_id "general-settings").
+      return "General settings";
     case "user":
     case "staff_user":
       return userName(resourceId);
