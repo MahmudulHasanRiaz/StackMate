@@ -194,7 +194,12 @@ function parseSessionCookie(cookieHeader: string | null): string | null {
     if (
       rawName === "stackmate_session" ||
       rawName === "__Host-stackmate_session" ||
-      rawName === "better-auth.session_token"
+      rawName === "better-auth.session_token" ||
+      // Staging/production set the session cookie with the __Secure-
+      // prefix (useSecureCookies: isProd). Without this name the app
+      // CSRF gate below never sees the cookie live and never enforces
+      // (ADR-0008 decision 10).
+      rawName === "__Secure-better-auth.session_token"
     ) {
       return rest.join("=").trim();
     }

@@ -44,10 +44,18 @@
   // `/api/v1/...` calls and Better Auth cookies stay same-origin; there
   // is no separate staging Pages project. Secrets (BETTER_AUTH_SECRET,
   // ENCRYPTION_KEY_V1, LICENSE_VERIFIER_SECRET, CHECKOUT_TOKEN_SECRET,
-  // SETUP_TOKEN, BETTER_AUTH_URL, TRUSTED_ORIGINS, APP_URL, API_URL) are set on the
-  // Worker in the Cloudflare dashboard, never in this file. SETUP_TOKEN is
-  // the operator-set secret gating POST /api/auth/bootstrap-super-admin:
-  // when unset the endpoint is disabled (404); see apps/api/src/app.ts.
+  // SETUP_TOKEN) are set on the Worker in the Cloudflare dashboard,
+  // never in this file. SETUP_TOKEN is the operator-set secret gating
+  // POST /api/auth/bootstrap-super-admin: when unset the endpoint is
+  // disabled (404); see apps/api/src/app.ts.
+  // The four staging URL vars below (BETTER_AUTH_URL, API_URL,
+  // APP_URL, TRUSTED_ORIGINS) live HERE, in env.staging.vars — NOT
+  // only in the dashboard. Dashboard-set plain vars are WIPED by
+  // every Git-build deploy (observed 2026-11-16: build 1544e07f
+  // reverted the Worker from 15 vars back to 11, dropping all four;
+  // they had to be re-added by hand). They are plain URLs, not
+  // secrets, so committing them is safe. Production gets NO URL vars
+  // here — its URL is unknown; never invent one.
   // Hyperdrive IDs (verified 2026-11-15):
   //   NO_CACHE: 30a29917780c4aff91b9a198b63eb387 (caching disabled)
   //   CACHED:   3ae1e99fbd6d4fcea9a0cb35de71ae4c (max_age 60s, swr 15s)
@@ -60,7 +68,16 @@
         "DEFAULT_CURRENCY": "BDT",
         "ACTIVE_ENCRYPTION_KEY_VERSION": "v1",
         "LICENSE_SIGNING_KEY_ID": "sm-ed25519-2026-11",
-        "META_GRAPH_API_VERSION": "v21.0"
+        "META_GRAPH_API_VERSION": "v21.0",
+        // Staging URL vars (ADR-0008 decision 10): plain Worker URL,
+        // durable here because dashboard-set plain vars are wiped by
+        // every Git-build deploy. All four name the same origin;
+        // any one suffices for Better Auth's origin check, all four
+        // is belt-and-braces against a stale single var.
+        "BETTER_AUTH_URL": "https://stackmate-api-staging.ad-dawah.workers.dev",
+        "API_URL": "https://stackmate-api-staging.ad-dawah.workers.dev",
+        "APP_URL": "https://stackmate-api-staging.ad-dawah.workers.dev",
+        "TRUSTED_ORIGINS": "https://stackmate-api-staging.ad-dawah.workers.dev"
       },
       "hyperdrive": [
         {
