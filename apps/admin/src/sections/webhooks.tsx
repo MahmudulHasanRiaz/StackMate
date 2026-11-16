@@ -37,7 +37,7 @@ import { Eye, FlaskConical, Plus, Trash2, Webhook } from "lucide-react";
 import { apiRequest } from "../lib/api-client";
 import { detailKey, listKey } from "../lib/query";
 import {
-  DetailFacts,
+  DetailLayout,
   ListTable,
   PageHeader,
   parseListSearch,
@@ -632,27 +632,8 @@ export function WebhookDetailSection({ id }: { id: string }) {
           </Button>
         }
       />
-      {lastTest ? (
-        <TestResultBanner
-          result={lastTest}
-          onDismiss={() => setLastTest(null)}
-        />
-      ) : null}
-      <Alert variant="info">
-        Production delivery is still simulated — only the Test button makes a
-        real HTTP call (10s timeout).
-      </Alert>
-      <Toolbar>
-        <StatusBadge status={endpoint.status} />
-        <span className="sm-mono">
-          {endpoint.secret_key_id}
-          <CopyButton
-            value={endpoint.secret_key_id}
-            label="Copy secret key ID"
-          />
-        </span>
-      </Toolbar>
-      <DetailFacts
+      <DetailLayout
+        title="Webhook"
         facts={[
           { label: "URL", value: endpoint.url },
           { label: "Site", value: siteName ?? "—" },
@@ -663,15 +644,36 @@ export function WebhookDetailSection({ id }: { id: string }) {
           { label: "Key version", value: endpoint.key_version },
           { label: "Created", value: <DateCell value={endpoint.created_at} /> },
         ]}
-      />
-      <WebhookDeliveriesTab webhookId={id} />
-      <Button
-        variant="ghost"
-        size="sm"
-        onClick={() => navigate({ to: "/settings/webhooks" })}
       >
-        ← Back to webhooks
-      </Button>
+        {lastTest ? (
+          <TestResultBanner
+            result={lastTest}
+            onDismiss={() => setLastTest(null)}
+          />
+        ) : null}
+        <Alert variant="info">
+          Production delivery is still simulated — only the Test button makes a
+          real HTTP call (10s timeout).
+        </Alert>
+        <Toolbar>
+          <StatusBadge status={endpoint.status} />
+          <span className="sm-mono">
+            {endpoint.secret_key_id}
+            <CopyButton
+              value={endpoint.secret_key_id}
+              label="Copy secret key ID"
+            />
+          </span>
+        </Toolbar>
+        <WebhookDeliveriesTab webhookId={id} />
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => navigate({ to: "/settings/webhooks" })}
+        >
+          ← Back to webhooks
+        </Button>
+      </DetailLayout>
     </section>
   );
 }

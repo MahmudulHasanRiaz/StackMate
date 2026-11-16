@@ -902,6 +902,19 @@ export function SettingsShell() {
     setNavOpen(false);
   }, [pathname]);
 
+  // Escape closes the settings drawer (mirrors MainShell). Without
+  // this + the backdrop below, the open drawer covered its own
+  // hamburger (z 50 over the topbar) and had no touch way to close
+  // — a trap on mobile (Chromium audit 2026-11-16).
+  useEffect(() => {
+    if (!navOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setNavOpen(false);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [navOpen]);
+
   // Entering Settings collapses the main menu (owner decision
   // 2026-11-15): the rail is collapsed on entry — never expanded.
   // The toggle can expand it again within Settings. Once per mount;
@@ -921,6 +934,11 @@ export function SettingsShell() {
         collapsed={navCollapsed}
         onToggleCollapse={toggleNavCollapsed}
         className="sm-sidebar sm-main-rail"
+      />
+      <div
+        className="sm-sidebar-backdrop"
+        aria-hidden="true"
+        onClick={() => setNavOpen(false)}
       />
       <aside className="sm-settings-nav" aria-label="Settings navigation">
         <div className="sm-sidebar-brand">

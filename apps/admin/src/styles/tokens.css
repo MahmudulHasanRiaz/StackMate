@@ -59,13 +59,17 @@
 
   /* The one accent — Neon green #00E599 (live neon.com CSS:          */
   /* .bg-green-45 / .text-green-45 / .border-primary-1). Text on      */
-  /* accent is black. The green FILL is a gradient, never flat:      */
-  /* linear-gradient(180deg, #00E599 24.85%, #007F55 68.32%).         */
+  /* accent is black. The green FILL is a LIGHT gradient, never flat */
+  /* and never dark: green mixed with WHITE —                         */
+  /* linear-gradient(180deg, #6FF2C4 0%, #00E599 100%). CORRECTED    */
+  /* 2026-11-16: the dark-ending gradient (#00E599 → #007F55) was a  */
+  /* mis-attribution — the 180deg class exists in Neon's CSS but is  */
+  /* used NOWHERE in the marketing homepage HTML (count 0); the      */
+  /* owner's image-85 hovered button is uniformly BRIGHT light green. */
   --sm-accent: #00e599;
   --sm-accent-hover: #00c987;
   --sm-accent-soft: rgba(0, 229, 153, 0.1);
-  --sm-accent-text-on: #000000;
-  --sm-accent-gradient: linear-gradient(180deg, #00e599 24.85%, #007f55 68.32%);
+  --sm-accent-gradient: linear-gradient(180deg, #6ff2c4 0%, #00e599 100%);
   /* Accent button bg: transparent in dark (Neon image-85). Light gets
      the pale green tint — see the light block. */
   --sm-btn-accent-bg: transparent;
@@ -181,7 +185,6 @@
   --sm-accent: #007f55;
   --sm-accent-hover: #005f40;
   --sm-accent-soft: rgba(0, 229, 153, 0.1);
-  --sm-accent-text-on: #ffffff;
   /* Light accent button (Neon image-86/87 "Connect"): pale green tint
      fill, NOT transparent. Hover is the same gradient as dark. */
   --sm-btn-accent-bg: rgba(0, 229, 153, 0.12);
@@ -249,6 +252,48 @@ body {
   font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
+}
+
+/* No horizontal page overflow at any width (owner 2026-11-16): `clip`
+   on html/body is the SAFETY NET only — the root cause is fixed per
+   element (tables scroll inside their card, drawers are fixed, grids
+   stack). `clip`, not `hidden`: `hidden` would break `position:
+   sticky` (table headers, topbar); `clip` creates no scroll
+   container, so sticky keeps working. */
+html,
+body {
+  overflow-x: clip;
+}
+/* Focus / scrollIntoView must clear the sticky chrome: 48px topbar +
+   ~37px table header + margin. Without this, keyboard Tab and
+   scrollIntoView() land the focused element UNDER the topbar (the
+   Chromium audit measured scrollIntoView() putting a row button at
+   y=0, covered by the topbar). WCAG 2.4.11 focus-not-obscured. */
+html {
+  scroll-padding-top: 96px;
+}
+
+/* Scrollbars — Neon uses thin dark scrollbars; the browser defaults
+   are light/white and wrong on the black theme. Tokenized via
+   --sm-border-strong (dark #333333 / light #cbd5e1); the track stays
+   transparent so the page background shows through. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--sm-border-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--sm-border-strong);
+  border-radius: var(--sm-radius-md);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-track,
+*::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 a {
@@ -793,6 +838,14 @@ a:hover {
   border-radius: var(--sm-radius-lg);
   overflow-x: auto;
 }
+/* Flat list table (Neon image-76 "2 Branches"): list tables sit
+   directly on the page background — no bordered panel, no radius,
+   rows separated by 1px lines only. Detail-page tables keep
+   .sm-table-wrap (Neon image-73 service table IS a bordered panel).
+   ListTable (section-kit) uses this; detail tables use the wrap. */
+.sm-table-flat {
+  overflow-x: auto;
+}
 .sm-table {
   width: 100%;
   border-collapse: collapse;
@@ -810,9 +863,25 @@ a:hover {
 }
 /* Neon header (screenshot 2, image-76): small WHITE semibold text, not
    uppercase, no background block — just a bottom border. This supersedes
-   the muted-header choice from screenshot 1 (audit G2). */
+   the muted-header choice from screenshot 1 (audit G2).
+   STICKY GEOMETRY — read before touching `top` (Chromium audit
+   2026-11-16, measured): the header does NOT stick to the viewport.
+   `.sm-table-wrap` / `.sm-table-flat` set `overflow-x: auto`, which
+   computes `overflow-y` to `auto` — so the WRAP is the sticky
+   scrollport, not the page. `top: 48px` therefore means "48px below
+   the wrap's top edge": the header was permanently displaced 48px
+   down, overlapping the first data row and covering its buttons
+   (elementFromPoint at the first row's Select button returned TH at
+   scrollY=0). `top: 0` puts the header at its natural position — no
+   displacement, first row clickable. The header then scrolls away
+   with the page (it never was viewport-sticky); a truly viewport-
+   sticky header is incompatible with the horizontal-scroll wrapper
+   and would need the internal-scroll card pattern (max-height +
+   overflow-y:auto on the wrap) — a design decision, not assumed here.
+   The opaque backgrounds stay: --sm-surface inside the bordered wrap,
+   --sm-bg inside the flat list table (Neon image-76: the list header
+   sits directly on the black page). */
 .sm-table th {
-  background: transparent;
   font-weight: 600;
   color: var(--sm-text);
   font-size: 12px;
@@ -821,6 +890,12 @@ a:hover {
   top: 0;
   z-index: var(--sm-z-sticky);
   white-space: nowrap;
+}
+.sm-table-wrap .sm-table th {
+  background: var(--sm-surface);
+}
+.sm-table-flat .sm-table th {
+  background: var(--sm-bg);
 }
 .sm-table tbody tr:hover {
   background: var(--sm-surface-muted);
@@ -898,10 +973,12 @@ a:hover {
   border-color: var(--sm-accent);
   color: var(--sm-accent);
 }
-/* Accent hover/focus: the button FILLS with Neon's green gradient
-   (owner screenshot 85 — hovered "Create child branch" is solid
-   green, dark text). Default stays unfilled. The gradient lives in
-   --sm-accent-gradient; never hardcode it per component. */
+/* Accent hover/focus: the button FILLS with Neon's LIGHT green
+   gradient (owner screenshot 85 — hovered "Create child branch" is
+   bright light green, dark text; owner 2026-11-16: Neon mixes green
+   with WHITE, never with black/dark). Default stays unfilled. The
+   gradient lives in --sm-accent-gradient; never hardcode it per
+   component. */
 .sm-btn-accent:hover:not(:disabled),
 .sm-btn-accent:focus-visible:not(:disabled) {
   background-image: var(--sm-accent-gradient);
@@ -1269,6 +1346,12 @@ a:hover {
   from { opacity: 0; transform: translateY(4px); }
   to { opacity: 1; transform: translateY(0); }
 }
+/* Bottom-sheet entrance (mobile only — see the ≤640px block). The
+   reduced-motion query zeroes the duration, so this respects it. */
+@keyframes sm-dialog-sheet-in {
+  from { opacity: 0; transform: translateY(24px); }
+  to { opacity: 1; transform: translateY(0); }
+}
 
 .sm-drawer-overlay {
   position: fixed;
@@ -1530,6 +1613,64 @@ a:hover {
 }
 
 /* ------------------------------------------------------------------ */
+/* Detail layout — main column + right inspector rail (Neon image-77:  */
+/* "Branch" / "Project" / "Usage" sections, label left / value right,  */
+/* dividers between sections). Audit G7. The rail is 300px; below      */
+/* 1280px it stacks under the main column as a full-width block with   */
+/* a top divider instead of the left border.                           */
+/* ------------------------------------------------------------------ */
+.sm-detail-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 300px;
+  gap: var(--sm-space-5);
+  align-items: start;
+}
+.sm-inspector {
+  border-left: 1px solid var(--sm-border);
+  padding-left: var(--sm-space-5);
+}
+.sm-inspector-section + .sm-inspector-section {
+  border-top: 1px solid var(--sm-border);
+  margin-top: var(--sm-space-4);
+  padding-top: var(--sm-space-4);
+}
+.sm-inspector-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--sm-text);
+  margin-bottom: var(--sm-space-3);
+}
+.sm-inspector-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--sm-space-4);
+  padding: 6px 0;
+  font-size: 13px;
+}
+.sm-inspector-label {
+  color: var(--sm-text-muted);
+  flex: none;
+}
+.sm-inspector-value {
+  color: var(--sm-text);
+  text-align: right;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 1280px) {
+  .sm-detail-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .sm-inspector {
+    border-left: none;
+    border-top: 1px solid var(--sm-border);
+    padding-left: 0;
+    padding-top: var(--sm-space-4);
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Core utilities — stack gaps + primitive layout (no inline styles).  */
 /* Every gap/padding here comes from the spacing scale. Sections and   */
 /* primitives use these instead of inline style objects.               */
@@ -1655,7 +1796,17 @@ a:hover {
 }
 
 @media (max-width: 900px) {
-  .sm-shell {
+  /* Single column — BUT the collapsed/expanded grid templates above
+     are (0,2,0) and beat a plain (0,1,0) rule. At <900px the sidebar
+     is a fixed drawer (out of flow), so the leftover first column
+     would squeeze .sm-main to 64px: the Chromium audit 2026-11-16
+     measured .sm-main at 64px wide after visiting Settings (which
+     persists nav-collapsed=true), with the account button at 120px
+     and its menu cut off at left -110. These selectors match the
+     (0,2,0) specificity so one column always wins below 900px. */
+  .sm-shell,
+  .sm-shell[data-nav-collapsed="true"],
+  .sm-shell[data-sidebar="rail"] {
     grid-template-columns: 1fr;
   }
   .sm-sidebar {
@@ -1678,8 +1829,29 @@ a:hover {
     background: var(--sm-overlay);
     z-index: var(--sm-z-drawer);
   }
-  .sm-settings-shell {
+  .sm-settings-shell,
+  .sm-settings-shell[data-nav-collapsed="false"] {
     grid-template-columns: 1fr;
+  }
+  /* The drawer always shows the FULL nav (labels): the desktop
+     collapse preference must not turn the mobile drawer into an icon
+     rail — touch users have no tooltips, and an unlabeled icon list
+     is unusable. The collapse rules above are (0,2,0)/(0,3,0); these
+     add .sm-sidebar for (0,3,0)/(0,4,0) so full labels win <900px. */
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar .sm-nav-btn,
+  .sm-shell[data-sidebar="rail"] .sm-sidebar .sm-nav-btn {
+    justify-content: flex-start;
+    padding: var(--sm-space-1-5) var(--sm-space-2-5);
+  }
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar .sm-nav-btn .sm-nav-label,
+  .sm-shell[data-sidebar="rail"] .sm-sidebar .sm-nav-btn .sm-nav-label,
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar .sm-sidebar-brand .sm-brand-name,
+  .sm-shell[data-sidebar="rail"] .sm-sidebar .sm-sidebar-brand .sm-brand-name {
+    display: inline;
+  }
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar .sm-nav-group-label,
+  .sm-shell[data-sidebar="rail"] .sm-sidebar .sm-nav-group-label {
+    display: block;
   }
   /* On mobile the main rail is hidden inside Settings — the settings
      nav is the drawer; the main menu is one "Back to admin" tap away. */
@@ -1702,6 +1874,13 @@ a:hover {
   .sm-settings-shell[data-settings-nav="open"] .sm-settings-nav {
     transform: translateX(0);
   }
+  .sm-settings-shell[data-settings-nav="open"] .sm-sidebar-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: var(--sm-overlay);
+    z-index: var(--sm-z-drawer);
+  }
   .sm-topbar {
     padding: 0 var(--sm-space-4);
   }
@@ -1714,10 +1893,14 @@ a:hover {
   .sm-search-input {
     width: 100%;
   }
+  /* Topbar search collapses to an icon (owner 2026-11-16): the label
+     and the ⌘K hint hide; the 40px icon button keeps the topbar
+     fitting at 390px (hamburger + search icon + avatar). */
   .sm-quicknav-btn {
     width: auto;
     min-width: 0;
   }
+  .sm-quicknav-btn .sm-quicknav-label,
   .sm-quicknav-btn .sm-kbd {
     display: none;
   }
@@ -1739,8 +1922,39 @@ a:hover {
     flex-direction: column;
     align-items: flex-start;
   }
+  /* Dialogs become full-width bottom sheets (owner 2026-11-16): the
+     overlay docks to the bottom, the sheet is full-width with top
+     corners only (6px, the dialog radius) and a slide-up entrance
+     (zeroed by the reduced-motion query). */
+  .sm-dialog-overlay {
+    align-items: flex-end;
+    padding: 0;
+  }
   .sm-dialog {
     max-width: 100%;
+    max-height: 92vh;
+    border-radius: var(--sm-radius-xl) var(--sm-radius-xl) 0 0;
+    animation: sm-dialog-sheet-in var(--sm-transition-slow);
+  }
+  /* Touch targets (owner 2026-11-16): primary actions are at least
+     ~40px on mobile. Buttons are 30px on desktop; the min-height
+     wins over the fixed height. Icon buttons, menu rows, nav rows,
+     tabs, copy buttons, the QuickNav button, and the account button
+     get the same floor. */
+  .sm-btn,
+  .sm-quicknav-btn,
+  .sm-account-btn {
+    min-height: 40px;
+  }
+  .sm-btn-icon,
+  .sm-copy-btn {
+    width: 40px;
+    height: 40px;
+  }
+  .sm-menu-item,
+  .sm-nav-btn,
+  .sm-tab {
+    min-height: 40px;
   }
 }
 

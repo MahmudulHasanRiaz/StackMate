@@ -27,6 +27,7 @@ import { apiRequest } from "../lib/api-client";
 import { detailKey, listKey } from "../lib/query";
 import {
   DetailFacts,
+  DetailLayout,
   ListTable,
   PageHeader,
   parseListSearch,
@@ -859,10 +860,8 @@ export function PaymentMethodDetailSection({ id }: { id: string }) {
           </span>
         }
       />
-      <div style={{ marginBottom: 16 }}>
-        <StatusBadge status={method.is_enabled ? "enabled" : "disabled"} />
-      </div>
-      <DetailFacts
+      <DetailLayout
+        title="Payment method"
         facts={[
           { label: "Method key", value: <span className="sm-mono">{method.method_key}</span> },
           { label: "Kind", value: KIND_LABELS[method.method_kind] },
@@ -871,34 +870,38 @@ export function PaymentMethodDetailSection({ id }: { id: string }) {
           { label: "Sort order", value: <span className="sm-tabular">{method.sort_order}</span> },
           { label: "Created", value: <DateCell value={method.created_at} /> },
         ]}
-      />
-      <Card title="Account configuration">
-        <DetailFacts
-          facts={[
-            {
-              label: "Account number",
-              value: (
-                <span className="sm-mono">
-                  {cfg.account_number} <CopyButton value={cfg.account_number} />
-                </span>
-              ),
-            },
-            { label: "Account holder", value: cfg.account_holder_name ?? "—" },
-            { label: "Bank", value: cfg.bank_name ?? "—" },
-            { label: "Branch", value: cfg.branch_name ?? "—" },
-            { label: "Routing number", value: cfg.routing_number ?? "—" },
-            { label: "Transaction ID", value: cfg.transaction_id_requirement },
-            { label: "Transfer rails", value: method.transfer_rails.length > 0 ? method.transfer_rails.join(", ").toUpperCase() : "—" },
-            { label: "Account label", value: method.account_label ?? "—" },
-          ]}
-        />
-        {method.instructions ? <p className="sm-hint">{method.instructions}</p> : null}
-      </Card>
-      {editOpen ? (
-        <Dialog open size="md" onClose={() => setEditOpen(false)} title={`Edit ${method.display_name}`}>
-          <MethodEditForm method={method} onDone={() => setEditOpen(false)} onCancel={() => setEditOpen(false)} />
-        </Dialog>
-      ) : null}
+      >
+        <div style={{ marginBottom: 16 }}>
+          <StatusBadge status={method.is_enabled ? "enabled" : "disabled"} />
+        </div>
+        <Card title="Account configuration">
+          <DetailFacts
+            facts={[
+              {
+                label: "Account number",
+                value: (
+                  <span className="sm-mono">
+                    {cfg.account_number} <CopyButton value={cfg.account_number} />
+                  </span>
+                ),
+              },
+              { label: "Account holder", value: cfg.account_holder_name ?? "—" },
+              { label: "Bank", value: cfg.bank_name ?? "—" },
+              { label: "Branch", value: cfg.branch_name ?? "—" },
+              { label: "Routing number", value: cfg.routing_number ?? "—" },
+              { label: "Transaction ID", value: cfg.transaction_id_requirement },
+              { label: "Transfer rails", value: method.transfer_rails.length > 0 ? method.transfer_rails.join(", ").toUpperCase() : "—" },
+              { label: "Account label", value: method.account_label ?? "—" },
+            ]}
+          />
+          {method.instructions ? <p className="sm-hint">{method.instructions}</p> : null}
+        </Card>
+        {editOpen ? (
+          <Dialog open size="md" onClose={() => setEditOpen(false)} title={`Edit ${method.display_name}`}>
+            <MethodEditForm method={method} onDone={() => setEditOpen(false)} onCancel={() => setEditOpen(false)} />
+          </Dialog>
+        ) : null}
+      </DetailLayout>
     </section>
   );
 }

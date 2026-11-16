@@ -28,7 +28,7 @@ import { Eye, RefreshCw } from "lucide-react";
 import { apiRequest } from "../lib/api-client";
 import { detailKey, listKey } from "../lib/query";
 import {
-  DetailFacts,
+  DetailLayout,
   ListTable,
   PageHeader,
   parseListSearch,
@@ -414,7 +414,7 @@ export function SubscriptionDetailSection({ id }: { id: string }) {
             ) : null}
             {sub.status === "paused" ? (
               <Button
-                variant="primary"
+                variant="accent"
                 disabled={busy}
                 loading={lifecycle.isPending && lifecycle.variables === "resume"}
                 onClick={() =>
@@ -464,7 +464,8 @@ export function SubscriptionDetailSection({ id }: { id: string }) {
           </>
         }
       />
-      <DetailFacts
+      <DetailLayout
+        title="Subscription"
         facts={[
           {
             label: "Customer",
@@ -487,106 +488,107 @@ export function SubscriptionDetailSection({ id }: { id: string }) {
           },
           { label: "Created", value: <DateCell value={sub.created_at} /> },
         ]}
-      />
-      <p className="sm-hint">
-        Renewal is manual — no automatic renewal runs yet. A renewal invoice only
-        extends the period once its payment is verified.
-      </p>
+      >
+        <p className="sm-hint">
+          Renewal is manual — no automatic renewal runs yet. A renewal invoice only
+          extends the period once its payment is verified.
+        </p>
 
-      <div className="sm-card">
-        <h2 className="sm-card-title">Renewal invoices</h2>
-        {sub.renewal_invoices.length === 0 ? (
-          <EmptyState
-            icon={RefreshCw}
-            title="No renewal invoices"
-            body="No renewal invoice has been generated for this subscription yet."
-          />
-        ) : (
-          <div className="sm-table-wrap">
-            <table className="sm-table">
-              <thead>
-                <tr>
-                  <th scope="col">Invoice</th>
-                  <th scope="col">Type</th>
-                  <th scope="col">Status</th>
-                  <th scope="col">Total</th>
-                  <th scope="col">Due</th>
-                  <th scope="col">Issued</th>
-                  <th scope="col">Paid</th>
-                </tr>
-              </thead>
-              <tbody>
-                {sub.renewal_invoices.map((inv) => (
-                  <tr key={inv.id}>
-                    <td>
-                      <span className="sm-mono">
-                        {inv.invoice_number}
-                        <CopyButton value={inv.invoice_number} label="Copy invoice number" />
-                      </span>
-                    </td>
-                    <td>{sentenceCase(inv.invoice_type)}</td>
-                    <td>
-                      <StatusBadge status={inv.status} />
-                    </td>
-                    <td>
-                      <MoneyCell currency={inv.currency_code} minor={inv.total_minor} />
-                    </td>
-                    <td>
-                      <MoneyCell currency={inv.currency_code} minor={inv.amount_due_minor} />
-                    </td>
-                    <td>
-                      <DateCell value={inv.issued_at} />
-                    </td>
-                    <td>
-                      <DateCell value={inv.paid_at} />
-                    </td>
+        <div className="sm-card">
+          <h2 className="sm-card-title">Renewal invoices</h2>
+          {sub.renewal_invoices.length === 0 ? (
+            <EmptyState
+              icon={RefreshCw}
+              title="No renewal invoices"
+              body="No renewal invoice has been generated for this subscription yet."
+            />
+          ) : (
+            <div className="sm-table-wrap">
+              <table className="sm-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Invoice</th>
+                    <th scope="col">Type</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">Total</th>
+                    <th scope="col">Due</th>
+                    <th scope="col">Issued</th>
+                    <th scope="col">Paid</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
+                </thead>
+                <tbody>
+                  {sub.renewal_invoices.map((inv) => (
+                    <tr key={inv.id}>
+                      <td>
+                        <span className="sm-mono">
+                          {inv.invoice_number}
+                          <CopyButton value={inv.invoice_number} label="Copy invoice number" />
+                        </span>
+                      </td>
+                      <td>{sentenceCase(inv.invoice_type)}</td>
+                      <td>
+                        <StatusBadge status={inv.status} />
+                      </td>
+                      <td>
+                        <MoneyCell currency={inv.currency_code} minor={inv.total_minor} />
+                      </td>
+                      <td>
+                        <MoneyCell currency={inv.currency_code} minor={inv.amount_due_minor} />
+                      </td>
+                      <td>
+                        <DateCell value={inv.issued_at} />
+                      </td>
+                      <td>
+                        <DateCell value={inv.paid_at} />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
 
-      <div className="sm-card">
-        <h2 className="sm-card-title">Billing periods</h2>
-        {sub.periods.length === 0 ? (
-          <EmptyState
-            icon={RefreshCw}
-            title="No billing periods"
-            body="This subscription has no billing periods recorded."
-          />
-        ) : (
-          <div className="sm-table-wrap">
-            <table className="sm-table">
-              <thead>
-                <tr>
-                  <th scope="col">Period</th>
-                  <th scope="col">Start</th>
-                  <th scope="col">End</th>
-                  <th scope="col">Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {sub.periods.map((p) => (
-                  <tr key={p.id}>
-                    <td className="sm-tabular">{p.period_number}</td>
-                    <td>
-                      <DateCell value={p.period_start} />
-                    </td>
-                    <td>
-                      <DateCell value={p.period_end} />
-                    </td>
-                    <td>
-                      <StatusBadge status={p.status} />
-                    </td>
+        <div className="sm-card">
+          <h2 className="sm-card-title">Billing periods</h2>
+          {sub.periods.length === 0 ? (
+            <EmptyState
+              icon={RefreshCw}
+              title="No billing periods"
+              body="This subscription has no billing periods recorded."
+            />
+          ) : (
+            <div className="sm-table-wrap">
+              <table className="sm-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Period</th>
+                    <th scope="col">Start</th>
+                    <th scope="col">End</th>
+                    <th scope="col">Status</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
+                </thead>
+                <tbody>
+                  {sub.periods.map((p) => (
+                    <tr key={p.id}>
+                      <td className="sm-tabular">{p.period_number}</td>
+                      <td>
+                        <DateCell value={p.period_start} />
+                      </td>
+                      <td>
+                        <DateCell value={p.period_end} />
+                      </td>
+                      <td>
+                        <StatusBadge status={p.status} />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </DetailLayout>
     </section>
   );
 }

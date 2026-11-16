@@ -43,7 +43,7 @@ import { SITE_CAPABILITIES } from "../../../../packages/contracts/src/index.ts";
 import { apiRequest } from "../lib/api-client";
 import { detailKey, listKey } from "../lib/query";
 import {
-  DetailFacts,
+  DetailLayout,
   ListTable,
   PageHeader,
   parseListSearch,
@@ -659,33 +659,8 @@ export function IntegratedSiteDetailSection({ id }: { id: string }) {
           </Button>
         }
       />
-      <Toolbar>
-        <StatusBadge status={site.status} />
-        <span className="sm-mono">
-          {site.site_key}
-          <CopyButton value={site.site_key} label="Copy site key" />
-        </span>
-        <span className="sm-toolbar-spacer" />
-        <Button
-          variant="secondary"
-          size="sm"
-          disabled={site.status === "suspended" || site.status === "revoked"}
-          loading={suspend.isPending}
-          onClick={() => void askSuspend()}
-        >
-          Suspend site
-        </Button>
-        <Button
-          variant="danger-ghost"
-          size="sm"
-          disabled={site.status === "revoked"}
-          loading={revoke.isPending}
-          onClick={() => void askRevoke()}
-        >
-          Revoke site
-        </Button>
-      </Toolbar>
-      <DetailFacts
+      <DetailLayout
+        title="Site"
         facts={[
           { label: "Environment", value: site.environment },
           { label: "API version", value: site.api_version },
@@ -697,38 +672,65 @@ export function IntegratedSiteDetailSection({ id }: { id: string }) {
           { label: "Created", value: <DateCell value={site.created_at} /> },
           { label: "Updated", value: <DateCell value={site.updated_at} /> },
         ]}
-      />
-      <Tabs
-        tabs={[
-          { key: "products", label: `Products (${site.product_ids.length})` },
-          {
-            key: "credentials",
-            label: `Credentials (${(site.credentials ?? []).length})`,
-          },
-          { key: "domains", label: `Domains (${site.domains.length})` },
-        ]}
-        active={tab}
-        onChange={setTab}
-      />
-      {tab === "products" ? (
-        <SiteProductsTab site={site} />
-      ) : tab === "credentials" ? (
-        <SiteCredentialsTab siteId={site.id} />
-      ) : (
-        <SiteDomainsTab site={site} />
-      )}
-      <EditSiteDialog
-        open={editOpen}
-        onClose={() => setEditOpen(false)}
-        site={site}
-      />
-      <Button
-        variant="ghost"
-        size="sm"
-        onClick={() => navigate({ to: "/settings/websites" })}
       >
-        ← Back to sites
-      </Button>
+        <Toolbar>
+          <StatusBadge status={site.status} />
+          <span className="sm-mono">
+            {site.site_key}
+            <CopyButton value={site.site_key} label="Copy site key" />
+          </span>
+          <span className="sm-toolbar-spacer" />
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={site.status === "suspended" || site.status === "revoked"}
+            loading={suspend.isPending}
+            onClick={() => void askSuspend()}
+          >
+            Suspend site
+          </Button>
+          <Button
+            variant="danger-ghost"
+            size="sm"
+            disabled={site.status === "revoked"}
+            loading={revoke.isPending}
+            onClick={() => void askRevoke()}
+          >
+            Revoke site
+          </Button>
+        </Toolbar>
+        <Tabs
+          tabs={[
+            { key: "products", label: `Products (${site.product_ids.length})` },
+            {
+              key: "credentials",
+              label: `Credentials (${(site.credentials ?? []).length})`,
+            },
+            { key: "domains", label: `Domains (${site.domains.length})` },
+          ]}
+          active={tab}
+          onChange={setTab}
+        />
+        {tab === "products" ? (
+          <SiteProductsTab site={site} />
+        ) : tab === "credentials" ? (
+          <SiteCredentialsTab siteId={site.id} />
+        ) : (
+          <SiteDomainsTab site={site} />
+        )}
+        <EditSiteDialog
+          open={editOpen}
+          onClose={() => setEditOpen(false)}
+          site={site}
+        />
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => navigate({ to: "/settings/websites" })}
+        >
+          ← Back to sites
+        </Button>
+      </DetailLayout>
     </section>
   );
 }

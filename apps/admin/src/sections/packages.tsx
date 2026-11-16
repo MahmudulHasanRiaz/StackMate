@@ -42,6 +42,7 @@ import { detailKey } from "../lib/query";
 import {
   apiErrorMessage,
   DetailFacts,
+  DetailLayout,
   ListTable,
   PageHeader,
   parseListSearch,
@@ -604,11 +605,11 @@ function CreatePackageDialog({
             </Button>
           ) : null}
           {step !== "review" ? (
-            <Button variant="primary" onClick={goNext}>
+            <Button variant="accent" onClick={goNext}>
               Next
             </Button>
           ) : (
-            <Button variant="primary" loading={create.isPending} onClick={submitForm}>
+            <Button variant="accent" loading={create.isPending} onClick={submitForm}>
               Create package
             </Button>
           )}
@@ -876,7 +877,7 @@ export function PackagesSection() {
         }
         action={
           selectedProduct ? (
-            <Button variant="primary" icon={Plus} onClick={() => setCreateOpen(true)}>
+            <Button variant="accent" icon={Plus} onClick={() => setCreateOpen(true)}>
               Create package
             </Button>
           ) : undefined
@@ -1119,7 +1120,7 @@ function CreatePriceDialog({
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={create.isPending} onClick={submitForm}>
+          <Button variant="accent" loading={create.isPending} onClick={submitForm}>
             Create price
           </Button>
         </>
@@ -1342,7 +1343,7 @@ function EditPriceDialog({
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={save.isPending} onClick={submitForm}>
+          <Button variant="accent" loading={save.isPending} onClick={submitForm}>
             Save changes
           </Button>
         </>
@@ -1521,7 +1522,7 @@ function NewVersionDialog({
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={create.isPending} onClick={submitForm}>
+          <Button variant="accent" loading={create.isPending} onClick={submitForm}>
             Create version
           </Button>
         </>
@@ -1627,7 +1628,7 @@ function EditPackageDialog({
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button variant="primary" loading={save.isPending} onClick={submitForm}>
+          <Button variant="accent" loading={save.isPending} onClick={submitForm}>
             Save changes
           </Button>
         </>
@@ -1814,7 +1815,7 @@ export function PackageDetailSection({ id }: { id: string }) {
               Edit
             </Button>
             <Button
-              variant="primary"
+              variant="accent"
               icon={Plus}
               onClick={() => setNewVersionOpen(true)}
             >
@@ -1823,7 +1824,8 @@ export function PackageDetailSection({ id }: { id: string }) {
           </div>
         }
       />
-      <DetailFacts
+      <DetailLayout
+        title="Package"
         facts={[
           {
             label: "Key",
@@ -1853,246 +1855,247 @@ export function PackageDetailSection({ id }: { id: string }) {
           { label: "Created", value: <DateCell value={pkg.created_at} /> },
           { label: "Updated", value: <DateCell value={pkg.updated_at} /> },
         ]}
-      />
+      >
 
-      <Tabs
-        tabs={[
-          { key: "versions", label: `Versions (${versions.length})` },
-          { key: "prices", label: `Prices (${allPrices.length})` },
-        ]}
-        active={tab}
-        onChange={setTab}
-      />
+        <Tabs
+          tabs={[
+            { key: "versions", label: `Versions (${versions.length})` },
+            { key: "prices", label: `Prices (${allPrices.length})` },
+          ]}
+          active={tab}
+          onChange={setTab}
+        />
 
-      {tab === "versions" ? (
-        <Card title="Versions">
-          {versions.length === 0 ? (
-            <p className="sm-hint">No versions yet.</p>
-          ) : (
-            <div className="sm-table-wrap">
-              <table className="sm-table">
-                <thead>
-                  <tr>
-                    <th>Version</th>
-                    <th>Status</th>
-                    <th>Change summary</th>
-                    <th>Features</th>
-                    <th>Prices</th>
-                    <th>Published</th>
-                    <th>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {versions.map((v) => (
-                    <tr key={v.id}>
-                      <td>
-                        <span className="sm-tabular">v{v.version_number}</span>
-                      </td>
-                      <td>
-                        <StatusBadge status={v.status} />
-                      </td>
-                      <td>{v.change_summary ?? "—"}</td>
-                      <td>
-                        <span className="sm-tabular">{v.features.length}</span>
-                      </td>
-                      <td>
-                        <span className="sm-tabular">{(v.prices ?? []).length}</span>
-                      </td>
-                      <td>
-                        <DateCell value={v.published_at} />
-                      </td>
-                      <td>
-                        <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                          <Button
-                            variant="secondary"
-                            size="sm"
-                            onClick={() => setPriceVersion(v)}
-                          >
-                            Add price
-                          </Button>
-                          {v.status === "draft" ? (
-                            <Button
-                              variant="primary"
-                              size="sm"
-                              loading={publishVersion.isPending}
-                              onClick={() => publishVersion.mutate(v.id)}
-                            >
-                              Publish
-                            </Button>
-                          ) : null}
-                          {v.status === "published" ? (
-                            <Button
-                              variant="danger-ghost"
-                              size="sm"
-                              loading={retireVersion.isPending}
-                              onClick={() => void onRetire(v)}
-                            >
-                              Retire
-                            </Button>
-                          ) : null}
-                        </div>
-                      </td>
+        {tab === "versions" ? (
+          <Card title="Versions">
+            {versions.length === 0 ? (
+              <p className="sm-hint">No versions yet.</p>
+            ) : (
+              <div className="sm-table-wrap">
+                <table className="sm-table">
+                  <thead>
+                    <tr>
+                      <th>Version</th>
+                      <th>Status</th>
+                      <th>Change summary</th>
+                      <th>Features</th>
+                      <th>Prices</th>
+                      <th>Published</th>
+                      <th>Actions</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-          {versions.length > 0 ? (
-            <div style={{ marginTop: 24 }}>
-              <h3 className="sm-card-title" style={{ marginBottom: 12 }}>
-                Features in the current version
-              </h3>
-              {(() => {
-                const shown =
-                  currentVersion ?? versions[0];
-                if (!shown || shown.features.length === 0) {
-                  return <p className="sm-hint">No feature grants on this version.</p>;
-                }
-                return (
-                  <div className="sm-table-wrap">
-                    <table className="sm-table">
-                      <thead>
-                        <tr>
-                          <th>Feature</th>
-                          <th>Value type</th>
-                          <th>Entitlement</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {shown.features.map((g) => (
-                          <tr key={g.id}>
-                            <td>
-                              <span className="sm-mono">{g.feature_key_snapshot}</span>
-                            </td>
-                            <td>{g.value_type_snapshot}</td>
-                            <td>{formatEntitlement(g.entitlement_value)}</td>
+                  </thead>
+                  <tbody>
+                    {versions.map((v) => (
+                      <tr key={v.id}>
+                        <td>
+                          <span className="sm-tabular">v{v.version_number}</span>
+                        </td>
+                        <td>
+                          <StatusBadge status={v.status} />
+                        </td>
+                        <td>{v.change_summary ?? "—"}</td>
+                        <td>
+                          <span className="sm-tabular">{v.features.length}</span>
+                        </td>
+                        <td>
+                          <span className="sm-tabular">{(v.prices ?? []).length}</span>
+                        </td>
+                        <td>
+                          <DateCell value={v.published_at} />
+                        </td>
+                        <td>
+                          <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              onClick={() => setPriceVersion(v)}
+                            >
+                              Add price
+                            </Button>
+                            {v.status === "draft" ? (
+                              <Button
+                                variant="accent"
+                                size="sm"
+                                loading={publishVersion.isPending}
+                                onClick={() => publishVersion.mutate(v.id)}
+                              >
+                                Publish
+                              </Button>
+                            ) : null}
+                            {v.status === "published" ? (
+                              <Button
+                                variant="danger-ghost"
+                                size="sm"
+                                loading={retireVersion.isPending}
+                                onClick={() => void onRetire(v)}
+                              >
+                                Retire
+                              </Button>
+                            ) : null}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {versions.length > 0 ? (
+              <div style={{ marginTop: 24 }}>
+                <h3 className="sm-card-title" style={{ marginBottom: 12 }}>
+                  Features in the current version
+                </h3>
+                {(() => {
+                  const shown =
+                    currentVersion ?? versions[0];
+                  if (!shown || shown.features.length === 0) {
+                    return <p className="sm-hint">No feature grants on this version.</p>;
+                  }
+                  return (
+                    <div className="sm-table-wrap">
+                      <table className="sm-table">
+                        <thead>
+                          <tr>
+                            <th>Feature</th>
+                            <th>Value type</th>
+                            <th>Entitlement</th>
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                );
-              })()}
-            </div>
-          ) : null}
-        </Card>
-      ) : (
-        <Card title="Prices">
-          {allPrices.length === 0 ? (
-            <p className="sm-hint">
-              No prices yet. Add a price to a version from the Versions tab.
-            </p>
-          ) : (
-            <div className="sm-table-wrap">
-              <table className="sm-table">
-                <thead>
-                  <tr>
-                    <th>Key</th>
-                    <th>Version</th>
-                    <th>Kind</th>
-                    <th>Amount</th>
-                    <th>Interval</th>
-                    <th>Trial</th>
-                    <th>Setup fee</th>
-                    <th>Status</th>
-                    <th>Used in orders</th>
-                    <th>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {allPrices.map((p) => (
-                    <tr key={p.id}>
-                      <td>
-                        <span className="sm-mono">{p.price_key}</span>
-                      </td>
-                      <td>
-                        <span className="sm-tabular">v{p.version_number}</span>
-                      </td>
-                      <td>{sentenceCase(p.price_kind)}</td>
-                      <td>
-                        <MoneyCell currency={p.currency_code} minor={p.amount_minor} />
-                      </td>
-                      <td>{formatInterval(p)}</td>
-                      <td>
-                        <span className="sm-tabular">
-                          {p.trial_days > 0 ? `${p.trial_days} days` : "—"}
-                        </span>
-                      </td>
-                      <td>
-                        <MoneyCell
-                          currency={p.currency_code}
-                          minor={p.setup_fee_minor}
-                        />
-                      </td>
-                      <td>
-                        <StatusBadge status={p.status} />
-                      </td>
-                      <td>{p.used_in_orders ? "Yes" : "No"}</td>
-                      <td>
-                        <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                          <Button
-                            variant="secondary"
-                            size="sm"
-                            disabled={p.used_in_orders}
-                            title={
-                              p.used_in_orders
-                                ? "Used in orders — create a replacement price instead"
-                                : "Edit price"
-                            }
-                            onClick={() => setEditPrice(p)}
-                          >
-                            Edit
-                          </Button>
-                          {p.status === "active" ? (
-                            <Button
-                              variant="danger-ghost"
-                              size="sm"
-                              loading={disablePrice.isPending}
-                              onClick={() => void onDisablePrice(p)}
-                            >
-                              Disable
-                            </Button>
-                          ) : null}
-                        </div>
-                      </td>
+                        </thead>
+                        <tbody>
+                          {shown.features.map((g) => (
+                            <tr key={g.id}>
+                              <td>
+                                <span className="sm-mono">{g.feature_key_snapshot}</span>
+                              </td>
+                              <td>{g.value_type_snapshot}</td>
+                              <td>{formatEntitlement(g.entitlement_value)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  );
+                })()}
+              </div>
+            ) : null}
+          </Card>
+        ) : (
+          <Card title="Prices">
+            {allPrices.length === 0 ? (
+              <p className="sm-hint">
+                No prices yet. Add a price to a version from the Versions tab.
+              </p>
+            ) : (
+              <div className="sm-table-wrap">
+                <table className="sm-table">
+                  <thead>
+                    <tr>
+                      <th>Key</th>
+                      <th>Version</th>
+                      <th>Kind</th>
+                      <th>Amount</th>
+                      <th>Interval</th>
+                      <th>Trial</th>
+                      <th>Setup fee</th>
+                      <th>Status</th>
+                      <th>Used in orders</th>
+                      <th>Actions</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </Card>
-      )}
+                  </thead>
+                  <tbody>
+                    {allPrices.map((p) => (
+                      <tr key={p.id}>
+                        <td>
+                          <span className="sm-mono">{p.price_key}</span>
+                        </td>
+                        <td>
+                          <span className="sm-tabular">v{p.version_number}</span>
+                        </td>
+                        <td>{sentenceCase(p.price_kind)}</td>
+                        <td>
+                          <MoneyCell currency={p.currency_code} minor={p.amount_minor} />
+                        </td>
+                        <td>{formatInterval(p)}</td>
+                        <td>
+                          <span className="sm-tabular">
+                            {p.trial_days > 0 ? `${p.trial_days} days` : "—"}
+                          </span>
+                        </td>
+                        <td>
+                          <MoneyCell
+                            currency={p.currency_code}
+                            minor={p.setup_fee_minor}
+                          />
+                        </td>
+                        <td>
+                          <StatusBadge status={p.status} />
+                        </td>
+                        <td>{p.used_in_orders ? "Yes" : "No"}</td>
+                        <td>
+                          <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              disabled={p.used_in_orders}
+                              title={
+                                p.used_in_orders
+                                  ? "Used in orders — create a replacement price instead"
+                                  : "Edit price"
+                              }
+                              onClick={() => setEditPrice(p)}
+                            >
+                              Edit
+                            </Button>
+                            {p.status === "active" ? (
+                              <Button
+                                variant="danger-ghost"
+                                size="sm"
+                                loading={disablePrice.isPending}
+                                onClick={() => void onDisablePrice(p)}
+                              >
+                                Disable
+                              </Button>
+                            ) : null}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Card>
+        )}
 
-      <EditPackageDialog
-        open={editOpen}
-        onClose={() => setEditOpen(false)}
-        pkg={pkg}
-      />
-      <NewVersionDialog
-        open={newVersionOpen}
-        onClose={() => setNewVersionOpen(false)}
-        pkg={pkg}
-      />
-      {priceVersion ? (
-        <CreatePriceDialog
-          open
-          onClose={() => setPriceVersion(null)}
-          version={priceVersion}
-          packageId={pkg.id}
-          productId={pkg.product_id}
+        <EditPackageDialog
+          open={editOpen}
+          onClose={() => setEditOpen(false)}
+          pkg={pkg}
         />
-      ) : null}
-      {editPrice ? (
-        <EditPriceDialog
-          open
-          onClose={() => setEditPrice(null)}
-          price={editPrice}
-          packageId={pkg.id}
-          productId={pkg.product_id}
+        <NewVersionDialog
+          open={newVersionOpen}
+          onClose={() => setNewVersionOpen(false)}
+          pkg={pkg}
         />
-      ) : null}
+        {priceVersion ? (
+          <CreatePriceDialog
+            open
+            onClose={() => setPriceVersion(null)}
+            version={priceVersion}
+            packageId={pkg.id}
+            productId={pkg.product_id}
+          />
+        ) : null}
+        {editPrice ? (
+          <EditPriceDialog
+            open
+            onClose={() => setEditPrice(null)}
+            price={editPrice}
+            packageId={pkg.id}
+            productId={pkg.product_id}
+          />
+        ) : null}
+      </DetailLayout>
     </section>
   );
 }

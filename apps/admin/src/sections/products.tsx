@@ -34,7 +34,7 @@ import { apiRequest } from "../lib/api-client";
 import { detailKey, listKey } from "../lib/query";
 import {
   apiErrorMessage,
-  DetailFacts,
+  DetailLayout,
   ListTable,
   PageHeader,
   parseListSearch,
@@ -824,7 +824,8 @@ export function ProductDetailSection({ id }: { id: string }) {
           </div>
         }
       />
-      <DetailFacts
+      <DetailLayout
+        title="Product"
         facts={[
           {
             label: "Code",
@@ -857,74 +858,10 @@ export function ProductDetailSection({ id }: { id: string }) {
           },
           { label: "Created", value: <DateCell value={product.created_at} /> },
         ]}
-      />
-
-      <Card
-        title={`Features (${product.features.length})`}
-        actions={
-          <Button
-            variant="secondary"
-            size="sm"
-            icon={Plus}
-            onClick={() => {
-              void navigate({
-                to: "/features",
-                search: { product: product.id },
-              } as never);
-            }}
-          >
-            Manage features
-          </Button>
-        }
       >
-        {product.features.length === 0 ? (
-          <EmptyState
-            icon={Package}
-            title="No features yet"
-            body="Features define what a package grants to a customer."
-            actionLabel="Create feature"
-            onAction={() => {
-              void navigate({
-                to: "/features",
-                search: { product: product.id },
-              } as never);
-            }}
-          />
-        ) : (
-          <div className="sm-table-wrap">
-            <table className="sm-table">
-              <thead>
-                <tr>
-                  <th>Key</th>
-                  <th>Name</th>
-                  <th>Value type</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {product.features.map((f) => (
-                  <tr key={f.id}>
-                    <td>
-                      <span className="sm-mono">{f.feature_key}</span>
-                    </td>
-                    <td>
-                      <a href={`/features/${f.id}?product=${product.id}`}>{f.name}</a>
-                    </td>
-                    <td>{f.value_type}</td>
-                    <td>
-                      <StatusBadge status={f.status} />
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </Card>
 
-      <div style={{ marginTop: 24 }}>
         <Card
-          title={`Packages (${product.packages.length})`}
+          title={`Features (${product.features.length})`}
           actions={
             <Button
               variant="secondary"
@@ -932,24 +869,24 @@ export function ProductDetailSection({ id }: { id: string }) {
               icon={Plus}
               onClick={() => {
                 void navigate({
-                  to: "/packages",
+                  to: "/features",
                   search: { product: product.id },
                 } as never);
               }}
             >
-              Manage packages
+              Manage features
             </Button>
           }
         >
-          {product.packages.length === 0 ? (
+          {product.features.length === 0 ? (
             <EmptyState
               icon={Package}
-              title="No packages yet"
-              body="Packages bundle features into something a customer can buy."
-              actionLabel="Create package"
+              title="No features yet"
+              body="Features define what a package grants to a customer."
+              actionLabel="Create feature"
               onAction={() => {
                 void navigate({
-                  to: "/packages",
+                  to: "/features",
                   search: { product: product.id },
                 } as never);
               }}
@@ -961,20 +898,22 @@ export function ProductDetailSection({ id }: { id: string }) {
                   <tr>
                     <th>Key</th>
                     <th>Name</th>
+                    <th>Value type</th>
                     <th>Status</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {product.packages.map((p) => (
-                    <tr key={p.id}>
+                  {product.features.map((f) => (
+                    <tr key={f.id}>
                       <td>
-                        <span className="sm-mono">{p.package_key}</span>
+                        <span className="sm-mono">{f.feature_key}</span>
                       </td>
                       <td>
-                        <a href={`/packages/${p.id}`}>{p.name}</a>
+                        <a href={`/features/${f.id}?product=${product.id}`}>{f.name}</a>
                       </td>
+                      <td>{f.value_type}</td>
                       <td>
-                        <StatusBadge status={p.status} />
+                        <StatusBadge status={f.status} />
                       </td>
                     </tr>
                   ))}
@@ -983,13 +922,76 @@ export function ProductDetailSection({ id }: { id: string }) {
             </div>
           )}
         </Card>
-      </div>
 
-      <EditProductDialog
-        open={editOpen}
-        onClose={() => setEditOpen(false)}
-        product={product}
-      />
+        <div style={{ marginTop: 24 }}>
+          <Card
+            title={`Packages (${product.packages.length})`}
+            actions={
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={Plus}
+                onClick={() => {
+                  void navigate({
+                    to: "/packages",
+                    search: { product: product.id },
+                  } as never);
+                }}
+              >
+                Manage packages
+              </Button>
+            }
+          >
+            {product.packages.length === 0 ? (
+              <EmptyState
+                icon={Package}
+                title="No packages yet"
+                body="Packages bundle features into something a customer can buy."
+                actionLabel="Create package"
+                onAction={() => {
+                  void navigate({
+                    to: "/packages",
+                    search: { product: product.id },
+                  } as never);
+                }}
+              />
+            ) : (
+              <div className="sm-table-wrap">
+                <table className="sm-table">
+                  <thead>
+                    <tr>
+                      <th>Key</th>
+                      <th>Name</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {product.packages.map((p) => (
+                      <tr key={p.id}>
+                        <td>
+                          <span className="sm-mono">{p.package_key}</span>
+                        </td>
+                        <td>
+                          <a href={`/packages/${p.id}`}>{p.name}</a>
+                        </td>
+                        <td>
+                          <StatusBadge status={p.status} />
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Card>
+        </div>
+
+        <EditProductDialog
+          open={editOpen}
+          onClose={() => setEditOpen(false)}
+          product={product}
+        />
+      </DetailLayout>
     </section>
   );
 }

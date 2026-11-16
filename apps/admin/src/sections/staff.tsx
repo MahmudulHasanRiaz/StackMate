@@ -64,6 +64,7 @@ import {
 } from "../components/primitives";
 import {
   DetailFacts,
+  DetailLayout,
   ListTable,
   PageHeader,
   apiErrorMessage,
@@ -586,11 +587,11 @@ export function StaffSection() {
 
   const headerAction =
     tab === "roles" ? (
-      <Button variant="primary" icon={KeyRound} onClick={openCreateRole}>
+      <Button variant="accent" icon={KeyRound} onClick={openCreateRole}>
         Create role
       </Button>
     ) : (
-      <Button variant="primary" icon={UserPlus} onClick={openInvite}>
+      <Button variant="accent" icon={UserPlus} onClick={openInvite}>
         Invite staff
       </Button>
     );
@@ -761,7 +762,7 @@ export function StaffSection() {
               Cancel
             </Button>
             <Button
-              variant="primary"
+              variant="accent"
               loading={createRole.isPending || updateRole.isPending}
               onClick={submitRole}
             >
@@ -884,7 +885,7 @@ export function StaffSection() {
               Cancel
             </Button>
             <Button
-              variant="primary"
+              variant="accent"
               loading={createInvitation.isPending}
               onClick={submitInvitation}
             >
@@ -1104,28 +1105,28 @@ export function StaffUserDetailSection({ id }: { id: string }) {
           />
         </div>
       ) : user ? (
-        <div>
-          <DetailFacts
-            facts={[
-              { label: "Name", value: user.name },
-              { label: "Email", value: user.email },
-              {
-                label: "Status",
-                value: <StatusBadge status={user.status} />,
-              },
-              {
-                label: "Roles",
-                value: (
-                  <span className="sm-mono">{roleKeysLabel(user.roles)}</span>
-                ),
-              },
-              {
-                label: "Created",
-                value: <DateCell value={user.created_at} />,
-              },
-              { label: "User ID", value: <span className="sm-mono">{user.id}</span> },
-            ]}
-          />
+        <DetailLayout
+          title="User"
+          facts={[
+            { label: "Name", value: user.name },
+            { label: "Email", value: user.email },
+            {
+              label: "Status",
+              value: <StatusBadge status={user.status} />,
+            },
+            {
+              label: "Roles",
+              value: (
+                <span className="sm-mono">{roleKeysLabel(user.roles)}</span>
+              ),
+            },
+            {
+              label: "Created",
+              value: <DateCell value={user.created_at} />,
+            },
+            { label: "User ID", value: <span className="sm-mono">{user.id}</span> },
+          ]}
+        >
           <Card
             title="Roles"
             actions={
@@ -1139,7 +1140,7 @@ export function StaffUserDetailSection({ id }: { id: string }) {
                   Reset
                 </Button>{" "}
                 <Button
-                  variant="primary"
+                  variant="accent"
                   size="sm"
                   disabled={!rolesChanged}
                   loading={updateRoles.isPending}
@@ -1195,7 +1196,7 @@ export function StaffUserDetailSection({ id }: { id: string }) {
               </div>
             )}
           </Card>
-        </div>
+        </DetailLayout>
       ) : null}
     </section>
   );

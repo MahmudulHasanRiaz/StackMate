@@ -30,6 +30,7 @@ import { apiRequest, formatMinorMoney } from "../lib/api-client";
 import { detailKey, listKey } from "../lib/query";
 import {
   DetailFacts,
+  DetailLayout,
   ListTable,
   PageHeader,
   parseListSearch,
@@ -264,7 +265,7 @@ export function PaymentReviewSection() {
             : "No submissions awaiting verification"
         }
         action={
-          <Button variant="primary" icon={Plus} onClick={() => setRecordOpen(true)}>
+          <Button variant="accent" icon={Plus} onClick={() => setRecordOpen(true)}>
             Record payment
           </Button>
         }
@@ -609,7 +610,7 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
           Cancel
         </Button>
         <Button
-          variant="primary"
+          variant="accent"
           loading={submitting || mutation.isPending}
           onClick={() => void submit()}
         >
@@ -698,33 +699,15 @@ export function PaymentSubmissionDetailSection({ id }: { id: string }) {
               <Button variant="danger-ghost" onClick={() => setRejectOpen(true)}>
                 Reject
               </Button>
-              <Button variant="primary" onClick={() => setApproveOpen(true)}>
+              <Button variant="accent" onClick={() => setApproveOpen(true)}>
                 Approve
               </Button>
             </span>
           ) : undefined
         }
       />
-      <div style={{ marginBottom: 16 }}>
-        <StatusBadge status={sub.status} />
-      </div>
-      {sub.duplicate_risk_Warning ? (
-        <div style={{ marginBottom: 16 }}>
-          <Alert variant="warning">
-            Duplicate transaction reference — another open submission uses this
-            reference. Check it before approving.
-          </Alert>
-        </div>
-      ) : null}
-      {!isReviewable ? (
-        <div style={{ marginBottom: 16 }}>
-          <Alert variant="info">
-            This submission has already been reviewed ({sub.status}). No further
-            action is available.
-          </Alert>
-        </div>
-      ) : null}
-      <DetailFacts
+      <DetailLayout
+        title="Submission"
         facts={[
           { label: "Amount", value: <MoneyCell currency={sub.currency_code} minor={sub.amount_minor} /> },
           {
@@ -741,84 +724,104 @@ export function PaymentSubmissionDetailSection({ id }: { id: string }) {
           { label: "Submitted", value: <DateTimeCell value={sub.submitted_at} /> },
           { label: "Reviewed", value: <DateTimeCell value={sub.reviewed_at} /> },
         ]}
-      />
-      <Card title="Sender & payment details">
-        <DetailFacts
-          facts={[
-            { label: "Sender name", value: sub.sender_name ?? "—" },
-            { label: "Sender phone", value: sub.sender_phone ?? "—" },
-            { label: "Sender bank", value: sub.sender_bank_name ?? "—" },
-            { label: "Sender account ref.", value: sub.sender_account_reference ?? "—" },
-            { label: "Transfer rail", value: sub.transfer_rail_key ? sub.transfer_rail_key.toUpperCase() : "—" },
-            { label: "Transaction ref.", value: sub.transaction_reference ?? "—" },
-            { label: "Payment date", value: <DateCell value={sub.payment_date} /> },
-            {
-              label: "Evidence",
-              value: sub.proof_asset_id ? (
-                <span className="sm-mono">
-                  {sub.proof_asset_id.slice(0, 8)}… <CopyButton value={sub.proof_asset_id} />{" "}
-                  <a href={`/api/v1/admin/assets/${sub.proof_asset_id}/content`} target="_blank" rel="noreferrer">
-                    View evidence
-                  </a>
-                </span>
-              ) : (
-                "—"
-              ),
-            },
-          ]}
-        />
-        {sub.customer_note ? <p className="sm-hint">{sub.customer_note}</p> : null}
-      </Card>
-      <div style={{ marginTop: 24 }}>
-        <Card title="Verification history">
-          {history.isPending && !sub.verification_logs ? (
-            <Skeleton height={20} />
-          ) : logs.length === 0 ? (
-            <p className="sm-hint">No verification entries yet.</p>
-          ) : (
-            <div className="sm-table-wrap">
-              <table className="sm-table">
-                <thead>
-                  <tr>
-                    <th>When</th>
-                    <th>Decision</th>
-                    <th>Reason code</th>
-                    <th>Customer message</th>
-                    <th>Notes</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {logs.map((log) => (
-                    <tr key={log.id}>
-                      <td>
-                        <DateTimeCell value={log.created_at} />
-                      </td>
-                      <td>
-                        <StatusBadge status={log.decision} />
-                      </td>
-                      <td>
-                        {log.reason_code ? <span className="sm-mono">{log.reason_code}</span> : "—"}
-                      </td>
-                      <td>{log.customer_message ?? "—"}</td>
-                      <td>{log.notes ?? "—"}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
+      >
+        <div style={{ marginBottom: 16 }}>
+          <StatusBadge status={sub.status} />
+        </div>
+        {sub.duplicate_risk_Warning ? (
+          <div style={{ marginBottom: 16 }}>
+            <Alert variant="warning">
+              Duplicate transaction reference — another open submission uses this
+              reference. Check it before approving.
+            </Alert>
+          </div>
+        ) : null}
+        {!isReviewable ? (
+          <div style={{ marginBottom: 16 }}>
+            <Alert variant="info">
+              This submission has already been reviewed ({sub.status}). No further
+              action is available.
+            </Alert>
+          </div>
+        ) : null}
+        <Card title="Sender & payment details">
+          <DetailFacts
+            facts={[
+              { label: "Sender name", value: sub.sender_name ?? "—" },
+              { label: "Sender phone", value: sub.sender_phone ?? "—" },
+              { label: "Sender bank", value: sub.sender_bank_name ?? "—" },
+              { label: "Sender account ref.", value: sub.sender_account_reference ?? "—" },
+              { label: "Transfer rail", value: sub.transfer_rail_key ? sub.transfer_rail_key.toUpperCase() : "—" },
+              { label: "Transaction ref.", value: sub.transaction_reference ?? "—" },
+              { label: "Payment date", value: <DateCell value={sub.payment_date} /> },
+              {
+                label: "Evidence",
+                value: sub.proof_asset_id ? (
+                  <span className="sm-mono">
+                    {sub.proof_asset_id.slice(0, 8)}… <CopyButton value={sub.proof_asset_id} />{" "}
+                    <a href={`/api/v1/admin/assets/${sub.proof_asset_id}/content`} target="_blank" rel="noreferrer">
+                      View evidence
+                    </a>
+                  </span>
+                ) : (
+                  "—"
+                ),
+              },
+            ]}
+          />
+          {sub.customer_note ? <p className="sm-hint">{sub.customer_note}</p> : null}
         </Card>
-      </div>
-      {approveOpen ? (
-        <Dialog open size="md" onClose={() => setApproveOpen(false)} title="Approve payment">
-          <ApproveForm submission={sub} onDone={() => setApproveOpen(false)} onCancel={() => setApproveOpen(false)} />
-        </Dialog>
-      ) : null}
-      {rejectOpen ? (
-        <Dialog open size="md" onClose={() => setRejectOpen(false)} title="Reject payment">
-          <RejectForm submission={sub} onDone={() => setRejectOpen(false)} onCancel={() => setRejectOpen(false)} />
-        </Dialog>
-      ) : null}
+        <div style={{ marginTop: 24 }}>
+          <Card title="Verification history">
+            {history.isPending && !sub.verification_logs ? (
+              <Skeleton height={20} />
+            ) : logs.length === 0 ? (
+              <p className="sm-hint">No verification entries yet.</p>
+            ) : (
+              <div className="sm-table-wrap">
+                <table className="sm-table">
+                  <thead>
+                    <tr>
+                      <th>When</th>
+                      <th>Decision</th>
+                      <th>Reason code</th>
+                      <th>Customer message</th>
+                      <th>Notes</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {logs.map((log) => (
+                      <tr key={log.id}>
+                        <td>
+                          <DateTimeCell value={log.created_at} />
+                        </td>
+                        <td>
+                          <StatusBadge status={log.decision} />
+                        </td>
+                        <td>
+                          {log.reason_code ? <span className="sm-mono">{log.reason_code}</span> : "—"}
+                        </td>
+                        <td>{log.customer_message ?? "—"}</td>
+                        <td>{log.notes ?? "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Card>
+        </div>
+        {approveOpen ? (
+          <Dialog open size="md" onClose={() => setApproveOpen(false)} title="Approve payment">
+            <ApproveForm submission={sub} onDone={() => setApproveOpen(false)} onCancel={() => setApproveOpen(false)} />
+          </Dialog>
+        ) : null}
+        {rejectOpen ? (
+          <Dialog open size="md" onClose={() => setRejectOpen(false)} title="Reject payment">
+            <RejectForm submission={sub} onDone={() => setRejectOpen(false)} onCancel={() => setRejectOpen(false)} />
+          </Dialog>
+        ) : null}
+      </DetailLayout>
     </section>
   );
 }
@@ -927,7 +930,7 @@ function ApproveForm({
         <Button variant="secondary" onClick={onCancel}>
           Cancel
         </Button>
-        <Button variant="primary" loading={mutation.isPending} onClick={submit}>
+        <Button variant="accent" loading={mutation.isPending} onClick={submit}>
           Approve payment
         </Button>
       </div>
