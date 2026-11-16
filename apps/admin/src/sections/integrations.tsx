@@ -1213,14 +1213,14 @@ function SiteCredentialsTab({ siteId }: { siteId: string }) {
                       title: "Revoke credential?",
                       body: (
                         <p>
-                          {cred.key_id} stops authenticating immediately. Any
-                          integration using it will fail until it switches to
-                          another credential.
+                          {cred.key_id} stops authenticating permanently. This
+                          cannot be undone — any integration using it will fail
+                          until it switches to another credential.
                         </p>
                       ),
                       confirmLabel: "Revoke",
                       danger: true,
-                      warning: `${cred.key_id} stops authenticating immediately.`,
+                      warning: `${cred.key_id} stops authenticating permanently.`,
                     });
                     if (ok) revoke.mutate(cred.id);
                   })(),
@@ -1513,7 +1513,8 @@ function SiteDomainsTab({ site }: { site: IntegratedSite }) {
                       body: (
                         <div>
                           <p>
-                            {domain.domain} will be removed from {site.name}.
+                            {domain.domain} will be permanently removed from{" "}
+                            {site.name}.
                           </p>
                           {domain.is_primary ? (
                             <p>
@@ -1525,7 +1526,7 @@ function SiteDomainsTab({ site }: { site: IntegratedSite }) {
                       ),
                       confirmLabel: "Delete",
                       danger: true,
-                      warning: `${domain.domain} will be removed from ${site.name}.`,
+                      warning: `${domain.domain} will be permanently removed from ${site.name}.`,
                     });
                     if (ok) remove.mutate(domain.id);
                   })(),

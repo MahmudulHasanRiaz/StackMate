@@ -306,15 +306,15 @@ export function WebhooksSection() {
                       body: (
                         <div>
                           <p>
-                            {ep.url} will stop receiving deliveries. Its past
-                            deliveries are removed with it; outbox history is
-                            kept.
+                            {ep.url} will be permanently deleted and will stop
+                            receiving deliveries. Its past deliveries are
+                            removed with it; outbox history is kept.
                           </p>
                         </div>
                       ),
                       confirmLabel: "Delete",
                       danger: true,
-                      warning: `${ep.url} will stop receiving deliveries.`,
+                      warning: `${ep.url} will be permanently deleted.`,
                     });
                     if (ok) deleteEndpoint.mutate(ep.id);
                   })(),

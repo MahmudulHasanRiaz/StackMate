@@ -67,6 +67,7 @@ import {
 } from "lucide-react";
 import { ApiClientError, apiRequest } from "../lib/api-client";
 import { queryClient } from "../lib/query";
+import { humanizeType } from "../lib/resolve-names";
 import { applyTheme, resolveThemeChoice, type ThemeChoice } from "../lib/theme";
 import {
   Alert,
@@ -326,8 +327,37 @@ function MainNav({
     items: group.items.filter((item) => can(item.permission)),
   })).filter((group) => group.items.length > 0);
 
+  // Peek suppression (live bug 2026-11-16, follow-up fix): the
+  // hover/focus-within peek is CSS-only, so after clicking "Collapse
+  // menu" the pointer is still over the toggle AND the button keeps
+  // focus — both :hover and :focus-within keep matching and the nav
+  // stays expanded even though the pinned state is collapsed (only a
+  // fresh navigation cleared it). While suppressed, the `sm-peek-off`
+  // class gates the peek selectors in tokens.css. It clears itself the
+  // moment the pointer leaves the nav or focus leaves it, so hover-peek
+  // and focus-within peek keep working afterwards — the suppression is
+  // transient, never persisted, and cannot desync the pinned state.
+  // Focus is deliberately NOT moved: the button keeps focus and the
+  // rail still returns at once.
+  const [peekSuppressed, setPeekSuppressed] = useState(false);
+  const handleToggleCollapse = () => {
+    // Unpinning (expanded → collapsed) suppresses the peek; pinning
+    // (collapsed → expanded) clears any suppression.
+    setPeekSuppressed(!collapsed);
+    onToggleCollapse();
+  };
+
   return (
-    <aside className={className ?? "sm-sidebar"} aria-label="Primary navigation">
+    <aside
+      className={`${className ?? "sm-sidebar"}${peekSuppressed ? " sm-peek-off" : ""}`}
+      aria-label="Primary navigation"
+      onMouseLeave={() => setPeekSuppressed(false)}
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+          setPeekSuppressed(false);
+        }
+      }}
+    >
       <div className="sm-sidebar-brand">
         <span className="sm-brand-mark">
           <Package size={20} strokeWidth={2} />
@@ -370,7 +400,7 @@ function MainNav({
       <button
         type="button"
         className="sm-nav-collapse-btn"
-        onClick={onToggleCollapse}
+        onClick={handleToggleCollapse}
         aria-label={collapsed ? "Expand menu" : "Collapse menu"}
         title={collapsed ? "Expand menu" : "Collapse menu"}
       >
@@ -630,7 +660,7 @@ function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }
           htmlFor="profile-roles"
           hint="Roles are set by an administrator."
         >
-          <Input id="profile-roles" value={principal.roles.join(", ")} disabled />
+          <Input id="profile-roles" value={principal.roles.map((r) => humanizeType(r)).join(", ")} disabled />
         </Field>
       </div>
     </Dialog>
@@ -833,7 +863,13 @@ function AccountMenu() {
           <div className="sm-menu-header-body">
             <div className="sm-menu-header-name">{principal.user.name}</div>
             <div className="sm-menu-header-sub">{principal.user.email}</div>
-            <div className="sm-menu-header-sub">{principal.roles.join(", ")}</div>
+            <div className="sm-menu-header-roles">
+              {principal.roles.map((r) => (
+                <span key={r} className="sm-badge sm-badge-neutral">
+                  {humanizeType(r)}
+                </span>
+              ))}
+            </div>
           </div>
         </MenuHeader>
         <MenuDivider />

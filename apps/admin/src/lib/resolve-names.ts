@@ -90,9 +90,13 @@ export function useResourceMaps(): ResourceMaps {
 
 /**
  * Human display for a resource id, or null when no name is known
- * (callers fall back to shortId). Resource types with no global list
- * (credential, domain, product, …) intentionally return null — their
- * ids stay short, never full UUIDs.
+ * (callers fall back to shortId). These client-side maps cover only the
+ * four flat lists the audit/outbox pages already fetch (staff, sites,
+ * webhooks, invitations) — the audit API now returns a server-resolved
+ * `resource_display_name` for every type (including nested resources
+ * and sessions), and callers must prefer it; this stays as the fallback
+ * for rows the server could not resolve (deleted resources) and for
+ * pages the server does not enrich (outbox aggregates).
  */
 export function resolveResourceName(
   resourceType: string,

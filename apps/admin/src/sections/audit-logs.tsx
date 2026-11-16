@@ -47,6 +47,9 @@ interface AuditLogRecord {
   action: string;
   resource_type: string;
   resource_id: string;
+  // Server-resolved human display name (F3 follow-up): the API returns
+  // it for every resource type; null when the resource no longer exists.
+  resource_display_name?: string | null;
   outcome: "success" | "denied" | "failed";
   request_id: string;
   changes: Record<string, unknown>;
@@ -120,10 +123,13 @@ export function AuditLogsSection() {
     "/api/v1/admin/audit-logs",
   );
 
-  /* F3 (2026-11-16): the API returns raw UUIDs for actors and
-     resources — resolve human names client-side (staff list join;
-     sites / webhooks / invitations for resources). Unknown ids fall
-     back to a short id, never the full UUID. */
+  /* F3 (2026-11-16, follow-up): the API returns a server-resolved
+     `resource_display_name` for every resource type (see
+     resolveAuditResourceDisplayName in the audit service); the
+     client-side maps below are only the fallback for rows the server
+     could not resolve (deleted resources). Actor names still resolve
+     client-side (staff list join). Unknown ids fall back to a short id,
+     never the full UUID. */
   const staffNames = useStaffNameMap();
   const resourceMaps = useResourceMaps();
 
@@ -200,11 +206,17 @@ export function AuditLogsSection() {
         accessorKey: "resource_type",
         header: "Resource",
         cell: ({ row }) => {
-          const display = resolveResourceName(
-            row.original.resource_type,
-            row.original.resource_id,
-            resourceMaps,
-          );
+          // Server value first (covers every resource type, including
+          // nested ones and sessions); client-side maps are the fallback
+          // for rows the server could not resolve (deleted resources);
+          // a short id is the last resort — never a bare full UUID.
+          const display =
+            row.original.resource_display_name ??
+            resolveResourceName(
+              row.original.resource_type,
+              row.original.resource_id,
+              resourceMaps,
+            );
           return (
             <div>
               {display ? (
@@ -403,11 +415,13 @@ export function AuditLogsSection() {
                   label: "Resource",
                   value: (
                     <span className="sm-break">
-                      {resolveResourceName(
-                        selected.resource_type,
-                        selected.resource_id,
-                        resourceMaps,
-                      ) ?? shortId(selected.resource_id)}{" "}
+                      {selected.resource_display_name ??
+                        resolveResourceName(
+                          selected.resource_type,
+                          selected.resource_id,
+                          resourceMaps,
+                        ) ??
+                        shortId(selected.resource_id)}{" "}
                       <span className="sm-hint">
                         ({humanizeType(selected.resource_type)})
                       </span>

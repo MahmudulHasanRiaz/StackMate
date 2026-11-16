@@ -136,6 +136,7 @@ import {
   replayOutboxEventByAdmin,
   testWebhookEndpointByAdmin,
 } from "./modules/webhooks/service.ts";
+import { resolveAuditResourceDisplayName } from "./modules/audit/service.ts";
 
 interface RouteMatch {
   params: Record<string, string>;
@@ -3192,6 +3193,16 @@ export function createStackMateApp(
           assertStaffPermission(principal, "audit_logs.read");
           const items = store.state.audit_logs.map((a) => ({
             ...a,
+            // Human display name for the resource (F3 follow-up): resolved
+            // server-side from the in-memory state; null when the resource
+            // no longer exists — the SPA falls back to its client-side
+            // maps, then a short id. Additive field, no contract break.
+            resource_display_name: resolveAuditResourceDisplayName(
+              store.state,
+              a.resource_type,
+              a.resource_id,
+              a.actor_user_id,
+            ),
             created_date_display: formatDisplayDateTimeDDMMYYYY(
               a.created_at,
               env.DEFAULT_TIMEZONE

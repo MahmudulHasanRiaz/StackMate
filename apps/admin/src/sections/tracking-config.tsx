@@ -293,7 +293,8 @@ function TrackingGroups({ site }: { site: IntegratedSite }) {
                                   <div>
                                     <p>
                                       {g.label ?? g.pixel_id} (
-                                      {PROVIDER_LABELS[g.provider]}) will stop
+                                      {PROVIDER_LABELS[g.provider]}) will be
+                                      permanently deleted and will stop
                                       receiving events for {site.name}. The
                                       stored CAPI token is deleted with it.
                                     </p>
@@ -301,7 +302,7 @@ function TrackingGroups({ site }: { site: IntegratedSite }) {
                                 ),
                                 confirmLabel: "Delete",
                                 danger: true,
-                                warning: `${g.label ?? g.pixel_id} (${PROVIDER_LABELS[g.provider]}) will stop receiving events for ${site.name}.`,
+                                warning: `${g.label ?? g.pixel_id} (${PROVIDER_LABELS[g.provider]}) will be permanently deleted.`,
                               });
                               if (ok) remove.mutate(g.id);
                             })(),
