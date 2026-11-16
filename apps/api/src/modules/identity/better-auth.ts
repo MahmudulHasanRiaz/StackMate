@@ -225,6 +225,38 @@ function originOf(url: string): string | null {
 }
 
 /**
+ * Normalize ONE configured trusted origin to the bare origin Better
+ * Auth actually compares against.
+ *
+ * Verified against the installed better-auth 1.7.23 dist
+ * (dist/auth/trusted-origins.mjs): `matchesOriginPattern` compares a
+ * non-wildcard pattern with EXACT string equality against
+ * `getOrigin(url)` — the pattern is never normalized — while
+ * `getTrustedOrigins` (dist/context/helpers.mjs) pushes
+ * `options.trustedOrigins` RAW. A dashboard value copied with a
+ * trailing slash or a path
+ * (`https://stackmate-api-staging.ad-dawah.workers.dev/`) therefore
+ * NEVER matches the browser's Origin header
+ * (`https://stackmate-api-staging.ad-dawah.workers.dev`, no slash):
+ * that is exactly the live 2FA failure (fix batch #2, 2026-11-16 —
+ * batch #1 only normalized API_URL/APP_URL and left TRUSTED_ORIGINS
+ * raw). `new URL().origin` also lower-cases the host and drops
+ * default ports and paths, so every dashboard variation collapses
+ * to the same bare origin.
+ *
+ * Wildcard patterns (`*` / `?` present) are Better Auth's own
+ * matching syntax and are kept verbatim (trimmed): `new URL()`
+ * rejects a bare `*.example.com` (no scheme), so running one through
+ * originOf() would silently DROP a legitimate wildcard entry.
+ */
+function normalizeTrustedOrigin(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (trimmed.includes("*") || trimmed.includes("?")) return trimmed;
+  return originOf(trimmed);
+}
+
+/**
  * CONFIG-ONLY helper: returns the plain Better Auth settings for this env.
  * It does NOT create an auth instance — use `createBetterAuth()` for that.
  */
@@ -250,12 +282,24 @@ export function buildBetterAuthWorkerConfig(
     // never lock the same-origin SPA out of its own auth endpoints.
     // These are the app's own deployment URLs, not user input — no
     // cross-site origin is trusted by this.
+    //
+    // NORMALIZATION (2FA origin fix batch #2, 2026-11-16): EVERY
+    // entry goes through normalizeTrustedOrigin (see above). Batch #1
+    // normalized only API_URL/APP_URL and left the TRUSTED_ORIGINS
+    // entries raw — a dashboard value with a trailing slash or path
+    // then never matched the browser's bare Origin header, and the
+    // live 2FA gate kept 403ing with INVALID_ORIGIN. BETTER_AUTH_URL
+    // is included explicitly as well (never rely on Better Auth
+    // auto-trusting baseURL alone): if it is the only var naming the
+    // deployment, the SPA still gets in. Wildcards are preserved
+    // verbatim by the normalizer.
     trustedOrigins: Array.from(
       new Set(
         [
-          ...env.TRUSTED_ORIGINS.split(",")
-            .map((s) => s.trim())
-            .filter(Boolean),
+          ...(env.TRUSTED_ORIGINS ?? "")
+            .split(",")
+            .map(normalizeTrustedOrigin),
+          originOf(env.BETTER_AUTH_URL),
           originOf(env.API_URL),
           originOf(env.APP_URL),
         ].filter((o): o is string => o !== null)

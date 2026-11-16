@@ -20,6 +20,28 @@
  * unrelated host and TRUSTED_ORIGINS does not cover the request
  * origin — only API_URL does.
  *
+ * FIX BATCH #2 (2026-11-16): the batch-#1 fix did NOT hold live — the
+ * 2FA gate still 403s with Better Auth's flat "Invalid origin"
+ * (INVALID_ORIGIN). Verified root cause, against the INSTALLED
+ * better-auth 1.7.23 dist (not memory): `matchesOriginPattern`
+ * (dist/auth/trusted-origins.mjs) compares a non-wildcard trusted
+ * pattern with EXACT string equality against `getOrigin(url)` — the
+ * pattern is never normalized — while `getTrustedOrigins`
+ * (dist/context/helpers.mjs) pushes `options.trustedOrigins` RAW. A
+ * dashboard TRUSTED_ORIGINS entry copied with a trailing slash or a
+ * path (`https://stackmate-api-staging.ad-dawah.workers.dev/`) can
+ * therefore NEVER match the browser's Origin header
+ * (`https://stackmate-api-staging.ad-dawah.workers.dev`). Batch #1
+ * only normalized API_URL/APP_URL via originOf(); TRUSTED_ORIGINS
+ * stayed raw and BETTER_AUTH_URL was never added explicitly. The
+ * matrix below reproduces the live failure shapes (trailing-slash
+ * TRUSTED_ORIGINS, API_URL/APP_URL undefined, BETTER_AUTH_URL as the
+ * sole covering source) — each new row MUST fail 403 INVALID_ORIGIN
+ * against the unfixed code and pass after the normalization fix.
+ * Wildcard rows are regression guards: normalization must not drop
+ * Better Auth's wildcard syntax (`new URL()` rejects bare
+ * `*.example.com`).
+ *
  * Rate limit note: the two-factor plugin allows 3 calls per 10s on
  * /two-factor/*, so the enable attempts sleep 11s apart (~33s total).
  *
@@ -38,6 +60,10 @@ import { Client } from "pg";
 const DATABASE_URL = process.env.DATABASE_URL;
 const ORIGIN_DB_NAME = "stackmate_test_two_factor_origin";
 const API_BASE = "http://localhost:8787";
+// The live staging origin (the browser's Origin header on the real
+// SPA — no trailing slash, no path). The failing live shape is a
+// TRUSTED_ORIGINS entry for this origin carrying a trailing slash.
+const STAGING_ORIGIN = "https://stackmate-api-staging.ad-dawah.workers.dev";
 const MIGRATIONS_DIR = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../../../db/migrations"
@@ -88,7 +114,8 @@ describe.skipIf(!DATABASE_URL)("two-factor origin check (check ON)", () => {
       cookie?: string;
       origin?: string;
       referer?: string;
-    } = {}
+    } = {},
+    envOverride?: import("../src/env.ts").StackMateBindings
   ): Promise<{ status: number; headers: Headers; body: any }> {
     const headers = new Headers();
     if (options.body !== undefined) headers.set("Content-Type", "application/json");
@@ -97,7 +124,7 @@ describe.skipIf(!DATABASE_URL)("two-factor origin check (check ON)", () => {
     if (options.referer !== undefined) headers.set("Referer", options.referer);
     const init: RequestInit = { method: options.method ?? "GET", headers };
     if (options.body !== undefined) init.body = JSON.stringify(options.body);
-    const res = await app.fetch(new Request(`${API_BASE}${path}`, init), env);
+    const res = await app.fetch(new Request(`${API_BASE}${path}`, init), envOverride ?? env);
     const text = await res.text();
     let body: any = null;
     try {
@@ -139,6 +166,42 @@ describe.skipIf(!DATABASE_URL)("two-factor origin check (check ON)", () => {
       API_URL: API_BASE,
       APP_URL: API_BASE,
     });
+
+    // Live-shape variants (batch #2 — see the header comment). Each
+    // varies one thing from the base env so the failing shape is
+    // isolated; the request Origin in every row is STAGING_ORIGIN.
+    envTrailingSlash = {
+      ...env,
+      BETTER_AUTH_URL: "https://auth.example.com",
+      TRUSTED_ORIGINS: `${STAGING_ORIGIN}/`,
+      API_URL: API_BASE,
+      APP_URL: API_BASE,
+    };
+    envNoApiApp = {
+      ...env,
+      BETTER_AUTH_URL: "https://auth.example.com",
+      TRUSTED_ORIGINS: `${STAGING_ORIGIN}/`,
+      // Deliberately undefined (cast): the live Worker sees the
+      // localhost fallback when the dashboard vars are unset, which
+      // never covers the staging origin — the fix must not depend on
+      // API_URL/APP_URL at all.
+      API_URL: undefined as unknown as string,
+      APP_URL: undefined as unknown as string,
+    };
+    envBaseUrlOnly = {
+      ...env,
+      BETTER_AUTH_URL: `${STAGING_ORIGIN}/`,
+      TRUSTED_ORIGINS: "https://trusted.example.com",
+      API_URL: API_BASE,
+      APP_URL: API_BASE,
+    };
+    envWildcard = {
+      ...env,
+      BETTER_AUTH_URL: "https://auth.example.com",
+      TRUSTED_ORIGINS: "https://*.example.com",
+      API_URL: API_BASE,
+      APP_URL: API_BASE,
+    };
 
     const maintenanceUrl = new URL(DATABASE_URL);
     maintenanceUrl.pathname = "/postgres";
@@ -204,17 +267,45 @@ describe.skipIf(!DATABASE_URL)("two-factor origin check (check ON)", () => {
     } catch {}
   });
 
-  async function enableTwoFactor(origin?: string, referer?: string) {
+  async function enableTwoFactor(
+    origin?: string,
+    referer?: string,
+    envOverride?: import("../src/env.ts").StackMateBindings
+  ) {
     // exactOptionalPropertyTypes: only pass origin/referer when set —
     // the no-Origin case is a real test (MISSING_OR_NULL_ORIGIN).
-    return apiRequest("/api/auth/two-factor/enable", {
-      method: "POST",
-      body: { password: "SuperAdminPass123!" },
-      cookie: sessionCookie,
-      ...(origin !== undefined ? { origin } : {}),
-      ...(referer !== undefined ? { referer } : {}),
-    });
+    return apiRequest(
+      "/api/auth/two-factor/enable",
+      {
+        method: "POST",
+        body: { password: "SuperAdminPass123!" },
+        cookie: sessionCookie,
+        ...(origin !== undefined ? { origin } : {}),
+        ...(referer !== undefined ? { referer } : {}),
+      },
+      envOverride
+    );
   }
+
+  // Live-shape envs (batch #2): each varies ONE thing from the base
+  // env so the failing shape is isolated. The request Origin in every
+  // row is the exact value a browser sends for the staging SPA.
+  // - envTrailingSlash: TRUSTED_ORIGINS carries the staging origin
+  //   with a trailing slash (copied from a browser address bar) and
+  //   nothing else covers it. REPRODUCES the live failure.
+  // - envNoApiApp: API_URL/APP_URL undefined (the localhost fallback
+  //   in env.ts is what a live Worker sees when the dashboard vars
+  //   are unset) + trailing-slash TRUSTED_ORIGINS.
+  // - envBaseUrlOnly: BETTER_AUTH_URL is the ONLY var naming the
+  //   staging origin (trailing-slash value) — Better Auth auto-trusts
+  //   the baseURL origin, so this passes even unfixed; it guards the
+  //   explicit originOf(BETTER_AUTH_URL) inclusion against regressions.
+  // - envWildcard: wildcard TRUSTED_ORIGINS — normalization must keep
+  //   Better Auth's wildcard syntax intact.
+  let envTrailingSlash: import("../src/env.ts").StackMateBindings;
+  let envNoApiApp: import("../src/env.ts").StackMateBindings;
+  let envBaseUrlOnly: import("../src/env.ts").StackMateBindings;
+  let envWildcard: import("../src/env.ts").StackMateBindings;
 
   it("rejects an untrusted cross-site origin (proves the check is ON in this file)", async () => {
     const res = await enableTwoFactor("https://evil.example.com", "https://evil.example.com/");
@@ -241,6 +332,62 @@ describe.skipIf(!DATABASE_URL)("two-factor origin check (check ON)", () => {
     const res = await enableTwoFactor();
     assert.equal(res.status, 403, `expected 403, got ${res.status}: ${JSON.stringify(res.body)}`);
     assert.equal(res.body.code, "MISSING_OR_NULL_ORIGIN");
+  }, 60_000);
+
+  it("accepts the staging origin when TRUSTED_ORIGINS carries a trailing slash (live failure shape)", async () => {
+    await sleep(11_000);
+    const res = await enableTwoFactor(
+      STAGING_ORIGIN,
+      `${STAGING_ORIGIN}/settings/authentication`,
+      envTrailingSlash
+    );
+    assert.equal(res.status, 200, `expected 200, got ${res.status}: ${JSON.stringify(res.body)}`);
+    assert.ok(
+      typeof res.body.totpURI === "string" && res.body.totpURI.startsWith("otpauth://totp/"),
+      "enable must return a totpURI (the QR)"
+    );
+  }, 60_000);
+
+  it("accepts the staging origin with API_URL/APP_URL undefined + trailing-slash TRUSTED_ORIGINS", async () => {
+    await sleep(11_000);
+    const res = await enableTwoFactor(
+      STAGING_ORIGIN,
+      `${STAGING_ORIGIN}/settings/authentication`,
+      envNoApiApp
+    );
+    assert.equal(res.status, 200, `expected 200, got ${res.status}: ${JSON.stringify(res.body)}`);
+    assert.ok(
+      typeof res.body.totpURI === "string" && res.body.totpURI.startsWith("otpauth://totp/"),
+      "enable must return a totpURI (the QR)"
+    );
+  }, 60_000);
+
+  it("accepts the staging origin when BETTER_AUTH_URL alone names it (trailing-slash value)", async () => {
+    await sleep(11_000);
+    const res = await enableTwoFactor(
+      STAGING_ORIGIN,
+      `${STAGING_ORIGIN}/settings/authentication`,
+      envBaseUrlOnly
+    );
+    assert.equal(res.status, 200, `expected 200, got ${res.status}: ${JSON.stringify(res.body)}`);
+    assert.ok(
+      typeof res.body.totpURI === "string" && res.body.totpURI.startsWith("otpauth://totp/"),
+      "enable must return a totpURI (the QR)"
+    );
+  }, 60_000);
+
+  it("accepts a wildcard TRUSTED_ORIGINS entry (normalization must not drop wildcards)", async () => {
+    await sleep(11_000);
+    const res = await enableTwoFactor(
+      "https://app.example.com",
+      "https://app.example.com/",
+      envWildcard
+    );
+    assert.equal(res.status, 200, `expected 200, got ${res.status}: ${JSON.stringify(res.body)}`);
+    assert.ok(
+      typeof res.body.totpURI === "string" && res.body.totpURI.startsWith("otpauth://totp/"),
+      "enable must return a totpURI (the QR)"
+    );
   }, 60_000);
 
   it("completes the full setup flow with the origin check on (password gate → QR → verify)", async () => {
