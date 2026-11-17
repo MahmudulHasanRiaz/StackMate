@@ -212,6 +212,7 @@ export function seedCustomer(
     whatsapp: null,
     credit_balance_minor: 0,
     company_name: null,
+    website: null,
     country_code: "BD",
     status: "active",
     registration_source: "admin",

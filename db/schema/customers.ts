@@ -17,6 +17,9 @@ export const customers = pgTable(
     whatsapp: varchar("whatsapp", { length: 40 }),
     creditBalanceMinor: bigint("credit_balance_minor", { mode: "number" }).notNull().default(0),
     companyName: varchar("company_name", { length: 200 }),
+    // Migration 0011: website (ADR-0009 decision 11) — the UI collected
+    // it but there was no column, so the value was silently discarded.
+    website: varchar("website", { length: 200 }),
     countryCode: char("country_code", { length: 2 }).default("BD"),
     status: text("status").notNull().default("active"), // active | inactive | blocked
     registrationSource: text("registration_source").notNull().default("admin"),

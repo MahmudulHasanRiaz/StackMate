@@ -1602,7 +1602,7 @@ function buildLoadStateQuery(caps: StoreCapabilities): string {
        FROM uploaded_assets` },
     { key: "customers", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, customer_number, customer_type, name, email, normalized_email,
             phone, normalized_phone, whatsapp, credit_balance_minor,
-            company_name, country_code, status,
+            company_name, website, country_code, status,
             registration_source, notes, created_at, updated_at
        FROM customers` },
     { key: "customerContacts", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, customer_id, kind, value, normalized_value, created_at
@@ -1946,6 +1946,7 @@ async function loadStateInternalImpl(
     whatsapp: str(row, "whatsapp"),
     credit_balance_minor: num(row, "credit_balance_minor") ?? 0,
     company_name: str(row, "company_name"),
+    website: str(row, "website"),
     country_code: str(row, "country_code") ?? "BD",
     status: asEnum(
       str(row, "status"),
@@ -3598,6 +3599,7 @@ async function persistStateDiff(
           "whatsapp",
           "credit_balance_minor",
           "company_name",
+          "website",
           "country_code",
           "status",
           "registration_source",
@@ -3617,6 +3619,7 @@ async function persistStateDiff(
           r.whatsapp,
           r.credit_balance_minor,
           r.company_name,
+          r.website,
           r.country_code,
           r.status,
           r.registration_source,
@@ -3638,6 +3641,7 @@ async function persistStateDiff(
         "whatsapp",
         "credit_balance_minor",
         "company_name",
+        "website",
         "country_code",
         "status",
         "registration_source",
@@ -3658,6 +3662,7 @@ async function persistStateDiff(
           r.whatsapp,
           r.credit_balance_minor,
           r.company_name,
+          r.website,
           r.country_code,
           r.status,
           r.registration_source,

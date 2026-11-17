@@ -28,16 +28,27 @@ export type OrderSource = (typeof ORDER_SOURCES)[number];
 // Contact rule (ADR-0009): a customer needs AT LEAST ONE of email/phone.
 // Enforced here at the schema boundary (both create and inline-create in
 // orders) and again in the service, which also runs the dedupe resolver.
+//
+// Null-tolerance (fix batch 2026-11-17, ADR-0009 decision 11): the admin
+// UI sends JSON `null` for empty optional fields (customerFormToCreateBody
+// maps "" → null), and valibot `.optional()` accepts `undefined` but NOT
+// `null` — so every Add Customer submission 422'd live. Optional fields
+// here are therefore `.nullable().optional()`: JSON null ≡ absent. The
+// refine treats null exactly like empty.
 export const CreateCustomerSchema = v
   .object({
     customer_type: v.enum(["person", "business"] as const).default("person"),
     name: v.string().trim().min(2).max(200),
-    email: v.string().trim().email().optional(),
-    phone: v.string().trim().min(6).max(40).optional(),
-    whatsapp: v.string().trim().min(6).max(40).optional(),
-    company_name: v.string().trim().max(200).optional(),
+    email: v.string().trim().email().nullable().optional(),
+    phone: v.string().trim().min(6).max(40).nullable().optional(),
+    whatsapp: v.string().trim().min(6).max(40).nullable().optional(),
+    company_name: v.string().trim().max(200).nullable().optional(),
+    // Migration 0011: website was collected by the UI but had no column
+    // and no schema field — valibot silently stripped it (data loss).
+    // It is a real stored field now.
+    website: v.string().trim().max(200).nullable().optional(),
     country_code: v.string().trim().min(2).max(2).default("BD"),
-    notes: v.string().trim().max(2000).optional(),
+    notes: v.string().trim().max(2000).nullable().optional(),
   })
   .refine(
     (val) => Boolean(val.email?.trim() || val.phone?.trim()),
@@ -55,29 +66,29 @@ export const PublicCreateCheckoutOrderSchema = v.object({
   items: v.array(CheckoutOrderItemInputSchema, { min: 1, max: 10 }),
   customer: v.object({
     name: v.string().trim().min(2).max(200),
-    email: v.string().trim().email().optional(),
-    phone: v.string().trim().min(6).max(40).optional(),
-    company_name: v.string().trim().max(200).optional(),
+    email: v.string().trim().email().nullable().optional(),
+    phone: v.string().trim().min(6).max(40).nullable().optional(),
+    company_name: v.string().trim().max(200).nullable().optional(),
   }),
   billing_address: v
     .object({
       country_code: v.string().trim().min(2).max(2).default("BD"),
-      address_line_1: v.string().trim().max(250).optional(),
-      city: v.string().trim().max(120).optional(),
-      postal_code: v.string().trim().max(40).optional(),
+      address_line_1: v.string().trim().max(250).nullable().optional(),
+      city: v.string().trim().max(120).nullable().optional(),
+      postal_code: v.string().trim().max(40).nullable().optional(),
     })
     .optional(),
   discount_code: v.string().trim().max(80).nullable().optional(),
   customer_note: v.string().trim().max(1000).nullable().optional(),
   attribution: v
     .object({
-      utm_source: v.string().trim().max(120).optional(),
-      utm_medium: v.string().trim().max(120).optional(),
-      utm_campaign: v.string().trim().max(120).optional(),
-      utm_content: v.string().trim().max(120).optional(),
-      utm_term: v.string().trim().max(120).optional(),
-      fbp: v.string().trim().max(200).optional(),
-      fbc: v.string().trim().max(200).optional(),
+      utm_source: v.string().trim().max(120).nullable().optional(),
+      utm_medium: v.string().trim().max(120).nullable().optional(),
+      utm_campaign: v.string().trim().max(120).nullable().optional(),
+      utm_content: v.string().trim().max(120).nullable().optional(),
+      utm_term: v.string().trim().max(120).nullable().optional(),
+      fbp: v.string().trim().max(200).nullable().optional(),
+      fbc: v.string().trim().max(200).nullable().optional(),
     })
     .optional(),
 });
@@ -101,13 +112,15 @@ export const AdminCustomFeatureItemSchema = v.object({
 export const PaymentPlanSchema = v
   .object({
     kind: v.enum(["full", "advance_rest", "equal_installments"] as const).default("full"),
-    due_date: v.string().trim().optional(),
+    // Null-tolerant (ADR-0009 decision 11): date fields arrive as JSON
+    // null from some callers; null ≡ absent here, same as undefined.
+    due_date: v.string().trim().nullable().optional(),
     advance_amount_minor: v.number().int().positive().optional(),
     advance_percent: v.number().int().min(1).max(99).optional(),
-    rest_due_date: v.string().trim().optional(),
+    rest_due_date: v.string().trim().nullable().optional(),
     installment_count: v.number().int().min(2).max(24).optional(),
     interval_days: v.number().int().min(1).max(365).optional(),
-    start_date: v.string().trim().optional(),
+    start_date: v.string().trim().nullable().optional(),
   })
   .refine(
     (val) =>
@@ -150,8 +163,8 @@ export const AdminCreateOrderSchema = v
     quantity: v.number().int().min(1).max(100).default(1),
     discount_minor: v.number().int().nonnegative().default(0),
     tax_minor: v.number().int().nonnegative().default(0),
-    customer_note: v.string().trim().max(1000).optional(),
-    internal_note: v.string().trim().max(2000).optional(),
+    customer_note: v.string().trim().max(1000).nullable().optional(),
+    internal_note: v.string().trim().max(2000).nullable().optional(),
     payment_method_id: v.string().uuid().nullable().optional(),
     payment_plan: PaymentPlanSchema.optional(),
     // License activation policy (ADR-0009). on_percent needs
@@ -196,6 +209,8 @@ export const UpdateCustomerSchema = v.object({
   phone: v.string().trim().min(6).max(40).nullable().optional(),
   whatsapp: v.string().trim().min(6).max(40).nullable().optional(),
   company_name: v.string().trim().max(200).nullable().optional(),
+  // Migration 0011 (ADR-0009 decision 11): website is a stored field.
+  website: v.string().trim().max(200).nullable().optional(),
   country_code: v.string().trim().min(2).max(2).optional(),
   status: v.enum(CUSTOMER_STATUSES).optional(),
   notes: v.string().trim().max(2000).nullable().optional(),
@@ -204,13 +219,15 @@ export const UpdateCustomerSchema = v.object({
 /** Billing/shipping address for a customer (table exists since 0000). */
 export const CreateCustomerAddressSchema = v.object({
   address_type: v.enum(["billing", "shipping", "other"] as const).default("billing"),
-  contact_name: v.string().trim().max(200).optional(),
-  phone: v.string().trim().min(6).max(40).optional(),
-  address_line_1: v.string().trim().max(250).optional(),
-  address_line_2: v.string().trim().max(250).optional(),
-  city: v.string().trim().max(120).optional(),
-  state_or_region: v.string().trim().max(120).optional(),
-  postal_code: v.string().trim().max(40).optional(),
+  // Null-tolerant (ADR-0009 decision 11): the admin UI sends JSON null
+  // for empty optional fields; null ≡ absent.
+  contact_name: v.string().trim().max(200).nullable().optional(),
+  phone: v.string().trim().min(6).max(40).nullable().optional(),
+  address_line_1: v.string().trim().max(250).nullable().optional(),
+  address_line_2: v.string().trim().max(250).nullable().optional(),
+  city: v.string().trim().max(120).nullable().optional(),
+  state_or_region: v.string().trim().max(120).nullable().optional(),
+  postal_code: v.string().trim().max(40).nullable().optional(),
   country_code: v.string().trim().min(2).max(2).default("BD"),
   is_default: v.boolean().default(false),
 });
@@ -249,7 +266,7 @@ export const SplitCustomerContactSchema = v.object({
 
 /** Admin edits to one installment (due date / notes; audit-logged). */
 export const UpdateInstallmentSchema = v.object({
-  due_date: v.string().trim().optional(),
+  due_date: v.string().trim().nullable().optional(),
   notes: v.string().trim().max(1000).nullable().optional(),
 });
 

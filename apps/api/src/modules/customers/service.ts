@@ -36,6 +36,8 @@ export function createCustomerInTx(
     phone?: string | null;
     whatsapp?: string | null;
     company_name?: string | null;
+    // Migration 0011: website (ADR-0009 decision 11).
+    website?: string | null;
     country_code?: string;
     registration_source: string;
     notes?: string | null;
@@ -59,6 +61,7 @@ export function createCustomerInTx(
     whatsapp: input.whatsapp ? input.whatsapp.trim() : null,
     credit_balance_minor: 0,
     company_name: input.company_name ? input.company_name.trim() : null,
+    website: input.website ? input.website.trim() : null,
     country_code: (input.country_code ?? "BD").toUpperCase(),
     status: "active",
     registration_source: input.registration_source,
@@ -169,6 +172,7 @@ export function resolveOrCreateCustomerInTx(
     phone?: string | null;
     whatsapp?: string | null;
     company_name?: string | null;
+    website?: string | null;
     country_code?: string;
     registration_source: string;
     notes?: string | null;
@@ -194,6 +198,11 @@ export function resolveOrCreateCustomerInTx(
     if (input.phone) attachSecondaryContactInTx(state, customer, "phone", input.phone);
     if (input.whatsapp && !customer.whatsapp) {
       customer.whatsapp = input.whatsapp.trim();
+    }
+    // Migration 0011: fill a missing website from the incoming input,
+    // same as whatsapp above — never overwrite an existing value.
+    if (input.website && !customer.website) {
+      customer.website = input.website.trim();
     }
     customer.updated_at = new Date().toISOString();
     return { customer, created: false };
@@ -221,6 +230,7 @@ export async function createCustomerByAdmin(
       phone: input.phone ?? null,
       whatsapp: input.whatsapp ?? null,
       company_name: input.company_name ?? null,
+      website: input.website ?? null,
       country_code: input.country_code,
       registration_source: "admin",
       notes: input.notes ?? null,
@@ -302,6 +312,10 @@ export async function updateCustomerByAdmin(
       customer.company_name = input.company_name ? input.company_name.trim() : null;
       changes.company_name = customer.company_name;
     }
+    if (input.website !== undefined) {
+      customer.website = input.website ? input.website.trim() : null;
+      changes.website = customer.website;
+    }
     if (input.country_code !== undefined) {
       customer.country_code = input.country_code.toUpperCase();
       changes.country_code = customer.country_code;
@@ -331,12 +345,52 @@ export async function updateCustomerByAdmin(
 }
 
 // -- Addresses (table exists since 0000; API wired in 0009) -------------------
+//
+// READ/WRITE SHAPE (fix batch 2026-11-17, ADR-0009 decision 11): the
+// admin UI's address DTO uses short keys (line1/line2/state) while the DB
+// record uses address_line_1/address_line_2/state_or_region. The old code
+// returned raw records from the detail endpoint (so the UI read `line1`
+// from a row that only had `address_line_1` — blank display) and the UI
+// POSTed short keys that valibot stripped (so a created address stored
+// all-null lines — silent data loss). The contract is now explicit: the
+// API accepts the DB-shaped schema on write and returns this DTO on read.
+export interface CustomerAddressDto {
+  id: string;
+  customer_id: string;
+  label: string | null;
+  line1: string;
+  line2: string | null;
+  city: string;
+  state: string | null;
+  postal_code: string | null;
+  country_code: string;
+  is_default: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export function toCustomerAddressDto(a: CustomerAddressRecord): CustomerAddressDto {
+  return {
+    id: a.id,
+    customer_id: a.customer_id,
+    label: a.address_type,
+    line1: a.address_line_1 ?? "",
+    line2: a.address_line_2,
+    city: a.city ?? "",
+    state: a.state_or_region,
+    postal_code: a.postal_code,
+    country_code: a.country_code,
+    is_default: a.is_default,
+    created_at: a.created_at,
+    updated_at: a.updated_at,
+  };
+}
 
 export async function listCustomerAddresses(
   store: StackMateDataStore,
   actor: StaffPrincipal,
   customerId: string
-): Promise<CustomerAddressRecord[]> {
+): Promise<CustomerAddressDto[]> {
   assertStaffPermission(actor, "customers.read");
   const state = store.state;
   if (!state.customers.some((c) => c.id === customerId)) {
@@ -344,7 +398,8 @@ export async function listCustomerAddresses(
   }
   return state.customer_addresses
     .filter((a) => a.customer_id === customerId)
-    .sort((a, b) => (a.is_default === b.is_default ? 0 : a.is_default ? -1 : 1));
+    .sort((a, b) => (a.is_default === b.is_default ? 0 : a.is_default ? -1 : 1))
+    .map(toCustomerAddressDto);
 }
 
 export async function createCustomerAddressByAdmin(
@@ -353,7 +408,7 @@ export async function createCustomerAddressByAdmin(
   customerId: string,
   rawInput: unknown,
   requestId: string
-): Promise<CustomerAddressRecord> {
+): Promise<CustomerAddressDto> {
   assertStaffPermission(actor, "customers.manage");
   const input = CreateCustomerAddressSchema.parse(rawInput);
   return store.withTransaction((state) => {
@@ -392,7 +447,7 @@ export async function createCustomerAddressByAdmin(
       request_id: requestId,
       changes: { address_id: address.id, address_type: address.address_type },
     });
-    return address;
+    return toCustomerAddressDto(address);
   });
 }
 
@@ -403,7 +458,7 @@ export async function updateCustomerAddressByAdmin(
   addressId: string,
   rawInput: unknown,
   requestId: string
-): Promise<CustomerAddressRecord> {
+): Promise<CustomerAddressDto> {
   assertStaffPermission(actor, "customers.manage");
   const input = UpdateCustomerAddressSchema.parse(rawInput);
   return store.withTransaction((state) => {
@@ -468,7 +523,7 @@ export async function updateCustomerAddressByAdmin(
       request_id: requestId,
       changes: { address_id: addressId, ...changes },
     });
-    return address;
+    return toCustomerAddressDto(address);
   });
 }
 

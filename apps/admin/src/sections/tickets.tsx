@@ -61,6 +61,14 @@ import {
   Textarea,
 } from "../components/primitives";
 import { CollapsibleSection, type CustomerDto } from "./customers";
+import { humanizeType } from "../lib/resolve-names";
+
+/** Assignee option label — name + email + roles, so two staff with the
+ *  same name are distinguishable (fix batch 2026-11-17). */
+function staffOptionLabel(u: StaffUserDto): string {
+  const roles = (u.roles ?? []).map((r) => humanizeType(r)).join(", ");
+  return roles ? `${u.name} — ${u.email} (${roles})` : `${u.name} — ${u.email}`;
+}
 
 /* ------------------------------------------------------------------ */
 /* DTOs                                                                */
@@ -95,6 +103,10 @@ export interface TicketDto {
   closed_at: string | null;
   customer?: { id: string; name: string; customer_number: string } | null;
   assignee_name?: string | null;
+  // Assignee disambiguation (fix batch 2026-11-17): two staff can share a
+  // name — the API embeds email + role keys with the assignee.
+  assignee_email?: string | null;
+  assignee_roles?: string[] | null;
 }
 
 export interface TicketCommentDto {
@@ -301,7 +313,7 @@ export function TicketsSection() {
               <option value="">All assignees</option>
               {(staffQuery.data ?? []).map((u) => (
                 <option key={u.id} value={u.id}>
-                  {u.name}
+                  {staffOptionLabel(u)}
                 </option>
               ))}
             </Select>
@@ -543,7 +555,7 @@ function CreateTicketDialog({
               .filter((u) => u.status === "active")
               .map((u) => (
                 <option key={u.id} value={u.id}>
-                  {u.name}
+                  {staffOptionLabel(u)}
                 </option>
               ))}
           </Select>
@@ -744,7 +756,16 @@ export function TicketDetailSection({ id }: { id: string }) {
             ),
           },
           { label: "Reporter", value: ticket.reporter_name ?? "—" },
-          { label: "Assignee", value: ticket.assignee_name ?? "Unassigned" },
+          {
+            label: "Assignee",
+            value: ticket.assignee_name
+              ? `${ticket.assignee_name} — ${ticket.assignee_email ?? ""}${
+                  (ticket.assignee_roles ?? []).length > 0
+                    ? ` (${(ticket.assignee_roles ?? []).map((r) => humanizeType(r)).join(", ")})`
+                    : ""
+                }`
+              : "Unassigned",
+          },
           { label: "Source", value: ticket.source_note ?? "—" },
           { label: "Created", value: <DateTimeCell value={ticket.created_at} /> },
           ...(ticket.resolved_at
@@ -799,7 +820,7 @@ export function TicketDetailSection({ id }: { id: string }) {
                       .filter((u) => u.status === "active")
                       .map((u) => (
                         <option key={u.id} value={u.id}>
-                          {u.name}
+                          {staffOptionLabel(u)}
                         </option>
                       ))}
                   </Select>

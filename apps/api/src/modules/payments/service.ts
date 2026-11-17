@@ -305,16 +305,18 @@ export function resolveClaimInstallment(
 
 export interface PaymentPlanInput {
   kind?: "full" | "advance_rest" | "equal_installments";
-  due_date?: string | undefined;
+  // Null-tolerant (ADR-0009 decision 11): the contract schema accepts
+  // JSON null for dates; null ≡ absent (falls back to today / start).
+  due_date?: string | null | undefined;
   advance_amount_minor?: number | undefined;
   advance_percent?: number | undefined;
-  rest_due_date?: string | undefined;
+  rest_due_date?: string | null | undefined;
   installment_count?: number | undefined;
   interval_days?: number | undefined;
-  start_date?: string | undefined;
+  start_date?: string | null | undefined;
 }
 
-function parsePlanDate(value: string | undefined, fallback: string): string {
+function parsePlanDate(value: string | null | undefined, fallback: string): string {
   const raw = (value ?? fallback).trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
     throw new AppError("VALIDATION_ERROR", `Invalid date '${raw}' — expected YYYY-MM-DD.`, 422);
@@ -1338,7 +1340,7 @@ export async function updateInstallmentByAdmin(
     const inst = state.order_installments.find((i) => i.id === installmentId);
     if (!inst) throw new AppError("NOT_FOUND", "Installment not found.", 404);
     const changes: Record<string, unknown> = {};
-    if (input.due_date !== undefined) {
+    if (input.due_date !== undefined && input.due_date !== null) {
       const raw = input.due_date.trim();
       if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
         throw new AppError("VALIDATION_ERROR", `Invalid due date '${raw}' — expected YYYY-MM-DD.`, 422);

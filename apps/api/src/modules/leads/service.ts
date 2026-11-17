@@ -51,16 +51,18 @@ export interface IngestLeadInput {
   email?: string | null | undefined;
   phone?: string | null | undefined;
   whatsapp?: string | null | undefined;
-  utm_source?: string | undefined;
-  utm_medium?: string | undefined;
-  utm_campaign?: string | undefined;
-  interest?: string | undefined;
+  // Null-tolerant (ADR-0009 decision 11): the contract schema accepts
+  // JSON null; null ≡ absent.
+  utm_source?: string | null | undefined;
+  utm_medium?: string | null | undefined;
+  utm_campaign?: string | null | undefined;
+  interest?: string | null | undefined;
   product_id?: string | null | undefined;
-  message?: string | undefined;
-  notes?: string | undefined;
-  fbp?: string | undefined;
-  fbc?: string | undefined;
-  event_source_url?: string | undefined;
+  message?: string | null | undefined;
+  notes?: string | null | undefined;
+  fbp?: string | null | undefined;
+  fbc?: string | null | undefined;
+  event_source_url?: string | null | undefined;
 }
 
 function normalizeLeadEmail(email?: string | null): string | null {
@@ -215,9 +217,9 @@ export function captureLeadInTx(
   };
   state.leads.push(lead);
   emitLeadTrackingEventInTx(state, lead, nowIso, {
-    fbp: input.fbp,
-    fbc: input.fbc,
-    eventSourceUrl: input.event_source_url,
+    fbp: input.fbp ?? undefined,
+    fbc: input.fbc ?? undefined,
+    eventSourceUrl: input.event_source_url ?? undefined,
   });
   return { lead, created: true, replayed: false };
 }
