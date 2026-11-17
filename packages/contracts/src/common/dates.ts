@@ -91,8 +91,7 @@ export function formatDisplayDateDDMMYYYY(
 
 /**
  * Formats an ISO 8601 timestamp into user-facing DD/MM/YYYY HH:mm in the specified IANA timezone.
- */
-export function formatDisplayDateTimeDDMMYYYY(
+ */export function formatDisplayDateTimeDDMMYYYY(
   isoTimestamp: string | Date,
   timeZone = "Asia/Dhaka"
 ): string {
@@ -164,4 +163,15 @@ export function addBillingIntervalUTC(
     result.setUTCDate(Math.min(origDay, maxDay));
   }
   return result.toISOString();
+}
+
+/**
+ * Calendar date (YYYY-MM-DD) of an ISO 8601 instant in the given IANA
+ * timezone. Used for inclusive day-boundary range checks: a timestamp
+ * counts for a date when its calendar date *in the display timezone*
+ * is within [from, to]. No UTC-offset arithmetic — Bangladesh has no
+ * DST, but this stays correct for any zone.
+ */
+export function isoDateOnlyInTimeZone(isoTimestamp: string, timeZone: string): string {
+  return parseStrictDDMMYYYYToIsoDate(formatDisplayDateDDMMYYYY(isoTimestamp, timeZone));
 }

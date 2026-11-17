@@ -40,6 +40,7 @@ import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
 import { Plus, Receipt, ShoppingCart } from "lucide-react";
 import { apiRequest, formatMinorMoney } from "../lib/api-client";
+import { ddmmyyyyToIso, isoToDdmmyyyy } from "../lib/dates";
 import { detailKey, listKey, queryClient } from "../lib/query";
 import {
   DetailFacts,
@@ -1178,33 +1179,6 @@ function EditInstallmentDialog({
       </form>
     </Dialog>
   );
-}
-
-/** Strict DD/MM/YYYY → YYYY-MM-DD (null when invalid). Mirrors the
- *  server's strict date parser; never uses Date.parse. */
-export function ddmmyyyyToIso(value: string): string | null {
-  const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(value.trim());
-  if (!m) return null;
-  const day = Number(m[1]);
-  const month = Number(m[2]);
-  const year = Number(m[3]);
-  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
-  const d = new Date(Date.UTC(year, month - 1, day));
-  if (
-    d.getUTCFullYear() !== year ||
-    d.getUTCMonth() !== month - 1 ||
-    d.getUTCDate() !== day
-  ) {
-    return null;
-  }
-  return `${m[3]}-${m[2]}-${m[1]}`;
-}
-
-/** YYYY-MM-DD → DD/MM/YYYY for display in date inputs. */
-export function isoToDdmmyyyy(value: string): string {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
-  if (!m) return value;
-  return `${m[3]}/${m[2]}/${m[1]}`;
 }
 
 /** Today as DD/MM/YYYY in the browser's local date. */

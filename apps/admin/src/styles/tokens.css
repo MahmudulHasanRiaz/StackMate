@@ -1194,6 +1194,21 @@ a:hover {
   gap: var(--sm-space-4);
   margin-bottom: var(--sm-space-6);
 }
+/* Dashboard date filter (PLAN §23): preset pills + range label. The row
+   wraps — on a 390px screen the pills flow onto a second line instead
+   of overflowing (the responsive audit checks the dashboard at 390px). */
+.sm-filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: var(--sm-space-4);
+}
+.sm-filter-label {
+  font-size: 13px;
+  color: var(--sm-text-muted);
+  margin-left: 4px;
+}
 /* KPI cards are Neon's flat Monitoring cards (image-99): pure-black
    bg + 1px border only, SQUARE corners (radius 0, owner 2026-11-16),
    no shadow. Only KPI cards are square — every other card keeps the
