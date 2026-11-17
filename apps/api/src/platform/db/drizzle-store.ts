@@ -160,14 +160,20 @@ import { AppError } from "../../shared/errors.ts";
 import {
   StackMateDataStore,
   type AuditLogRecord,
+  type CustomerAddressRecord,
+  type CustomerContactRecord,
   type CustomerRecord,
+  type CustomerReportRecord,
   type DatabaseState,
   type IdempotencyRecord,
   type IntegratedSiteRecord,
   type InvoiceRecord,
+  type LeadRecord,
   type LicenseActivationRecord,
   type LicenseEntitlementSnapshotRecord,
+  type LicenseEventRecord,
   type LicenseRecord,
+  type OrderInstallmentRecord,
   type OrderItemRecord,
   type OrderItemSnapshotRecord,
   type OrderRecord,
@@ -183,12 +189,16 @@ import {
   type ProductFeatureRecord,
   type ProductPackageRecord,
   type ProductRecord,
+  type ReminderSettingsRecord,
   type RoleRecord,
+  type SentReminderRecord,
   type SessionRecord,
   type SiteCredentialRecord,
   type StaffInvitationRecord,
   type SubscriptionPeriodRecord,
   type SubscriptionRecord,
+  type SupportTicketRecord,
+  type TicketCommentRecord,
   type TrackingConfigRecord,
   type TrackingEventRecord,
   type TwoFactorPolicyRecord,
@@ -239,6 +249,8 @@ const COUNTER_BASE_VALUES: DatabaseState["sequence_counters"] = {
   invoice: 20000,
   subscription: 30000,
   license: 40000,
+  ticket: 50000,
+  lead: 60000,
 };
 
 export interface DrizzleStoreCreateOptions {
@@ -1528,6 +1540,14 @@ function deriveCountersFromData(
       COUNTER_BASE_VALUES.license,
       maxSuffix(state.licenses.map((l) => l.license_number))
     ),
+    ticket: Math.max(
+      COUNTER_BASE_VALUES.ticket,
+      maxSuffix(state.support_tickets.map((t) => t.ticket_number))
+    ),
+    lead: Math.max(
+      COUNTER_BASE_VALUES.lead,
+      maxSuffix(state.leads.map((l) => l.lead_number))
+    ),
   };
 }
 
@@ -1581,9 +1601,18 @@ function buildLoadStateQuery(caps: StoreCapabilities): string {
             owner_customer_id, created_at
        FROM uploaded_assets` },
     { key: "customers", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, customer_number, customer_type, name, email, normalized_email,
-            phone, normalized_phone, company_name, country_code, status,
+            phone, normalized_phone, whatsapp, credit_balance_minor,
+            company_name, country_code, status,
             registration_source, notes, created_at, updated_at
        FROM customers` },
+    { key: "customerContacts", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, customer_id, kind, value, normalized_value, created_at
+       FROM customer_contacts` },
+    { key: "customerAddresses", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, customer_id, address_type, contact_name, phone,
+            address_line_1, address_line_2, city, state_or_region,
+            postal_code, country_code, is_default, created_at, updated_at
+       FROM customer_addresses` },
+    { key: "customerReports", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, customer_id, author_user_id, type, detail, created_at
+       FROM customer_reports` },
     { key: "channels", orderBy: "t.product_id, t.channel_key", sql: `SELECT product_id, channel_key FROM product_distribution_channels` },
     { key: "products", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, code, slug, name, description, product_type, fulfillment_type,
             status, website_url, documentation_url, created_by_user_id,
@@ -1641,9 +1670,15 @@ function buildLoadStateQuery(caps: StoreCapabilities): string {
     { key: "orders", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, order_number, public_reference, customer_id, source,
             integrated_site_id, status, payment_status, currency_code,
             subtotal_minor, discount_minor, tax_minor, total_minor,
-            customer_note, internal_note, created_by_user_id, created_at,
+            customer_note, internal_note, created_by_user_id,
+            activation_mode, activation_percent, activation_date,
+            suspend_on_missed_schedule, grace_days, payment_method_id,
+            lead_id, created_at,
             updated_at, completed_at, cancelled_at
        FROM orders` },
+    { key: "orderInstallments", orderBy: "t.order_id, t.installment_number ASC", sql: `SELECT id, order_id, installment_number, amount_minor, due_date,
+            status, paid_amount_minor, paid_at, notes, created_at, updated_at
+       FROM order_installments` },
     { key: "periods", orderBy: "t.subscription_id, t.period_number ASC", sql: `SELECT id, subscription_id, period_number, period_start, period_end,
             status, renewal_order_id, invoice_id, payment_transaction_id,
             activated_at, created_at
@@ -1652,7 +1687,8 @@ function buildLoadStateQuery(caps: StoreCapabilities): string {
             source_order_item_id, source_package_version_id, status,
             billing_kind, interval_unit, interval_count, currency_code,
             current_period_start, current_period_end, next_renewal_at,
-            cancel_at_period_end, cancelled_at, created_at, updated_at
+            cancel_at_period_end, cancelled_at, created_at, updated_at,
+            grace_days
             ${caps.subscriptionsUnitAmount ? ", unit_amount_minor" : ""}
        FROM subscriptions` },
     { key: "invoiceItems", orderBy: "t.invoice_id, t.created_at ASC, t.id ASC", sql: `SELECT id, invoice_id, description_snapshot, quantity,
@@ -1670,7 +1706,7 @@ function buildLoadStateQuery(caps: StoreCapabilities): string {
             account_type, account_label, instructions, configuration,
             is_enabled, sort_order, created_at
        FROM payment_methods` },
-    { key: "submissions", orderBy: "t.submitted_at ASC, t.id ASC", sql: `SELECT id, order_id, customer_id, payment_method_id, amount_minor,
+    { key: "submissions", orderBy: "t.submitted_at ASC, t.id ASC", sql: `SELECT id, order_id, customer_id, payment_method_id, installment_id, amount_minor,
             currency_code, sender_name, sender_phone, sender_bank_name,
             sender_account_reference, transfer_rail_key,
             transaction_reference, normalized_transaction_reference,
@@ -1729,6 +1765,26 @@ function buildLoadStateQuery(caps: StoreCapabilities): string {
     { key: "audit", orderBy: "t.created_at DESC, t.id DESC", sql: `SELECT id, actor_type, actor_user_id, integrated_site_id, action,
             resource_type, resource_id, outcome, request_id, changes, created_at
        FROM audit_logs` },
+    { key: "licenseEvents", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, license_id, event_type, actor_type, actor_user_id,
+            activation_id, metadata, created_at
+       FROM license_events` },
+    { key: "reminderSettings", orderBy: null, sql: `SELECT id, due_offsets_days, overdue_offsets_days, overdue_enabled, updated_at
+       FROM reminder_settings` },
+    { key: "sentReminders", orderBy: "t.sent_at ASC, t.id ASC", sql: `SELECT id, kind, reference_id, offset_days, sent_at
+       FROM sent_reminders` },
+    { key: "supportTickets", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, ticket_number, customer_id, order_id, subscription_id,
+            license_id, product_id, title, description, status, priority,
+            category, reporter_user_id, source_note, assignee_user_id,
+            created_at, updated_at, resolved_at, closed_at
+       FROM support_tickets` },
+    { key: "ticketComments", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, ticket_id, author_user_id, body, is_internal, created_at
+       FROM ticket_comments` },
+    { key: "leads", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, lead_number, name, email, normalized_email, phone,
+            normalized_phone, whatsapp, source_site_id, utm_source,
+            utm_medium, utm_campaign, interest, product_id, message, notes,
+            status, assignee_user_id, created_at, updated_at, converted_at,
+            converted_customer_id, converted_order_id
+       FROM leads` },
   ];
   // Migration 0007 (auth + email): the policy table only exists on a
   // migrated database — selecting it unconditionally would break a
@@ -1887,6 +1943,8 @@ async function loadStateInternalImpl(
     normalized_email: str(row, "normalized_email"),
     phone: str(row, "phone"),
     normalized_phone: str(row, "normalized_phone"),
+    whatsapp: str(row, "whatsapp"),
+    credit_balance_minor: num(row, "credit_balance_minor") ?? 0,
     company_name: str(row, "company_name"),
     country_code: str(row, "country_code") ?? "BD",
     status: asEnum(
@@ -1898,6 +1956,49 @@ async function loadStateInternalImpl(
     notes: str(row, "notes"),
     created_at: reqIso(row, "created_at", "customers"),
     updated_at: reqIso(row, "updated_at", "customers"),
+  }));
+
+  // -- Customer contacts / addresses / reports (migration 0009) ---------------
+  const customerContactRows = loadRows(combined, "customerContacts");
+  const customer_contacts: CustomerContactRecord[] = customerContactRows.map((row) => ({
+    id: reqStr(row, "id", "customer_contacts"),
+    customer_id: reqStr(row, "customer_id", "customer_contacts"),
+    kind: asEnum(str(row, "kind"), ["email", "phone"] as const, "email"),
+    value: reqStr(row, "value", "customer_contacts"),
+    normalized_value: reqStr(row, "normalized_value", "customer_contacts"),
+    created_at: reqIso(row, "created_at", "customer_contacts"),
+  }));
+
+  const customerAddressRows = loadRows(combined, "customerAddresses");
+  const customer_addresses: CustomerAddressRecord[] = customerAddressRows.map((row) => ({
+    id: reqStr(row, "id", "customer_addresses"),
+    customer_id: reqStr(row, "customer_id", "customer_addresses"),
+    address_type: asEnum(
+      str(row, "address_type"),
+      ["billing", "shipping", "other"] as const,
+      "billing"
+    ),
+    contact_name: str(row, "contact_name"),
+    phone: str(row, "phone"),
+    address_line_1: str(row, "address_line_1"),
+    address_line_2: str(row, "address_line_2"),
+    city: str(row, "city"),
+    state_or_region: str(row, "state_or_region"),
+    postal_code: str(row, "postal_code"),
+    country_code: str(row, "country_code") ?? "BD",
+    is_default: bool(row, "is_default"),
+    created_at: reqIso(row, "created_at", "customer_addresses"),
+    updated_at: reqIso(row, "updated_at", "customer_addresses"),
+  }));
+
+  const customerReportRows = loadRows(combined, "customerReports");
+  const customer_reports: CustomerReportRecord[] = customerReportRows.map((row) => ({
+    id: reqStr(row, "id", "customer_reports"),
+    customer_id: reqStr(row, "customer_id", "customer_reports"),
+    author_user_id: reqStr(row, "author_user_id", "customer_reports"),
+    type: asEnum(str(row, "type"), ["note", "concern"] as const, "note"),
+    detail: reqStr(row, "detail", "customer_reports"),
+    created_at: reqIso(row, "created_at", "customer_reports"),
   }));
 
   // -- Catalog ---------------------------------------------------------------
@@ -2262,7 +2363,7 @@ async function loadStateInternalImpl(
       ),
       payment_status: asEnum(
         str(row, "payment_status"),
-        ["unpaid", "pending_verification", "paid", "partially_refunded", "refunded"] as const,
+        ["unpaid", "pending_verification", "partially_paid", "paid", "partially_refunded", "refunded"] as const,
         "unpaid"
       ),
       currency_code: reqStr(row, "currency_code", "orders"),
@@ -2275,12 +2376,43 @@ async function loadStateInternalImpl(
       items,
       attribution: attributionByOrder.get(id) ?? null,
       created_by_user_id: str(row, "created_by_user_id"),
+      activation_mode: asEnum(
+        str(row, "activation_mode"),
+        ["on_full_payment", "on_percent", "on_date"] as const,
+        "on_full_payment"
+      ),
+      activation_percent: num(row, "activation_percent"),
+      activation_date: dateOnly(row, "activation_date"),
+      suspend_on_missed_schedule: bool(row, "suspend_on_missed_schedule"),
+      grace_days: num(row, "grace_days") ?? 3,
+      payment_method_id: str(row, "payment_method_id"),
+      lead_id: str(row, "lead_id"),
       created_at: reqIso(row, "created_at", "orders"),
       updated_at: reqIso(row, "updated_at", "orders"),
       completed_at: iso(row, "completed_at"),
       cancelled_at: iso(row, "cancelled_at"),
     };
   });
+
+  // -- Order installments (migration 0009) ------------------------------------
+  const orderInstallmentRows = loadRows(combined, "orderInstallments");
+  const order_installments: OrderInstallmentRecord[] = orderInstallmentRows.map((row) => ({
+    id: reqStr(row, "id", "order_installments"),
+    order_id: reqStr(row, "order_id", "order_installments"),
+    installment_number: reqNum(row, "installment_number", "order_installments"),
+    amount_minor: reqNum(row, "amount_minor", "order_installments"),
+    due_date: dateOnly(row, "due_date") ?? "",
+    status: asEnum(
+      str(row, "status"),
+      ["pending", "partially_paid", "paid", "overdue"] as const,
+      "pending"
+    ),
+    paid_amount_minor: num(row, "paid_amount_minor") ?? 0,
+    paid_at: iso(row, "paid_at"),
+    notes: str(row, "notes"),
+    created_at: reqIso(row, "created_at", "order_installments"),
+    updated_at: reqIso(row, "updated_at", "order_installments"),
+  }));
 
   // -- Subscriptions (periods) + invoices (items) -----------------------------
   const periodRows = loadRows(combined, "periods");
@@ -2337,6 +2469,7 @@ async function loadStateInternalImpl(
       unit_amount_minor: caps.subscriptionsUnitAmount
         ? reqNum(row, "unit_amount_minor", "subscriptions")
         : 0,
+      grace_days: num(row, "grace_days") ?? 3,
       current_period_start: iso(row, "current_period_start"),
       current_period_end: iso(row, "current_period_end"),
       next_renewal_at: iso(row, "next_renewal_at"),
@@ -2473,6 +2606,7 @@ async function loadStateInternalImpl(
     order_id: reqStr(row, "order_id", "payment_submissions"),
     customer_id: reqStr(row, "customer_id", "payment_submissions"),
     payment_method_id: reqStr(row, "payment_method_id", "payment_submissions"),
+    installment_id: str(row, "installment_id"),
     amount_minor: reqNum(row, "amount_minor", "payment_submissions"),
     currency_code: reqStr(row, "currency_code", "payment_submissions"),
     sender_name: str(row, "sender_name"),
@@ -2832,6 +2966,132 @@ async function loadStateInternalImpl(
     created_at: reqIso(row, "created_at", "audit_logs"),
   }));
 
+  // -- License events (table since 0000; wired up in 0009) --------------------
+  const licenseEventRows = loadRows(combined, "licenseEvents");
+  const license_events: LicenseEventRecord[] = licenseEventRows.map((row) => ({
+    id: reqStr(row, "id", "license_events"),
+    license_id: reqStr(row, "license_id", "license_events"),
+    event_type: reqStr(row, "event_type", "license_events"),
+    actor_type: asEnum(
+      str(row, "actor_type"),
+      ["system", "staff", "client"] as const,
+      "system"
+    ),
+    actor_user_id: str(row, "actor_user_id"),
+    activation_id: str(row, "activation_id"),
+    metadata: asJsonObject(row, "metadata"),
+    created_at: reqIso(row, "created_at", "license_events"),
+  }));
+
+  // -- Reminder settings (migration 0009, read-only state — no SyncSpec,
+  // same pattern as two_factor_policy: the reminders service writes via
+  // direct Drizzle).
+  const reminder_settings: ReminderSettingsRecord[] = loadRows(combined, "reminderSettings").map(
+    (row) => ({
+      id: reqStr(row, "id", "reminder_settings"),
+      due_offsets_days: asJsonArray<number>(row, "due_offsets_days") ?? [7, 1],
+      overdue_offsets_days: asJsonArray<number>(row, "overdue_offsets_days") ?? [1, 3],
+      overdue_enabled: bool(row, "overdue_enabled"),
+      updated_at: reqIso(row, "updated_at", "reminder_settings"),
+    })
+  );
+
+  const sentReminderRows = loadRows(combined, "sentReminders");
+  const sent_reminders: SentReminderRecord[] = sentReminderRows.map((row) => ({
+    id: reqStr(row, "id", "sent_reminders"),
+    kind: asEnum(
+      str(row, "kind"),
+      [
+        "installment_due",
+        "installment_overdue",
+        "subscription_renewal",
+        "subscription_overdue",
+      ] as const,
+      "installment_due"
+    ),
+    reference_id: reqStr(row, "reference_id", "sent_reminders"),
+    offset_days: reqNum(row, "offset_days", "sent_reminders"),
+    sent_at: reqIso(row, "sent_at", "sent_reminders"),
+  }));
+
+  // -- Support tickets + comments (migration 0009) ---------------------------
+  const supportTicketRows = loadRows(combined, "supportTickets");
+  const support_tickets: SupportTicketRecord[] = supportTicketRows.map((row) => ({
+    id: reqStr(row, "id", "support_tickets"),
+    ticket_number: reqStr(row, "ticket_number", "support_tickets"),
+    customer_id: str(row, "customer_id"),
+    order_id: str(row, "order_id"),
+    subscription_id: str(row, "subscription_id"),
+    license_id: str(row, "license_id"),
+    product_id: str(row, "product_id"),
+    title: reqStr(row, "title", "support_tickets"),
+    description: str(row, "description") ?? "",
+    status: asEnum(
+      str(row, "status"),
+      ["open", "in_progress", "waiting_on_customer", "resolved", "closed"] as const,
+      "open"
+    ),
+    priority: asEnum(
+      str(row, "priority"),
+      ["low", "medium", "high", "urgent"] as const,
+      "medium"
+    ),
+    category: asEnum(
+      str(row, "category"),
+      ["billing", "technical", "license", "order", "other"] as const,
+      "other"
+    ),
+    reporter_user_id: reqStr(row, "reporter_user_id", "support_tickets"),
+    source_note: str(row, "source_note"),
+    assignee_user_id: str(row, "assignee_user_id"),
+    created_at: reqIso(row, "created_at", "support_tickets"),
+    updated_at: reqIso(row, "updated_at", "support_tickets"),
+    resolved_at: iso(row, "resolved_at"),
+    closed_at: iso(row, "closed_at"),
+  }));
+
+  const ticketCommentRows = loadRows(combined, "ticketComments");
+  const ticket_comments: TicketCommentRecord[] = ticketCommentRows.map((row) => ({
+    id: reqStr(row, "id", "ticket_comments"),
+    ticket_id: reqStr(row, "ticket_id", "ticket_comments"),
+    author_user_id: reqStr(row, "author_user_id", "ticket_comments"),
+    body: reqStr(row, "body", "ticket_comments"),
+    is_internal: bool(row, "is_internal"),
+    created_at: reqIso(row, "created_at", "ticket_comments"),
+  }));
+
+  // -- Leads (migration 0009) --------------------------------------------------
+  const leadRows = loadRows(combined, "leads");
+  const leads: LeadRecord[] = leadRows.map((row) => ({
+    id: reqStr(row, "id", "leads"),
+    lead_number: reqStr(row, "lead_number", "leads"),
+    name: reqStr(row, "name", "leads"),
+    email: str(row, "email"),
+    normalized_email: str(row, "normalized_email"),
+    phone: str(row, "phone"),
+    normalized_phone: str(row, "normalized_phone"),
+    whatsapp: str(row, "whatsapp"),
+    source_site_id: str(row, "source_site_id"),
+    utm_source: str(row, "utm_source"),
+    utm_medium: str(row, "utm_medium"),
+    utm_campaign: str(row, "utm_campaign"),
+    interest: str(row, "interest"),
+    product_id: str(row, "product_id"),
+    message: str(row, "message"),
+    notes: str(row, "notes"),
+    status: asEnum(
+      str(row, "status"),
+      ["new", "contacted", "qualified", "converted", "lost"] as const,
+      "new"
+    ),
+    assignee_user_id: str(row, "assignee_user_id"),
+    created_at: reqIso(row, "created_at", "leads"),
+    updated_at: reqIso(row, "updated_at", "leads"),
+    converted_at: iso(row, "converted_at"),
+    converted_customer_id: str(row, "converted_customer_id"),
+    converted_order_id: str(row, "converted_order_id"),
+  }));
+
   // 2FA policy rows (migration 0007, read-only state — no SyncSpec, so
   // persistStateDiff never writes them; the auth-config service writes
   // via direct Drizzle). Empty on a pre-0007 database (the combined
@@ -2863,7 +3123,11 @@ async function loadStateInternalImpl(
     package_versions,
     package_prices,
     customers,
+    customer_contacts,
+    customer_addresses,
+    customer_reports,
     orders,
+    order_installments,
     invoices,
     payment_providers,
     payment_methods,
@@ -2872,6 +3136,12 @@ async function loadStateInternalImpl(
     payment_verification_logs,
     subscriptions,
     licenses,
+    license_events,
+    reminder_settings,
+    sent_reminders,
+    support_tickets,
+    ticket_comments,
+    leads,
     integrated_sites,
     site_credentials,
     request_nonces,
@@ -2899,7 +3169,9 @@ async function loadStateInternalImpl(
           key === "order" ||
           key === "invoice" ||
           key === "subscription" ||
-          key === "license")
+          key === "license" ||
+          key === "ticket" ||
+          key === "lead")
       ) {
         values[key] = value;
       }
@@ -3323,6 +3595,8 @@ async function persistStateDiff(
           "normalized_email",
           "phone",
           "normalized_phone",
+          "whatsapp",
+          "credit_balance_minor",
           "company_name",
           "country_code",
           "status",
@@ -3340,6 +3614,8 @@ async function persistStateDiff(
           r.normalized_email,
           r.phone,
           r.normalized_phone,
+          r.whatsapp,
+          r.credit_balance_minor,
           r.company_name,
           r.country_code,
           r.status,
@@ -3359,6 +3635,8 @@ async function persistStateDiff(
         "normalized_email",
         "phone",
         "normalized_phone",
+        "whatsapp",
+        "credit_balance_minor",
         "company_name",
         "country_code",
         "status",
@@ -3377,6 +3655,8 @@ async function persistStateDiff(
           r.normalized_email,
           r.phone,
           r.normalized_phone,
+          r.whatsapp,
+          r.credit_balance_minor,
           r.company_name,
           r.country_code,
           r.status,
@@ -3391,6 +3671,137 @@ async function persistStateDiff(
     },
     remove: async (c, r) => {
       await del("customers", idWhere(1), [r.id]);
+    },
+  };
+
+  // -- Customer operations (migration 0009) ----------------------------------
+  const customerContactSpec: SyncSpec<CustomerContactRecord> = {
+    keyOf: (r) => r.id,
+    scalarOf: (r) => r,
+    insert: async (c, r) => {
+      await ins(
+        "customer_contacts",
+        ["id", "customer_id", "kind", "value", "normalized_value", "created_at"],
+        [r.id, r.customer_id, r.kind, r.value, r.normalized_value, r.created_at]
+      );
+    },
+    update: async (c, _b, r) => {
+      const cols = ["customer_id", "kind", "value", "normalized_value"];
+      await upd(
+        "customer_contacts",
+        cols,
+        [r.customer_id, r.kind, r.value, r.normalized_value, r.id],
+        idWhere(cols.length + 1),
+        false
+      );
+    },
+    remove: async (c, r) => {
+      await del("customer_contacts", idWhere(1), [r.id]);
+    },
+  };
+
+  const customerAddressSpec: SyncSpec<CustomerAddressRecord> = {
+    keyOf: (r) => r.id,
+    scalarOf: (r) => r,
+    insert: async (c, r) => {
+      await ins(
+        "customer_addresses",
+        [
+          "id",
+          "customer_id",
+          "address_type",
+          "contact_name",
+          "phone",
+          "address_line_1",
+          "address_line_2",
+          "city",
+          "state_or_region",
+          "postal_code",
+          "country_code",
+          "is_default",
+          "created_at",
+          "updated_at",
+        ],
+        [
+          r.id,
+          r.customer_id,
+          r.address_type,
+          r.contact_name,
+          r.phone,
+          r.address_line_1,
+          r.address_line_2,
+          r.city,
+          r.state_or_region,
+          r.postal_code,
+          r.country_code,
+          r.is_default,
+          r.created_at,
+          r.updated_at,
+        ]
+      );
+    },
+    update: async (c, _b, r) => {
+      const cols = [
+        "address_type",
+        "contact_name",
+        "phone",
+        "address_line_1",
+        "address_line_2",
+        "city",
+        "state_or_region",
+        "postal_code",
+        "country_code",
+        "is_default",
+        "updated_at",
+      ];
+      await upd(
+        "customer_addresses",
+        cols,
+        [
+          r.address_type,
+          r.contact_name,
+          r.phone,
+          r.address_line_1,
+          r.address_line_2,
+          r.city,
+          r.state_or_region,
+          r.postal_code,
+          r.country_code,
+          r.is_default,
+          r.updated_at,
+          r.id,
+        ],
+        idWhere(cols.length + 1),
+        false
+      );
+    },
+    remove: async (c, r) => {
+      await del("customer_addresses", idWhere(1), [r.id]);
+    },
+  };
+
+  const customerReportSpec: SyncSpec<CustomerReportRecord> = {
+    keyOf: (r) => r.id,
+    scalarOf: (r) => r,
+    insert: async (c, r) => {
+      await ins(
+        "customer_reports",
+        ["id", "customer_id", "author_user_id", "type", "detail", "created_at"],
+        [r.id, r.customer_id, r.author_user_id, r.type, r.detail, r.created_at]
+      );
+    },
+    update: async (c, _b, r) => {
+      const cols = ["type", "detail"];
+      await upd(
+        "customer_reports",
+        cols,
+        [r.type, r.detail, r.id],
+        idWhere(cols.length + 1),
+        false
+      );
+    },
+    remove: async (c, r) => {
+      await del("customer_reports", idWhere(1), [r.id]);
     },
   };
 
@@ -4034,6 +4445,13 @@ async function persistStateDiff(
           "customer_note",
           "internal_note",
           "created_by_user_id",
+          "activation_mode",
+          "activation_percent",
+          "activation_date",
+          "suspend_on_missed_schedule",
+          "grace_days",
+          "payment_method_id",
+          "lead_id",
           "created_at",
           "updated_at",
           "completed_at",
@@ -4056,6 +4474,13 @@ async function persistStateDiff(
           r.customer_note,
           r.internal_note,
           r.created_by_user_id,
+          r.activation_mode,
+          r.activation_percent,
+          r.activation_date,
+          r.suspend_on_missed_schedule,
+          r.grace_days,
+          r.payment_method_id,
+          r.lead_id,
           r.created_at,
           r.updated_at,
           r.completed_at,
@@ -4080,6 +4505,13 @@ async function persistStateDiff(
         "customer_note",
         "internal_note",
         "created_by_user_id",
+        "activation_mode",
+        "activation_percent",
+        "activation_date",
+        "suspend_on_missed_schedule",
+        "grace_days",
+        "payment_method_id",
+        "lead_id",
         "updated_at",
         "completed_at",
         "cancelled_at",
@@ -4103,6 +4535,13 @@ async function persistStateDiff(
           r.customer_note,
           r.internal_note,
           r.created_by_user_id,
+          r.activation_mode,
+          r.activation_percent,
+          r.activation_date,
+          r.suspend_on_missed_schedule,
+          r.grace_days,
+          r.payment_method_id,
+          r.lead_id,
           r.updated_at,
           r.completed_at,
           r.cancelled_at,
@@ -4114,6 +4553,74 @@ async function persistStateDiff(
     },
     remove: async (c, r) => {
       await del("orders", idWhere(1), [r.id]);
+    },
+  };
+
+  const orderInstallmentSpec: SyncSpec<OrderInstallmentRecord> = {
+    keyOf: (r) => r.id,
+    scalarOf: (r) => r,
+    insert: async (c, r) => {
+      await ins(
+        "order_installments",
+        [
+          "id",
+          "order_id",
+          "installment_number",
+          "amount_minor",
+          "due_date",
+          "status",
+          "paid_amount_minor",
+          "paid_at",
+          "notes",
+          "created_at",
+          "updated_at",
+        ],
+        [
+          r.id,
+          r.order_id,
+          r.installment_number,
+          r.amount_minor,
+          r.due_date,
+          r.status,
+          r.paid_amount_minor,
+          r.paid_at,
+          r.notes,
+          r.created_at,
+          r.updated_at,
+        ]
+      );
+    },
+    update: async (c, _b, r) => {
+      const cols = [
+        "installment_number",
+        "amount_minor",
+        "due_date",
+        "status",
+        "paid_amount_minor",
+        "paid_at",
+        "notes",
+        "updated_at",
+      ];
+      await upd(
+        "order_installments",
+        cols,
+        [
+          r.installment_number,
+          r.amount_minor,
+          r.due_date,
+          r.status,
+          r.paid_amount_minor,
+          r.paid_at,
+          r.notes,
+          r.updated_at,
+          r.id,
+        ],
+        idWhere(cols.length + 1),
+        false
+      );
+    },
+    remove: async (c, r) => {
+      await del("order_installments", idWhere(1), [r.id]);
     },
   };
 
@@ -4264,6 +4771,271 @@ async function persistStateDiff(
     remove: immutableStub(),
   };
 
+  // -- Support tickets + comments, leads, sent reminders (migration 0009) ----
+  const supportTicketSpec: SyncSpec<SupportTicketRecord> = {
+    keyOf: (r) => r.id,
+    scalarOf: (r) => r,
+    insert: async (c, r) => {
+      await ins(
+        "support_tickets",
+        [
+          "id",
+          "ticket_number",
+          "customer_id",
+          "order_id",
+          "subscription_id",
+          "license_id",
+          "product_id",
+          "title",
+          "description",
+          "status",
+          "priority",
+          "category",
+          "reporter_user_id",
+          "source_note",
+          "assignee_user_id",
+          "created_at",
+          "updated_at",
+          "resolved_at",
+          "closed_at",
+        ],
+        [
+          r.id,
+          r.ticket_number,
+          r.customer_id,
+          r.order_id,
+          r.subscription_id,
+          r.license_id,
+          r.product_id,
+          r.title,
+          r.description,
+          r.status,
+          r.priority,
+          r.category,
+          r.reporter_user_id,
+          r.source_note,
+          r.assignee_user_id,
+          r.created_at,
+          r.updated_at,
+          r.resolved_at,
+          r.closed_at,
+        ]
+      );
+    },
+    update: async (c, _b, r) => {
+      const cols = [
+        "customer_id",
+        "order_id",
+        "subscription_id",
+        "license_id",
+        "product_id",
+        "title",
+        "description",
+        "status",
+        "priority",
+        "category",
+        "source_note",
+        "assignee_user_id",
+        "updated_at",
+        "resolved_at",
+        "closed_at",
+      ];
+      await upd(
+        "support_tickets",
+        cols,
+        [
+          r.customer_id,
+          r.order_id,
+          r.subscription_id,
+          r.license_id,
+          r.product_id,
+          r.title,
+          r.description,
+          r.status,
+          r.priority,
+          r.category,
+          r.source_note,
+          r.assignee_user_id,
+          r.updated_at,
+          r.resolved_at,
+          r.closed_at,
+          r.id,
+        ],
+        idWhere(cols.length + 1),
+        false
+      );
+    },
+    remove: async (c, r) => {
+      await del("support_tickets", idWhere(1), [r.id]);
+    },
+  };
+
+  const ticketCommentSpec: SyncSpec<TicketCommentRecord> = {
+    keyOf: (r) => r.id,
+    scalarOf: (r) => r,
+    insert: async (c, r) => {
+      await ins(
+        "ticket_comments",
+        ["id", "ticket_id", "author_user_id", "body", "is_internal", "created_at"],
+        [r.id, r.ticket_id, r.author_user_id, r.body, r.is_internal, r.created_at]
+      );
+    },
+    update: async (c, _b, r) => {
+      const cols = ["body", "is_internal"];
+      await upd(
+        "ticket_comments",
+        cols,
+        [r.body, r.is_internal, r.id],
+        idWhere(cols.length + 1),
+        false
+      );
+    },
+    remove: async (c, r) => {
+      await del("ticket_comments", idWhere(1), [r.id]);
+    },
+  };
+
+  const leadSpec: SyncSpec<LeadRecord> = {
+    keyOf: (r) => r.id,
+    scalarOf: (r) => r,
+    insert: async (c, r) => {
+      await ins(
+        "leads",
+        [
+          "id",
+          "lead_number",
+          "name",
+          "email",
+          "normalized_email",
+          "phone",
+          "normalized_phone",
+          "whatsapp",
+          "source_site_id",
+          "utm_source",
+          "utm_medium",
+          "utm_campaign",
+          "interest",
+          "product_id",
+          "message",
+          "notes",
+          "status",
+          "assignee_user_id",
+          "created_at",
+          "updated_at",
+          "converted_at",
+          "converted_customer_id",
+          "converted_order_id",
+        ],
+        [
+          r.id,
+          r.lead_number,
+          r.name,
+          r.email,
+          r.normalized_email,
+          r.phone,
+          r.normalized_phone,
+          r.whatsapp,
+          r.source_site_id,
+          r.utm_source,
+          r.utm_medium,
+          r.utm_campaign,
+          r.interest,
+          r.product_id,
+          r.message,
+          r.notes,
+          r.status,
+          r.assignee_user_id,
+          r.created_at,
+          r.updated_at,
+          r.converted_at,
+          r.converted_customer_id,
+          r.converted_order_id,
+        ]
+      );
+    },
+    update: async (c, _b, r) => {
+      const cols = [
+        "name",
+        "email",
+        "normalized_email",
+        "phone",
+        "normalized_phone",
+        "whatsapp",
+        "source_site_id",
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "interest",
+        "product_id",
+        "message",
+        "notes",
+        "status",
+        "assignee_user_id",
+        "updated_at",
+        "converted_at",
+        "converted_customer_id",
+        "converted_order_id",
+      ];
+      await upd(
+        "leads",
+        cols,
+        [
+          r.name,
+          r.email,
+          r.normalized_email,
+          r.phone,
+          r.normalized_phone,
+          r.whatsapp,
+          r.source_site_id,
+          r.utm_source,
+          r.utm_medium,
+          r.utm_campaign,
+          r.interest,
+          r.product_id,
+          r.message,
+          r.notes,
+          r.status,
+          r.assignee_user_id,
+          r.updated_at,
+          r.converted_at,
+          r.converted_customer_id,
+          r.converted_order_id,
+          r.id,
+        ],
+        idWhere(cols.length + 1),
+        false
+      );
+    },
+    remove: async (c, r) => {
+      await del("leads", idWhere(1), [r.id]);
+    },
+  };
+
+  const sentReminderSpec: SyncSpec<SentReminderRecord> = {
+    keyOf: (r) => r.id,
+    scalarOf: (r) => r,
+    insert: async (c, r) => {
+      await ins(
+        "sent_reminders",
+        ["id", "kind", "reference_id", "offset_days", "sent_at"],
+        [r.id, r.kind, r.reference_id, r.offset_days, r.sent_at]
+      );
+    },
+    update: async (c, _b, r) => {
+      const cols = ["kind", "reference_id", "offset_days", "sent_at"];
+      await upd(
+        "sent_reminders",
+        cols,
+        [r.kind, r.reference_id, r.offset_days, r.sent_at, r.id],
+        idWhere(cols.length + 1),
+        false
+      );
+    },
+    remove: async (c, r) => {
+      await del("sent_reminders", idWhere(1), [r.id]);
+    },
+  };
+
   const orderSnapshotItemSpec: SyncSpec<OrderSnapshotItemRow> = {
     keyOf: (r) => `${r.snapshot_id}|${r.feature_key_snapshot}`,
     scalarOf: (r) => r,
@@ -4309,6 +5081,7 @@ async function persistStateDiff(
         "interval_unit",
         "interval_count",
         "currency_code",
+        "grace_days",
         "current_period_start",
         "current_period_end",
         "next_renewal_at",
@@ -4329,6 +5102,7 @@ async function persistStateDiff(
         r.interval_unit,
         r.interval_count,
         r.currency_code,
+        r.grace_days,
         r.current_period_start,
         r.current_period_end,
         r.next_renewal_at,
@@ -4355,6 +5129,7 @@ async function persistStateDiff(
         "interval_unit",
         "interval_count",
         "currency_code",
+        "grace_days",
         "current_period_start",
         "current_period_end",
         "next_renewal_at",
@@ -4373,6 +5148,7 @@ async function persistStateDiff(
         r.interval_unit,
         r.interval_count,
         r.currency_code,
+        r.grace_days,
         r.current_period_start,
         r.current_period_end,
         r.next_renewal_at,
@@ -4721,6 +5497,7 @@ async function persistStateDiff(
         "order_id",
         "customer_id",
         "payment_method_id",
+        "installment_id",
         "amount_minor",
         "currency_code",
         "sender_name",
@@ -4743,6 +5520,7 @@ async function persistStateDiff(
         r.order_id,
         r.customer_id,
         r.payment_method_id,
+        r.installment_id,
         r.amount_minor,
         r.currency_code,
         r.sender_name,
@@ -4771,6 +5549,7 @@ async function persistStateDiff(
         "order_id",
         "customer_id",
         "payment_method_id",
+        "installment_id",
         "amount_minor",
         "currency_code",
         "sender_name",
@@ -4791,6 +5570,7 @@ async function persistStateDiff(
         r.order_id,
         r.customer_id,
         r.payment_method_id,
+        r.installment_id,
         r.amount_minor,
         r.currency_code,
         r.sender_name,
@@ -5163,6 +5943,49 @@ async function persistStateDiff(
     },
     remove: async (c, r) => {
       await del("license_activations", idWhere(1), [r.id]);
+    },
+  };
+
+  const licenseEventSpec: SyncSpec<LicenseEventRecord> = {
+    keyOf: (r) => r.id,
+    scalarOf: (r) => r,
+    insert: async (c, r) => {
+      await ins(
+        "license_events",
+        [
+          "id",
+          "license_id",
+          "event_type",
+          "actor_type",
+          "actor_user_id",
+          "activation_id",
+          "metadata",
+          "created_at",
+        ],
+        [
+          r.id,
+          r.license_id,
+          r.event_type,
+          r.actor_type,
+          r.actor_user_id,
+          r.activation_id,
+          json(r.metadata),
+          r.created_at,
+        ]
+      );
+    },
+    update: async (c, _b, r) => {
+      const cols = ["event_type", "actor_type", "actor_user_id", "activation_id", "metadata"];
+      await upd(
+        "license_events",
+        cols,
+        [r.event_type, r.actor_type, r.actor_user_id, r.activation_id, json(r.metadata), r.id],
+        idWhere(cols.length + 1),
+        false
+      );
+    },
+    remove: async (c, r) => {
+      await del("license_events", idWhere(1), [r.id]);
     },
   };
 
@@ -5678,10 +6501,12 @@ async function persistStateDiff(
 
   // -- Delete pass: children before parents ----------------------------------
   await syncDeletes(client, before.audit_logs, after.audit_logs, auditLogSpec, "audit_logs");
+  await syncDeletes(client, before.sent_reminders, after.sent_reminders, sentReminderSpec, "sent_reminders");
   await syncDeletes(client, before.payment_verification_logs, after.payment_verification_logs, verificationLogSpec, "payment_verification_logs");
   await syncDeletes(client, fb.licenseSnapshotItems, fa.licenseSnapshotItems, licenseSnapshotItemSpec, "license_entitlement_snapshot_items");
   await syncDeletes(client, fb.licenseSnapshots, fa.licenseSnapshots, licenseSnapshotSpec, "license_entitlement_snapshots");
   await syncDeletes(client, fb.licenseActivations, fa.licenseActivations, licenseActivationSpec, "license_activations");
+  await syncDeletes(client, before.license_events, after.license_events, licenseEventSpec, "license_events");
   await syncDeletes(client, fb.invoiceItems, fa.invoiceItems, invoiceItemSpec, "invoice_items");
   await syncDeletes(client, before.invoices, after.invoices, invoiceSpec, "invoices");
   await syncDeletes(client, fb.periods, fa.periods, periodSpec, "subscription_periods");
@@ -5690,6 +6515,7 @@ async function persistStateDiff(
   await syncDeletes(client, fb.orderSnapshotItems, fa.orderSnapshotItems, orderSnapshotItemSpec, "order_item_entitlement_snapshot_items");
   await syncDeletes(client, fb.orderSnapshots, fa.orderSnapshots, orderSnapshotSpec, "order_item_entitlement_snapshots");
   await syncDeletes(client, fb.orderItems, fa.orderItems, orderItemSpec, "order_items");
+  await syncDeletes(client, before.order_installments, after.order_installments, orderInstallmentSpec, "order_installments");
   await syncDeletes(client, before.payment_transactions, after.payment_transactions, transactionSpec, "payment_transactions");
   await syncDeletes(client, before.payment_submissions, after.payment_submissions, submissionSpec, "payment_submissions");
   await syncDeletes(client, before.webhook_deliveries, after.webhook_deliveries, webhookDeliverySpec, "webhook_deliveries");
@@ -5718,6 +6544,12 @@ async function persistStateDiff(
   await deleteDerivedForMissing("staff_profiles", "user_id", before.users.map((u) => u.id), new Set(after.users.map((u) => u.id)));
   await syncDeletes(client, before.users, after.users, userSpec, "users");
   await syncDeletes(client, before.orders, after.orders, orderSpec, "orders");
+  await syncDeletes(client, before.ticket_comments, after.ticket_comments, ticketCommentSpec, "ticket_comments");
+  await syncDeletes(client, before.support_tickets, after.support_tickets, supportTicketSpec, "support_tickets");
+  await syncDeletes(client, before.leads, after.leads, leadSpec, "leads");
+  await syncDeletes(client, before.customer_contacts, after.customer_contacts, customerContactSpec, "customer_contacts");
+  await syncDeletes(client, before.customer_addresses, after.customer_addresses, customerAddressSpec, "customer_addresses");
+  await syncDeletes(client, before.customer_reports, after.customer_reports, customerReportSpec, "customer_reports");
   await syncDeletes(client, before.customers, after.customers, customerSpec, "customers");
   await syncDeletes(client, before.idempotency_records, after.idempotency_records, idempotencySpec, "idempotency_records");
 
@@ -5728,6 +6560,9 @@ async function persistStateDiff(
   await syncUpserts(client, before.user_roles, after.user_roles, userRoleSpec, "user_roles");
   await syncUpserts(client, before.sessions, after.sessions, sessionSpec, "sessions");
   await syncUpserts(client, before.customers, after.customers, customerSpec, "customers");
+  await syncUpserts(client, before.customer_contacts, after.customer_contacts, customerContactSpec, "customer_contacts");
+  await syncUpserts(client, before.customer_addresses, after.customer_addresses, customerAddressSpec, "customer_addresses");
+  await syncUpserts(client, before.customer_reports, after.customer_reports, customerReportSpec, "customer_reports");
   await syncUpserts(client, before.uploaded_assets, after.uploaded_assets, assetSpec, "uploaded_assets");
   await syncUpserts(client, before.products, after.products, productSpec, "products");
   await syncUpserts(client, before.product_features, after.product_features, featureSpec, "product_features");
@@ -5743,6 +6578,7 @@ async function persistStateDiff(
   await syncUpserts(client, fb.orderItems, fa.orderItems, orderItemSpec, "order_items");
   await syncUpserts(client, fb.orderSnapshots, fa.orderSnapshots, orderSnapshotSpec, "order_item_entitlement_snapshots");
   await syncUpserts(client, fb.orderSnapshotItems, fa.orderSnapshotItems, orderSnapshotItemSpec, "order_item_entitlement_snapshot_items");
+  await syncUpserts(client, before.order_installments, after.order_installments, orderInstallmentSpec, "order_installments");
   await syncUpserts(client, before.subscriptions, after.subscriptions, subscriptionSpec, "subscriptions");
   await syncUpserts(client, fb.periods, fa.periods, periodSpec, "subscription_periods");
   await syncUpserts(client, before.invoices, after.invoices, invoiceSpec, "invoices");
@@ -5756,6 +6592,10 @@ async function persistStateDiff(
   await syncUpserts(client, fb.licenseSnapshots, fa.licenseSnapshots, licenseSnapshotSpec, "license_entitlement_snapshots");
   await syncUpserts(client, fb.licenseSnapshotItems, fa.licenseSnapshotItems, licenseSnapshotItemSpec, "license_entitlement_snapshot_items");
   await syncUpserts(client, fb.licenseActivations, fa.licenseActivations, licenseActivationSpec, "license_activations");
+  await syncUpserts(client, before.license_events, after.license_events, licenseEventSpec, "license_events");
+  await syncUpserts(client, before.support_tickets, after.support_tickets, supportTicketSpec, "support_tickets");
+  await syncUpserts(client, before.ticket_comments, after.ticket_comments, ticketCommentSpec, "ticket_comments");
+  await syncUpserts(client, before.leads, after.leads, leadSpec, "leads");
   await syncUpserts(client, before.tracking_configurations, after.tracking_configurations, trackingConfigSpec, "tracking_configurations");
   await syncUpserts(client, before.tracking_events, after.tracking_events, trackingEventSpec, "tracking_events");
   await syncUpserts(client, before.webhook_endpoints, after.webhook_endpoints, webhookEndpointSpec, "webhook_endpoints");
@@ -5763,6 +6603,7 @@ async function persistStateDiff(
   await syncUpserts(client, before.outbox_events, after.outbox_events, outboxSpec, "outbox_events");
   await syncUpserts(client, before.idempotency_records, after.idempotency_records, idempotencySpec, "idempotency_records");
   await syncUpserts(client, before.audit_logs, after.audit_logs, auditLogSpec, "audit_logs");
+  await syncUpserts(client, before.sent_reminders, after.sent_reminders, sentReminderSpec, "sent_reminders");
 
   // -- Derived rows for surviving parents --------------------------------------
   // Staff status lives in staff_profiles (the store model has no such table).
@@ -5946,7 +6787,7 @@ async function persistStateDiff(
 
   // -- Sequence counters ---------------------------------------------------------
   if (caps.sequenceCounters) {
-    const keys = ["customer", "order", "invoice", "subscription", "license"] as const;
+    const keys = ["customer", "order", "invoice", "subscription", "license", "ticket", "lead"] as const;
     for (const key of keys) {
       if (before.sequence_counters[key] !== after.sequence_counters[key]) {
         await execSql(

@@ -12,15 +12,19 @@ import {
   randomOpaqueToken,
 } from "../../platform/crypto/index.ts";
 import type {
+  CustomerRecord,
   DatabaseState,
   InvoiceRecord,
+  LeadRecord,
   OrderItemRecord,
   OrderRecord,
+  PaymentMethodRecord,
   StackMateDataStore,
 } from "../../platform/db/store.ts";
 import { AppError } from "../../shared/errors.ts";
 import { appendAuditLog } from "../audit/service.ts";
-import { createCustomerInTx } from "../customers/service.ts";
+import { resolveOrCreateCustomerInTx } from "../customers/service.ts";
+import { createInstallmentsForOrderInTx } from "../payments/service.ts";
 import { assertStaffPermission, type StaffPrincipal } from "../identity/service.ts";
 
 export function generateInvoiceForOrderInTx(
@@ -119,7 +123,10 @@ export async function createPublicCheckoutOrder(
         throw new AppError("FORBIDDEN", "Site does not have checkout.create capability.", 403);
       }
 
-      const customer = createCustomerInTx(state, {
+      // Dedupe (ADR-0009): the same email/phone never creates a second
+      // customer — a match resolves to the existing customer (the new phone
+      // or email attaches as a secondary contact); a conflict 409s.
+      const { customer } = resolveOrCreateCustomerInTx(state, {
         customer_type: parsed.customer.company_name ? "business" : "person",
         name: parsed.customer.name,
         email: parsed.customer.email ?? null,
@@ -128,6 +135,31 @@ export async function createPublicCheckoutOrder(
         country_code: parsed.billing_address?.country_code ?? "BD",
         registration_source: "website",
       });
+
+      // Store the checkout billing address (table exists since 0000).
+      if (parsed.billing_address?.address_line_1 || parsed.billing_address?.city) {
+        const hasAddress = state.customer_addresses.some(
+          (a) => a.customer_id === customer.id && a.address_type === "billing"
+        );
+        if (!hasAddress) {
+          state.customer_addresses.push({
+            id: randomUUID(),
+            customer_id: customer.id,
+            address_type: "billing",
+            contact_name: parsed.customer.name,
+            phone: parsed.customer.phone ?? null,
+            address_line_1: parsed.billing_address.address_line_1 ?? null,
+            address_line_2: null,
+            city: parsed.billing_address.city ?? null,
+            state_or_region: null,
+            postal_code: parsed.billing_address.postal_code ?? null,
+            country_code: parsed.billing_address.country_code ?? "BD",
+            is_default: true,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          });
+        }
+      }
 
       const orderId = randomUUID();
       const orderItems: OrderItemRecord[] = [];
@@ -288,6 +320,13 @@ export async function createPublicCheckoutOrder(
         items: orderItems,
         attribution: parsed.attribution ?? null,
         created_by_user_id: null,
+        activation_mode: "on_full_payment",
+        activation_percent: null,
+        activation_date: null,
+        suspend_on_missed_schedule: false,
+        grace_days: 3,
+        payment_method_id: null,
+        lead_id: null,
         created_at: now,
         updated_at: now,
         completed_at: null,
@@ -375,10 +414,52 @@ export async function createOrderByAdmin(
   const input = AdminCreateOrderSchema.parse(rawInput);
 
   return store.withTransaction((state) => {
-    const customer = state.customers.find((c) => c.id === input.customer_id);
-    if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
+    // Customer: exactly one of customer_id / new_customer (schema refine).
+    // new_customer is validated + deduped exactly like POST /customers.
+    let customer: CustomerRecord;
+    if (input.new_customer) {
+      const nc = input.new_customer;
+      customer = resolveOrCreateCustomerInTx(state, {
+        customer_type: nc.customer_type,
+        name: nc.name,
+        email: nc.email ?? null,
+        phone: nc.phone ?? null,
+        whatsapp: nc.whatsapp ?? null,
+        company_name: nc.company_name ?? null,
+        country_code: nc.country_code,
+        registration_source: "admin",
+        notes: nc.notes ?? null,
+      }).customer;
+    } else {
+      const found = state.customers.find((c) => c.id === input.customer_id);
+      if (!found) throw new AppError("NOT_FOUND", "Customer not found.", 404);
+      customer = found;
+    }
     const product = state.products.find((p) => p.id === input.product_id);
     if (!product) throw new AppError("NOT_FOUND", "Product not found.", 404);
+
+    // Lead conversion (ADR-0009): the order links the lead; the lead is
+    // marked converted (history stays) once the order exists.
+    let lead: LeadRecord | null = null;
+    if (input.lead_id) {
+      lead = state.leads.find((l) => l.id === input.lead_id) ?? null;
+      if (!lead) throw new AppError("NOT_FOUND", "Lead not found.", 404);
+      if (lead.status === "converted") {
+        throw new AppError(
+          "LEAD_ALREADY_CONVERTED",
+          `Lead ${lead.lead_number} is already converted.`,
+          409
+        );
+      }
+    }
+
+    // Payment method the order will be paid with (stored on the order).
+    let paymentMethod: PaymentMethodRecord | null = null;
+    if (input.payment_method_id) {
+      paymentMethod =
+        state.payment_methods.find((m) => m.id === input.payment_method_id) ?? null;
+      if (!paymentMethod) throw new AppError("NOT_FOUND", "Payment method not found.", 404);
+    }
 
     const now = new Date().toISOString();
     const orderId = randomUUID();
@@ -593,6 +674,15 @@ export async function createOrderByAdmin(
       items: [orderItem],
       attribution: null,
       created_by_user_id: actor.user.id,
+      activation_mode: input.activation_mode,
+      activation_percent:
+        input.activation_mode === "on_percent" ? (input.activation_percent ?? 100) : null,
+      activation_date:
+        input.activation_mode === "on_date" ? (input.activation_date ?? null) : null,
+      suspend_on_missed_schedule: input.suspend_on_missed_schedule,
+      grace_days: input.grace_days,
+      payment_method_id: paymentMethod?.id ?? null,
+      lead_id: lead?.id ?? null,
       created_at: now,
       updated_at: now,
       completed_at: null,
@@ -600,7 +690,18 @@ export async function createOrderByAdmin(
     };
 
     state.orders.push(order);
+    // Payment plan (ADR-0009): installments always exist — one-time full
+    // is a single installment — so paid/remaining is always computable.
+    createInstallmentsForOrderInTx(state, order, input.payment_plan, new Date(now));
     const invoice = generateInvoiceForOrderInTx(state, order, "initial");
+
+    if (lead) {
+      lead.status = "converted";
+      lead.converted_at = now;
+      lead.converted_customer_id = customer.id;
+      lead.converted_order_id = order.id;
+      lead.updated_at = now;
+    }
 
     appendAuditLog(state, {
       actor_type: "staff",
@@ -615,6 +716,9 @@ export async function createOrderByAdmin(
         item_kind: orderItem.item_kind,
         total_minor: order.total_minor,
         currency_code: order.currency_code,
+        activation_mode: order.activation_mode,
+        payment_plan_kind: input.payment_plan?.kind ?? "full",
+        lead_id: lead?.id ?? null,
       },
     });
 

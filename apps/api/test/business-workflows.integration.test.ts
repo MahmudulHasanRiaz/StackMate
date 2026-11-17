@@ -759,24 +759,23 @@ describe.skipIf(!DATABASE_URL)("Business workflows (Postgres)", () => {
   }, 30_000);
 
   it("8. subscription activation after verification: active row, correct 1-year period", async () => {
-    // NOTE (real behaviour, not a test artifact): the public checkout
-    // ALWAYS creates a fresh customer row (createPublicCheckoutOrder calls
-    // createCustomerInTx unconditionally — no dedupe by email), so the
-    // subscription/license belong to the checkout's customer, not the
-    // admin-created one from test 3. The workflow customer is therefore
-    // read from the public order itself.
+    // ADR-0009 (Decision 3, owner rules 2026-11-17): public checkout now
+    // DEDUPES by normalized email/phone — the checkout resolves to the
+    // admin-created customer from test 3 instead of creating a second
+    // row for the same email. (Before this batch the checkout ALWAYS
+    // created a fresh customer row; the old assertion is inverted here.)
     workflowCustomerId = (
       await one("SELECT customer_id FROM orders WHERE id = $1", [publicOrderId])
     ).customer_id as string;
-    assert.notEqual(
+    assert.equal(
       workflowCustomerId,
       customerId,
-      "checkout must have created its own customer row"
+      "checkout must resolve to the existing customer (ADR-0009 dedupe)"
     );
     assert.equal(
       await countWhere("customers", "normalized_email = $1", ["tanvir@agency.bd"]),
-      2,
-      "admin customer + checkout customer share one email with no dedupe"
+      1,
+      "one customer row for the shared email — no duplicate from checkout"
     );
     subscriptionId = (await one("SELECT * FROM subscriptions WHERE customer_id = $1", [workflowCustomerId])).id;
     const subRow = await one("SELECT * FROM subscriptions WHERE id = $1", [subscriptionId]);
@@ -1496,9 +1495,13 @@ describe.skipIf(!DATABASE_URL)("Business workflows (Postgres)", () => {
     assert.equal(again.status, 409, JSON.stringify(again.body));
     assert.deepEqual(await snapshot(), before, "a duplicate approval must leave zero partial state");
 
-    // A payment claim with the wrong amount against the still-unpaid admin
+    // A payment claim with a WRONG CURRENCY against the still-unpaid admin
     // order -> 422 PAYMENT_AMOUNT_MISMATCH, no submission row, order untouched.
     // (The public order is already paid, so it cannot exercise this path.)
+    // NOTE (ADR-0009): a wrong AMOUNT no longer fails — partial payments are
+    // accepted now, so the failing step here is the currency mismatch,
+    // which still 422s. The rollback intent is unchanged: a rejected claim
+    // must leave zero partial state.
     const adminRef = (await one("SELECT public_reference FROM orders WHERE id = $1", [
       adminOrderId,
     ])).public_reference as string;
@@ -1516,13 +1519,13 @@ describe.skipIf(!DATABASE_URL)("Business workflows (Postgres)", () => {
       {
         method: "POST",
         token: adminToken,
-        headers: { "Idempotency-Key": "idem-biz-payment-wrong-amount" },
+        headers: { "Idempotency-Key": "idem-biz-payment-wrong-currency" },
         body: {
           payment_method_id: (await one("SELECT id FROM payment_methods WHERE method_key = $1", [
             "bkash-merchant-main",
           ])).id as string,
           amount_minor: 100,
-          currency_code: "BDT",
+          currency_code: "USD",
           sender_phone: "01711223344",
           transaction_id: "BKA-BIZ-999",
         },

@@ -14,7 +14,7 @@
  * /settings (e.g. /settings/websites) with its own detail routes;
  * the settings index redirects to the first category.
  */
-import { BarChart3, CreditCard, Globe, Mail, Settings2, ShieldCheck, Webhook, type LucideIcon } from "lucide-react";
+import { BarChart3, BookOpen, CreditCard, Globe, Mail, Settings2, ShieldCheck, Webhook, type LucideIcon } from "lucide-react";
 
 export interface SettingsCategory {
   slug: string;
@@ -88,5 +88,20 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
     to: "/settings/authentication",
     group: "Security",
     permission: "users.manage",
+  },
+  {
+    // Customer+Order batch (ADR-0009): the receiver requirements for
+    // products built on StackMate — license validation, entitlement
+    // tokens, webhook receiver spec, renewal prompts. Documentation,
+    // not configuration, but it lives in Settings with the other
+    // integration material (owner decision: Integration Guide under
+    // Settings). Gated on integrations.manage like the other
+    // integration pages.
+    slug: "integration-guide",
+    label: "Integration Guide",
+    icon: BookOpen,
+    to: "/settings/integration-guide",
+    group: "Documentation",
+    permission: "integrations.manage",
   },
 ];

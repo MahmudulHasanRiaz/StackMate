@@ -48,6 +48,7 @@ import {
   ClipboardCheck,
   KeyRound,
   LayoutDashboard,
+  LifeBuoy,
   ListChecks,
   LogOut,
   Menu as MenuIcon,
@@ -62,6 +63,7 @@ import {
   SunMoon,
   Tags,
   User,
+  UserPlus,
   Users,
   X,
   type LucideIcon,
@@ -181,6 +183,13 @@ export const NAVIGATION_GROUPS: ReadonlyArray<{
       { to: "/customers", label: "Customers", icon: Users, permission: "customers.read" },
       { to: "/orders", label: "Orders & Invoices", icon: ShoppingCart, permission: "orders.read" },
       { to: "/payment-review", label: "Payment Review", icon: ClipboardCheck, permission: "payments.read" },
+      { to: "/leads", label: "Leads", icon: UserPlus, permission: "leads.view" },
+    ],
+  },
+  {
+    group: "Support",
+    items: [
+      { to: "/tickets", label: "Support Tickets", icon: LifeBuoy, permission: "tickets.view" },
     ],
   },
   {

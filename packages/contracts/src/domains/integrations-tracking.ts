@@ -40,6 +40,7 @@ export const RegisterIntegratedSiteSchema = v.object({
         "orders.cancel:own",
         "tracking.events.write",
         "webhooks.test",
+        "leads.create",
       ] as const)
     )
     .default(["catalog.read", "checkout.create", "tracking.events.write"]),
@@ -128,6 +129,7 @@ export const SITE_CAPABILITIES = [
   "orders.cancel:own",
   "tracking.events.write",
   "webhooks.test",
+  "leads.create",
 ] as const;
 
 export const UpdateIntegratedSiteSchema = v.object({

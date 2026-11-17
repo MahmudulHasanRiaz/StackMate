@@ -153,6 +153,23 @@ const SubscriptionDetailSection = lazy(() =>
 const TrackingSection = lazy(() =>
   import("./sections/tracking").then((m) => ({ default: m.TrackingSection })),
 );
+const TicketsSection = lazy(() =>
+  import("./sections/tickets").then((m) => ({ default: m.TicketsSection })),
+);
+const TicketDetailSection = lazy(() =>
+  import("./sections/tickets").then((m) => ({ default: m.TicketDetailSection })),
+);
+const LeadsSection = lazy(() =>
+  import("./sections/leads").then((m) => ({ default: m.LeadsSection })),
+);
+const LeadDetailSection = lazy(() =>
+  import("./sections/leads").then((m) => ({ default: m.LeadDetailSection })),
+);
+const IntegrationGuideSection = lazy(() =>
+  import("./sections/integration-guide").then((m) => ({
+    default: m.IntegrationGuideSection,
+  })),
+);
 const TrackingConfigSection = lazy(() =>
   import("./sections/tracking-config").then((m) => ({
     default: m.TrackingConfigSection,
@@ -353,6 +370,12 @@ const outboxRoute = makeListRoute("/outbox", OutboxSection);
 const staffRoute = makeListRoute("/staff", StaffSection);
 const staffUserDetailRoute = makeDetailRoute("/staff/$userId", "userId", StaffUserDetailSection);
 const auditLogsRoute = makeListRoute("/audit-logs", AuditLogsSection);
+// Customer+Order batch (ADR-0009): Support Tickets + Leads are
+// operational main-menu sections (not Settings).
+const ticketsRoute = makeListRoute("/tickets", TicketsSection);
+const ticketDetailRoute = makeDetailRoute("/tickets/$ticketId", "ticketId", TicketDetailSection);
+const leadsRoute = makeListRoute("/leads", LeadsSection);
+const leadDetailRoute = makeDetailRoute("/leads/$leadId", "leadId", LeadDetailSection);
 
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -428,6 +451,10 @@ const settingsTrackingRoute = makeSettingsListRoute("/tracking", TrackingConfigS
 const settingsAuthRoute = makeSettingsListRoute("/authentication", AuthSettingsSection);
 const settingsEmailRoute = makeSettingsListRoute("/email", EmailSettingsSection);
 const settingsGeneralRoute = makeSettingsListRoute("/general", GeneralSettingsSection);
+const settingsIntegrationGuideRoute = makeSettingsListRoute(
+  "/integration-guide",
+  IntegrationGuideSection,
+);
 
 const settingsIndexRoute = createRoute({
   getParentRoute: () => settingsRoute,
@@ -459,6 +486,10 @@ const routeTree = rootRoute.addChildren([
     staffRoute,
     staffUserDetailRoute,
     auditLogsRoute,
+    ticketsRoute,
+    ticketDetailRoute,
+    leadsRoute,
+    leadDetailRoute,
   ]),
   settingsRoute.addChildren([
     settingsIndexRoute,
@@ -472,6 +503,7 @@ const routeTree = rootRoute.addChildren([
     settingsAuthRoute,
     settingsEmailRoute,
     settingsGeneralRoute,
+    settingsIntegrationGuideRoute,
   ]),
 ]);
 

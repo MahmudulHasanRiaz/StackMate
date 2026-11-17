@@ -97,6 +97,10 @@ export interface PaymentSubmission {
   reviewed_by_user_id: string | null;
   order_number?: string | null;
   order_total_minor?: number | null;
+  // ADR-0009: the approve form needs the order's remaining amount and
+  // the customer's credit balance to offer apply-credit explicitly.
+  order_remaining_minor?: number | null;
+  customer_credit_balance_minor?: number | null;
   customer_name?: string | null;
   payment_method_name?: string | null;
   submitted_date_display?: string | null;
@@ -112,7 +116,19 @@ export interface OrderSummary {
   payment_status: string;
   currency_code: string;
   total_minor: number;
+  // ADR-0009: computed from verified payments (API order list/detail).
+  paid_amount_minor?: number;
+  remaining_minor?: number;
   created_at: string;
+}
+
+interface OrderInstallmentOption {
+  id: string;
+  installment_number: number;
+  amount_minor: number;
+  paid_amount_minor: number;
+  due_date: string;
+  status: string;
 }
 
 const STATUS_FILTERS = ["all", "submitted", "under_review", "approved", "rejected", "cancelled"] as const;
@@ -373,12 +389,29 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
 
   const onOrderChange = (nextId: string) => {
     setOrderId(nextId);
+    setInstallmentId("");
     const order = openOrders.find((o) => o.id === nextId);
     if (order) {
-      setAmountMinor(String(order.total_minor));
+      // Default to the remaining amount (ADR-0009: partial payments
+      // are allowed; the claim no longer has to match the full total).
+      setAmountMinor(String(order.remaining_minor ?? order.total_minor));
       setCurrency(order.currency_code);
     }
   };
+
+  // Installments for the picked order (ADR-0009): the claim may name
+  // one; otherwise the server allocates oldest-first.
+  const installmentsQuery = useQuery({
+    queryKey: ["admin", "orders", "installments", orderId],
+    queryFn: async () => {
+      const res = await apiRequest<{ items: OrderInstallmentOption[] }>(
+        `/api/v1/admin/orders/${orderId}/installments`,
+      );
+      return res.items;
+    },
+    enabled: orderId !== "",
+  });
+  const [installmentId, setInstallmentId] = useState("");
 
   const mutation = useAdminMutation<
     { payment_submission: PaymentSubmission; order: OrderSummary },
@@ -404,8 +437,11 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
     if (!selectedMethod) next.payment_method_id = "Choose an enabled payment method.";
     if (!Number.isInteger(amountNum) || amountNum <= 0)
       next.amount_minor = "Enter the amount in minor units (e.g. 50000 = ৳500.00).";
-    else if (selectedOrder && amountNum !== selectedOrder.total_minor)
-      next.amount_minor = `Amount must match the order total exactly (${selectedOrder.total_minor} minor units).`;
+    // ADR-0009: partial payments are allowed — any positive amount.
+    // Above the remaining amount is NOT an error: the excess becomes
+    // the customer's credit balance at approval (the form says so
+    // under the amount field); the server 422s only on <= 0 or a
+    // currency mismatch.
     if (!/^[A-Za-z]{3}$/.test(currency.trim()))
       next.currency_code = "Currency must be a 3-letter code.";
     else if (selectedOrder && currency.trim().toUpperCase() !== selectedOrder.currency_code)
@@ -453,6 +489,7 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
           payment_method_id: methodId,
           amount_minor: amountNum,
           currency_code: currency.trim().toUpperCase(),
+          ...(installmentId ? { installment_id: installmentId } : {}),
           ...(senderPhone.trim() ? { sender_phone: senderPhone.trim() } : {}),
           ...(senderName.trim() ? { sender_name: senderName.trim() } : {}),
           ...(senderBank.trim() ? { sender_bank_name: senderBank.trim() } : {}),
@@ -525,7 +562,11 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
         <Field
           label="Amount (minor units)"
           required
-          hint={amountPreview ? `= ${amountPreview}` : "Minor units, e.g. 50000 = ৳500.00."}
+          hint={
+            amountPreview
+              ? `= ${amountPreview}${selectedOrder ? ` · Remaining ${formatMinorMoney(selectedOrder.remaining_minor ?? selectedOrder.total_minor, selectedOrder.currency_code)}` : ""}${selectedOrder && amountNum > (selectedOrder.remaining_minor ?? selectedOrder.total_minor) ? ` · Exceeds the remaining amount by ${formatMinorMoney(amountNum - (selectedOrder.remaining_minor ?? selectedOrder.total_minor), selectedOrder.currency_code)} — the excess becomes the customer's credit balance at approval.` : ""}`
+              : "Minor units, e.g. 50000 = ৳500.00."
+          }
           error={errors.amount_minor ?? ""}
         >
           <Input
@@ -535,6 +576,26 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
             aria-invalid={Boolean(errors.amount_minor) || undefined}
           />
         </Field>
+        {orderId !== "" ? (
+          <Field label="Apply to installment" hint="Optional — oldest unpaid first when left blank.">
+            <Select
+              value={installmentId}
+              onChange={(e) => setInstallmentId(e.target.value)}
+              disabled={installmentsQuery.isPending}
+            >
+              <option value="">Oldest unpaid first</option>
+              {(installmentsQuery.data ?? [])
+                .filter((i) => i.status !== "paid")
+                .map((i) => (
+                  <option key={i.id} value={i.id}>
+                    #{i.installment_number} —{" "}
+                    {formatMinorMoney(i.amount_minor - i.paid_amount_minor, currency.trim().toUpperCase() || "BDT")}{" "}
+                    due {i.due_date} ({i.status.replace(/_/g, " ")})
+                  </option>
+                ))}
+            </Select>
+          </Field>
+        ) : null}
         <Field label="Currency" required error={errors.currency_code ?? ""}>
           <Input
             value={currency}
@@ -842,8 +903,15 @@ function ApproveForm({
   const [currency, setCurrency] = useState(submission.currency_code);
   const [reference, setReference] = useState("");
   const [internalNote, setInternalNote] = useState("");
+  // ADR-0009 apply-credit: explicit, never silent. Capped at the
+  // smaller of the customer's credit balance and the order's
+  // remaining amount (the server enforces the same caps).
+  const [applyCredit, setApplyCredit] = useState("0");
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [formError, setFormError] = useState<string | null>(null);
+  const creditBalance = submission.customer_credit_balance_minor ?? 0;
+  const orderRemaining = submission.order_remaining_minor ?? submission.amount_minor;
+  const maxCredit = Math.max(0, Math.min(creditBalance, orderRemaining));
 
   const mutation = useAdminMutation<unknown, Record<string, unknown>>({
     mutationFn: (body) =>
@@ -857,15 +925,22 @@ function ApproveForm({
       listKey("orders"),
     ],
     successTitle: "Payment approved",
-    successMessage: "The order is now paid and fulfillment has started.",
+    // ADR-0009: approval may leave the order partially paid — the
+    // message must not claim "paid" when the order is not.
+    successMessage: "The verified amount was applied to the order.",
     onSuccess: onDone,
   });
 
   const submit = () => {
     const next: Record<string, string> = {};
     const amount = Number(verifiedAmount);
+    const credit = Number(applyCredit);
     if (!Number.isInteger(amount) || amount <= 0)
       next.verified_amount_minor = "Enter the verified amount in minor units.";
+    if (!Number.isInteger(credit) || credit < 0)
+      next.apply_credit_minor = "Enter 0 or a positive amount in minor units.";
+    else if (credit > maxCredit)
+      next.apply_credit_minor = `At most ${formatMinorMoney(maxCredit, submission.currency_code)} can be applied (credit ${formatMinorMoney(creditBalance, submission.currency_code)}, remaining ${formatMinorMoney(orderRemaining, submission.currency_code)}).`;
     if (!/^[A-Za-z]{3}$/.test(currency.trim())) next.currency_code = "Currency must be a 3-letter code.";
     if (reference.trim().length < 2) next.verification_reference = "Verification reference is required.";
     setErrors(next);
@@ -876,6 +951,7 @@ function ApproveForm({
         verified_amount_minor: amount,
         currency_code: currency.trim().toUpperCase(),
         verification_reference: reference.trim(),
+        ...(credit > 0 ? { apply_credit_minor: credit } : {}),
         ...(internalNote.trim() ? { internal_note: internalNote.trim() } : {}),
       },
       {
@@ -892,8 +968,10 @@ function ApproveForm({
       }}
     >
       <Alert variant="warning">
-        Approve only after confirming actual receipt. Approval marks the order
-        paid and starts fulfillment (subscriptions and licenses).
+        Approve only after confirming actual receipt. Approval applies the
+        verified amount to the order — a partial approval leaves the order
+        partially paid; fulfillment (subscriptions and licenses) follows
+        the order's activation policy.
       </Alert>
       <div className="sm-form-grid" style={{ marginTop: 16 }}>
         <Field label="Verified amount (minor units)" required error={errors.verified_amount_minor ?? ""}>
@@ -906,6 +984,23 @@ function ApproveForm({
         </Field>
         <Field label="Currency" required error={errors.currency_code ?? ""}>
           <Input value={currency} onChange={(e) => setCurrency(e.target.value)} />
+        </Field>
+        <Field
+          label="Apply customer credit (minor units)"
+          hint={
+            creditBalance > 0
+              ? `Customer credit balance ${formatMinorMoney(creditBalance, submission.currency_code)} · order remaining ${formatMinorMoney(orderRemaining, submission.currency_code)} · at most ${formatMinorMoney(maxCredit, submission.currency_code)} can be applied.`
+              : "This customer has no credit balance."
+          }
+          error={errors.apply_credit_minor ?? ""}
+        >
+          <Input
+            inputMode="numeric"
+            value={applyCredit}
+            onChange={(e) => setApplyCredit(e.target.value)}
+            aria-invalid={Boolean(errors.apply_credit_minor) || undefined}
+            disabled={maxCredit <= 0}
+          />
         </Field>
         <Field label="Verification reference" required hint="Bank statement or receipt reference." error={errors.verification_reference ?? ""}>
           <Input

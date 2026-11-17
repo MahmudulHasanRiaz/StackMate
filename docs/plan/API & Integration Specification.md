@@ -445,28 +445,42 @@ Money uses integer minor units and currency code in API contracts. For example, 
 
 | Method | Endpoint | Behavior |
 |---|---|---|
-| GET | /api/v1/admin/customers | Search/list customers using authorized fields |
+| GET | /api/v1/admin/customers | Search/list customers using authorized fields; each row carries `report_count` and `has_concern_report` |
 | POST | /api/v1/admin/customers | Create customer |
-| GET | /api/v1/admin/customers/{customerId} | Customer detail |
+| GET | /api/v1/admin/customers/{customerId} | Customer detail: financials (`total_billed/paid/due`, `credit_balance`), contacts, addresses, reports, orders with per-order paid/remaining, subscriptions, licenses, payments, installations, tickets, activity |
 | PATCH | /api/v1/admin/customers/{customerId} | Update allowed contact/billing data; audit sensitive changes |
-| GET | /api/v1/admin/customers/{customerId}/orders | Customer order history |
+| GET | /api/v1/admin/customers/{customerId}/orders | Customer order history (every row carries billed / paid / due) |
 | GET | /api/v1/admin/customers/{customerId}/subscriptions | Customer subscriptions |
 | GET | /api/v1/admin/customers/{customerId}/licenses | Customer licenses |
+| GET | /api/v1/admin/customers/{customerId}/payments | Customer payment submissions + verified transactions |
+| GET | /api/v1/admin/customers/{customerId}/installations | Connected installations (license activations) |
+| GET | /api/v1/admin/customers/{customerId}/activity | Audit log filtered to the customer and their orders/subscriptions/licenses (last 100) |
+| GET | /api/v1/admin/customers/{customerId}/tickets | All tickets for the customer |
+| GET/POST | /api/v1/admin/customers/{customerId}/addresses | Billing/shipping address list + create |
+| PATCH/DELETE | /api/v1/admin/customers/{customerId}/addresses/{addressId} | Update / delete an address (one default; setting a new default clears the old one) |
+| GET/POST | /api/v1/admin/customers/{customerId}/reports | Staff reports on the customer (type note/concern, detail required) |
+| POST | /api/v1/admin/customers/{customerId}/split-contact | Detach a SECONDARY email/phone into its own customer; the picked phone moves with it; orders stay with the source |
 
 Customer identity resolution must be deliberate. Email or phone matches may suggest a possible existing customer; do not automatically merge records on an unverified client claim. Customer is not the same entity as a staff login account.
+
+**Dedupe (ADR-0009 §3, owner rules 2026-11-17):** normalized email and normalized phone each belong to at most ONE customer. Email match → that customer (new phone attaches as secondary); phone match + new email → that customer (email attaches as secondary); neither match → new customer; both match DIFFERENT customers → 409 `CUSTOMER_CONTACT_CONFLICT` naming both customers, admin resolves, never auto-merge. The rule applies to admin create, public checkout, and inline order creation. Secondary contacts live in `customer_contacts` (UNIQUE (kind, normalized_value)). A unique index on the primaries is NOT yet enforced at the DB level — staging holds duplicates from the old checkout path; the resolver enforces the rule on all write paths until a data-cleanup migration adds the indexes. Create validation: name required; AT LEAST ONE of email/phone (422 otherwise; WhatsApp alone does not satisfy it). Phone normalizes to E.164 (Bangladeshi `01…` → `+880…`). WhatsApp has a "same as phone" copy in the UI (still editable after).
 
 ### 10.2 Orders
 
 | Method | Endpoint | Behavior |
 |---|---|---|
-| GET | /api/v1/admin/orders | Filterable order list |
+| GET | /api/v1/admin/orders | Filterable order list (each row carries `paid_amount_minor` / `remaining_minor`) |
 | POST | /api/v1/admin/orders | Create an admin-originated order; permission required |
-| GET | /api/v1/admin/orders/{orderId} | Order detail with safe line-item snapshots |
+| GET | /api/v1/admin/orders/{orderId} | Order detail with safe line-item snapshots, installments, paid/remaining |
 | POST | /api/v1/admin/orders/{orderId}/cancel | Explicit cancellation command |
 | POST | /api/v1/admin/orders/{orderId}/complete | Only for fulfillment workflow; cannot bypass payment verification |
 | GET | /api/v1/admin/orders/{orderId}/invoices | Related invoices |
+| GET | /api/v1/admin/orders/{orderId}/installments | Payment plan installments |
+| PATCH | /api/v1/admin/orders/{orderId}/installments/{installmentId} | Change an installment due date / notes (audit-logged) |
 
 Order amount, discount, tax, and entitlement snapshots are computed/validated server-side. The Admin SPA must not send a trusted total as an instruction to persist.
+
+**Create order (ADR-0009):** accepts EITHER `customer_id` OR a `new_customer` object (validated + deduped exactly as §10.1); `payment_method_id` is stored on the order; the payment plan (§10.4) and the license activation policy (§12.2) travel with the order. `lead_id` links a converted lead. The order starts `awaiting_payment` / `unpaid`. A first payment is recorded as a separate staff-claim request after creation — the wizard never auto-approves; approval still happens via Payment Review.
 
 ### 10.3 Invoices
 
@@ -478,6 +492,54 @@ Order amount, discount, tax, and entitlement snapshots are computed/validated se
 | POST | /api/v1/admin/invoices/{invoiceId}/void | Void through an authorized financial workflow |
 
 Issued invoices are immutable financial documents except for explicit status transitions and correction/credit-note workflows. Do not regenerate historical invoice items from the current package catalogue.
+
+**Partial payments (ADR-0009 §1, §27 flipped 2026-11-17):** an invoice now moves `open → partially_paid → paid` as verified payments land (`amount_paid_minor` / `amount_due_minor` synced per approval, `paid_at` when fully paid).
+
+### 10.4 Payment plans, installments and credit (ADR-0009 §1–§2)
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/orders/{orderId}/installments | Installments: number, due date (DD/MM/YYYY display, ISO YYYY-MM-DD stored), amount, paid, remaining, status (pending/partially_paid/paid/overdue), timing (early/on-time/late vs due date) |
+| PATCH | /api/v1/admin/orders/{orderId}/installments/{installmentId} | Edit due date / notes (audit `orders.installment.updated`) |
+
+Plan kinds (set at order creation): `full` (one installment, due = clearance date), `advance_rest` (advance amount XOR percent + rest due date), `equal_installments` (N parts every X days from a start date; floor parts, remainder to the last). Claims + approvals accept ANY positive amount (422 only for amount <= 0 or currency mismatch); allocation is oldest-unpaid-installment first unless the claim names an `installment_id`. Order `payment_status` gains `partially_paid` (migration 0010 adds the value to the DB check constraint — the service set it before the constraint did). Paid/remaining are computed on read from verified payments — no denormalized drift. **Credit:** a payment above the remaining amount is accepted; the excess becomes the customer's `credit_balance_minor`, visible on the profile. Credit applies ONLY at approval, explicitly (`apply_credit_minor` in the approve body, capped at the credit balance AND at the remaining amount, else 422 `CREDIT_EXCEEDS_BALANCE`) — never silent auto-apply.
+
+### 10.5 Support tickets (ADR-0009 §7)
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/tickets | List; filters status / priority / customer_id / assignee_user_id / q |
+| POST | /api/v1/admin/tickets | Create (customer optional; see linkages) |
+| GET | /api/v1/admin/tickets/{ticketId} | Detail: customer, reporter/assignee, comments, linked records |
+| PATCH | /api/v1/admin/tickets/{ticketId} | Update title / description / priority / category |
+| POST | /api/v1/admin/tickets/{ticketId}/transition | Move status (enforced, 409 `INVALID_TICKET_TRANSITION`); optional note lands as an internal comment |
+| POST | /api/v1/admin/tickets/{ticketId}/assign | Assign to a staff user (must exist, else 404) |
+| POST | /api/v1/admin/tickets/{ticketId}/comments | Add a comment (`is_internal` flag) |
+
+Ticket number is server-generated (`TKT-<sequence>`). Status flow: open → in_progress → waiting_on_customer → resolved → closed, with reopen (closed/resolved → open, clears resolved/closed_at). Priority low/medium/high/urgent; category billing/technical/license/order/other. **Linkages:** `order_id`, `subscription_id`, `license_id`, `product_id` (all nullable). Picking an order auto-assigns its customer; picking a subscription/license auto-assigns customer + product; a manual customer disagreeing with the linked record's customer → 422 `TICKET_LINK_MISMATCH`. Status + assignment changes are audit-logged. Permissions: `tickets.view` / `tickets.manage`.
+
+### 10.6 Leads (ADR-0009 §8)
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/leads | List; filters status / source_site_id / utm_campaign / from / to / q |
+| POST | /api/v1/admin/leads | Manual create (staff) |
+| GET | /api/v1/admin/leads/{leadId} | Detail: source site, product, assignee, converted customer/order |
+| PATCH | /api/v1/admin/leads/{leadId} | Update contact / interest / notes |
+| POST | /api/v1/admin/leads/{leadId}/transition | Move status (enforced, 409 `INVALID_LEAD_TRANSITION`) |
+| POST | /api/v1/admin/leads/{leadId}/assign | Assign to a staff user |
+| POST | /api/v1/admin/leads/{leadId}/convert | Resolve/create the customer via the §10.1 dedupe rules and return it; the lead is NOT marked converted yet |
+
+Lead fields: name, email, phone, whatsapp (optional), source_site_id (nullable for manual), utm_source/medium/campaign, interest (free text + optional product_id), message/notes, status (new → contacted → qualified → converted / lost), assignee, converted_at / converted_customer_id / converted_order_id. Contact rule mirrors customers (at least one of email/phone). **Ingestion (the main source):** `POST /api/v1/integrations/sites/{siteKey}/leads` — S2S HMAC auth, scope `leads.create` (§15); 201 when created, 200 when dedupe-matched. **Dedupe window:** same normalized contact from the same site within 30 days → update the existing lead, never a duplicate. **Tracking:** every API-ingested lead emits a Lead event into the existing tracking pipeline (event_name `Lead`, status `queued`) + a `tracking.meta_capi.dispatch` outbox entry, on CREATE only; manual leads emit none. Meta CAPI real delivery is a KNOWN STUB — the event is recorded + queued, never claimed as delivered. **Conversion:** convert resolves the customer, then the Create Order wizard opens with the customer prefilled; order creation with `lead_id` marks the lead converted. Converting never deletes the lead. Permissions: `leads.view` / `leads.manage`.
+
+### 10.7 Reminder settings (ADR-0009 §5)
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/reminder-settings | `{ due_offsets_days: [7,1], overdue_offsets_days: [1,3], overdue_enabled: true }` (permission `users.manage`) |
+| PUT | /api/v1/admin/reminder-settings | Update offsets / toggle (audit-logged) |
+
+Stored DB-side (singleton `reminder_settings`, id `default`, migration 0009) and edited from Settings → Email. Due reminders fire when today == due_date − offset; overdue reminders when today == due_date + offset (only when enabled); renewal reminders use the same offsets against `current_period_end`. Each reminder is sent once per (kind, reference_id, offset) — tracked in `sent_reminders`. The sweep returns `reminders_due`; the caller sends each email and only then marks it sent, so a failed send retries on the next run.
 
 ---
 
@@ -515,7 +577,8 @@ Approval request example:
       "verified_amount_minor": 49900,
       "currency_code": "BDT",
       "verification_reference": "statement-line-reference",
-      "internal_note": "Verified against account statement."
+      "internal_note": "Verified against account statement.",
+      "apply_credit_minor": 0
     }
 
 Approval rules:
@@ -523,7 +586,7 @@ Approval rules:
 - The submission must still be pending/reviewable.
 - Verify actual account receipt independently of the customer's claim or screenshot.
 - Check amount, currency, destination account, transaction/reference, order/invoice, and duplicate indicators.
-- If the verified amount differs from the outstanding amount, reject or route to an explicit partial-payment/overpayment workflow; never silently mark the full order paid.
+- **Partial payments (ADR-0009, §27 flipped 2026-11-17):** the verified amount may be ANY positive amount — a partial approval sets the order `partially_paid` (and the invoice `partially_paid`) and allocates oldest-unpaid-installment first (or to the installment named in the claim). A payment above the remaining amount is accepted and the excess becomes customer credit. `apply_credit_minor` applies part of the customer's credit balance on top of the verified money (capped at the balance and at the remaining amount, else 422 `CREDIT_EXCEEDS_BALANCE`). Never silently mark the full order paid: the success message and the outbox `payment.approved` event carry the COMPUTED payment status, and the order completes only when fully paid.
 - Approval must be one atomic database transaction.
 - A second concurrent approval must receive 409 conflict.
 - Insert verification log, audit event, and outbox event in the same transaction.
@@ -565,6 +628,10 @@ Manual providers do not implement automated debit, automated balance check, or p
 | POST | /api/v1/admin/subscriptions/{subscriptionId}/resume | Resume where policy allows |
 
 Manual-payment renewal is a fresh invoice/order followed by a new customer payment submission and staff verification. The API must not expose an auto-debit flag for manual MFS/bank methods.
+
+**Renewal + expiry automation (ADR-0009 §5):** the every-minute cron runs a renewal/expiry sweep AFTER the outbox drain (never failing the drain): date-based license activation; missed-schedule suspension/reactivation; installments past due → overdue; renewal detection — a recurring active subscription whose period end is within the first reminder offset gets exactly ONE renewal invoice/order (`generateRenewalInvoiceInTx`, idempotent via the pending-period check); subscriptions past period end → `past_due` inside the grace window (license keeps working), `expired` after grace (licenses suspended at that moment until renewal payment verifies); licenses past `grace_until` → `expired` + `license.expired` outbox event. Renewal orders carry NO installments.
+
+**License activation policy (ADR-0009 §4):** per-order `activation_mode` (on_full_payment | on_percent | on_date), `activation_percent` (threshold `ceil(total × percent / 100)`), `activation_date`, `suspend_on_missed_schedule` (default false); `grace_days` on the subscription (default 3). Fulfillment follows the activation policy, not payment completion alone: on_full_payment activates when paid == total; on_percent when paid >= percent; on_date on that date regardless of payment. A missed scheduled installment (suspend toggle ON) suspends an active license until paid, then auto-reactivates (only missed-schedule suspensions auto-reactivate). Evaluated at payment approval and in the cron sweep. Every activation/suspension/reactivation writes a `license_event` + audit log entry, and pushes `license.activated` / `license.suspended` / `license.reactivated` / `license.expired` through the existing outbox (payload: license_number, product, status, expires_at, grace_until, reason). The in-app Integration Guide (Settings → Integration Guide) documents the receiver contract.
 
 ### 12.2 Licenses
 
@@ -844,6 +911,7 @@ These routes are called from the registered site's trusted server/runtime and re
 | GET | /api/v1/integrations/sites/{siteKey}/orders/{publicReference} | orders.read:own |
 | POST | /api/v1/integrations/sites/{siteKey}/orders/{publicReference}/cancel | orders.cancel:own |
 | POST | /api/v1/integrations/sites/{siteKey}/tracking/events | tracking.events.write |
+| POST | /api/v1/integrations/sites/{siteKey}/leads | leads.create |
 | POST | /api/v1/integrations/sites/{siteKey}/webhook-test | webhooks.test |
 
 Rules:
@@ -1117,6 +1185,7 @@ Initial event names:
     license.created
     license.activated
     license.suspended
+    license.reactivated
     license.expired
     license.revoked
     entitlement.updated
@@ -1580,7 +1649,7 @@ Do not postpone security gates merely because a happy-path UI demo works.
 | Checkout access token | Opaque stateful or signed stateless token | Short-lived, single-order scope; select based on revocation and storage requirements |
 | HMAC nonce storage | Reuse idempotency storage or add dedicated nonce table | Add explicit uniqueness/TTL guarantee before enabling HMAC |
 | Currency scales | Currency registry and supported decimals | Store minor units with explicit scale policy |
-| Partial payment | Whether multiple verified payments may settle one invoice | Disabled for initial release unless product owner explicitly approves |
+| Partial payment | Whether multiple verified payments may settle one invoice | **APPROVED by the product owner 2026-11-17 (ADR-0009): multiple verified payments may settle one invoice — payment plans, partial approvals, and credit (see §10.4, §11.2).** |
 | Order contents | Single-product or multi-product checkout | Allow multiple items only when all products are assigned to the integration; test fulfillment per item |
 | License token format | JWS claims, TTL, refresh policy | EdDSA compact JWS after signing spike |
 | Meta Graph API version | Version used by CAPI adapter | Pin current supported version at implementation and review upgrades |

@@ -22,7 +22,7 @@
  * and reports the honest result — success or the real error, never a
  * fake success. When SMTP is not configured the page says so plainly.
  */
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { apiRequest, ApiClientError } from "../lib/api-client";
 import { PageHeader, useAdminMutation } from "../lib/section-kit";
@@ -246,6 +246,142 @@ export function EmailSettingsSection() {
       <div className="sm-card">
         <SmtpForm smtp={smtp} onSaved={refetch} />
       </div>
+      <div className="sm-card" style={{ marginTop: 16 }}>
+        <RemindersForm />
+      </div>
     </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Payment reminders (ADR-0009) — Settings → Email                     */
+/* Offsets are days before a due date (installment due / renewal);     */
+/* overdue offsets are days after a missed due date. Each reminder     */
+/* is sent once per (installment/subscription, offset) by the cron     */
+/* sweep; editing the offsets here takes effect on the next run.       */
+/* ------------------------------------------------------------------ */
+interface ReminderSettingsView {
+  due_offsets_days: number[];
+  overdue_offsets_days: number[];
+  overdue_enabled: boolean;
+  updated_at: string | null;
+}
+
+function parseOffsets(value: string): number[] | null {
+  const parts = value
+    .split(",")
+    .map((p) => p.trim())
+    .filter((p) => p !== "");
+  if (parts.length === 0) return null;
+  const nums = parts.map((p) => Number(p));
+  if (nums.some((n) => !Number.isInteger(n) || n < 0 || n > 90)) return null;
+  return [...new Set(nums)].sort((a, b) => b - a);
+}
+
+function RemindersForm() {
+  const query = useQuery({
+    queryKey: ["reminder-settings"],
+    queryFn: () =>
+      apiRequest<ReminderSettingsView>("/api/v1/admin/reminder-settings"),
+  });
+  const [dueOffsets, setDueOffsets] = useState("7,1");
+  const [overdueOffsets, setOverdueOffsets] = useState("1,3");
+  const [overdueEnabled, setOverdueEnabled] = useState(true);
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => {
+    if (query.data && !loaded) {
+      setDueOffsets(query.data.due_offsets_days.join(","));
+      setOverdueOffsets(query.data.overdue_offsets_days.join(","));
+      setOverdueEnabled(query.data.overdue_enabled);
+      setLoaded(true);
+    }
+  }, [query.data, loaded]);
+  const mutation = useAdminMutation<ReminderSettingsView, void>({
+    mutationFn: () =>
+      apiRequest<ReminderSettingsView>("/api/v1/admin/reminder-settings", {
+        method: "PUT",
+        body: JSON.stringify({
+          due_offsets_days: parseOffsets(dueOffsets) ?? [],
+          overdue_offsets_days: parseOffsets(overdueOffsets) ?? [],
+          overdue_enabled: overdueEnabled,
+        }),
+      }),
+    invalidateKeys: [["reminder-settings"]],
+    successTitle: "Reminder settings saved",
+    onSuccess: () => setLoaded(false),
+  });
+  const onSubmit = (e: FormEvent) => {
+    e.preventDefault();
+    const next: Record<string, string> = {};
+    if (parseOffsets(dueOffsets) === null)
+      next.due_offsets_days = "Enter days before due, comma-separated (0–90), e.g. 7,1.";
+    if (parseOffsets(overdueOffsets) === null)
+      next.overdue_offsets_days = "Enter days after due, comma-separated (0–90), e.g. 1,3.";
+    setErrors(next);
+    if (Object.keys(next).length > 0) return;
+    mutation.mutate();
+  };
+  if (query.isPending) return <TableSkeleton rows={3} />;
+  if (query.isError) {
+    return (
+      <ErrorState
+        message={`Could not load reminder settings. ${(query.error as ApiClientError)?.message ?? "Try again."}`}
+        onRetry={() => void query.refetch()}
+      />
+    );
+  }
+  return (
+    <form onSubmit={onSubmit} aria-label="Payment reminder settings">
+      <h2 className="sm-card-title">Payment reminders</h2>
+      <p className="sm-hint">
+        Reminder emails go to the customer&apos;s email address. Due reminders
+        fire before an installment due date or a subscription renewal;
+        overdue reminders fire after a missed due date. Each reminder is
+        sent once per due item and offset.
+      </p>
+      <Field
+        label="Days before due"
+        hint="Comma-separated days, e.g. 7,1 sends a reminder 7 days and 1 day before the due date."
+        error={errors.due_offsets_days ?? ""}
+      >
+        <Input
+          value={dueOffsets}
+          onChange={(e) => setDueOffsets(e.target.value)}
+          inputMode="numeric"
+          autoComplete="off"
+          aria-invalid={Boolean(errors.due_offsets_days) || undefined}
+        />
+      </Field>
+      <Switch
+        label="Overdue reminders"
+        checked={overdueEnabled}
+        onChange={(e) => setOverdueEnabled(e.target.checked)}
+      />
+      <Field
+        label="Days after due (overdue)"
+        hint="Comma-separated days after a missed due date, e.g. 1,3."
+        error={errors.overdue_offsets_days ?? ""}
+      >
+        <Input
+          value={overdueOffsets}
+          onChange={(e) => setOverdueOffsets(e.target.value)}
+          inputMode="numeric"
+          autoComplete="off"
+          disabled={!overdueEnabled}
+          aria-invalid={Boolean(errors.overdue_offsets_days) || undefined}
+        />
+      </Field>
+      {mutation.isError ? (
+        <Alert variant="danger">
+          {(mutation.error as ApiClientError)?.message ?? "Could not save reminder settings."}
+        </Alert>
+      ) : null}
+      <div className="sm-form-actions">
+        <Button type="submit" variant="accent" disabled={mutation.isPending}>
+          {mutation.isPending ? "Saving…" : "Save reminder settings"}
+        </Button>
+      </div>
+    </form>
   );
 }

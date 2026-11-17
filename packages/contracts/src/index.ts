@@ -8,3 +8,6 @@ export * from "./domains/commerce.ts";
 export * from "./domains/payments.ts";
 export * from "./domains/subscriptions-licensing.ts";
 export * from "./domains/integrations-tracking.ts";
+export * from "./domains/tickets.ts";
+export * from "./domains/leads.ts";
+export * from "./domains/reminders.ts";

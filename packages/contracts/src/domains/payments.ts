@@ -64,6 +64,10 @@ export const SubmitManualPaymentSchema = v.object({
   payment_date_display: v.string().trim().optional(), // DD/MM/YYYY if provided by customer
   evidence_asset_id: v.string().uuid().optional(),
   customer_note: v.string().trim().max(1000).optional(),
+  // ADR-0009: partial payments. Any positive amount up to the order's
+  // remaining balance is accepted; allocation is oldest-unpaid-installment
+  // first unless a specific installment is named here.
+  installment_id: v.string().uuid().nullable().optional(),
 });
 
 export const ApprovePaymentSubmissionSchema = v.object({
@@ -71,6 +75,10 @@ export const ApprovePaymentSubmissionSchema = v.object({
   currency_code: v.string().trim().min(3).max(3).default("BDT"),
   verification_reference: v.string().trim().min(2).max(160),
   internal_note: v.string().trim().max(2000).optional(),
+  // ADR-0009: apply part of the customer's credit balance to this order,
+  // on top of the verified money. 0 = none. Capped at the customer's
+  // credit balance and at the order's remaining amount; never silent.
+  apply_credit_minor: v.number().int().nonnegative().default(0),
 });
 
 export const RejectPaymentSubmissionSchema = v.object({
