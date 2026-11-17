@@ -18,6 +18,8 @@ import {
   ddmmyyyyToIso,
   formatRangeLabel,
   isoToDdmmyyyy,
+  normalizeDateInput,
+  normalizePastedDate,
   presetRange,
   type DashboardPreset,
 } from "../lib/dates";
@@ -289,7 +291,11 @@ export function DashboardSection() {
               <input
                 className="sm-input"
                 value={customFrom}
-                onChange={(e) => setCustomFrom(e.target.value)}
+                onChange={(e) => setCustomFrom(normalizeDateInput(e.target.value))}
+                onPaste={(e) => {
+                  e.preventDefault();
+                  setCustomFrom(normalizePastedDate(e.clipboardData.getData("text")));
+                }}
                 placeholder="DD/MM/YYYY"
                 inputMode="numeric"
                 autoComplete="off"
@@ -299,7 +305,11 @@ export function DashboardSection() {
               <input
                 className="sm-input"
                 value={customTo}
-                onChange={(e) => setCustomTo(e.target.value)}
+                onChange={(e) => setCustomTo(normalizeDateInput(e.target.value))}
+                onPaste={(e) => {
+                  e.preventDefault();
+                  setCustomTo(normalizePastedDate(e.clipboardData.getData("text")));
+                }}
                 placeholder="DD/MM/YYYY"
                 inputMode="numeric"
                 autoComplete="off"

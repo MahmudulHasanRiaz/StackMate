@@ -66,6 +66,7 @@ import {
   ErrorState,
   Field,
   Input,
+  MenuSelect,
   MoneyCell,
   Select,
   StatusBadge,
@@ -1502,6 +1503,18 @@ function CreateOrderWizard({
     }));
   })();
 
+  // Live defect 2026-11-17: step-2 errors were set only by validateStep
+  // (on Continue) and never cleared — a "Choose a price." error stayed
+  // visible after the price was chosen. Each field clears its own
+  // error as soon as its value changes.
+  const clearItemError = (key: string) =>
+    setItemErrors((prev) => {
+      if (!(key in prev)) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+
   const validateStep = (s: number): boolean => {
     if (s === 1) {
       if (customerMode === "existing") {
@@ -1658,10 +1671,18 @@ function CreateOrderWizard({
         grace_days: Number(graceDays),
         ...(prefill?.leadId ? { lead_id: prefill.leadId } : {}),
       };
-      const created = await apiRequest<OrderDto>("/api/v1/admin/orders", {
-        method: "POST",
-        body: JSON.stringify(body),
-      });
+      // POST /api/v1/admin/orders returns { order, invoice } — NOT a
+      // bare order. The wizard used to type this as OrderDto and read
+      // created.id (undefined), navigating to /orders/undefined after
+      // a successful create (live defect 2026-11-17).
+      const created = await apiRequest<{ order: OrderDto; invoice: InvoiceDto }>(
+        "/api/v1/admin/orders",
+        {
+          method: "POST",
+          body: JSON.stringify(body),
+        }
+      );
+      const createdOrder = created.order;
       // Optional first payment — a second request, recorded as a staff
       // claim (never auto-approved). The order exists even if the claim
       // fails; the error is shown and the order can be opened.
@@ -1669,12 +1690,12 @@ function CreateOrderWizard({
         firstPaymentAmount.trim() === "" ? 0 : Number(firstPaymentAmount);
       if (firstAmount > 0) {
         try {
-          await apiRequest(`/api/v1/admin/orders/${created.id}/payment-submissions`, {
+          await apiRequest(`/api/v1/admin/orders/${createdOrder.id}/payment-submissions`, {
             method: "POST",
             body: JSON.stringify({
               payment_method_id: paymentMethodId,
               amount_minor: firstAmount,
-              currency_code: created.currency_code,
+              currency_code: createdOrder.currency_code,
               ...(firstPaymentSender.trim()
                 ? { sender_name: firstPaymentSender.trim() }
                 : {}),
@@ -1690,16 +1711,16 @@ function CreateOrderWizard({
             }),
           });
         } catch (err) {
-          setCreatedOrderId(created.id);
+          setCreatedOrderId(createdOrder.id);
           setFormError(
-            `Order ${created.order_number} was created, but the first payment claim failed: ${err instanceof Error ? err.message : "Request failed"}. Open the order to record it from Payment Review.`,
+            `Order ${createdOrder.order_number} was created, but the first payment claim failed: ${err instanceof Error ? err.message : "Request failed"}. Open the order to record it from Payment Review.`,
           );
           setCreating(false);
           return;
         }
       }
       void queryClient.invalidateQueries({ queryKey: listKey("orders") });
-      onCreated(created.id);
+      onCreated(createdOrder.id);
     } catch (err) {
       setFormError(err instanceof Error ? err.message : "Could not create the order.");
     } finally {
@@ -1852,6 +1873,9 @@ function CreateOrderWizard({
                 setPackageId("");
                 setPriceId("");
                 setCustomFeatures([{ featureId: "", value: "" }]);
+                clearItemError("product");
+                clearItemError("package");
+                clearItemError("price");
               }}
               disabled={productsQuery.isPending}
             >
@@ -1873,6 +1897,8 @@ function CreateOrderWizard({
                   onChange={(e) => {
                     setPackageId(e.target.value);
                     setPriceId("");
+                    clearItemError("package");
+                    clearItemError("price");
                   }}
                   disabled={!productId || packagesQuery.isPending}
                 >
@@ -1893,23 +1919,33 @@ function CreateOrderWizard({
                 </Alert>
               ) : null}
               <Field label="Price" required error={itemErrors.price ?? ""}>
-                <Select
+                {/* MenuSelect, not the native Select: the native popup
+                    is OS-rendered and never opened on click in the
+                    user's extension-driven browser (live defect
+                    2026-11-17 — only type-ahead worked). The DOM
+                    listbox opens on an ordinary click. */}
+                <MenuSelect
                   value={priceId}
-                  onChange={(e) => setPriceId(e.target.value)}
-                  disabled={!publishedVersion || pricesQuery.isPending}
-                >
-                  <option value="">Select a price…</option>
-                  {(pricesQuery.data ?? [])
+                  onChange={(v) => {
+                    setPriceId(v);
+                    clearItemError("price");
+                  }}
+                  options={(pricesQuery.data ?? [])
                     .filter((p) => p.status === "active")
-                    .map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {formatMinorMoney(p.amount_minor, p.currency_code)}
-                        {p.price_kind === "recurring" && p.interval_unit
+                    .map((p) => ({
+                      value: p.id,
+                      label: `${formatMinorMoney(p.amount_minor, p.currency_code)}${
+                        p.price_kind === "recurring" && p.interval_unit
                           ? ` / ${p.interval_count ?? 1} ${p.interval_unit}${(p.interval_count ?? 1) > 1 ? "s" : ""}`
-                          : ` (${p.price_kind.replace(/_/g, " ")})`}
-                      </option>
-                    ))}
-                </Select>
+                          : ` (${p.price_kind.replace(/_/g, " ")})`
+                      }`,
+                    }))}
+                  placeholder={
+                    pricesQuery.isPending ? "Loading prices…" : "Select a price…"
+                  }
+                  disabled={!publishedVersion || pricesQuery.isPending}
+                  ariaLabel="Price"
+                />
               </Field>
             </>
           ) : (
@@ -1917,7 +1953,10 @@ function CreateOrderWizard({
               <Field label="Offer label" required error={itemErrors.customLabel ?? ""}>
                 <Input
                   value={customLabel}
-                  onChange={(e) => setCustomLabel(e.target.value)}
+                  onChange={(e) => {
+                    setCustomLabel(e.target.value);
+                    clearItemError("customLabel");
+                  }}
                   maxLength={160}
                   placeholder="e.g. Custom ERP setup"
                 />
@@ -1926,7 +1965,10 @@ function CreateOrderWizard({
                 <Input
                   inputMode="numeric"
                   value={customPrice}
-                  onChange={(e) => setCustomPrice(e.target.value)}
+                  onChange={(e) => {
+                    setCustomPrice(e.target.value);
+                    clearItemError("customPrice");
+                  }}
                   placeholder="500000"
                 />
               </Field>
@@ -2007,21 +2049,30 @@ function CreateOrderWizard({
             <Input
               inputMode="numeric"
               value={quantity}
-              onChange={(e) => setQuantity(e.target.value)}
+              onChange={(e) => {
+                setQuantity(e.target.value);
+                clearItemError("quantity");
+              }}
             />
           </Field>
           <Field label="Discount (minor units)" error={itemErrors.discount ?? ""}>
             <Input
               inputMode="numeric"
               value={discount}
-              onChange={(e) => setDiscount(e.target.value)}
+              onChange={(e) => {
+                setDiscount(e.target.value);
+                clearItemError("discount");
+              }}
             />
           </Field>
           <Field label="Tax (minor units)" error={itemErrors.tax ?? ""}>
             <Input
               inputMode="numeric"
               value={tax}
-              onChange={(e) => setTax(e.target.value)}
+              onChange={(e) => {
+                setTax(e.target.value);
+                clearItemError("tax");
+              }}
             />
           </Field>
           <Field label="Internal notes">

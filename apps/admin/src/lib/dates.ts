@@ -38,6 +38,34 @@ export function isoToDdmmyyyy(value: string): string {
   return `${m[3]}/${m[2]}/${m[1]}`;
 }
 
+/**
+ * Normalize free-form date typing to DD/MM/YYYY as the user types:
+ * keep digits only (max 8) and re-insert the slashes. Typing
+ * "01/01/2020" keystroke by keystroke and pasting "01/01/2020" both
+ * land on "01/01/2020"; the strict ddmmyyyyToIso still validates on
+ * submit. (Live defect 2026-11-17: the dashboard Custom dialog's
+ * plain text inputs left a pasted "01/01/2020" as "0".)
+ */
+export function normalizeDateInput(value: string): string {
+  const digits = value.replace(/\D/g, "").slice(0, 8);
+  if (digits.length <= 2) return digits;
+  if (digits.length <= 4) return `${digits.slice(0, 2)}/${digits.slice(2)}`;
+  return `${digits.slice(0, 2)}/${digits.slice(2, 4)}/${digits.slice(4)}`;
+}
+
+/**
+ * Normalize pasted text to DD/MM/YYYY. Accepts DD/MM/YYYY,
+ * DD-MM-YYYY, DDMMYYYY and ISO YYYY-MM-DD (e.g. from a spreadsheet
+ * or a date-picker copy). Anything unrecognizable falls back to the
+ * digit mask, which yields "" for non-numeric text.
+ */
+export function normalizePastedDate(text: string): string {
+  const t = text.trim();
+  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(t);
+  if (iso) return `${iso[3]}/${iso[2]}/${iso[1]}`;
+  return normalizeDateInput(t);
+}
+
 /** Today's calendar date in Asia/Dhaka as YYYY-MM-DD. */
 export function dhakaTodayIso(now = new Date()): string {
   return new Intl.DateTimeFormat("en-CA", {

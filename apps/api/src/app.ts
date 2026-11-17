@@ -2770,6 +2770,21 @@ export function createStackMateApp(
             )
             .slice(-100)
             .reverse();
+          // Payments tab shape (live defect 2026-11-17): the detail
+          // must return { submissions, transactions } — the same shape
+          // as GET /customers/:id/payments — NOT a bare submissions
+          // array. The UI reads customer.payments.submissions.length
+          // as the tab-count fallback while the sub-query is pending;
+          // a bare array made that read throw "Cannot read properties
+          // of undefined (reading 'length')" on first load of a fresh
+          // customer (warm cache on reload hid it — hence intermittent).
+          // Filtered by the customer's orders only, like the
+          // sub-endpoint (the old filter also included any submission
+          // with ANY transaction, even for another customer's order).
+          const paymentSubmissions = store.state.payment_submissions.filter((s) =>
+            orderIds.has(s.order_id)
+          );
+          const paymentSubmissionIds = new Set(paymentSubmissions.map((s) => s.id));
           return jsonResponse({
             ...customer,
             financials: computeCustomerFinancials(store.state, customer.id),
@@ -2789,13 +2804,14 @@ export function createStackMateApp(
             orders: customerOrders,
             subscriptions: store.state.subscriptions.filter((s) => s.customer_id === customer.id),
             licenses: store.state.licenses.filter((l) => l.customer_id === customer.id),
-            payments: store.state.payment_submissions.filter(
-              (s) =>
-                orderIds.has(s.order_id) ||
-                store.state.payment_transactions.some(
-                  (t) => t.payment_submission_id === s.id
-                )
-            ),
+            payments: {
+              submissions: paymentSubmissions,
+              transactions: store.state.payment_transactions.filter(
+                (t) =>
+                  t.payment_submission_id !== null &&
+                  paymentSubmissionIds.has(t.payment_submission_id)
+              ),
+            },
             installations: store.state.licenses
               .filter((l) => l.customer_id === customer.id)
               .flatMap((l) =>
