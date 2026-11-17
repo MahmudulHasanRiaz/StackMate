@@ -972,18 +972,25 @@ export function CustomerDetailSection({ id }: { id: string }) {
 
   const customer = query.data;
   const fin = customer.financials;
-  const orderCount = ordersQuery.data?.length ?? customer.orders.length;
-  const subCount = subsQuery.data?.length ?? customer.subscriptions.length;
-  const licenseCount = licensesQuery.data?.length ?? customer.licenses.length;
+  // Tab counts: the sub-query data wins when it has resolved; the
+  // embedded detail arrays are the fallback. Every fallback is
+  // optional-chained (live defect 2026-11-17: the detail used to
+  // return payments as a bare array, so
+  // customer.payments.submissions.length threw "Cannot read properties
+  // of undefined (reading 'length')" on first load while the
+  // sub-query was still pending — warm cache on reload hid it).
+  const orderCount = ordersQuery.data?.length ?? customer.orders?.length ?? 0;
+  const subCount = subsQuery.data?.length ?? customer.subscriptions?.length ?? 0;
+  const licenseCount = licensesQuery.data?.length ?? customer.licenses?.length ?? 0;
   const paymentCount =
-    paymentsQuery.data?.submissions.length ?? customer.payments.submissions.length;
+    paymentsQuery.data?.submissions.length ?? customer.payments?.submissions?.length ?? 0;
   const installationCount =
-    installationsQuery.data?.length ?? customer.installations.length;
-  const activityCount = activityQuery.data?.length ?? customer.activity.length;
-  const issueCount = issuesQuery.data?.length ?? customer.tickets.length;
-  const reportCount = customer.reports.length;
-  const secondaryContacts = customer.contacts.filter((c) => !c.is_primary);
-  const hasConcern = customer.reports.some((r) => r.type === "concern");
+    installationsQuery.data?.length ?? customer.installations?.length ?? 0;
+  const activityCount = activityQuery.data?.length ?? customer.activity?.length ?? 0;
+  const issueCount = issuesQuery.data?.length ?? customer.tickets?.length ?? 0;
+  const reportCount = customer.reports?.length ?? 0;
+  const secondaryContacts = (customer.contacts ?? []).filter((c) => !c.is_primary);
+  const hasConcern = (customer.reports ?? []).some((r) => r.type === "concern");
 
   const orderColumns: ColumnDef<CustomerOrderDto, unknown>[] = [
     {
@@ -1377,7 +1384,7 @@ export function CustomerDetailSection({ id }: { id: string }) {
             </Button>
           }
         >
-          {customer.addresses.length === 0 ? (
+          {(customer.addresses ?? []).length === 0 ? (
             <p className="sm-hint">No billing address on file.</p>
           ) : (
             <div className="sm-table-wrap">
@@ -1394,7 +1401,7 @@ export function CustomerDetailSection({ id }: { id: string }) {
                   </tr>
                 </thead>
                 <tbody>
-                  {customer.addresses.map((a) => (
+                  {(customer.addresses ?? []).map((a) => (
                     <tr key={a.id}>
                       <td>
                         {a.line1}
@@ -1581,7 +1588,7 @@ export function CustomerDetailSection({ id }: { id: string }) {
                 </Button>
               }
             >
-              {customer.reports.length === 0 ? (
+              {(customer.reports ?? []).length === 0 ? (
                 <p className="sm-hint">
                   No reports on file. File a note or a concern when something
                   about this customer needs to be on record.
@@ -1598,7 +1605,7 @@ export function CustomerDetailSection({ id }: { id: string }) {
                       </tr>
                     </thead>
                     <tbody>
-                      {customer.reports.map((r) => (
+                      {(customer.reports ?? []).map((r) => (
                         <tr key={r.id}>
                           <td>
                             {r.type === "concern" ? (
@@ -2105,9 +2112,9 @@ function SplitContactDialog({
   onClose: () => void;
   onCreated: (newCustomerId: string) => void;
 }) {
-  const secondary = customer.contacts.filter((c) => !c.is_primary);
+  const secondary = (customer.contacts ?? []).filter((c) => !c.is_primary);
   const secondaryPhones = secondary.filter((c) => c.kind === "phone");
-  const primaryPhone = customer.contacts.find(
+  const primaryPhone = (customer.contacts ?? []).find(
     (c) => c.kind === "phone" && c.is_primary
   );
   const [contactId, setContactId] = useState(secondary[0]?.id ?? "");

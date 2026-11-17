@@ -275,6 +275,211 @@ export function Select({
   );
 }
 
+/* ------------------------------------------------------------------ */
+/* MenuSelect — DOM listbox (button + portaled option list).            */
+/* Live defect 2026-11-17: the native <select> popup is rendered by   */
+/* the OS, not the DOM — in the user's extension-driven browser the    */
+/* click never opened it (Price dropdown in the order wizard, Assign   */
+/* on the ticket detail), while type-ahead still worked. A DOM listbox */
+/* responds to ordinary clicks in every client, is keyboard-operable   */
+/* (Arrow keys / Enter / Esc), and IS testable in jsdom, where a       */
+/* native popup cannot be driven at all. Styled with the existing      */
+/* .sm-select trigger look + the .sm-row-menu portaled menu, so no     */
+/* new visual language. Use ONLY where a native select proved          */
+/* unusable; everywhere else the native Select stays.                  */
+/* ------------------------------------------------------------------ */
+export interface MenuSelectOption {
+  value: string;
+  label: string;
+  disabled?: boolean;
+}
+
+export function MenuSelect({
+  value,
+  onChange,
+  options,
+  placeholder,
+  disabled,
+  ariaLabel,
+  id,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  options: MenuSelectOption[];
+  placeholder: string;
+  disabled?: boolean;
+  ariaLabel: string;
+  id?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ top: number; left: number; width: number } | null>(null);
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const selected = options.find((o) => o.value === value) ?? null;
+
+  const close = useCallback(() => {
+    setOpen(false);
+    setActiveIndex(-1);
+    triggerRef.current?.focus();
+  }, []);
+
+  const openMenu = useCallback(() => {
+    if (disabled) return;
+    const rect = triggerRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    setPos({
+      top: rect.bottom + 4,
+      left: Math.max(8, rect.left),
+      width: Math.max(200, rect.width),
+    });
+    const selectedIdx = options.findIndex((o) => o.value === value);
+    setActiveIndex(selectedIdx >= 0 ? selectedIdx : 0);
+    setOpen(true);
+  }, [disabled, options, value]);
+
+  // Flip above the trigger when the menu would overflow the viewport bottom.
+  useLayoutEffect(() => {
+    if (!open || !pos) return;
+    const menu = menuRef.current;
+    const rect = triggerRef.current?.getBoundingClientRect();
+    if (!menu || !rect) return;
+    const height = menu.getBoundingClientRect().height;
+    if (pos.top + height > window.innerHeight - 8) {
+      setPos({ ...pos, top: Math.max(8, rect.top - height - 4) });
+    }
+    // Runs once per open on purpose, like RowMenu's flip.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open ]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const target = e.target as Node;
+      if (menuRef.current?.contains(target)) return;
+      if (triggerRef.current?.contains(target)) return;
+      setOpen(false);
+      setActiveIndex(-1);
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        close();
+      }
+    };
+    const onScrollOrResize = () => {
+      setOpen(false);
+      setActiveIndex(-1);
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("scroll", onScrollOrResize, true);
+    window.addEventListener("resize", onScrollOrResize);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("scroll", onScrollOrResize, true);
+      window.removeEventListener("resize", onScrollOrResize);
+    };
+  }, [open, close]);
+
+  // Focus the active option when the menu opens or the active index moves.
+  useEffect(() => {
+    if (!open || activeIndex < 0) return;
+    const items = menuRef.current?.querySelectorAll<HTMLElement>('[role="option"]') ?? [];
+    items[activeIndex]?.focus();
+  }, [open, activeIndex]);
+
+  const choose = (optionValue: string) => {
+    onChange(optionValue);
+    setOpen(false);
+    setActiveIndex(-1);
+    triggerRef.current?.focus();
+  };
+
+  const onTriggerKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      if (!open) openMenu();
+    }
+  };
+
+  const onMenuKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp" && e.key !== "Enter" && e.key !== " ") return;
+    e.preventDefault();
+    const enabled = options
+      .map((o, i) => ({ o, i }))
+      .filter(({ o }) => !o.disabled);
+    if (enabled.length === 0) return;
+    if (e.key === "Enter" || e.key === " ") {
+      const current = enabled.find(({ i }) => i === activeIndex) ?? enabled[0]!;
+      choose(current.o.value);
+      return;
+    }
+    const currentPos = enabled.findIndex(({ i }) => i === activeIndex);
+    const next =
+      currentPos === -1
+        ? enabled[e.key === "ArrowDown" ? 0 : enabled.length - 1]!
+        : enabled[(currentPos + (e.key === "ArrowDown" ? 1 : -1) + enabled.length) % enabled.length]!;
+    setActiveIndex(next.i);
+  };
+
+  return (
+    <>
+      <button
+        type="button"
+        ref={triggerRef}
+        id={id}
+        className="sm-select sm-menu-select"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label={ariaLabel}
+        disabled={disabled}
+        onClick={() => (open ? close() : openMenu())}
+        onKeyDown={onTriggerKeyDown}
+      >
+        <span className="sm-menu-select-label">{selected ? selected.label : placeholder}</span>
+      </button>
+      {open && pos
+        ? createPortal(
+            <div
+              ref={menuRef}
+              className="sm-row-menu"
+              role="listbox"
+              aria-label={ariaLabel}
+              style={{ top: pos.top, left: pos.left, width: pos.width, right: "auto" }}
+              onKeyDown={onMenuKeyDown}
+            >
+              {options.length === 0 ? (
+                <div className="sm-menu-item" aria-disabled="true">
+                  No options
+                </div>
+              ) : (
+                options.map((o, i) => (
+                  <button
+                    key={o.value}
+                    type="button"
+                    role="option"
+                    aria-selected={o.value === value}
+                    className="sm-menu-item"
+                    data-active={i === activeIndex || undefined}
+                    disabled={o.disabled}
+                    onClick={() => choose(o.value)}
+                    onMouseEnter={() => setActiveIndex(i)}
+                  >
+                    <span className="sm-menu-item-label">{o.label}</span>
+                    {o.value === value ? <Check size={14} strokeWidth={2} aria-hidden="true" /> : null}
+                  </button>
+                ))
+              )}
+            </div>,
+            document.body,
+          )
+        : null}
+    </>
+  );
+}
+
 export function Textarea(props: TextareaHTMLAttributes<HTMLTextAreaElement>) {
   return (
     <textarea {...props} className={`sm-textarea ${props.className ?? ""}`.trim()} />

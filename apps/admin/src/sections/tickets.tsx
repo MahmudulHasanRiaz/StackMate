@@ -55,6 +55,7 @@ import {
   ErrorState,
   Field,
   Input,
+  MenuSelect,
   Select,
   StatusBadge,
   TableSkeleton,
@@ -804,26 +805,28 @@ export function TicketDetailSection({ id }: { id: string }) {
               {
                 label: "Assignee",
                 value: (
-                  <Select
+                  // MenuSelect, not the native Select: the native popup
+                  // is OS-rendered and never opened on click in the
+                  // user's extension-driven browser (live defect
+                  // 2026-11-17). The assign endpoint itself already
+                  // exists (POST /tickets/:id/assign, tickets.manage).
+                  <MenuSelect
                     value={ticket.assignee_user_id ?? ""}
-                    onChange={(e) =>
+                    onChange={(v) =>
                       assignMutation.mutate({
-                        assignee_user_id:
-                          e.target.value === "" ? null : e.target.value,
+                        assignee_user_id: v === "" ? null : v,
                       })
                     }
+                    options={[
+                      { value: "", label: "Unassigned" },
+                      ...(staffQuery.data ?? [])
+                        .filter((u) => u.status === "active")
+                        .map((u) => ({ value: u.id, label: staffOptionLabel(u) })),
+                    ]}
+                    placeholder="Unassigned"
                     disabled={assignMutation.isPending}
-                    aria-label="Assign ticket"
-                  >
-                    <option value="">Unassigned</option>
-                    {(staffQuery.data ?? [])
-                      .filter((u) => u.status === "active")
-                      .map((u) => (
-                        <option key={u.id} value={u.id}>
-                          {staffOptionLabel(u)}
-                        </option>
-                      ))}
-                  </Select>
+                    ariaLabel="Assign ticket"
+                  />
                 ),
               },
             ]}

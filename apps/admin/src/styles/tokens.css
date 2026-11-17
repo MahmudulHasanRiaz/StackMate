@@ -1539,6 +1539,23 @@ a:hover {
   color: var(--sm-text-muted);
   cursor: not-allowed;
 }
+/* MenuSelect trigger (live defect 2026-11-17): a <button> wearing the
+   .sm-select look — left-aligned label, ellipsis, pointer cursor.
+   The option list itself reuses the portaled .sm-row-menu. */
+.sm-menu-select {
+  text-align: left;
+  cursor: pointer;
+  padding-right: 32px;
+}
+.sm-menu-select-label {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sm-menu-select:disabled {
+  cursor: not-allowed;
+}
 .sm-required {
   color: var(--sm-danger-text);
 }
