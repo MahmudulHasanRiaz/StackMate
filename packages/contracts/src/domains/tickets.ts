@@ -49,12 +49,13 @@ export const CreateTicketSchema = v.object({
   category: v.enum(TICKET_CATEGORIES).default("other"),
   assignee_user_id: v.string().trim().min(1).max(200).nullable().optional(),
   // How the issue reached us (phone / email / WhatsApp / in person).
-  source_note: v.string().trim().max(500).optional(),
+  // Null-tolerant (ADR-0009 decision 11): JSON null ≡ absent.
+  source_note: v.string().trim().max(500).nullable().optional(),
 });
 
 export const UpdateTicketSchema = v.object({
   title: v.string().trim().min(2).max(200).optional(),
-  description: v.string().trim().max(5000).optional(),
+  description: v.string().trim().max(5000).nullable().optional(),
   priority: v.enum(TICKET_PRIORITIES).optional(),
   category: v.enum(TICKET_CATEGORIES).optional(),
   assignee_user_id: v.string().trim().min(1).max(200).nullable().optional(),
@@ -63,7 +64,7 @@ export const UpdateTicketSchema = v.object({
 
 export const TransitionTicketSchema = v.object({
   status: v.enum(TICKET_STATUSES),
-  note: v.string().trim().max(2000).optional(),
+  note: v.string().trim().max(2000).nullable().optional(),
 });
 
 export const AssignTicketSchema = v.object({

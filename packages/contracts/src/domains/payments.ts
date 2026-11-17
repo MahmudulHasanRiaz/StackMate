@@ -55,15 +55,17 @@ export const SubmitManualPaymentSchema = v.object({
   payment_method_id: v.string().uuid(),
   amount_minor: v.number().int().positive(),
   currency_code: v.string().trim().min(3).max(3).default("BDT"),
-  sender_phone: v.string().trim().min(6).max(40).optional(),
-  sender_name: v.string().trim().max(160).optional(),
-  sender_bank_name: v.string().trim().max(160).optional(),
-  sender_account_reference: v.string().trim().max(160).optional(),
-  transfer_rail: v.enum(BANK_TRANSFER_RAILS).optional(),
-  transaction_id: v.string().trim().max(160).optional(),
-  payment_date_display: v.string().trim().optional(), // DD/MM/YYYY if provided by customer
-  evidence_asset_id: v.string().uuid().optional(),
-  customer_note: v.string().trim().max(1000).optional(),
+  // Null-tolerant (ADR-0009 decision 11): JSON null ≡ absent for every
+  // optional field, so callers that send null for empties do not 422.
+  sender_phone: v.string().trim().min(6).max(40).nullable().optional(),
+  sender_name: v.string().trim().max(160).nullable().optional(),
+  sender_bank_name: v.string().trim().max(160).nullable().optional(),
+  sender_account_reference: v.string().trim().max(160).nullable().optional(),
+  transfer_rail: v.enum(BANK_TRANSFER_RAILS).nullable().optional(),
+  transaction_id: v.string().trim().max(160).nullable().optional(),
+  payment_date_display: v.string().trim().nullable().optional(), // DD/MM/YYYY if provided by customer
+  evidence_asset_id: v.string().uuid().nullable().optional(),
+  customer_note: v.string().trim().max(1000).nullable().optional(),
   // ADR-0009: partial payments. Any positive amount up to the order's
   // remaining balance is accepted; allocation is oldest-unpaid-installment
   // first unless a specific installment is named here.
@@ -74,7 +76,7 @@ export const ApprovePaymentSubmissionSchema = v.object({
   verified_amount_minor: v.number().int().positive(),
   currency_code: v.string().trim().min(3).max(3).default("BDT"),
   verification_reference: v.string().trim().min(2).max(160),
-  internal_note: v.string().trim().max(2000).optional(),
+  internal_note: v.string().trim().max(2000).nullable().optional(),
   // ADR-0009: apply part of the customer's credit balance to this order,
   // on top of the verified money. 0 = none. Capped at the customer's
   // credit balance and at the order's remaining amount; never silent.
@@ -89,7 +91,7 @@ export const RejectPaymentSubmissionSchema = v.object({
     .max(80)
     .regex(/^[A-Z0-9_]+$/),
   customer_message: v.string().trim().min(5).max(1000),
-  internal_note: v.string().trim().max(2000).optional(),
+  internal_note: v.string().trim().max(2000).nullable().optional(),
 });
 
 export const CreatePaymentProviderSchema = v.object({

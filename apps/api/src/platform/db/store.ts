@@ -200,6 +200,8 @@ export interface CustomerRecord {
   whatsapp: string | null;
   credit_balance_minor: number;
   company_name: string | null;
+  // Migration 0011: website (ADR-0009 decision 11).
+  website: string | null;
   country_code: string;
   status: "active" | "inactive" | "blocked";
   registration_source: string;
@@ -322,7 +324,9 @@ export interface OrderRecord {
   customer_note: string | null;
   internal_note: string | null;
   items: OrderItemRecord[];
-  attribution: Record<string, string | undefined> | null;
+  // Null-tolerant (ADR-0009 decision 11): the checkout schema accepts
+  // JSON null for attribution values; null ≡ absent. Stored as JSON.
+  attribution: Record<string, string | null | undefined> | null;
   created_by_user_id: string | null;
   // Migration 0009: license activation policy + renewal grace + payment
   // method + lead link (ADR-0009).

@@ -26,9 +26,12 @@ export const LEAD_TRANSITIONS: Record<LeadStatus, LeadStatus[]> = {
 
 const LeadContactFields = {
   name: v.string().trim().min(2).max(200),
-  email: v.string().trim().email().optional(),
-  phone: v.string().trim().min(6).max(40).optional(),
-  whatsapp: v.string().trim().min(6).max(40).optional(),
+  // Null-tolerant (ADR-0009 decision 11): JSON null ≡ absent, same as
+  // customers — the ingestion API is JSON and external sites send null
+  // for empty optionals.
+  email: v.string().trim().email().nullable().optional(),
+  phone: v.string().trim().min(6).max(40).nullable().optional(),
+  whatsapp: v.string().trim().min(6).max(40).nullable().optional(),
 };
 
 const CONTACT_RULE = "At least one of email or phone is required.";
@@ -43,17 +46,17 @@ function contactRule<T extends { email?: string | null | undefined; phone?: stri
 export const IngestLeadSchema = v
   .object({
     ...LeadContactFields,
-    utm_source: v.string().trim().max(120).optional(),
-    utm_medium: v.string().trim().max(120).optional(),
-    utm_campaign: v.string().trim().max(120).optional(),
-    interest: v.string().trim().max(2000).optional(),
+    utm_source: v.string().trim().max(120).nullable().optional(),
+    utm_medium: v.string().trim().max(120).nullable().optional(),
+    utm_campaign: v.string().trim().max(120).nullable().optional(),
+    interest: v.string().trim().max(2000).nullable().optional(),
     product_id: v.string().uuid().nullable().optional(),
-    message: v.string().trim().max(5000).optional(),
-    notes: v.string().trim().max(2000).optional(),
+    message: v.string().trim().max(5000).nullable().optional(),
+    notes: v.string().trim().max(2000).nullable().optional(),
     // Browser identifiers the site may forward for the Lead tracking event.
-    fbp: v.string().trim().max(200).optional(),
-    fbc: v.string().trim().max(200).optional(),
-    event_source_url: v.string().trim().max(500).optional(),
+    fbp: v.string().trim().max(200).nullable().optional(),
+    fbc: v.string().trim().max(200).nullable().optional(),
+    event_source_url: v.string().trim().max(500).nullable().optional(),
   })
   .refine(contactRule, CONTACT_RULE);
 
@@ -62,13 +65,13 @@ export const CreateLeadSchema = v
   .object({
     ...LeadContactFields,
     source_site_id: v.string().uuid().nullable().optional(),
-    utm_source: v.string().trim().max(120).optional(),
-    utm_medium: v.string().trim().max(120).optional(),
-    utm_campaign: v.string().trim().max(120).optional(),
-    interest: v.string().trim().max(2000).optional(),
+    utm_source: v.string().trim().max(120).nullable().optional(),
+    utm_medium: v.string().trim().max(120).nullable().optional(),
+    utm_campaign: v.string().trim().max(120).nullable().optional(),
+    interest: v.string().trim().max(2000).nullable().optional(),
     product_id: v.string().uuid().nullable().optional(),
-    message: v.string().trim().max(5000).optional(),
-    notes: v.string().trim().max(2000).optional(),
+    message: v.string().trim().max(5000).nullable().optional(),
+    notes: v.string().trim().max(2000).nullable().optional(),
     assignee_user_id: v.string().trim().min(1).max(200).nullable().optional(),
   })
   .refine(contactRule, CONTACT_RULE);
@@ -90,7 +93,7 @@ export const UpdateLeadSchema = v.object({
 
 export const TransitionLeadSchema = v.object({
   status: v.enum(LEAD_STATUSES),
-  note: v.string().trim().max(2000).optional(),
+  note: v.string().trim().max(2000).nullable().optional(),
 });
 
 export const AssignLeadSchema = v.object({

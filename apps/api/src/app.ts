@@ -109,6 +109,7 @@ import {
   listCustomerAddresses,
   listCustomerReports,
   splitCustomerContactByAdmin,
+  toCustomerAddressDto,
   updateCustomerAddressByAdmin,
   updateCustomerByAdmin,
 } from "./modules/customers/service.ts";
@@ -2771,9 +2772,9 @@ export function createStackMateApp(
             contacts: store.state.customer_contacts.filter(
               (cc) => cc.customer_id === customer.id
             ),
-            addresses: store.state.customer_addresses.filter(
-              (a) => a.customer_id === customer.id
-            ),
+            addresses: store.state.customer_addresses
+              .filter((a) => a.customer_id === customer.id)
+              .map(toCustomerAddressDto),
             reports: store.state.customer_reports
               .filter((r) => r.customer_id === customer.id)
               .map((r) => ({
@@ -3233,6 +3234,21 @@ export function createStackMateApp(
         }
 
         // Customer+Order batch (ADR-0009): Support Tickets.
+        // Assignee disambiguation (fix batch 2026-11-17, ADR-0009
+        // decision 11): two staff can share a name — list + detail embed
+        // the assignee's email and role keys next to the name.
+        const staffContactFor = (userId: string | null) => {
+          if (!userId) return { email: null, roles: [] as string[] };
+          const user = store.state.users.find((u) => u.id === userId);
+          if (!user) return { email: null, roles: [] as string[] };
+          const roleIds = new Set(
+            store.state.user_roles.filter((ur) => ur.user_id === user.id).map((ur) => ur.role_id)
+          );
+          const roles = store.state.roles
+            .filter((r) => roleIds.has(r.id))
+            .map((r) => r.key);
+          return { email: user.email, roles };
+        };
         if (method === "GET" && pathname === "/api/v1/admin/tickets") {
           assertStaffPermission(principal, "tickets.view");
           const statusFilter = url.searchParams.get("status");
@@ -3260,6 +3276,8 @@ export function createStackMateApp(
               assignee_name: t.assignee_user_id
                 ? (store.state.users.find((u) => u.id === t.assignee_user_id)?.name ?? null)
                 : null,
+              assignee_email: staffContactFor(t.assignee_user_id).email,
+              assignee_roles: staffContactFor(t.assignee_user_id).roles,
             }));
           return collectionResponse(items);
         }
@@ -3299,6 +3317,8 @@ export function createStackMateApp(
             assignee_name: ticket.assignee_user_id
               ? (store.state.users.find((u) => u.id === ticket.assignee_user_id)?.name ?? null)
               : null,
+            assignee_email: staffContactFor(ticket.assignee_user_id).email,
+            assignee_roles: staffContactFor(ticket.assignee_user_id).roles,
             comments: store.state.ticket_comments
               .filter((c) => c.ticket_id === ticket.id)
               .sort((a, b) => a.created_at.localeCompare(b.created_at))

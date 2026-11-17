@@ -184,7 +184,7 @@ export async function updateTicketByAdmin(
       ticket.title = input.title.trim();
       changes.title = ticket.title;
     }
-    if (input.description !== undefined) {
+    if (input.description !== undefined && input.description !== null) {
       ticket.description = input.description;
       changes.description = ticket.description;
     }

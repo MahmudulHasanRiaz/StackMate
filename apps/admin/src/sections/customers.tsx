@@ -410,11 +410,15 @@ export function customerFormToAddressBody(
   v: CustomerFormValues
 ): Record<string, unknown> | null {
   if (v.address_line1.trim() === "" && v.address_city.trim() === "") return null;
+  // Schema keys (ADR-0009 decision 11): the API schema expects
+  // address_line_1/address_line_2/state_or_region — the old short keys
+  // (line1/line2/state) were stripped by valibot and the address stored
+  // all-null lines. Nulls for empty optionals are accepted by the schema.
   return {
-    line1: v.address_line1.trim(),
-    line2: v.address_line2.trim() === "" ? null : v.address_line2.trim(),
+    address_line_1: v.address_line1.trim(),
+    address_line_2: v.address_line2.trim() === "" ? null : v.address_line2.trim(),
     city: v.address_city.trim(),
-    state: v.address_state.trim() === "" ? null : v.address_state.trim(),
+    state_or_region: v.address_state.trim() === "" ? null : v.address_state.trim(),
     postal_code: v.address_postal_code.trim() === "" ? null : v.address_postal_code.trim(),
     country_code: v.address_country.trim().toUpperCase() || "BD",
     is_default: true,
@@ -1302,6 +1306,16 @@ export function CustomerDetailSection({ id }: { id: string }) {
             label: "Company",
             value: customer.company_name ?? "—",
           },
+          {
+            label: "Website",
+            value: customer.website ? (
+              <a href={customer.website} target="_blank" rel="noreferrer">
+                {customer.website}
+              </a>
+            ) : (
+              "—"
+            ),
+          },
           { label: "Country", value: customer.country_code },
           { label: "Registered", value: <DateCell value={customer.created_at} /> },
           {
@@ -1915,10 +1929,11 @@ function AddressDialog({
     setErrors(next);
     if (Object.keys(next).length > 0) return;
     mutation.mutate({
-      line1: line1.trim(),
-      line2: line2.trim() === "" ? null : line2.trim(),
+      // Schema keys (ADR-0009 decision 11) — see customerFormToAddressBody.
+      address_line_1: line1.trim(),
+      address_line_2: line2.trim() === "" ? null : line2.trim(),
       city: city.trim(),
-      state: state.trim() === "" ? null : state.trim(),
+      state_or_region: state.trim() === "" ? null : state.trim(),
       postal_code: postalCode.trim() === "" ? null : postalCode.trim(),
       country_code: countryCode.trim().toUpperCase(),
       is_default: isDefault,
