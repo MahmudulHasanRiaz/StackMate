@@ -541,6 +541,19 @@ Lead fields: name, email, phone, whatsapp (optional), source_site_id (nullable f
 
 Stored DB-side (singleton `reminder_settings`, id `default`, migration 0009) and edited from Settings → Email. Due reminders fire when today == due_date − offset; overdue reminders when today == due_date + offset (only when enabled); renewal reminders use the same offsets against `current_period_end`. Each reminder is sent once per (kind, reference_id, offset) — tracked in `sent_reminders`. The sweep returns `reminders_due`; the caller sends each email and only then marks it sent, so a failed send retries on the next run.
 
+### 10.8 Dashboard analytics overview — date filter (PLAN §23)
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/analytics/overview | Analytics overview DTO (permission `products.read`) |
+| GET | /api/v1/admin/analytics/overview?from=YYYY-MM-DD&to=YYYY-MM-DD | Same DTO, flow metrics scoped to the inclusive range |
+
+Query params: `from` / `to` are ISO date-only values. Both absent = all time (response `range: null`). Exactly one present, an invalid date, `from` after `to`, or a span over 366 days → 400 `VALIDATION_ERROR`. The response echoes the applied range as `range: { from, to } | null` (additive field).
+
+Day boundaries are Asia/Dhaka (the fixed product timezone): a timestamp counts when its calendar date in that zone is within [from, to] inclusive.
+
+Per-metric semantics — the dashboard has no charts or recent-activity lists, only KPI cards. The range scopes the FLOW metrics: `verified_revenue_minor` = sum of `total_minor` over orders with `payment_status=paid` whose `completed_at` falls in the range (pending payments are never revenue; all time is the pre-filter computation, including a paid order with no `completed_at`); `total_orders` = orders with `created_at` in the range; `paid_orders` = orders with `created_at` in the range AND paid (cohort semantics, so "paid / total" stays a coherent ratio). Everything else is a current-state snapshot and is NOT range-scoped — history cannot be reconstructed from current state: `total_products` / `active_products` (inventory), `active_subscriptions` / `active_licenses` / `expired_or_revoked_licenses` (state now), `pending_payment_submissions` / `pending_outbox_events` (live queues), `total_customers` (all-time total).
+
 ---
 
 ## 11. Admin API — Payment Methods and Payment Verification

@@ -57,6 +57,10 @@ import {
 } from "./modules/general-settings/service.ts";
 import { AppError } from "./shared/errors.ts";
 import {
+  isTimestampInOverviewRange,
+  parseOverviewRange,
+} from "./modules/analytics/overview-range.ts";
+import {
   acceptStaffInvitation,
   assertStaffPermission,
   bootstrapInitialSuperAdmin,
@@ -4475,10 +4479,32 @@ export function createStackMateApp(
         }
 
         // Dashboard & Analytics Overview (PRD §18: Pending payments are NEVER counted as revenue!)
+        // PLAN §23 — date filter: `?from=YYYY-MM-DD&to=YYYY-MM-DD` scopes
+        // the FLOW metrics to the inclusive range (Dhaka day boundaries).
+        // verified_revenue_minor = paid orders completed in the range (the
+        // existing paid-only definition, unchanged for all time);
+        // total_orders = created in the range; paid_orders = created in the
+        // range AND paid (cohort, so "paid / total" stays a coherent ratio).
+        // Everything else is a current-state snapshot — history cannot be
+        // reconstructed from current state, so products / subscriptions /
+        // licenses / queues / all-time customer total are NOT range-scoped.
         if (method === "GET" && pathname === "/api/v1/admin/analytics/overview") {
           assertStaffPermission(principal, "products.read");
-          const paidOrders = store.state.orders.filter((o) => o.payment_status === "paid");
+          const range = parseOverviewRange(url.searchParams);
+          const timeZone = env.DEFAULT_TIMEZONE;
+          const inRange = (iso: string | null | undefined) =>
+            isTimestampInOverviewRange(iso, range, timeZone);
+          // Revenue: paid orders completed in the range. A null range
+          // (all time) matches every paid order, including one with no
+          // completed_at — exactly the pre-filter computation.
+          const paidOrders = store.state.orders.filter(
+            (o) =>
+              o.payment_status === "paid" &&
+              (range === null ? true : inRange(o.completed_at)),
+          );
           const verifiedRevenueMinor = paidOrders.reduce((acc, o) => acc + o.total_minor, 0);
+          const ordersInRange = store.state.orders.filter((o) => inRange(o.created_at));
+          const paidOrdersInRange = ordersInRange.filter((o) => o.payment_status === "paid");
           const pendingSubmissions = store.state.payment_submissions.filter(
             (s) => s.status === "submitted" || s.status === "under_review"
           );
@@ -4488,8 +4514,8 @@ export function createStackMateApp(
             total_products: store.state.products.length,
             active_products: store.state.products.filter((p) => p.status === "active").length,
             total_customers: store.state.customers.length,
-            total_orders: store.state.orders.length,
-            paid_orders: paidOrders.length,
+            total_orders: ordersInRange.length,
+            paid_orders: paidOrdersInRange.length,
             pending_payment_submissions: pendingSubmissions.length,
             active_subscriptions: store.state.subscriptions.filter((s) => s.status === "active")
               .length,
@@ -4501,6 +4527,7 @@ export function createStackMateApp(
             pending_outbox_events: store.state.outbox_events.filter(
               (e) => e.status === "pending"
             ).length,
+            range,
           });
         }
 
