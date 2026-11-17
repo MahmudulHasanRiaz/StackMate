@@ -186,6 +186,18 @@ export function resolveAuditResourceDisplayName(
     }
     case "customer":
       return state.customers.find((c) => c.id === resourceId)?.name ?? null;
+    case "ticket":
+      return (
+        state.support_tickets.find((t) => t.id === resourceId)?.ticket_number ??
+        changeString("ticket_number") ??
+        null
+      );
+    case "lead":
+      return (
+        state.leads.find((l) => l.id === resourceId)?.name ??
+        changeString("name") ??
+        null
+      );
     case "order":
       return (
         state.orders.find((o) => o.id === resourceId)?.order_number ?? null

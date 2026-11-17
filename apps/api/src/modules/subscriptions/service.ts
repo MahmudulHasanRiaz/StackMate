@@ -18,7 +18,9 @@ export function createOrExtendSubscriptionInTx(
   state: DatabaseState,
   order: OrderRecord,
   orderItem: OrderItemRecord,
-  paymentTransactionId: string
+  // Nullable since 0009: date-based activation (cron sweep) fulfills without
+  // a payment transaction; the period's payment_transaction_id stays null.
+  paymentTransactionId: string | null
 ): SubscriptionRecord {
   const nowIso = new Date().toISOString();
   // Check if this order is a renewal order for an existing pending subscription period
@@ -105,6 +107,7 @@ export function createOrExtendSubscriptionInTx(
     interval_count: orderItem.interval_count_snapshot,
     currency_code: orderItem.currency_code,
     unit_amount_minor: orderItem.unit_amount_minor,
+    grace_days: order.grace_days ?? 3,
     current_period_start: nowIso,
     current_period_end: periodEnd,
     next_renewal_at: periodEnd,
@@ -155,6 +158,145 @@ export function createOrExtendSubscriptionInTx(
 }
 
 /**
+ * In-transaction core of renewal-invoice generation (extracted 2026-11-17
+ * for the renewal sweep, ADR-0009). Idempotent: a pending period with a
+ * renewal order already returns the existing order + invoice instead of
+ * creating a duplicate. Does NOT extend the active period — that happens
+ * when the renewal payment is verified and approved.
+ */
+export function generateRenewalInvoiceInTx(
+  state: DatabaseState,
+  sub: SubscriptionRecord,
+  actorUserId: string | null,
+  requestId: string
+): {
+  subscription: SubscriptionRecord;
+  renewal_order: OrderRecord;
+  renewal_invoice: InvoiceRecord;
+  checkout_access_token_reference: string;
+} {
+  if (sub.billing_kind !== "recurring" || !sub.interval_unit || !sub.interval_count) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "Only recurring subscriptions generate renewal invoices.",
+      422
+    );
+  }
+
+  // Check if a pending renewal period already exists
+  const existingPending = sub.periods.find((p) => p.status === "pending");
+  if (existingPending && existingPending.renewal_order_id) {
+    const existingOrder = state.orders.find((o) => o.id === existingPending.renewal_order_id)!;
+    const existingInvoice = state.invoices.find((i) => i.order_id === existingOrder.id)!;
+    return {
+      subscription: sub,
+      renewal_order: existingOrder,
+      renewal_invoice: existingInvoice,
+      checkout_access_token_reference: existingOrder.public_reference,
+    };
+  }
+
+  const sourceOrderItem = state.orders
+    .flatMap((o) => o.items)
+    .find((it) => it.id === sub.source_order_item_id);
+  if (!sourceOrderItem) {
+    throw new AppError("NOT_FOUND", "Original subscription order item not found.", 404);
+  }
+
+  const nextPeriodNumber = sub.periods.reduce((max, p) => Math.max(max, p.period_number), 0) + 1;
+  const nextStart = sub.current_period_end ?? new Date().toISOString();
+  const nextEnd = addBillingIntervalUTC(nextStart, sub.interval_unit, sub.interval_count);
+  const now = new Date().toISOString();
+
+  state.sequence_counters.order += 1;
+  const renewalOrderId = randomUUID();
+  const renewalOrderItemId = randomUUID();
+  const clonedItem: OrderItemRecord = {
+    ...structuredClone(sourceOrderItem),
+    id: renewalOrderItemId,
+    order_id: renewalOrderId,
+    entitlement_snapshot: {
+      ...structuredClone(sourceOrderItem.entitlement_snapshot),
+      id: randomUUID(),
+      order_item_id: renewalOrderItemId,
+      created_at: now,
+    },
+    created_at: now,
+  };
+
+  const renewalOrder: OrderRecord = {
+    id: renewalOrderId,
+    order_number: `ORD-${state.sequence_counters.order}`,
+    public_reference: randomOpaqueToken("SMO", 18),
+    customer_id: sub.customer_id,
+    source: "admin",
+    integrated_site_id: null,
+    status: "awaiting_payment",
+    payment_status: "unpaid",
+    currency_code: sub.currency_code,
+    subtotal_minor: clonedItem.line_subtotal_minor,
+    discount_minor: clonedItem.line_discount_minor,
+    tax_minor: clonedItem.line_tax_minor,
+    total_minor: clonedItem.line_total_minor,
+    customer_note: `Renewal for ${sub.subscription_number} (Period #${nextPeriodNumber})`,
+    internal_note: null,
+    items: [clonedItem],
+    attribution: null,
+    created_by_user_id: actorUserId,
+    activation_mode: "on_full_payment",
+    activation_percent: null,
+    activation_date: null,
+    suspend_on_missed_schedule: false,
+    grace_days: sub.grace_days ?? 3,
+    payment_method_id: null,
+    lead_id: null,
+    created_at: now,
+    updated_at: now,
+    completed_at: null,
+    cancelled_at: null,
+  };
+  state.orders.push(renewalOrder);
+
+  const renewalInvoice = generateInvoiceForOrderInTx(state, renewalOrder, "renewal", sub.id);
+
+  sub.periods.push({
+    id: randomUUID(),
+    subscription_id: sub.id,
+    period_number: nextPeriodNumber,
+    period_start: nextStart,
+    period_end: nextEnd,
+    status: "pending",
+    renewal_order_id: renewalOrder.id,
+    invoice_id: renewalInvoice.id,
+    payment_transaction_id: null,
+    activated_at: null,
+    created_at: now,
+  });
+
+  appendAuditLog(state, {
+    actor_type: actorUserId ? "staff" : "system",
+    actor_user_id: actorUserId,
+    action: "subscriptions.renewal_invoice.created",
+    resource_type: "subscription",
+    resource_id: sub.id,
+    outcome: "success",
+    request_id: requestId,
+    changes: {
+      period_number: nextPeriodNumber,
+      renewal_order_id: renewalOrder.id,
+      renewal_invoice_id: renewalInvoice.id,
+    },
+  });
+
+  return {
+    subscription: sub,
+    renewal_order: renewalOrder,
+    renewal_invoice: renewalInvoice,
+    checkout_access_token_reference: renewalOrder.public_reference,
+  };
+}
+
+/**
  * Generates an idempotent manual-payment renewal order and invoice for a recurring subscription (PRD §12.4, Database Design §21.3).
  * Does NOT extend active subscription period until the customer's manual payment is verified and approved.
  */
@@ -180,126 +322,7 @@ export async function generateSubscriptionRenewalInvoice(
     (state) => {
       const sub = state.subscriptions.find((s) => s.id === subscriptionId);
       if (!sub) throw new AppError("NOT_FOUND", "Subscription not found.", 404);
-      if (sub.billing_kind !== "recurring" || !sub.interval_unit || !sub.interval_count) {
-        throw new AppError(
-          "VALIDATION_ERROR",
-          "Only recurring subscriptions generate renewal invoices.",
-          422
-        );
-      }
-
-      // Check if a pending renewal period already exists
-      const existingPending = sub.periods.find((p) => p.status === "pending");
-      if (existingPending && existingPending.renewal_order_id) {
-        const existingOrder = state.orders.find((o) => o.id === existingPending.renewal_order_id)!;
-        const existingInvoice = state.invoices.find(
-          (i) => i.order_id === existingOrder.id
-        )!;
-        return {
-          subscription: sub,
-          renewal_order: existingOrder,
-          renewal_invoice: existingInvoice,
-          checkout_access_token_reference: existingOrder.public_reference,
-        };
-      }
-
-      const sourceOrderItem = state.orders
-        .flatMap((o) => o.items)
-        .find((it) => it.id === sub.source_order_item_id);
-      if (!sourceOrderItem) {
-        throw new AppError("NOT_FOUND", "Original subscription order item not found.", 404);
-      }
-
-      const nextPeriodNumber =
-        sub.periods.reduce((max, p) => Math.max(max, p.period_number), 0) + 1;
-      const nextStart = sub.current_period_end ?? new Date().toISOString();
-      const nextEnd = addBillingIntervalUTC(nextStart, sub.interval_unit, sub.interval_count);
-      const now = new Date().toISOString();
-
-      state.sequence_counters.order += 1;
-      const renewalOrderId = randomUUID();
-      const renewalOrderItemId = randomUUID();
-      const clonedItem: OrderItemRecord = {
-        ...structuredClone(sourceOrderItem),
-        id: renewalOrderItemId,
-        order_id: renewalOrderId,
-        entitlement_snapshot: {
-          ...structuredClone(sourceOrderItem.entitlement_snapshot),
-          id: randomUUID(),
-          order_item_id: renewalOrderItemId,
-          created_at: now,
-        },
-        created_at: now,
-      };
-
-      const renewalOrder: OrderRecord = {
-        id: renewalOrderId,
-        order_number: `ORD-${state.sequence_counters.order}`,
-        public_reference: randomOpaqueToken("SMO", 18),
-        customer_id: sub.customer_id,
-        source: "admin",
-        integrated_site_id: null,
-        status: "awaiting_payment",
-        payment_status: "unpaid",
-        currency_code: sub.currency_code,
-        subtotal_minor: clonedItem.line_subtotal_minor,
-        discount_minor: clonedItem.line_discount_minor,
-        tax_minor: clonedItem.line_tax_minor,
-        total_minor: clonedItem.line_total_minor,
-        customer_note: `Renewal for ${sub.subscription_number} (Period #${nextPeriodNumber})`,
-        internal_note: null,
-        items: [clonedItem],
-        attribution: null,
-        created_by_user_id: actor.user.id,
-        created_at: now,
-        updated_at: now,
-        completed_at: null,
-        cancelled_at: null,
-      };
-      state.orders.push(renewalOrder);
-
-      const renewalInvoice = generateInvoiceForOrderInTx(
-        state,
-        renewalOrder,
-        "renewal",
-        sub.id
-      );
-
-      sub.periods.push({
-        id: randomUUID(),
-        subscription_id: sub.id,
-        period_number: nextPeriodNumber,
-        period_start: nextStart,
-        period_end: nextEnd,
-        status: "pending",
-        renewal_order_id: renewalOrder.id,
-        invoice_id: renewalInvoice.id,
-        payment_transaction_id: null,
-        activated_at: null,
-        created_at: now,
-      });
-
-      appendAuditLog(state, {
-        actor_type: "staff",
-        actor_user_id: actor.user.id,
-        action: "subscriptions.renewal_invoice.created",
-        resource_type: "subscription",
-        resource_id: sub.id,
-        outcome: "success",
-        request_id: requestId,
-        changes: {
-          period_number: nextPeriodNumber,
-          renewal_order_id: renewalOrder.id,
-          renewal_invoice_id: renewalInvoice.id,
-        },
-      });
-
-      return {
-        subscription: sub,
-        renewal_order: renewalOrder,
-        renewal_invoice: renewalInvoice,
-        checkout_access_token_reference: renewalOrder.public_reference,
-      };
+      return generateRenewalInvoiceInTx(state, sub, actor.user.id, requestId);
     }
   );
 

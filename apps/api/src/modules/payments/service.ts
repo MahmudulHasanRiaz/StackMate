@@ -18,12 +18,15 @@ import {
   parseStrictDDMMYYYYToIsoDate,
   RejectPaymentSubmissionSchema,
   SubmitManualPaymentSchema,
+  UpdateInstallmentSchema,
   UpdatePaymentMethodSchema,
   UpdatePaymentProviderSchema,
 } from "../../../../../packages/contracts/src/index.ts";
 import { storeValidatedPrivateR2Object } from "../../platform/storage/r2.ts";
 import type {
+  DatabaseState,
   LicenseRecord,
+  OrderInstallmentRecord,
   OrderRecord,
   PaymentMethodRecord,
   PaymentProviderRecord,
@@ -34,10 +37,16 @@ import type {
   UploadedAssetRecord,
 } from "../../platform/db/store.ts";
 import { AppError } from "../../shared/errors.ts";
+import {
+  evaluateActivationForOrderInTx,
+  evaluateSuspensionForOrderInTx,
+} from "../activation/service.ts";
 import { appendAuditLog } from "../audit/service.ts";
+import {
+  computeOrderPaid,
+  computeOrderRemaining,
+} from "../customers/service.ts";
 import { assertStaffPermission, type StaffPrincipal } from "../identity/service.ts";
-import { issueLicenseForOrderItemInTx } from "../licensing/service.ts";
-import { createOrExtendSubscriptionInTx } from "../subscriptions/service.ts";
 
 export interface PublicPaymentMethodDto {
   id: string;
@@ -210,6 +219,184 @@ export async function uploadPrivatePaymentEvidence(
  * Sets submission status to 'submitted' and order payment_status to 'pending_verification'.
  * NEVER marks the order paid or issues a license.
  */
+// -- Installment allocation (ADR-0009) ----------------------------------------
+// A verified payment settles against installments oldest-first (by due date,
+// then installment number). The caller may name one installment, which is
+// filled first and the rest spills oldest-first. Amounts are capped at the
+// order's remaining amount by the caller; this helper only distributes what
+// it is given. Every installment touched gets its paid amount, status
+// (partially_paid / paid) and paid_at (set when fully paid) updated.
+
+export interface InstallmentAllocation {
+  installment_id: string;
+  amount_minor: number;
+}
+
+export function allocatePaymentToInstallmentsInTx(
+  state: DatabaseState,
+  order: OrderRecord,
+  amountMinor: number,
+  preferredInstallmentId?: string | null
+): InstallmentAllocation[] {
+  const nowIso = new Date().toISOString();
+  const installments = state.order_installments
+    .filter((i) => i.order_id === order.id && i.paid_amount_minor < i.amount_minor)
+    .sort((a, b) =>
+      a.due_date === b.due_date
+        ? a.installment_number - b.installment_number
+        : a.due_date < b.due_date
+          ? -1
+          : 1
+    );
+  const ordered = [...installments];
+  if (preferredInstallmentId) {
+    const idx = ordered.findIndex((i) => i.id === preferredInstallmentId);
+    if (idx > 0) {
+      const [preferred] = ordered.splice(idx, 1);
+      ordered.unshift(preferred as (typeof ordered)[number]);
+    }
+  }
+  const allocations: InstallmentAllocation[] = [];
+  let remaining = amountMinor;
+  for (const inst of ordered) {
+    if (remaining <= 0) break;
+    const due = inst.amount_minor - inst.paid_amount_minor;
+    const take = Math.min(due, remaining);
+    inst.paid_amount_minor += take;
+    inst.status = inst.paid_amount_minor >= inst.amount_minor ? "paid" : "partially_paid";
+    if (inst.status === "paid") inst.paid_at = nowIso;
+    inst.updated_at = nowIso;
+    allocations.push({ installment_id: inst.id, amount_minor: take });
+    remaining -= take;
+  }
+  return allocations;
+}
+
+/** Validate an optional installment target named in a claim. */
+export function resolveClaimInstallment(
+  state: DatabaseState,
+  order: OrderRecord,
+  installmentId?: string | null
+): void {
+  if (!installmentId) return;
+  const inst = state.order_installments.find((i) => i.id === installmentId);
+  if (!inst || inst.order_id !== order.id) {
+    throw new AppError(
+      "INVALID_INSTALLMENT",
+      "The named installment does not belong to this order.",
+      422
+    );
+  }
+  if (inst.paid_amount_minor >= inst.amount_minor) {
+    throw new AppError(
+      "INVALID_INSTALLMENT",
+      `Installment #${inst.installment_number} is already fully paid.`,
+      422
+    );
+  }
+}
+
+// -- Payment-plan builder (ADR-0009) ------------------------------------------
+// Builds the order_installments rows for an order from the wizard's plan:
+// full → one installment (due = clearance date); advance_rest → advance +
+// rest; equal_installments → N equal parts every X days from a start date.
+// Amounts always sum to the order total exactly (the remainder of an uneven
+// split goes to the last installment). Due dates are ISO YYYY-MM-DD.
+
+export interface PaymentPlanInput {
+  kind?: "full" | "advance_rest" | "equal_installments";
+  due_date?: string | undefined;
+  advance_amount_minor?: number | undefined;
+  advance_percent?: number | undefined;
+  rest_due_date?: string | undefined;
+  installment_count?: number | undefined;
+  interval_days?: number | undefined;
+  start_date?: string | undefined;
+}
+
+function parsePlanDate(value: string | undefined, fallback: string): string {
+  const raw = (value ?? fallback).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    throw new AppError("VALIDATION_ERROR", `Invalid date '${raw}' — expected YYYY-MM-DD.`, 422);
+  }
+  const d = new Date(`${raw}T00:00:00.000Z`);
+  if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== raw) {
+    throw new AppError("VALIDATION_ERROR", `Invalid date '${raw}'.`, 422);
+  }
+  return raw;
+}
+
+function addDaysIso(dateIso: string, days: number): string {
+  const d = new Date(`${dateIso}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+export function createInstallmentsForOrderInTx(
+  state: DatabaseState,
+  order: OrderRecord,
+  plan: PaymentPlanInput | undefined,
+  now: Date
+): OrderInstallmentRecord[] {
+  const nowIso = now.toISOString();
+  const today = nowIso.slice(0, 10);
+  const kind = plan?.kind ?? "full";
+  const rows: Array<{ amount_minor: number; due_date: string }> = [];
+
+  if (kind === "full") {
+    rows.push({
+      amount_minor: order.total_minor,
+      due_date: parsePlanDate(plan?.due_date, today),
+    });
+  } else if (kind === "advance_rest") {
+    const advance =
+      plan?.advance_amount_minor ??
+      (plan?.advance_percent !== undefined
+        ? Math.round((order.total_minor * plan.advance_percent) / 100)
+        : 0);
+    if (advance <= 0 || advance >= order.total_minor) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        "Advance must be greater than 0 and less than the order total.",
+        422
+      );
+    }
+    rows.push({ amount_minor: advance, due_date: parsePlanDate(plan?.start_date, today) });
+    rows.push({
+      amount_minor: order.total_minor - advance,
+      due_date: parsePlanDate(plan?.rest_due_date, today),
+    });
+  } else {
+    const count = plan?.installment_count ?? 2;
+    const interval = plan?.interval_days ?? 30;
+    const start = parsePlanDate(plan?.start_date, today);
+    const base = Math.floor(order.total_minor / count);
+    for (let i = 0; i < count; i += 1) {
+      const amount = i === count - 1 ? order.total_minor - base * (count - 1) : base;
+      rows.push({ amount_minor: amount, due_date: addDaysIso(start, i * interval) });
+    }
+  }
+
+  const created: OrderInstallmentRecord[] = rows.map((row, idx) => {
+    const rec: OrderInstallmentRecord = {
+      id: randomUUID(),
+      order_id: order.id,
+      installment_number: idx + 1,
+      amount_minor: row.amount_minor,
+      due_date: row.due_date,
+      status: "pending",
+      paid_amount_minor: 0,
+      paid_at: null,
+      notes: null,
+      created_at: nowIso,
+      updated_at: nowIso,
+    };
+    state.order_installments.push(rec);
+    return rec;
+  });
+  return created;
+}
+
 export async function submitManualPaymentClaim(
   store: StackMateDataStore,
   input: {
@@ -248,7 +435,10 @@ export async function submitManualPaymentClaim(
         throw new AppError("NOT_FOUND", "Selected payment method is not available.", 404);
       }
 
-      // Enforce full-payment amount and currency match (Section 5: Partial payments disabled initially)
+      // Partial payments (ADR-0009, flips API spec §27): any positive amount
+      // is accepted; only the currency must match. Amounts above the
+      // remaining are accepted too — the excess becomes customer credit at
+      // approval. The old full-amount 422 is gone.
       if (parsed.currency_code.toUpperCase() !== order.currency_code) {
         throw new AppError(
           "PAYMENT_AMOUNT_MISMATCH",
@@ -256,13 +446,7 @@ export async function submitManualPaymentClaim(
           422
         );
       }
-      if (parsed.amount_minor !== order.total_minor) {
-        throw new AppError(
-          "PAYMENT_AMOUNT_MISMATCH",
-          `Submitted payment amount (${parsed.amount_minor}) must match exact order total (${order.total_minor}).`,
-          422
-        );
-      }
+      resolveClaimInstallment(state, order, parsed.installment_id ?? null);
 
       // Enforce Transaction ID policy (PRD §11.4, API Spec §14.7)
       const txnReq = method.configuration.transaction_id_requirement;
@@ -341,6 +525,7 @@ export async function submitManualPaymentClaim(
         order_id: order.id,
         customer_id: order.customer_id,
         payment_method_id: method.id,
+        installment_id: parsed.installment_id ?? null,
         amount_minor: parsed.amount_minor,
         currency_code: order.currency_code,
         sender_name: parsed.sender_name ?? null,
@@ -459,16 +644,44 @@ export async function approvePaymentSubmissionByStaff(
       );
     }
 
-    if (
-      input.currency_code.toUpperCase() !== order.currency_code ||
-      input.verified_amount_minor !== order.total_minor
-    ) {
+    // Partial payments (ADR-0009, flips API spec §27): the verified amount
+    // is any positive amount in the order's currency. Credit may be applied
+    // on top (explicit, never silent): apply_credit_minor must not exceed
+    // the customer's credit balance nor the order's remaining amount.
+    if (input.currency_code.toUpperCase() !== order.currency_code) {
       throw new AppError(
         "PAYMENT_AMOUNT_MISMATCH",
-        `Verified amount (${input.verified_amount_minor} ${input.currency_code}) does not match order total (${order.total_minor} ${order.currency_code}).`,
+        `Verified currency '${input.currency_code}' does not match order currency '${order.currency_code}'.`,
         422
       );
     }
+    const customer = state.customers.find((c) => c.id === order.customer_id);
+    if (!customer) {
+      throw new AppError("NOT_FOUND", "Associated customer not found.", 404);
+    }
+    const applyCredit = input.apply_credit_minor ?? 0;
+    if (applyCredit > customer.credit_balance_minor) {
+      throw new AppError(
+        "CREDIT_EXCEEDS_BALANCE",
+        `Credit to apply (${applyCredit}) exceeds the customer's credit balance (${customer.credit_balance_minor}).`,
+        422
+      );
+    }
+    const remainingBefore = computeOrderRemaining(state, order);
+    if (applyCredit > remainingBefore) {
+      throw new AppError(
+        "CREDIT_EXCEEDS_BALANCE",
+        `Credit to apply (${applyCredit}) exceeds the order's remaining amount (${remainingBefore}).`,
+        422
+      );
+    }
+    // Settled value for this approval = verified money + applied credit.
+    // Any money above the remaining becomes customer credit (overpayment).
+    const settledMinor = input.verified_amount_minor + applyCredit;
+    const appliedToOrder = Math.min(settledMinor, remainingBefore);
+    const excessMoney = Math.max(0, settledMinor - remainingBefore);
+    const newCreditBalance =
+      customer.credit_balance_minor - applyCredit + excessMoney;
 
     const method = state.payment_methods.find((m) => m.id === submission.payment_method_id);
     if (!method) {
@@ -487,7 +700,11 @@ export async function approvePaymentSubmissionByStaff(
       decision: "approved",
       reason_code: null,
       customer_message: null,
-      notes: input.internal_note ?? `Verified reference: ${input.verification_reference}`,
+      notes:
+        input.internal_note ??
+        `Verified reference: ${input.verification_reference}` +
+          (applyCredit > 0 ? `; credit applied: ${applyCredit}` : "") +
+          (excessMoney > 0 ? `; overpayment to credit: ${excessMoney}` : ""),
       created_at: nowIso,
     });
 
@@ -509,62 +726,56 @@ export async function approvePaymentSubmissionByStaff(
     };
     state.payment_transactions.push(transaction);
 
-    order.payment_status = "paid";
-    order.status = "completed";
-    order.completed_at = nowIso;
+    // Settle: allocate the settled value across installments (the claim's
+    // named installment first, then oldest-first), update the customer's
+    // credit balance (applied credit leaves, overpaid money enters), and
+    // recompute the order + invoice paid/due state from the installments.
+    const allocations = allocatePaymentToInstallmentsInTx(
+      state,
+      order,
+      appliedToOrder,
+      submission.installment_id
+    );
+    if (newCreditBalance !== customer.credit_balance_minor) {
+      customer.credit_balance_minor = newCreditBalance;
+      customer.updated_at = nowIso;
+    }
+
+    const paidAfter = computeOrderPaid(state, order.id);
+    const remainingAfter = Math.max(0, order.total_minor - paidAfter);
+    const fullyPaid = remainingAfter === 0;
+    order.payment_status = fullyPaid ? "paid" : "partially_paid";
+    if (fullyPaid) {
+      order.status = "completed";
+      order.completed_at = nowIso;
+    }
     order.updated_at = nowIso;
 
     for (const inv of state.invoices) {
-      if (inv.order_id === order.id && inv.status === "open") {
-        inv.status = "paid";
-        inv.amount_paid_minor = inv.total_minor;
-        inv.amount_due_minor = 0;
-        inv.paid_at = nowIso;
+      if (inv.order_id === order.id && (inv.status === "open" || inv.status === "partially_paid")) {
+        inv.amount_paid_minor = Math.min(inv.total_minor, paidAfter);
+        inv.amount_due_minor = Math.max(0, inv.total_minor - paidAfter);
+        inv.status = inv.amount_due_minor === 0 ? "paid" : "partially_paid";
+        if (inv.status === "paid") inv.paid_at = nowIso;
       }
     }
 
-    // Fulfillment Orchestrator (ADR-0003: dispatches by fulfillment_type_snapshot)
-    const subscriptionsCreated: SubscriptionRecord[] = [];
-    const licensesIssued: Array<{ license: LicenseRecord; issued_license_key_once: string }> = [];
-
-    for (const item of order.items) {
-      if (item.fulfillment_type_snapshot === "digital_service") {
-        // ADR-0003: Service order does not issue a software license
-        state.outbox_events.push({
-          id: randomUUID(),
-          event_key: `service_fulfillment.queued:${item.id}`,
-          aggregate_type: "order_item",
-          aggregate_id: item.id,
-          event_type: "service.fulfillment_requested",
-          payload: {
-            order_id: order.id,
-            order_item_id: item.id,
-            product_id: item.product_id,
-          },
-          status: "pending",
-          attempt_count: 0,
-          available_at: nowIso,
-          locked_until: null,
-          locked_by: null,
-          last_error_code: null,
-          created_at: nowIso,
-          processed_at: null,
-        });
-        continue;
-      }
-
-      const sub = createOrExtendSubscriptionInTx(state, order, item, transaction.id);
-      subscriptionsCreated.push(sub);
-
-      const { license, rawKeyOnce } = issueLicenseForOrderItemInTx(
-        state,
-        order,
-        item,
-        sub,
-        config.licenseVerifierSecret
-      );
-      licensesIssued.push({ license, issued_license_key_once: rawKeyOnce });
-    }
+    // Fulfillment follows the activation policy (ADR-0009), not payment
+    // completion alone: on_full_payment / on_percent / on_date decide when
+    // the subscription + license are created; the missed-schedule rule
+    // suspends/reactivates afterwards.
+    const activation = evaluateActivationForOrderInTx(state, order, nowIso, {
+      licenseVerifierSecret: config.licenseVerifierSecret,
+      paymentTransactionId: transaction.id,
+      actorUserId: actor.user.id,
+      requestId: config.requestId,
+    });
+    const subscriptionsCreated = activation.subscriptions;
+    const licensesIssued = activation.issued_licenses;
+    evaluateSuspensionForOrderInTx(state, order, new Date(nowIso), {
+      actorUserId: actor.user.id,
+      requestId: config.requestId,
+    });
 
     // Outbox events: payment.approved, order.paid, and verified Meta Purchase event (API Spec §17.4)
     state.outbox_events.push({
@@ -578,7 +789,7 @@ export async function approvePaymentSubmissionByStaff(
         payment_submission_id: submission.id,
         currency_code: order.currency_code,
         amount_minor: transaction.amount_minor,
-        payment_status: "paid",
+        payment_status: order.payment_status,
       },
       status: "pending",
       attempt_count: 0,
@@ -660,6 +871,11 @@ export async function approvePaymentSubmissionByStaff(
         verified_amount_minor: input.verified_amount_minor,
         currency_code: order.currency_code,
         verification_reference: input.verification_reference,
+        credit_applied_minor: applyCredit,
+        overpayment_to_credit_minor: excessMoney,
+        customer_credit_balance_minor: newCreditBalance,
+        installment_allocations: allocations,
+        activation: activation.reason,
         licenses_issued: licensesIssued.map((l) => l.license.license_number),
       },
     });
@@ -970,13 +1186,10 @@ export async function recordManualPaymentClaimByAdmin(
         422
       );
     }
-    if (parsed.amount_minor !== order.total_minor) {
-      throw new AppError(
-        "PAYMENT_AMOUNT_MISMATCH",
-        `Submitted payment amount (${parsed.amount_minor}) must match exact order total (${order.total_minor}).`,
-        422
-      );
-    }
+    // Partial payments (ADR-0009): any positive amount is accepted; the
+    // old full-amount 422 is gone. Overpayment excess becomes credit at
+    // approval.
+    resolveClaimInstallment(state, order, parsed.installment_id ?? null);
     const txnReq = method.configuration.transaction_id_requirement;
     const rawTxn = parsed.transaction_id?.trim() || "";
     if (txnReq === "required" && !rawTxn) {
@@ -1047,6 +1260,7 @@ export async function recordManualPaymentClaimByAdmin(
       order_id: order.id,
       customer_id: order.customer_id,
       payment_method_id: method.id,
+      installment_id: parsed.installment_id ?? null,
       amount_minor: parsed.amount_minor,
       currency_code: order.currency_code,
       sender_name: parsed.sender_name ?? null,
@@ -1103,5 +1317,50 @@ export async function recordManualPaymentClaimByAdmin(
     });
 
     return { payment_submission: submission, order };
+  });
+}
+
+// -- Installment edits (ADR-0009) ----------------------------------------------
+// Admin may change an installment's due date (or notes) after creation;
+// audit-logged. Paid amounts / status are never edited by hand — they are
+// derived from verified payments only.
+
+export async function updateInstallmentByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  installmentId: string,
+  rawInput: unknown,
+  requestId: string
+): Promise<OrderInstallmentRecord> {
+  assertStaffPermission(actor, "orders.manage");
+  const input = UpdateInstallmentSchema.parse(rawInput);
+  return store.withTransaction((state) => {
+    const inst = state.order_installments.find((i) => i.id === installmentId);
+    if (!inst) throw new AppError("NOT_FOUND", "Installment not found.", 404);
+    const changes: Record<string, unknown> = {};
+    if (input.due_date !== undefined) {
+      const raw = input.due_date.trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+        throw new AppError("VALIDATION_ERROR", `Invalid due date '${raw}' — expected YYYY-MM-DD.`, 422);
+      }
+      inst.due_date = raw;
+      changes.due_date = raw;
+    }
+    if (input.notes !== undefined) {
+      inst.notes = input.notes;
+      changes.notes = input.notes;
+    }
+    inst.updated_at = new Date().toISOString();
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "orders.installment.updated",
+      resource_type: "order",
+      resource_id: inst.order_id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { installment_id: inst.id, installment_number: inst.installment_number, ...changes },
+    });
+    return inst;
   });
 }

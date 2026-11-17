@@ -98,7 +98,20 @@ import {
   updateProductStatus,
   withFeatureUsage,
 } from "./modules/catalog/service.ts";
-import { createCustomerByAdmin, updateCustomerByAdmin } from "./modules/customers/service.ts";
+import {
+  computeCustomerFinancials,
+  computeOrderPaid,
+  computeOrderRemaining,
+  createCustomerAddressByAdmin,
+  createCustomerByAdmin,
+  createCustomerReportByAdmin,
+  deleteCustomerAddressByAdmin,
+  listCustomerAddresses,
+  listCustomerReports,
+  splitCustomerContactByAdmin,
+  updateCustomerAddressByAdmin,
+  updateCustomerByAdmin,
+} from "./modules/customers/service.ts";
 import {
   cancelOrderByAdmin,
   cancelOrderInTx,
@@ -117,6 +130,7 @@ import {
   setPaymentMethodEnabledByAdmin,
   submitManualPaymentClaim,
   toPublicPaymentMethodDto,
+  updateInstallmentByAdmin,
   updatePaymentMethodByAdmin,
   updatePaymentProviderByAdmin,
   uploadPrivatePaymentEvidence,
@@ -165,6 +179,29 @@ import {
   testWebhookEndpointByAdmin,
 } from "./modules/webhooks/service.ts";
 import { appendAuditLog, resolveAuditResourceDisplayName } from "./modules/audit/service.ts";
+import {
+  addTicketCommentByAdmin,
+  assignTicketByAdmin,
+  createTicketByAdmin,
+  transitionTicketByAdmin,
+  updateTicketByAdmin,
+} from "./modules/tickets/service.ts";
+import {
+  assignLeadByAdmin,
+  convertLeadByAdmin,
+  createLeadByAdmin,
+  ingestLead,
+  transitionLeadByAdmin,
+  updateLeadByAdmin,
+} from "./modules/leads/service.ts";
+import {
+  getReminderSettings,
+  saveReminderSettings,
+} from "./modules/reminders/service.ts";
+import {
+  markSweepRemindersSent,
+  runRenewalExpirySweep,
+} from "./modules/renewal/sweep.ts";
 
 interface RouteMatch {
   params: Record<string, string>;
@@ -1790,6 +1827,38 @@ export function createStackMateApp(
           );
           return jsonResponse(res, 202);
         }
+
+        // Customer+Order batch (ADR-0009): lead ingestion from connected
+        // websites. Same S2S HMAC auth as the other integration
+        // endpoints (scope leads.create) — the brief's "wpi_ Bearer
+        // token" does not exist in this codebase; the HMAC scheme is
+        // the real one. A Lead tracking event is recorded + queued
+        // through the existing pipeline; Meta CAPI delivery itself is
+        // a known stub and is never claimed.
+        const mServerLeads = matchPath(
+          "/api/v1/integrations/sites/:siteKey/leads",
+          pathname
+        );
+        if (method === "POST" && mServerLeads) {
+          const siteKey = mServerLeads.params.siteKey!;
+          const rawBodyText = await request.text();
+          const { site } = await authenticateSignedServerRequest(store, {
+            siteKey,
+            requiredScope: "leads.create",
+            keyIdHeader: request.headers.get("X-StackMate-Key-Id") ?? undefined,
+            timestampHeader: request.headers.get("X-StackMate-Timestamp") ?? undefined,
+            nonceHeader: request.headers.get("X-StackMate-Nonce") ?? undefined,
+            contentSha256Header: request.headers.get("X-StackMate-Content-SHA256") ?? undefined,
+            signatureHeader: request.headers.get("X-StackMate-Signature") ?? undefined,
+            method,
+            host: url.host,
+            rawPathAndQuery: `${url.pathname}${url.search}`,
+            rawBody: rawBodyText,
+            encryptionKey: env.ENCRYPTION_KEY_V1,
+          });
+          const result = await ingestLead(store, site, JSON.parse(rawBodyText));
+          return jsonResponse(result, result.created ? 201 : 200);
+        }
       }
 
       // 6. Staff Admin API (/api/v1/admin/*)
@@ -2638,6 +2707,14 @@ export function createStackMateApp(
           assertStaffPermission(principal, "customers.read");
           const items = store.state.customers.map((c) => ({
             ...c,
+            // Staff-report flag (ADR-0009): a warning badge when a concern
+            // report exists; the count lets the list row show it plainly.
+            report_count: store.state.customer_reports.filter(
+              (r) => r.customer_id === c.id
+            ).length,
+            has_concern_report: store.state.customer_reports.some(
+              (r) => r.customer_id === c.id && r.type === "concern"
+            ),
             created_date_display: formatDisplayDateDDMMYYYY(c.created_at, env.DEFAULT_TIMEZONE),
           }));
           return collectionResponse(items);
@@ -2656,11 +2733,77 @@ export function createStackMateApp(
             (c) => c.id === mCustDetail.params.customerId
           );
           if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
+          // Per-order billed/paid/due (owner 2026-11-17): every order row
+          // carries its own three amounts, computed from verified payments.
+          const customerOrders = store.state.orders
+            .filter((o) => o.customer_id === customer.id)
+            .map((o) => ({
+              ...o,
+              paid_amount_minor: computeOrderPaid(store.state, o.id),
+              remaining_minor: computeOrderRemaining(store.state, o),
+            }));
+          const orderIds = new Set(customerOrders.map((o) => o.id));
+          const subIds = new Set(
+            store.state.subscriptions
+              .filter((s) => s.customer_id === customer.id)
+              .map((s) => s.id)
+          );
+          const licenseIds = new Set(
+            store.state.licenses
+              .filter((l) => l.customer_id === customer.id)
+              .map((l) => l.id)
+          );
+          // Activity history: audit rows touching the customer or any of
+          // their orders/subscriptions/licenses, newest first (max 100).
+          const activity = store.state.audit_logs
+            .filter(
+              (a) =>
+                a.resource_id === customer.id ||
+                (a.resource_type === "order" && orderIds.has(a.resource_id)) ||
+                (a.resource_type === "subscription" && subIds.has(a.resource_id)) ||
+                (a.resource_type === "license" && licenseIds.has(a.resource_id))
+            )
+            .slice(-100)
+            .reverse();
           return jsonResponse({
             ...customer,
-            orders: store.state.orders.filter((o) => o.customer_id === customer.id),
+            financials: computeCustomerFinancials(store.state, customer.id),
+            contacts: store.state.customer_contacts.filter(
+              (cc) => cc.customer_id === customer.id
+            ),
+            addresses: store.state.customer_addresses.filter(
+              (a) => a.customer_id === customer.id
+            ),
+            reports: store.state.customer_reports
+              .filter((r) => r.customer_id === customer.id)
+              .map((r) => ({
+                ...r,
+                author_name:
+                  store.state.users.find((u) => u.id === r.author_user_id)?.name ?? null,
+              })),
+            orders: customerOrders,
             subscriptions: store.state.subscriptions.filter((s) => s.customer_id === customer.id),
             licenses: store.state.licenses.filter((l) => l.customer_id === customer.id),
+            payments: store.state.payment_submissions.filter(
+              (s) =>
+                orderIds.has(s.order_id) ||
+                store.state.payment_transactions.some(
+                  (t) => t.payment_submission_id === s.id
+                )
+            ),
+            installations: store.state.licenses
+              .filter((l) => l.customer_id === customer.id)
+              .flatMap((l) =>
+                l.activations.map((a) => ({
+                  ...a,
+                  license_number: l.license_number,
+                  product_id: l.product_id,
+                }))
+              ),
+            tickets: store.state.support_tickets.filter(
+              (t) => t.customer_id === customer.id
+            ),
+            activity,
           });
         }
 
@@ -2672,6 +2815,10 @@ export function createStackMateApp(
             .map((o) => ({
               ...o,
               customer: store.state.customers.find((c) => c.id === o.customer_id) ?? null,
+              // Paid/remaining are computed from verified payments
+              // (ADR-0009) — never denormalized, so they cannot drift.
+              paid_amount_minor: computeOrderPaid(store.state, o.id),
+              remaining_minor: computeOrderRemaining(store.state, o),
               created_date_display: formatDisplayDateDDMMYYYY(o.created_at, env.DEFAULT_TIMEZONE),
             }));
           return collectionResponse(items);
@@ -2691,6 +2838,18 @@ export function createStackMateApp(
           return jsonResponse({
             ...order,
             customer: store.state.customers.find((c) => c.id === order.customer_id) ?? null,
+            paid_amount_minor: computeOrderPaid(store.state, order.id),
+            remaining_minor: computeOrderRemaining(store.state, order),
+            installments: store.state.order_installments
+              .filter((i) => i.order_id === order.id)
+              .sort((a, b) => a.installment_number - b.installment_number)
+              .map((i) => ({
+                ...i,
+                due_date_display: formatDisplayDateDDMMYYYY(
+                  `${i.due_date}T00:00:00.000Z`,
+                  env.DEFAULT_TIMEZONE
+                ),
+              })),
             invoices: store.state.invoices.filter((i) => i.order_id === order.id),
             payment_submissions: store.state.payment_submissions.filter(
               (s) => s.order_id === order.id
@@ -2726,7 +2885,13 @@ export function createStackMateApp(
           );
           if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
           return collectionResponse(
-            store.state.orders.filter((o) => o.customer_id === customer.id)
+            store.state.orders
+              .filter((o) => o.customer_id === customer.id)
+              .map((o) => ({
+                ...o,
+                paid_amount_minor: computeOrderPaid(store.state, o.id),
+                remaining_minor: computeOrderRemaining(store.state, o),
+              }))
           );
         }
 
@@ -2759,6 +2924,194 @@ export function createStackMateApp(
             store.state.licenses
               .filter((l) => l.customer_id === customer.id)
               .map(({ license_key_hash: _h, issued_raw_key_once: _r, ...safe }) => safe)
+          );
+        }
+
+        // Customer+Order batch (ADR-0009): addresses, reports, split,
+        // payments, installations, activity, issues — the four missing
+        // detail tabs (PRD §9) plus the dedupe/split/report APIs.
+        const mCustAddresses = matchPath(
+          "/api/v1/admin/customers/:customerId/addresses",
+          pathname
+        );
+        if (method === "GET" && mCustAddresses) {
+          assertStaffPermission(principal, "customers.read");
+          return collectionResponse(
+            await listCustomerAddresses(store, principal, mCustAddresses.params.customerId!)
+          );
+        }
+        if (method === "POST" && mCustAddresses) {
+          const body = await request.json();
+          const address = await createCustomerAddressByAdmin(
+            store,
+            principal,
+            mCustAddresses.params.customerId!,
+            body,
+            requestId
+          );
+          return jsonResponse(address, 201);
+        }
+        const mCustAddressDetail = matchPath(
+          "/api/v1/admin/customers/:customerId/addresses/:addressId",
+          pathname
+        );
+        if (method === "PATCH" && mCustAddressDetail) {
+          const body = await request.json();
+          const address = await updateCustomerAddressByAdmin(
+            store,
+            principal,
+            mCustAddressDetail.params.customerId!,
+            mCustAddressDetail.params.addressId!,
+            body,
+            requestId
+          );
+          return jsonResponse(address);
+        }
+        if (method === "DELETE" && mCustAddressDetail) {
+          await deleteCustomerAddressByAdmin(
+            store,
+            principal,
+            mCustAddressDetail.params.customerId!,
+            mCustAddressDetail.params.addressId!,
+            requestId
+          );
+          return jsonResponse({ deleted: true });
+        }
+
+        const mCustReports = matchPath(
+          "/api/v1/admin/customers/:customerId/reports",
+          pathname
+        );
+        if (method === "GET" && mCustReports) {
+          assertStaffPermission(principal, "customers.read");
+          return collectionResponse(
+            await listCustomerReports(store, principal, mCustReports.params.customerId!)
+          );
+        }
+        if (method === "POST" && mCustReports) {
+          const body = await request.json();
+          const report = await createCustomerReportByAdmin(
+            store,
+            principal,
+            mCustReports.params.customerId!,
+            body,
+            requestId
+          );
+          return jsonResponse(report, 201);
+        }
+
+        const mCustSplit = matchPath(
+          "/api/v1/admin/customers/:customerId/split-contact",
+          pathname
+        );
+        if (method === "POST" && mCustSplit) {
+          const body = await request.json();
+          const result = await splitCustomerContactByAdmin(
+            store,
+            principal,
+            mCustSplit.params.customerId!,
+            body,
+            requestId
+          );
+          return jsonResponse(result, 201);
+        }
+
+        const mCustPayments = matchPath(
+          "/api/v1/admin/customers/:customerId/payments",
+          pathname
+        );
+        if (method === "GET" && mCustPayments) {
+          assertStaffPermission(principal, "customers.read");
+          const customer = store.state.customers.find(
+            (c) => c.id === mCustPayments.params.customerId
+          );
+          if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
+          const orderIds = new Set(
+            store.state.orders
+              .filter((o) => o.customer_id === customer.id)
+              .map((o) => o.id)
+          );
+          const submissions = store.state.payment_submissions.filter((s) =>
+            orderIds.has(s.order_id)
+          );
+          const submissionIds = new Set(submissions.map((s) => s.id));
+          return jsonResponse({
+            submissions,
+            transactions: store.state.payment_transactions.filter((t) =>
+              t.payment_submission_id !== null &&
+              submissionIds.has(t.payment_submission_id)
+            ),
+          });
+        }
+
+        const mCustInstallations = matchPath(
+          "/api/v1/admin/customers/:customerId/installations",
+          pathname
+        );
+        if (method === "GET" && mCustInstallations) {
+          assertStaffPermission(principal, "customers.read");
+          return collectionResponse(
+            store.state.licenses
+              .filter((l) => l.customer_id === mCustInstallations.params.customerId)
+              .flatMap((l) =>
+                l.activations.map((a) => ({
+                  ...a,
+                  license_number: l.license_number,
+                  product_id: l.product_id,
+                }))
+              )
+          );
+        }
+
+        const mCustActivity = matchPath(
+          "/api/v1/admin/customers/:customerId/activity",
+          pathname
+        );
+        if (method === "GET" && mCustActivity) {
+          assertStaffPermission(principal, "customers.read");
+          const customer = store.state.customers.find(
+            (c) => c.id === mCustActivity.params.customerId
+          );
+          if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
+          const orderIds = new Set(
+            store.state.orders
+              .filter((o) => o.customer_id === customer.id)
+              .map((o) => o.id)
+          );
+          const subIds = new Set(
+            store.state.subscriptions
+              .filter((s) => s.customer_id === customer.id)
+              .map((s) => s.id)
+          );
+          const licenseIds = new Set(
+            store.state.licenses
+              .filter((l) => l.customer_id === customer.id)
+              .map((l) => l.id)
+          );
+          return collectionResponse(
+            store.state.audit_logs
+              .filter(
+                (a) =>
+                  a.resource_id === customer.id ||
+                  (a.resource_type === "order" && orderIds.has(a.resource_id)) ||
+                  (a.resource_type === "subscription" && subIds.has(a.resource_id)) ||
+                  (a.resource_type === "license" && licenseIds.has(a.resource_id))
+              )
+              .slice(-100)
+              .reverse()
+          );
+        }
+
+        const mCustTickets = matchPath(
+          "/api/v1/admin/customers/:customerId/tickets",
+          pathname
+        );
+        if (method === "GET" && mCustTickets) {
+          assertStaffPermission(principal, "tickets.view");
+          return collectionResponse(
+            store.state.support_tickets.filter(
+              (t) => t.customer_id === mCustTickets.params.customerId
+            )
           );
         }
 
@@ -2809,6 +3162,46 @@ export function createStackMateApp(
           return jsonResponse(invoice, 201);
         }
 
+        // Customer+Order batch (ADR-0009): installment plan read + edits.
+        const mOrderInstallments = matchPath(
+          "/api/v1/admin/orders/:orderId/installments",
+          pathname
+        );
+        if (method === "GET" && mOrderInstallments) {
+          assertStaffPermission(principal, "orders.read");
+          const order = store.state.orders.find(
+            (o) => o.id === mOrderInstallments.params.orderId
+          );
+          if (!order) throw new AppError("NOT_FOUND", "Order not found.", 404);
+          return collectionResponse(
+            store.state.order_installments
+              .filter((i) => i.order_id === order.id)
+              .sort((a, b) => a.installment_number - b.installment_number)
+              .map((i) => ({
+                ...i,
+                due_date_display: formatDisplayDateDDMMYYYY(
+                  `${i.due_date}T00:00:00.000Z`,
+                  env.DEFAULT_TIMEZONE
+                ),
+              }))
+          );
+        }
+        const mOrderInstallmentDetail = matchPath(
+          "/api/v1/admin/orders/:orderId/installments/:installmentId",
+          pathname
+        );
+        if (method === "PATCH" && mOrderInstallmentDetail) {
+          const body = await request.json();
+          const updated = await updateInstallmentByAdmin(
+            store,
+            principal,
+            mOrderInstallmentDetail.params.installmentId!,
+            body,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+
         const mInvoiceDetail = matchPath("/api/v1/admin/invoices/:invoiceId", pathname);
         if (method === "GET" && mInvoiceDetail) {
           assertStaffPermission(principal, "orders.read");
@@ -2837,6 +3230,295 @@ export function createStackMateApp(
             requestId
           );
           return jsonResponse(voided);
+        }
+
+        // Customer+Order batch (ADR-0009): Support Tickets.
+        if (method === "GET" && pathname === "/api/v1/admin/tickets") {
+          assertStaffPermission(principal, "tickets.view");
+          const statusFilter = url.searchParams.get("status");
+          const priorityFilter = url.searchParams.get("priority");
+          const customerFilter = url.searchParams.get("customer_id");
+          const assigneeFilter = url.searchParams.get("assignee_user_id");
+          const q = url.searchParams.get("q")?.trim().toLowerCase() ?? "";
+          const items = store.state.support_tickets
+            .filter((t) => (!statusFilter ? true : t.status === statusFilter))
+            .filter((t) => (!priorityFilter ? true : t.priority === priorityFilter))
+            .filter((t) => (!customerFilter ? true : t.customer_id === customerFilter))
+            .filter((t) => (!assigneeFilter ? true : t.assignee_user_id === assigneeFilter))
+            .filter((t) =>
+              !q
+                ? true
+                : t.ticket_number.toLowerCase().includes(q) ||
+                  t.title.toLowerCase().includes(q) ||
+                  (t.description ?? "").toLowerCase().includes(q)
+            )
+            .map((t) => ({
+              ...t,
+              customer: t.customer_id
+                ? (store.state.customers.find((c) => c.id === t.customer_id) ?? null)
+                : null,
+              assignee_name: t.assignee_user_id
+                ? (store.state.users.find((u) => u.id === t.assignee_user_id)?.name ?? null)
+                : null,
+            }));
+          return collectionResponse(items);
+        }
+        if (method === "POST" && pathname === "/api/v1/admin/tickets") {
+          const body = await request.json();
+          const ticket = await createTicketByAdmin(store, principal, body, requestId);
+          return jsonResponse(ticket, 201);
+        }
+        const mTicketDetail = matchPath("/api/v1/admin/tickets/:ticketId", pathname);
+        if (method === "GET" && mTicketDetail) {
+          assertStaffPermission(principal, "tickets.view");
+          const ticket = store.state.support_tickets.find(
+            (t) => t.id === mTicketDetail.params.ticketId
+          );
+          if (!ticket) throw new AppError("NOT_FOUND", "Ticket not found.", 404);
+          const linked = {
+            order: ticket.order_id
+              ? (store.state.orders.find((o) => o.id === ticket.order_id) ?? null)
+              : null,
+            subscription: ticket.subscription_id
+              ? (store.state.subscriptions.find((s) => s.id === ticket.subscription_id) ?? null)
+              : null,
+            license: ticket.license_id
+              ? (store.state.licenses.find((l) => l.id === ticket.license_id) ?? null)
+              : null,
+            product: ticket.product_id
+              ? (store.state.products.find((p) => p.id === ticket.product_id) ?? null)
+              : null,
+          };
+          return jsonResponse({
+            ...ticket,
+            customer: ticket.customer_id
+              ? (store.state.customers.find((c) => c.id === ticket.customer_id) ?? null)
+              : null,
+            reporter_name: store.state.users.find((u) => u.id === ticket.reporter_user_id)
+              ?.name ?? null,
+            assignee_name: ticket.assignee_user_id
+              ? (store.state.users.find((u) => u.id === ticket.assignee_user_id)?.name ?? null)
+              : null,
+            comments: store.state.ticket_comments
+              .filter((c) => c.ticket_id === ticket.id)
+              .sort((a, b) => a.created_at.localeCompare(b.created_at))
+              .map((c) => ({
+                ...c,
+                author_name:
+                  store.state.users.find((u) => u.id === c.author_user_id)?.name ?? null,
+              })),
+            linked,
+          });
+        }
+        if (method === "PATCH" && mTicketDetail) {
+          const body = await request.json();
+          const updated = await updateTicketByAdmin(
+            store,
+            principal,
+            mTicketDetail.params.ticketId!,
+            body,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+        const mTicketTransition = matchPath(
+          "/api/v1/admin/tickets/:ticketId/transition",
+          pathname
+        );
+        if (method === "POST" && mTicketTransition) {
+          const body = await request.json();
+          const updated = await transitionTicketByAdmin(
+            store,
+            principal,
+            mTicketTransition.params.ticketId!,
+            body,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+        const mTicketAssign = matchPath(
+          "/api/v1/admin/tickets/:ticketId/assign",
+          pathname
+        );
+        if (method === "POST" && mTicketAssign) {
+          const body = await request.json();
+          const updated = await assignTicketByAdmin(
+            store,
+            principal,
+            mTicketAssign.params.ticketId!,
+            body,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+        const mTicketComments = matchPath(
+          "/api/v1/admin/tickets/:ticketId/comments",
+          pathname
+        );
+        if (method === "POST" && mTicketComments) {
+          const body = await request.json();
+          const comment = await addTicketCommentByAdmin(
+            store,
+            principal,
+            mTicketComments.params.ticketId!,
+            body,
+            requestId
+          );
+          return jsonResponse(comment, 201);
+        }
+
+        // Customer+Order batch (ADR-0009): Leads.
+        if (method === "GET" && pathname === "/api/v1/admin/leads") {
+          assertStaffPermission(principal, "leads.view");
+          const statusFilter = url.searchParams.get("status");
+          const siteFilter = url.searchParams.get("source_site_id");
+          const campaignFilter = url.searchParams.get("utm_campaign");
+          const fromFilter = url.searchParams.get("from");
+          const toFilter = url.searchParams.get("to");
+          const q = url.searchParams.get("q")?.trim().toLowerCase() ?? "";
+          const items = store.state.leads
+            .filter((l) => (!statusFilter ? true : l.status === statusFilter))
+            .filter((l) => (!siteFilter ? true : l.source_site_id === siteFilter))
+            .filter((l) => (!campaignFilter ? true : l.utm_campaign === campaignFilter))
+            .filter((l) => (!fromFilter ? true : l.created_at.slice(0, 10) >= fromFilter))
+            .filter((l) => (!toFilter ? true : l.created_at.slice(0, 10) <= toFilter))
+            .filter((l) =>
+              !q
+                ? true
+                : l.name.toLowerCase().includes(q) ||
+                  (l.email ?? "").toLowerCase().includes(q) ||
+                  (l.phone ?? "").includes(q) ||
+                  (l.interest ?? "").toLowerCase().includes(q)
+            )
+            .map((l) => ({
+              ...l,
+              source_site: l.source_site_id
+                ? (store.state.integrated_sites.find((s) => s.id === l.source_site_id) ?? null)
+                : null,
+              assignee_name: l.assignee_user_id
+                ? (store.state.users.find((u) => u.id === l.assignee_user_id)?.name ?? null)
+                : null,
+            }));
+          return collectionResponse(items);
+        }
+        if (method === "POST" && pathname === "/api/v1/admin/leads") {
+          const body = await request.json();
+          const lead = await createLeadByAdmin(store, principal, body, requestId);
+          return jsonResponse(lead, 201);
+        }
+        const mLeadDetail = matchPath("/api/v1/admin/leads/:leadId", pathname);
+        if (method === "GET" && mLeadDetail) {
+          assertStaffPermission(principal, "leads.view");
+          const lead = store.state.leads.find((l) => l.id === mLeadDetail.params.leadId);
+          if (!lead) throw new AppError("NOT_FOUND", "Lead not found.", 404);
+          return jsonResponse({
+            ...lead,
+            source_site: lead.source_site_id
+              ? (store.state.integrated_sites.find((s) => s.id === lead.source_site_id) ?? null)
+              : null,
+            product: lead.product_id
+              ? (store.state.products.find((p) => p.id === lead.product_id) ?? null)
+              : null,
+            assignee_name: lead.assignee_user_id
+              ? (store.state.users.find((u) => u.id === lead.assignee_user_id)?.name ?? null)
+              : null,
+            converted_customer: lead.converted_customer_id
+              ? (store.state.customers.find((c) => c.id === lead.converted_customer_id) ?? null)
+              : null,
+            converted_order: lead.converted_order_id
+              ? (store.state.orders.find((o) => o.id === lead.converted_order_id) ?? null)
+              : null,
+          });
+        }
+        if (method === "PATCH" && mLeadDetail) {
+          const body = await request.json();
+          const updated = await updateLeadByAdmin(
+            store,
+            principal,
+            mLeadDetail.params.leadId!,
+            body,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+        const mLeadTransition = matchPath(
+          "/api/v1/admin/leads/:leadId/transition",
+          pathname
+        );
+        if (method === "POST" && mLeadTransition) {
+          const body = await request.json();
+          const updated = await transitionLeadByAdmin(
+            store,
+            principal,
+            mLeadTransition.params.leadId!,
+            body,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+        const mLeadAssign = matchPath("/api/v1/admin/leads/:leadId/assign", pathname);
+        if (method === "POST" && mLeadAssign) {
+          const body = await request.json();
+          const updated = await assignLeadByAdmin(
+            store,
+            principal,
+            mLeadAssign.params.leadId!,
+            body,
+            requestId
+          );
+          return jsonResponse(updated);
+        }
+        const mLeadConvert = matchPath("/api/v1/admin/leads/:leadId/convert", pathname);
+        if (method === "POST" && mLeadConvert) {
+          const result = await convertLeadByAdmin(
+            store,
+            principal,
+            mLeadConvert.params.leadId!,
+            requestId
+          );
+          return jsonResponse(result);
+        }
+
+        // Customer+Order batch (ADR-0009): reminder settings (Settings →
+        // Email). Singleton row, direct Drizzle save — same pattern as
+        // general_settings. Reads come from the load-only state
+        // collection (populated by the store load query). The save is
+        // the users.manage gate, like SMTP.
+        if (method === "GET" && pathname === "/api/v1/admin/reminder-settings") {
+          assertStaffPermission(principal, "users.manage");
+          return jsonResponse(getReminderSettings(store.state));
+        }
+        if (method === "PUT" && pathname === "/api/v1/admin/reminder-settings") {
+          assertStaffPermission(principal, "users.manage");
+          const body = await request.json();
+          const db = (store as unknown as { drizzleDb?: unknown }).drizzleDb as
+            | Parameters<typeof saveReminderSettings>[0]
+            | undefined;
+          if (!db) {
+            throw new AppError(
+              "STORE_UNAVAILABLE",
+              "Reminder settings require the database store.",
+              503
+            );
+          }
+          const saved = await saveReminderSettings(db, body);
+          // Best-effort audit (same shape as general settings): the
+          // settings save itself already succeeded.
+          await store
+            .withTransaction((state) => {
+              appendAuditLog(state, {
+                actor_type: "staff",
+                actor_user_id: principal.user.id,
+                action: "settings.reminder_settings.updated",
+                resource_type: "general_settings",
+                resource_id: "reminder-settings",
+                outcome: "success",
+                request_id: requestId,
+                changes: { ...saved },
+              });
+            })
+            .catch(() => {});
+          return jsonResponse(saved);
         }
 
         // Batch 1: staff-recorded manual payment claim + staff evidence
@@ -3004,6 +3686,11 @@ export function createStackMateApp(
             ...sub,
             order_number: order?.order_number ?? null,
             order_total_minor: order?.total_minor ?? null,
+            // ADR-0009: the approve form needs the order's remaining
+            // amount and the customer's credit balance to offer
+            // apply-credit explicitly (never silent).
+            order_remaining_minor: order ? computeOrderRemaining(store.state, order) : null,
+            customer_credit_balance_minor: customer?.credit_balance_minor ?? 0,
             customer_name: customer?.name ?? null,
             payment_method_name: methodRec?.display_name ?? null,
             submitted_date_display: formatDisplayDateTimeDDMMYYYY(
@@ -3884,10 +4571,36 @@ export function createStackMateApp(
       // cron invocation errored (~1/min uncaught exceptions in the
       // Cloudflare metrics) and the outbox never drained on schedule.
       // fetchHandler already awaits for the same reason.
-      return await processTransactionalOutboxBatch(store, {
+      const drainResult = await processTransactionalOutboxBatch(store, {
         encryptionKey: env.ENCRYPTION_KEY_V1,
         allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
       });
+      // Renewal + expiry sweep (ADR-0009): runs AFTER the drain, so a
+      // sweep failure can never block outbox delivery. The sweep itself
+      // never throws (its report carries per-item errors); the reminder
+      // sends below are best-effort and a failed send is NOT marked
+      // sent, so the next minute's run retries it (send-first-then-mark).
+      try {
+        const sweep = await runRenewalExpirySweep(store, {
+          licenseVerifierSecret: env.LICENSE_VERIFIER_SECRET,
+          requestId: `cron:sweep:${new Date().toISOString()}`,
+        });
+        const sent: typeof sweep.reminders_due = [];
+        for (const reminder of sweep.reminders_due) {
+          const result = await sendEmailViaSmtp(store, env, {
+            to: reminder.to_email,
+            subject: reminder.subject,
+            text: reminder.text,
+          });
+          if (result.sent) sent.push(reminder);
+        }
+        if (sent.length > 0) await markSweepRemindersSent(store, sent);
+      } catch (err) {
+        // Never fail the cron (and never mask the drain result) for
+        // sweep or reminder-mail errors — the next run retries.
+        console.error("[stackmate-cron] renewal sweep failed", err);
+      }
+      return drainResult;
     } finally {
       // The cron uses the same request-scoped store path as fetch (see
       // closeRequestStore): a factory-created store is closed here.

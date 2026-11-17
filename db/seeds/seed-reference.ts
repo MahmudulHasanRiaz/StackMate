@@ -37,6 +37,10 @@ export const SEED_PERMISSIONS = [
   { id: "00000000-0000-4000-8000-000000000123", key: "tracking.manage", description: "Configure Meta Pixel and Conversions API tracking" },
   { id: "00000000-0000-4000-8000-000000000124", key: "users.manage", description: "Manage staff users, roles, and permissions" },
   { id: "00000000-0000-4000-8000-000000000125", key: "audit_logs.read", description: "Inspect administrative and security audit logs" },
+  { id: "00000000-0000-4000-8000-000000000126", key: "tickets.view", description: "View support tickets and their history" },
+  { id: "00000000-0000-4000-8000-000000000127", key: "tickets.manage", description: "Create, assign, and resolve support tickets" },
+  { id: "00000000-0000-4000-8000-000000000128", key: "leads.view", description: "View leads and their history" },
+  { id: "00000000-0000-4000-8000-000000000129", key: "leads.manage", description: "Create, assign, convert, and manage leads" },
 ] as const;
 
 export const SEED_ROLES: ReadonlyArray<{
@@ -130,6 +134,10 @@ export const SEED_ROLES: ReadonlyArray<{
       "payments.read",
       "subscriptions.read",
       "licenses.read",
+      "tickets.view",
+      "tickets.manage",
+      "leads.view",
+      "leads.manage",
     ],
   },
   {
@@ -159,6 +167,8 @@ export const SEED_ROLES: ReadonlyArray<{
       "subscriptions.read",
       "licenses.read",
       "audit_logs.read",
+      "tickets.view",
+      "leads.view",
     ],
   },
 ];

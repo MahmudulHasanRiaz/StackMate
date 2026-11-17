@@ -17,7 +17,7 @@ import { users } from "./auth.ts";
 import { customers } from "./customers.ts";
 import { uploadedAssets } from "./assets.ts";
 import { currencies } from "./catalog.ts";
-import { orders } from "./orders.ts";
+import { orders, orderInstallments } from "./orders.ts";
 
 export const paymentProviders = pgTable("payment_providers", {
   id: uuid("id").primaryKey(),
@@ -95,6 +95,11 @@ export const paymentSubmissions = pgTable(
     paymentMethodId: uuid("payment_method_id")
       .notNull()
       .references(() => paymentMethods.id, { onDelete: "restrict" }),
+    // Migration 0009: optional installment this claim is paying towards
+    // (oldest-first allocation when null).
+    installmentId: uuid("installment_id").references(() => orderInstallments.id, {
+      onDelete: "set null",
+    }),
     amountMinor: bigint("amount_minor", { mode: "number" }).notNull(),
     currencyCode: varchar("currency_code", { length: 3 })
       .notNull()

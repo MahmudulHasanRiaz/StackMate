@@ -34,12 +34,13 @@
  * the routes (with validateSearch) are registered. The cast can then be
  * dropped.
  */
-import { useState } from "react";
+import { useState, type FormEvent } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
-import { Receipt, ShoppingCart } from "lucide-react";
-import { apiRequest } from "../lib/api-client";
-import { detailKey, listKey } from "../lib/query";
+import { Plus, Receipt, ShoppingCart } from "lucide-react";
+import { apiRequest, formatMinorMoney } from "../lib/api-client";
+import { detailKey, listKey, queryClient } from "../lib/query";
 import {
   DetailFacts,
   DetailLayout,
@@ -55,18 +56,33 @@ import {
   Alert,
   Button,
   Card,
+  Checkbox,
   CopyButton,
   DateCell,
   DateTimeCell,
   Dialog,
   EmptyState,
   ErrorState,
+  Field,
+  Input,
   MoneyCell,
   Select,
   StatusBadge,
   TableSkeleton,
+  Textarea,
   useConfirm,
 } from "../components/primitives";
+import {
+  CollapsibleSection,
+  CustomerFormFields,
+  customerFormToCreateBody,
+  emptyCustomerForm,
+  validateCustomerForm,
+  type CustomerDto,
+  type CustomerFormValues,
+} from "./customers";
+import type { FeatureDto } from "./features";
+import type { PackageDto, PackagePriceDto } from "./packages";
 
 /* ------------------------------------------------------------------ */
 /* DTOs (apps/api/src/platform/db/store.ts record shapes)              */
@@ -106,6 +122,14 @@ export interface OrderDto {
   total_minor: number;
   customer_note: string | null;
   internal_note: string | null;
+  // ADR-0009: activation policy + grace (stored on the order).
+  activation_mode: "on_full_payment" | "on_percent" | "on_date";
+  activation_percent: number | null;
+  activation_date: string | null;
+  suspend_on_missed_schedule: boolean;
+  grace_days: number;
+  payment_method_id: string | null;
+  lead_id: string | null;
   items: OrderItemDto[];
   created_at: string;
   updated_at: string;
@@ -115,6 +139,8 @@ export interface OrderDto {
 
 export interface OrderListDto extends Omit<OrderDto, "items"> {
   customer: OrderCustomerDto | null;
+  paid_amount_minor?: number;
+  remaining_minor?: number;
   created_date_display?: string;
 }
 
@@ -164,8 +190,26 @@ export interface PaymentSubmissionDto {
   reviewed_at: string | null;
 }
 
+export interface OrderInstallmentDto {
+  id: string;
+  order_id: string;
+  installment_number: number;
+  amount_minor: number;
+  due_date: string;
+  due_date_display: string;
+  status: "pending" | "partially_paid" | "paid" | "overdue";
+  paid_amount_minor: number;
+  paid_at: string | null;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface OrderDetailDto extends OrderDto {
   customer: OrderCustomerDto | null;
+  paid_amount_minor: number;
+  remaining_minor: number;
+  installments: OrderInstallmentDto[];
   invoices: InvoiceDto[];
   payment_submissions: PaymentSubmissionDto[];
 }
@@ -197,6 +241,7 @@ function useListSearchControls(parsed: ListSearch) {
 
 const PAYMENT_STATUS_OPTIONS = [
   "unpaid",
+  "partially_paid",
   "pending_verification",
   "paid",
   "partially_refunded",
@@ -217,6 +262,18 @@ export function OrdersSection() {
   const updateSearch = useListSearchControls(parsed);
   const goTo = useGoTo();
   const query = useAdminList<OrderListDto>("orders", "/api/v1/admin/orders");
+  // Opened from a lead conversion (?new=1&customer=<id>&lead=<id>) or
+  // the Create order button. The wizard reads the same search params
+  // for its prefill.
+  const [wizardOpen, setWizardOpen] = useState(
+    rawSearch.new === "1" || rawSearch.new === 1
+  );
+  const wizardPrefill =
+    typeof rawSearch.customer === "string" && typeof rawSearch.lead === "string"
+      ? { customerId: rawSearch.customer, leadId: rawSearch.lead }
+      : typeof rawSearch.customer === "string"
+        ? { customerId: rawSearch.customer, leadId: null }
+        : null;
 
   const columns: ColumnDef<OrderListDto, unknown>[] = [
     {
@@ -270,6 +327,26 @@ export function OrdersSection() {
       ),
     },
     {
+      accessorKey: "paid_amount_minor",
+      header: "Paid",
+      cell: ({ row }) => (
+        <MoneyCell
+          currency={row.original.currency_code}
+          minor={row.original.paid_amount_minor ?? 0}
+        />
+      ),
+    },
+    {
+      accessorKey: "remaining_minor",
+      header: "Due",
+      cell: ({ row }) => (
+        <MoneyCell
+          currency={row.original.currency_code}
+          minor={row.original.remaining_minor ?? row.original.total_minor}
+        />
+      ),
+    },
+    {
       accessorKey: "created_at",
       header: "Created",
       cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
@@ -297,6 +374,11 @@ export function OrdersSection() {
         breadcrumb={[{ label: "Commerce" }, { label: "Orders & Invoices" }]}
         title="Orders & Invoices"
         help="Orders placed through admin, website, API, or import"
+        action={
+          <Button variant="primary" icon={Plus} onClick={() => setWizardOpen(true)}>
+            Create order
+          </Button>
+        }
       />
       <ListTable<OrderListDto>
         columns={columns}
@@ -336,6 +418,16 @@ export function OrdersSection() {
         }
         getRowId={(row) => row.id}
       />
+      {wizardOpen ? (
+        <CreateOrderWizard
+          prefill={wizardPrefill}
+          onClose={() => setWizardOpen(false)}
+          onCreated={(orderId) => {
+            setWizardOpen(false);
+            goTo(`/orders/${orderId}`);
+          }}
+        />
+      ) : null}
     </section>
   );
 }
@@ -347,6 +439,7 @@ const TERMINAL_STATUSES = ["completed", "cancelled", "failed"];
 
 export function OrderDetailSection({ id }: { id: string }) {
   const [invoiceId, setInvoiceId] = useState<string | null>(null);
+  const [editInstallment, setEditInstallment] = useState<OrderInstallmentDto | null>(null);
   const confirm = useConfirm();
   const goTo = useGoTo();
   const query = useAdminDetail<OrderDetailDto>(
@@ -573,6 +666,31 @@ export function OrderDetailSection({ id }: { id: string }) {
             label: "Total",
             value: <MoneyCell currency={order.currency_code} minor={order.total_minor} />,
           },
+          {
+            label: "Paid",
+            value: (
+              <MoneyCell currency={order.currency_code} minor={order.paid_amount_minor} />
+            ),
+          },
+          {
+            label: "Due",
+            value: (
+              <MoneyCell currency={order.currency_code} minor={order.remaining_minor} />
+            ),
+          },
+          {
+            label: "Activation",
+            value:
+              order.activation_mode === "on_percent"
+                ? `On ${order.activation_percent}% paid`
+                : order.activation_mode === "on_date"
+                  ? `On ${order.activation_date ?? "—"}`
+                  : "On full payment",
+          },
+          {
+            label: "Grace days",
+            value: `${order.grace_days} day${order.grace_days === 1 ? "" : "s"}`,
+          },
           { label: "Created", value: <DateCell value={order.created_at} /> },
           {
             label: order.completed_at ? "Completed" : order.cancelled_at ? "Cancelled" : "Updated",
@@ -660,6 +778,88 @@ export function OrderDetailSection({ id }: { id: string }) {
               ) : null}
             </p>
           ) : null}
+        </Card>
+        <Card title="Payment plan">
+          <p className="sm-hint">
+            Total{" "}
+            <MoneyCell currency={order.currency_code} minor={order.total_minor} />
+            {" · Paid "}
+            <MoneyCell currency={order.currency_code} minor={order.paid_amount_minor} />
+            {" · Due "}
+            <MoneyCell currency={order.currency_code} minor={order.remaining_minor} />
+            {order.suspend_on_missed_schedule
+              ? " · Licenses suspend when an installment passes its due date unpaid."
+              : ""}
+          </p>
+          {order.installments.length === 0 ? (
+            <EmptyState
+              icon={Receipt}
+              title="No payment plan"
+              body="This order has no installments yet."
+            />
+          ) : (
+            <div className="sm-table-wrap">
+              <table className="sm-table">
+                <thead>
+                  <tr>
+                    <th scope="col">#</th>
+                    <th scope="col">Due date</th>
+                    <th scope="col">Amount</th>
+                    <th scope="col">Paid</th>
+                    <th scope="col">Remaining</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">Timing</th>
+                    <th scope="col">
+                      <span className="sm-hint">Actions</span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {order.installments.map((inst) => (
+                    <tr key={inst.id}>
+                      <td>{inst.installment_number}</td>
+                      <td>{inst.due_date_display}</td>
+                      <td>
+                        <MoneyCell
+                          currency={order.currency_code}
+                          minor={inst.amount_minor}
+                        />
+                      </td>
+                      <td>
+                        <MoneyCell
+                          currency={order.currency_code}
+                          minor={inst.paid_amount_minor}
+                        />
+                      </td>
+                      <td>
+                        <MoneyCell
+                          currency={order.currency_code}
+                          minor={inst.amount_minor - inst.paid_amount_minor}
+                        />
+                      </td>
+                      <td>
+                        <StatusBadge status={inst.status} />
+                      </td>
+                      <td>{installmentTiming(inst)}</td>
+                      <td>
+                        {inst.status !== "paid" ? (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => setEditInstallment(inst)}
+                          >
+                            Edit due date
+                          </Button>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </Card>
         <Card
           title="Invoices"
@@ -854,9 +1054,164 @@ export function OrderDetailSection({ id }: { id: string }) {
             onClose={() => setInvoiceId(null)}
           />
         ) : null}
+        {editInstallment ? (
+          <EditInstallmentDialog
+            orderId={order.id}
+            installment={editInstallment}
+            currency={order.currency_code}
+            onClose={() => setEditInstallment(null)}
+          />
+        ) : null}
       </DetailLayout>
     </section>
   );
+}
+
+/** Early / on-time / late vs the due date (ADR-0009). */
+function installmentTiming(i: OrderInstallmentDto): string {
+  if (i.status === "paid" && i.paid_at) {
+    const paidDay = i.paid_at.slice(0, 10);
+    if (paidDay < i.due_date) return "Early";
+    if (paidDay === i.due_date) return "On time";
+    return "Late";
+  }
+  if (i.status === "overdue") return "Overdue";
+  const today = new Date().toISOString().slice(0, 10);
+  if (i.due_date < today) return "Overdue";
+  return "—";
+}
+
+/* ------------------------------------------------------------------ */
+/* Edit installment due date — PATCH .../installments/:id              */
+/* ------------------------------------------------------------------ */
+function EditInstallmentDialog({
+  orderId,
+  installment,
+  currency,
+  onClose,
+}: {
+  orderId: string;
+  installment: OrderInstallmentDto;
+  currency: string;
+  onClose: () => void;
+}) {
+  const [dueDate, setDueDate] = useState(installment.due_date_display);
+  const [notes, setNotes] = useState(installment.notes ?? "");
+  const [error, setError] = useState<string | null>(null);
+
+  const mutation = useAdminMutation<OrderInstallmentDto, Record<string, unknown>>({
+    mutationFn: (body) =>
+      apiRequest<OrderInstallmentDto>(
+        `/api/v1/admin/orders/${orderId}/installments/${installment.id}`,
+        { method: "PATCH", body: JSON.stringify(body) },
+      ),
+    invalidateKeys: [listKey("orders"), detailKey("orders", orderId)],
+    successTitle: "Installment updated",
+    onSuccess: () => onClose(),
+  });
+
+  const onSubmit = (e: FormEvent) => {
+    e.preventDefault();
+    const iso = ddmmyyyyToIso(dueDate);
+    if (!iso) {
+      setError("Due date must be DD/MM/YYYY.");
+      return;
+    }
+    setError(null);
+    mutation.mutate({
+      due_date: iso,
+      notes: notes.trim() === "" ? null : notes.trim(),
+    });
+  };
+
+  return (
+    <Dialog
+      open
+      onClose={onClose}
+      title={`Edit installment #${installment.installment_number}`}
+      size="md"
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            variant="accent"
+            type="submit"
+            form="edit-installment-form"
+            loading={mutation.isPending}
+          >
+            Save changes
+          </Button>
+        </>
+      }
+    >
+      <form id="edit-installment-form" onSubmit={onSubmit} aria-label="Edit installment">
+        {mutation.isError ? (
+          <Alert variant="danger">
+            {mutation.error instanceof Error
+              ? mutation.error.message
+              : "Could not save the installment."}
+          </Alert>
+        ) : null}
+        <Field label="Due date" required hint="DD/MM/YYYY." error={error ?? ""}>
+          <Input
+            value={dueDate}
+            onChange={(e) => setDueDate(e.target.value)}
+            placeholder="15/11/2026"
+            maxLength={10}
+          />
+        </Field>
+        <Field label="Amount (read-only)">
+          <Input
+            value={formatMinorMoney(installment.amount_minor, currency)}
+            disabled
+          />
+        </Field>
+        <Field label="Notes">
+          <Textarea
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+            maxLength={1000}
+          />
+        </Field>
+      </form>
+    </Dialog>
+  );
+}
+
+/** Strict DD/MM/YYYY → YYYY-MM-DD (null when invalid). Mirrors the
+ *  server's strict date parser; never uses Date.parse. */
+export function ddmmyyyyToIso(value: string): string | null {
+  const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(value.trim());
+  if (!m) return null;
+  const day = Number(m[1]);
+  const month = Number(m[2]);
+  const year = Number(m[3]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const d = new Date(Date.UTC(year, month - 1, day));
+  if (
+    d.getUTCFullYear() !== year ||
+    d.getUTCMonth() !== month - 1 ||
+    d.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return `${m[3]}-${m[2]}-${m[1]}`;
+}
+
+/** YYYY-MM-DD → DD/MM/YYYY for display in date inputs. */
+export function isoToDdmmyyyy(value: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
+  if (!m) return value;
+  return `${m[3]}/${m[2]}/${m[1]}`;
+}
+
+/** Today as DD/MM/YYYY in the browser's local date. */
+export function todayDdmmyyyy(): string {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -958,6 +1313,1093 @@ function InvoiceDetailDialog({
           ) : null}
         </div>
       )}
+    </Dialog>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Create Order wizard — POST /api/v1/admin/orders (orders.manage)     */
+/*                                                                     */
+/* Steps: (1) Customer — existing or inline new (same fields +        */
+/* dedupe as Add Customer); (2) Item — package or custom offer;        */
+/* (3) Payment plan — full / advance+rest / equal installments;        */
+/* (4) Activation policy + payment method + optional first payment;    */
+/* (5) Review → create.                                                */
+/*                                                                     */
+/* The wizard never bypasses verification: an optional first payment   */
+/* is recorded as a staff claim AFTER the order is created, and still  */
+/* needs approval in Payment Review. The order starts                   */
+/* awaiting_payment/unpaid.                                            */
+/* ------------------------------------------------------------------ */
+interface WizardProductDto {
+  id: string;
+  name: string;
+  status: string;
+}
+
+interface WizardPaymentMethodDto {
+  id: string;
+  display_name: string;
+  is_enabled: boolean;
+  method_kind: string;
+}
+
+interface WizardPrefill {
+  customerId: string | null;
+  leadId: string | null;
+}
+
+interface PlanPreviewRow {
+  n: number;
+  amount: number;
+  due: string;
+}
+
+function parseFeatureValue(raw: string): unknown {
+  const v = raw.trim();
+  if (v === "true") return true;
+  if (v === "false") return false;
+  if (/^-?\d+$/.test(v)) return Number(v);
+  return v;
+}
+
+function addDaysIso(isoDate: string, days: number): string {
+  const d = new Date(`${isoDate}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function CreateOrderWizard({
+  prefill,
+  onClose,
+  onCreated,
+}: {
+  prefill: WizardPrefill | null;
+  onClose: () => void;
+  onCreated: (orderId: string) => void;
+}) {
+  const [step, setStep] = useState(1);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [createdOrderId, setCreatedOrderId] = useState<string | null>(null);
+
+  /* Step 1 — customer */
+  const [customerMode, setCustomerMode] = useState<"existing" | "new">("existing");
+  const [customerId, setCustomerId] = useState(prefill?.customerId ?? "");
+  const [customerSearch, setCustomerSearch] = useState("");
+  const [newCustomer, setNewCustomer] = useState<CustomerFormValues>(emptyCustomerForm);
+  const [customerErrors, setCustomerErrors] = useState<Record<string, string>>({});
+  const customersQuery = useAdminList<CustomerDto>("customers", "/api/v1/admin/customers");
+  const customerOptions = (customersQuery.data ?? []).filter((c) => {
+    const q = customerSearch.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      c.name.toLowerCase().includes(q) ||
+      (c.email ?? "").toLowerCase().includes(q) ||
+      (c.phone ?? "").includes(q)
+    );
+  });
+
+  /* Step 2 — item */
+  const [itemKind, setItemKind] = useState<"package" | "custom">("package");
+  const [productId, setProductId] = useState("");
+  const [packageId, setPackageId] = useState("");
+  const [priceId, setPriceId] = useState("");
+  const [customLabel, setCustomLabel] = useState("");
+  const [customPrice, setCustomPrice] = useState("");
+  const [customPriceKind, setCustomPriceKind] = useState<
+    "one_time" | "recurring" | "lifetime" | "free"
+  >("one_time");
+  const [customFeatures, setCustomFeatures] = useState<
+    { featureId: string; value: string }[]
+  >([{ featureId: "", value: "" }]);
+  const [quantity, setQuantity] = useState("1");
+  const [discount, setDiscount] = useState("0");
+  const [tax, setTax] = useState("0");
+  const [notes, setNotes] = useState("");
+  const [itemErrors, setItemErrors] = useState<Record<string, string>>({});
+  const productsQuery = useAdminList<WizardProductDto>("products", "/api/v1/admin/products");
+  const packagesQuery = useQuery({
+    queryKey: ["admin", "products", productId, "packages"],
+    queryFn: async () => {
+      const res = await apiRequest<{ items: PackageDto[] }>(
+        `/api/v1/admin/products/${productId}/packages`,
+      );
+      return res.items;
+    },
+    enabled: productId !== "" && itemKind === "package",
+  });
+  const selectedPackage = (packagesQuery.data ?? []).find((p) => p.id === packageId);
+  const publishedVersion = selectedPackage?.versions.find(
+    (v) => v.status === "published",
+  );
+  const pricesQuery = useQuery({
+    queryKey: ["admin", "package-versions", publishedVersion?.id, "prices"],
+    queryFn: async () => {
+      const res = await apiRequest<{ items: PackagePriceDto[] }>(
+        `/api/v1/admin/package-versions/${publishedVersion!.id}/prices`,
+      );
+      return res.items;
+    },
+    enabled: Boolean(publishedVersion),
+  });
+  const featuresQuery = useQuery({
+    queryKey: ["admin", "products", productId, "features"],
+    queryFn: async () => {
+      const res = await apiRequest<{ items: FeatureDto[] }>(
+        `/api/v1/admin/products/${productId}/features`,
+      );
+      return res.items;
+    },
+    enabled: productId !== "" && itemKind === "custom",
+  });
+  const selectedPrice = (pricesQuery.data ?? []).find((p) => p.id === priceId);
+
+  /* Step 3 — plan */
+  const [planKind, setPlanKind] = useState<"full" | "advance_rest" | "equal_installments">(
+    "full",
+  );
+  const [dueDate, setDueDate] = useState(todayDdmmyyyy());
+  const [advanceAmount, setAdvanceAmount] = useState("");
+  const [advancePercent, setAdvancePercent] = useState("");
+  const [restDueDate, setRestDueDate] = useState("");
+  const [installmentCount, setInstallmentCount] = useState("3");
+  const [intervalDays, setIntervalDays] = useState("30");
+  const [startDate, setStartDate] = useState(todayDdmmyyyy());
+  const [planErrors, setPlanErrors] = useState<Record<string, string>>({});
+
+  /* Step 4 — activation + method + first payment */
+  const [activationMode, setActivationMode] = useState<
+    "on_full_payment" | "on_percent" | "on_date"
+  >("on_full_payment");
+  const [activationPercent, setActivationPercent] = useState("50");
+  const [activationDate, setActivationDate] = useState("");
+  const [suspendOnMissed, setSuspendOnMissed] = useState(false);
+  const [graceDays, setGraceDays] = useState("3");
+  const [paymentMethodId, setPaymentMethodId] = useState("");
+  const [firstPaymentAmount, setFirstPaymentAmount] = useState("");
+  const [firstPaymentSender, setFirstPaymentSender] = useState("");
+  const [firstPaymentPhone, setFirstPaymentPhone] = useState("");
+  const [firstPaymentRef, setFirstPaymentRef] = useState("");
+  const [firstPaymentDate, setFirstPaymentDate] = useState("");
+  const [step4Errors, setStep4Errors] = useState<Record<string, string>>({});
+  const methodsQuery = useAdminList<WizardPaymentMethodDto>(
+    "payment-methods",
+    "/api/v1/admin/payment-methods",
+  );
+  const enabledMethods = (methodsQuery.data ?? []).filter((m) => m.is_enabled);
+
+  /* Derived totals (same formula the server uses: unit × qty − discount
+   * + tax). The review shows the estimated total; the created order's
+   * authoritative total comes from the server. */
+  const unitAmount =
+    itemKind === "package"
+      ? (selectedPrice?.amount_minor ?? 0)
+      : Number(customPrice) || 0;
+  const qty = Number(quantity) || 0;
+  const discountMinor = Number(discount) || 0;
+  const taxMinor = Number(tax) || 0;
+  const estimatedTotal = Math.max(0, unitAmount * qty - discountMinor + taxMinor);
+
+  const planPreview: PlanPreviewRow[] = (() => {
+    if (estimatedTotal <= 0) return [];
+    if (planKind === "full") {
+      return [{ n: 1, amount: estimatedTotal, due: dueDate }];
+    }
+    if (planKind === "advance_rest") {
+      const advance = advanceAmount.trim()
+        ? Number(advanceAmount)
+        : Math.round((estimatedTotal * (Number(advancePercent) || 0)) / 100);
+      if (!Number.isInteger(advance) || advance <= 0 || advance >= estimatedTotal) return [];
+      return [
+        { n: 1, amount: advance, due: todayDdmmyyyy() },
+        { n: 2, amount: estimatedTotal - advance, due: restDueDate },
+      ];
+    }
+    const count = Number(installmentCount) || 0;
+    const interval = Number(intervalDays) || 0;
+    const startIso = ddmmyyyyToIso(startDate);
+    if (count < 2 || interval < 1 || !startIso) return [];
+    const part = Math.floor(estimatedTotal / count);
+    return Array.from({ length: count }, (_, i) => ({
+      n: i + 1,
+      amount: i === count - 1 ? estimatedTotal - part * (count - 1) : part,
+      due: isoToDdmmyyyy(addDaysIso(startIso, i * interval)),
+    }));
+  })();
+
+  const validateStep = (s: number): boolean => {
+    if (s === 1) {
+      if (customerMode === "existing") {
+        if (!customerId) {
+          setCustomerErrors({ customer: "Choose a customer, or switch to New customer." });
+          return false;
+        }
+        setCustomerErrors({});
+        return true;
+      }
+      const next = validateCustomerForm(newCustomer);
+      setCustomerErrors(next);
+      return Object.keys(next).length === 0;
+    }
+    if (s === 2) {
+      const next: Record<string, string> = {};
+      if (!productId) next.product = "Choose a product.";
+      if (itemKind === "package") {
+        if (!packageId) next.package = "Choose a package.";
+        else if (!publishedVersion) next.package = "This package has no published version.";
+        if (!priceId) next.price = "Choose a price.";
+      } else {
+        if (customLabel.trim().length < 2) next.customLabel = "Label must be at least 2 characters.";
+        if (!Number.isInteger(Number(customPrice)) || Number(customPrice) < 0)
+          next.customPrice = "Enter the price in minor units (0 or more).";
+        if (customFeatures.filter((f) => f.featureId).length < 1)
+          next.customFeatures = "Pick at least one feature for the custom offer.";
+      }
+      if (!Number.isInteger(qty) || qty < 1 || qty > 100)
+        next.quantity = "Quantity must be 1–100.";
+      if (!Number.isInteger(discountMinor) || discountMinor < 0)
+        next.discount = "Discount must be 0 or more (minor units).";
+      if (!Number.isInteger(taxMinor) || taxMinor < 0)
+        next.tax = "Tax must be 0 or more (minor units).";
+      setItemErrors(next);
+      return Object.keys(next).length === 0;
+    }
+    if (s === 3) {
+      const next: Record<string, string> = {};
+      if (planKind === "full") {
+        if (!ddmmyyyyToIso(dueDate)) next.dueDate = "Due date must be DD/MM/YYYY.";
+      } else if (planKind === "advance_rest") {
+        const hasAmount = advanceAmount.trim() !== "";
+        const hasPercent = advancePercent.trim() !== "";
+        if (hasAmount === hasPercent)
+          next.advance = "Enter an advance amount OR a percent, not both.";
+        else if (hasAmount && (!Number.isInteger(Number(advanceAmount)) || Number(advanceAmount) <= 0))
+          next.advance = "Advance amount must be a positive integer (minor units).";
+        else if (hasPercent && (!Number.isInteger(Number(advancePercent)) || Number(advancePercent) < 1 || Number(advancePercent) > 99))
+          next.advance = "Advance percent must be 1–99.";
+        else if (hasAmount && Number(advanceAmount) >= estimatedTotal)
+          next.advance = "Advance must be less than the order total.";
+        if (!ddmmyyyyToIso(restDueDate)) next.restDueDate = "Rest due date must be DD/MM/YYYY.";
+      } else {
+        if (!Number.isInteger(Number(installmentCount)) || Number(installmentCount) < 2 || Number(installmentCount) > 24)
+          next.installmentCount = "Installments must be 2–24.";
+        if (!Number.isInteger(Number(intervalDays)) || Number(intervalDays) < 1 || Number(intervalDays) > 365)
+          next.intervalDays = "Interval must be 1–365 days.";
+        if (!ddmmyyyyToIso(startDate)) next.startDate = "Start date must be DD/MM/YYYY.";
+      }
+      setPlanErrors(next);
+      return Object.keys(next).length === 0;
+    }
+    if (s === 4) {
+      const next: Record<string, string> = {};
+      if (activationMode === "on_percent") {
+        if (!Number.isInteger(Number(activationPercent)) || Number(activationPercent) < 1 || Number(activationPercent) > 100)
+          next.activationPercent = "Percent must be 1–100.";
+      }
+      if (activationMode === "on_date" && !ddmmyyyyToIso(activationDate))
+        next.activationDate = "Activation date must be DD/MM/YYYY.";
+      if (!Number.isInteger(Number(graceDays)) || Number(graceDays) < 0 || Number(graceDays) > 90)
+        next.graceDays = "Grace days must be 0–90.";
+      const firstAmount = firstPaymentAmount.trim() === "" ? 0 : Number(firstPaymentAmount);
+      if (firstPaymentAmount.trim() !== "" && (!Number.isInteger(firstAmount) || firstAmount <= 0))
+        next.firstPaymentAmount = "First payment must be a positive amount (minor units).";
+      else if (firstAmount > 0 && !paymentMethodId)
+        next.paymentMethod = "Choose a payment method for the first payment.";
+      if (firstAmount > 0 && firstPaymentPhone.trim() !== "" && firstPaymentPhone.trim().length < 6)
+        next.firstPaymentPhone = "Phone must be at least 6 characters.";
+      if (firstAmount > 0 && firstPaymentDate.trim() !== "" && !/^\d{2}\/\d{2}\/\d{4}$/.test(firstPaymentDate.trim()))
+        next.firstPaymentDate = "Use DD/MM/YYYY.";
+      setStep4Errors(next);
+      return Object.keys(next).length === 0;
+    }
+    return true;
+  };
+
+  const create = async () => {
+    if (!validateStep(4)) {
+      setStep(4);
+      return;
+    }
+    setFormError(null);
+    setCreating(true);
+    try {
+      const planBody: Record<string, unknown> =
+        planKind === "full"
+          ? { kind: "full", due_date: ddmmyyyyToIso(dueDate) }
+          : planKind === "advance_rest"
+            ? {
+                kind: "advance_rest",
+                ...(advanceAmount.trim()
+                  ? { advance_amount_minor: Number(advanceAmount) }
+                  : { advance_percent: Number(advancePercent) }),
+                rest_due_date: ddmmyyyyToIso(restDueDate),
+              }
+            : {
+                kind: "equal_installments",
+                installment_count: Number(installmentCount),
+                interval_days: Number(intervalDays),
+                start_date: ddmmyyyyToIso(startDate),
+              };
+      const body: Record<string, unknown> = {
+        ...(customerMode === "existing"
+          ? { customer_id: customerId }
+          : { new_customer: customerFormToCreateBody(newCustomer) }),
+        product_id: productId,
+        item_kind: itemKind,
+        ...(itemKind === "package"
+          ? {
+              package_version_id: publishedVersion!.id,
+              package_price_id: priceId,
+            }
+          : {
+              custom_offer: {
+                label: customLabel.trim(),
+                price_kind: customPriceKind,
+                unit_amount_minor: Number(customPrice),
+                currency_code: "BDT",
+                activation_limit: 1,
+                features: customFeatures
+                  .filter((f) => f.featureId)
+                  .map((f) => ({
+                    product_feature_id: f.featureId,
+                    entitlement_value: parseFeatureValue(f.value),
+                  })),
+              },
+            }),
+        quantity: qty,
+        discount_minor: discountMinor,
+        tax_minor: taxMinor,
+        ...(notes.trim() ? { internal_note: notes.trim() } : {}),
+        ...(paymentMethodId ? { payment_method_id: paymentMethodId } : {}),
+        payment_plan: planBody,
+        activation_mode: activationMode,
+        ...(activationMode === "on_percent"
+          ? { activation_percent: Number(activationPercent) }
+          : {}),
+        ...(activationMode === "on_date"
+          ? { activation_date: ddmmyyyyToIso(activationDate) }
+          : {}),
+        suspend_on_missed_schedule: suspendOnMissed,
+        grace_days: Number(graceDays),
+        ...(prefill?.leadId ? { lead_id: prefill.leadId } : {}),
+      };
+      const created = await apiRequest<OrderDto>("/api/v1/admin/orders", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      // Optional first payment — a second request, recorded as a staff
+      // claim (never auto-approved). The order exists even if the claim
+      // fails; the error is shown and the order can be opened.
+      const firstAmount =
+        firstPaymentAmount.trim() === "" ? 0 : Number(firstPaymentAmount);
+      if (firstAmount > 0) {
+        try {
+          await apiRequest(`/api/v1/admin/orders/${created.id}/payment-submissions`, {
+            method: "POST",
+            body: JSON.stringify({
+              payment_method_id: paymentMethodId,
+              amount_minor: firstAmount,
+              currency_code: created.currency_code,
+              ...(firstPaymentSender.trim()
+                ? { sender_name: firstPaymentSender.trim() }
+                : {}),
+              ...(firstPaymentPhone.trim()
+                ? { sender_phone: firstPaymentPhone.trim() }
+                : {}),
+              ...(firstPaymentRef.trim()
+                ? { transaction_id: firstPaymentRef.trim() }
+                : {}),
+              ...(firstPaymentDate.trim()
+                ? { payment_date_display: firstPaymentDate.trim() }
+                : {}),
+            }),
+          });
+        } catch (err) {
+          setCreatedOrderId(created.id);
+          setFormError(
+            `Order ${created.order_number} was created, but the first payment claim failed: ${err instanceof Error ? err.message : "Request failed"}. Open the order to record it from Payment Review.`,
+          );
+          setCreating(false);
+          return;
+        }
+      }
+      void queryClient.invalidateQueries({ queryKey: listKey("orders") });
+      onCreated(created.id);
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : "Could not create the order.");
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const stepTitles = [
+    "Customer",
+    "Item",
+    "Payment plan",
+    "Activation & payment",
+    "Review",
+  ];
+  const selectedCustomer =
+    customerMode === "existing"
+      ? (customersQuery.data ?? []).find((c) => c.id === customerId) ?? null
+      : null;
+
+  return (
+    <Dialog
+      open
+      onClose={onClose}
+      title="Create order"
+      size="md"
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          {step > 1 ? (
+            <Button variant="secondary" onClick={() => setStep(step - 1)}>
+              Back
+            </Button>
+          ) : null}
+          {step < 5 ? (
+            <Button
+              variant="accent"
+              onClick={() => {
+                if (validateStep(step)) setStep(step + 1);
+              }}
+            >
+              Continue
+            </Button>
+          ) : (
+            <Button variant="primary" loading={creating} onClick={() => void create()}>
+              Create order
+            </Button>
+          )}
+        </>
+      }
+    >
+      <p className="sm-hint">
+        Step {step} of 5 — {stepTitles[step - 1]}
+      </p>
+      {formError ? (
+        <div style={{ marginTop: 12 }}>
+          <Alert variant="danger">{formError}</Alert>
+          {createdOrderId ? (
+            <div style={{ marginTop: 12 }}>
+              <Button
+                variant="secondary"
+                onClick={() => onCreated(createdOrderId)}
+              >
+                Open order
+              </Button>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      {step === 1 ? (
+        <div style={{ marginTop: 12 }}>
+          <Field label="Customer">
+            <Select
+              value={customerMode}
+              onChange={(e) => setCustomerMode(e.target.value as "existing" | "new")}
+            >
+              <option value="existing">Existing customer</option>
+              <option value="new">New customer</option>
+            </Select>
+          </Field>
+          {customerMode === "existing" ? (
+            <>
+              <Field label="Search customers">
+                <Input
+                  value={customerSearch}
+                  onChange={(e) => setCustomerSearch(e.target.value)}
+                  placeholder="Name, email or phone"
+                  autoComplete="off"
+                />
+              </Field>
+              <Field
+                label="Customer"
+                required
+                error={customerErrors.customer ?? ""}
+              >
+                <Select
+                  value={customerId}
+                  onChange={(e) => setCustomerId(e.target.value)}
+                  disabled={customersQuery.isPending}
+                >
+                  <option value="">Select a customer…</option>
+                  {customerOptions.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                      {c.email ? ` — ${c.email}` : ""}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+              {prefill?.leadId ? (
+                <p className="sm-hint">
+                  Converting lead — the lead becomes converted when this order
+                  is created.
+                </p>
+              ) : null}
+            </>
+          ) : (
+            <CustomerFormFields
+              values={newCustomer}
+              onChange={(patch) => setNewCustomer((v) => ({ ...v, ...patch }))}
+              errors={customerErrors}
+              idPrefix="wizard-new-customer"
+            />
+          )}
+        </div>
+      ) : null}
+
+      {step === 2 ? (
+        <div style={{ marginTop: 12 }}>
+          <Field label="Item type">
+            <Select
+              value={itemKind}
+              onChange={(e) => {
+                setItemKind(e.target.value as "package" | "custom");
+                setPackageId("");
+                setPriceId("");
+              }}
+            >
+              <option value="package">Published package</option>
+              <option value="custom">Custom offer</option>
+            </Select>
+          </Field>
+          <Field label="Product" required error={itemErrors.product ?? ""}>
+            <Select
+              value={productId}
+              onChange={(e) => {
+                setProductId(e.target.value);
+                setPackageId("");
+                setPriceId("");
+                setCustomFeatures([{ featureId: "", value: "" }]);
+              }}
+              disabled={productsQuery.isPending}
+            >
+              <option value="">Select a product…</option>
+              {(productsQuery.data ?? [])
+                .filter((p) => p.status === "active")
+                .map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+            </Select>
+          </Field>
+          {itemKind === "package" ? (
+            <>
+              <Field label="Package" required error={itemErrors.package ?? ""}>
+                <Select
+                  value={packageId}
+                  onChange={(e) => {
+                    setPackageId(e.target.value);
+                    setPriceId("");
+                  }}
+                  disabled={!productId || packagesQuery.isPending}
+                >
+                  <option value="">Select a package…</option>
+                  {(packagesQuery.data ?? [])
+                    .filter((p) => p.status === "active")
+                    .map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name}
+                      </option>
+                    ))}
+                </Select>
+              </Field>
+              {packageId && !publishedVersion ? (
+                <Alert variant="warning">
+                  This package has no published version — publish one before
+                  ordering it.
+                </Alert>
+              ) : null}
+              <Field label="Price" required error={itemErrors.price ?? ""}>
+                <Select
+                  value={priceId}
+                  onChange={(e) => setPriceId(e.target.value)}
+                  disabled={!publishedVersion || pricesQuery.isPending}
+                >
+                  <option value="">Select a price…</option>
+                  {(pricesQuery.data ?? [])
+                    .filter((p) => p.status === "active")
+                    .map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {formatMinorMoney(p.amount_minor, p.currency_code)}
+                        {p.price_kind === "recurring" && p.interval_unit
+                          ? ` / ${p.interval_count ?? 1} ${p.interval_unit}${(p.interval_count ?? 1) > 1 ? "s" : ""}`
+                          : ` (${p.price_kind.replace(/_/g, " ")})`}
+                      </option>
+                    ))}
+                </Select>
+              </Field>
+            </>
+          ) : (
+            <>
+              <Field label="Offer label" required error={itemErrors.customLabel ?? ""}>
+                <Input
+                  value={customLabel}
+                  onChange={(e) => setCustomLabel(e.target.value)}
+                  maxLength={160}
+                  placeholder="e.g. Custom ERP setup"
+                />
+              </Field>
+              <Field label="Price (minor units)" required error={itemErrors.customPrice ?? ""}>
+                <Input
+                  inputMode="numeric"
+                  value={customPrice}
+                  onChange={(e) => setCustomPrice(e.target.value)}
+                  placeholder="500000"
+                />
+              </Field>
+              <Field label="Billing kind">
+                <Select
+                  value={customPriceKind}
+                  onChange={(e) =>
+                    setCustomPriceKind(
+                      e.target.value as "one_time" | "recurring" | "lifetime" | "free",
+                    )
+                  }
+                >
+                  <option value="one_time">One-time</option>
+                  <option value="recurring">Recurring</option>
+                  <option value="lifetime">Lifetime</option>
+                  <option value="free">Free</option>
+                </Select>
+              </Field>
+              <Field
+                label="Features"
+                hint="At least one feature from this product, with its entitlement value (true/false, a number, or text)."
+                error={itemErrors.customFeatures ?? ""}
+              >
+                <div>
+                  {customFeatures.map((f, i) => (
+                    <div key={i} className="sm-form-grid" style={{ marginTop: i > 0 ? 8 : 0 }}>
+                      <Select
+                        value={f.featureId}
+                        onChange={(e) =>
+                          setCustomFeatures((rows) =>
+                            rows.map((r, j) =>
+                              j === i ? { ...r, featureId: e.target.value } : r,
+                            ),
+                          )
+                        }
+                        disabled={!productId || featuresQuery.isPending}
+                        aria-label="Feature"
+                      >
+                        <option value="">Select a feature…</option>
+                        {(featuresQuery.data ?? [])
+                          .filter((feat) => feat.status === "active")
+                          .map((feat) => (
+                            <option key={feat.id} value={feat.id}>
+                              {feat.name} ({feat.value_type})
+                            </option>
+                          ))}
+                      </Select>
+                      <Input
+                        value={f.value}
+                        onChange={(e) =>
+                          setCustomFeatures((rows) =>
+                            rows.map((r, j) =>
+                              j === i ? { ...r, value: e.target.value } : r,
+                            ),
+                          )
+                        }
+                        placeholder="Value"
+                        aria-label="Entitlement value"
+                      />
+                    </div>
+                  ))}
+                  <div style={{ marginTop: 8 }}>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() =>
+                        setCustomFeatures((rows) => [...rows, { featureId: "", value: "" }])
+                      }
+                    >
+                      Add feature
+                    </Button>
+                  </div>
+                </div>
+              </Field>
+            </>
+          )}
+          <Field label="Quantity" required error={itemErrors.quantity ?? ""}>
+            <Input
+              inputMode="numeric"
+              value={quantity}
+              onChange={(e) => setQuantity(e.target.value)}
+            />
+          </Field>
+          <Field label="Discount (minor units)" error={itemErrors.discount ?? ""}>
+            <Input
+              inputMode="numeric"
+              value={discount}
+              onChange={(e) => setDiscount(e.target.value)}
+            />
+          </Field>
+          <Field label="Tax (minor units)" error={itemErrors.tax ?? ""}>
+            <Input
+              inputMode="numeric"
+              value={tax}
+              onChange={(e) => setTax(e.target.value)}
+            />
+          </Field>
+          <Field label="Internal notes">
+            <Textarea
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              maxLength={2000}
+            />
+          </Field>
+        </div>
+      ) : null}
+
+      {step === 3 ? (
+        <div style={{ marginTop: 12 }}>
+          <p className="sm-hint">
+            Estimated total {formatMinorMoney(estimatedTotal, "BDT")} — the plan
+            below is built from it.
+          </p>
+          <Field label="Payment plan">
+            <Select
+              value={planKind}
+              onChange={(e) =>
+                setPlanKind(e.target.value as "full" | "advance_rest" | "equal_installments")
+              }
+            >
+              <option value="full">One-time full payment</option>
+              <option value="advance_rest">Advance + rest</option>
+              <option value="equal_installments">Equal installments</option>
+            </Select>
+          </Field>
+          {planKind === "full" ? (
+            <Field label="Due date" required hint="DD/MM/YYYY." error={planErrors.dueDate ?? ""}>
+              <Input
+                value={dueDate}
+                onChange={(e) => setDueDate(e.target.value)}
+                placeholder="15/11/2026"
+                maxLength={10}
+              />
+            </Field>
+          ) : null}
+          {planKind === "advance_rest" ? (
+            <>
+              <Field
+                label="Advance amount (minor units)"
+                hint="Or a percent below — one of the two."
+                error={planErrors.advance ?? ""}
+              >
+                <Input
+                  inputMode="numeric"
+                  value={advanceAmount}
+                  onChange={(e) => setAdvanceAmount(e.target.value)}
+                  placeholder="e.g. 50000"
+                />
+              </Field>
+              <Field
+                label="Advance percent"
+                hint="1–99% of the total. Leave blank when an amount is given."
+                error={planErrors.advance ?? ""}
+              >
+                <Input
+                  inputMode="numeric"
+                  value={advancePercent}
+                  onChange={(e) => setAdvancePercent(e.target.value)}
+                  placeholder="e.g. 50"
+                />
+              </Field>
+              <Field
+                label="Rest due date"
+                required
+                hint="DD/MM/YYYY."
+                error={planErrors.restDueDate ?? ""}
+              >
+                <Input
+                  value={restDueDate}
+                  onChange={(e) => setRestDueDate(e.target.value)}
+                  placeholder="15/12/2026"
+                  maxLength={10}
+                />
+              </Field>
+            </>
+          ) : null}
+          {planKind === "equal_installments" ? (
+            <>
+              <Field
+                label="Number of installments"
+                required
+                error={planErrors.installmentCount ?? ""}
+              >
+                <Input
+                  inputMode="numeric"
+                  value={installmentCount}
+                  onChange={(e) => setInstallmentCount(e.target.value)}
+                />
+              </Field>
+              <Field
+                label="Every X days"
+                required
+                error={planErrors.intervalDays ?? ""}
+              >
+                <Input
+                  inputMode="numeric"
+                  value={intervalDays}
+                  onChange={(e) => setIntervalDays(e.target.value)}
+                />
+              </Field>
+              <Field
+                label="Start date"
+                required
+                hint="DD/MM/YYYY — the first installment is due on this date."
+                error={planErrors.startDate ?? ""}
+              >
+                <Input
+                  value={startDate}
+                  onChange={(e) => setStartDate(e.target.value)}
+                  placeholder="15/11/2026"
+                  maxLength={10}
+                />
+              </Field>
+            </>
+          ) : null}
+          {planPreview.length > 0 ? (
+            <Card title="Installment preview">
+              <div className="sm-table-wrap">
+                <table className="sm-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">#</th>
+                      <th scope="col">Due</th>
+                      <th scope="col">Amount</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {planPreview.map((row) => (
+                      <tr key={row.n}>
+                        <td>{row.n}</td>
+                        <td>{row.due}</td>
+                        <td>{formatMinorMoney(row.amount, "BDT")}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          ) : null}
+        </div>
+      ) : null}
+
+      {step === 4 ? (
+        <div style={{ marginTop: 12 }}>
+          <Field label="License activation">
+            <Select
+              value={activationMode}
+              onChange={(e) =>
+                setActivationMode(
+                  e.target.value as "on_full_payment" | "on_percent" | "on_date",
+                )
+              }
+            >
+              <option value="on_full_payment">On full payment</option>
+              <option value="on_percent">On X% paid</option>
+              <option value="on_date">On a fixed date</option>
+            </Select>
+          </Field>
+          {activationMode === "on_percent" ? (
+            <Field
+              label="Activation percent"
+              required
+              hint="The license activates once this much of the total is paid."
+              error={step4Errors.activationPercent ?? ""}
+            >
+              <Input
+                inputMode="numeric"
+                value={activationPercent}
+                onChange={(e) => setActivationPercent(e.target.value)}
+              />
+            </Field>
+          ) : null}
+          {activationMode === "on_date" ? (
+            <Field
+              label="Activation date"
+              required
+              hint="DD/MM/YYYY — activates on this date regardless of payment."
+              error={step4Errors.activationDate ?? ""}
+            >
+              <Input
+                value={activationDate}
+                onChange={(e) => setActivationDate(e.target.value)}
+                placeholder="01/12/2026"
+                maxLength={10}
+              />
+            </Field>
+          ) : null}
+          <Checkbox
+            label="Suspend license when an installment passes its due date unpaid"
+            checked={suspendOnMissed}
+            onChange={(e) => setSuspendOnMissed(e.target.checked)}
+          />
+          {activationMode === "on_full_payment" ? (
+            <p className="sm-hint">
+              The suspend toggle has no effect before activation — the license
+              does not exist yet until the order is fully paid.
+            </p>
+          ) : null}
+          <Field
+            label="Subscription grace days"
+            hint="After a renewal is missed, the license keeps working for this many days before it is suspended."
+            error={step4Errors.graceDays ?? ""}
+          >
+            <Input
+              inputMode="numeric"
+              value={graceDays}
+              onChange={(e) => setGraceDays(e.target.value)}
+            />
+          </Field>
+          <CollapsibleSection title="Payment method & first payment (optional)">
+            <Field label="Payment method" error={step4Errors.paymentMethod ?? ""}>
+              <Select
+                value={paymentMethodId}
+                onChange={(e) => setPaymentMethodId(e.target.value)}
+                disabled={methodsQuery.isPending}
+              >
+                <option value="">No method yet</option>
+                {enabledMethods.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.display_name}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field
+              label="First payment amount (minor units)"
+              hint="Recorded as a claim after the order is created — it still needs approval in Payment Review."
+              error={step4Errors.firstPaymentAmount ?? ""}
+            >
+              <Input
+                inputMode="numeric"
+                value={firstPaymentAmount}
+                onChange={(e) => setFirstPaymentAmount(e.target.value)}
+                placeholder="Leave blank for no first payment"
+              />
+            </Field>
+            <Field label="Sender name">
+              <Input
+                value={firstPaymentSender}
+                onChange={(e) => setFirstPaymentSender(e.target.value)}
+              />
+            </Field>
+            <Field label="Sender phone" error={step4Errors.firstPaymentPhone ?? ""}>
+              <Input
+                value={firstPaymentPhone}
+                onChange={(e) => setFirstPaymentPhone(e.target.value)}
+                placeholder="01XXXXXXXXX"
+              />
+            </Field>
+            <Field label="Transaction reference">
+              <Input
+                value={firstPaymentRef}
+                onChange={(e) => setFirstPaymentRef(e.target.value)}
+              />
+            </Field>
+            <Field label="Payment date" hint="DD/MM/YYYY, if known." error={step4Errors.firstPaymentDate ?? ""}>
+              <Input
+                value={firstPaymentDate}
+                onChange={(e) => setFirstPaymentDate(e.target.value)}
+                placeholder="15/11/2026"
+                maxLength={10}
+              />
+            </Field>
+          </CollapsibleSection>
+        </div>
+      ) : null}
+
+      {step === 5 ? (
+        <div style={{ marginTop: 12 }}>
+          <DetailFacts
+            facts={[
+              {
+                label: "Customer",
+                value:
+                  customerMode === "existing"
+                    ? (selectedCustomer?.name ?? "—")
+                    : `${newCustomer.name.trim()} (new)`,
+              },
+              {
+                label: "Item",
+                value:
+                  itemKind === "package"
+                    ? `${selectedPackage?.name ?? "—"} — ${selectedPrice ? formatMinorMoney(selectedPrice.amount_minor, selectedPrice.currency_code) : "—"}`
+                    : `${customLabel.trim()} — ${formatMinorMoney(Number(customPrice) || 0, "BDT")}`,
+              },
+              { label: "Quantity", value: String(qty) },
+              {
+                label: "Estimated total",
+                value: formatMinorMoney(estimatedTotal, "BDT"),
+              },
+              {
+                label: "Payment plan",
+                value:
+                  planKind === "full"
+                    ? `Full — due ${dueDate}`
+                    : planKind === "advance_rest"
+                      ? `Advance + rest — rest due ${restDueDate}`
+                      : `${installmentCount} installments every ${intervalDays} days from ${startDate}`,
+              },
+              {
+                label: "Activation",
+                value:
+                  activationMode === "on_percent"
+                    ? `On ${activationPercent}% paid`
+                    : activationMode === "on_date"
+                      ? `On ${activationDate}`
+                      : "On full payment",
+              },
+              {
+                label: "First payment",
+                value:
+                  firstPaymentAmount.trim() !== ""
+                    ? `${formatMinorMoney(Number(firstPaymentAmount), "BDT")} (as a claim — needs approval)`
+                    : "None",
+              },
+            ]}
+          />
+          {planPreview.length > 0 ? (
+            <Card title="Installments">
+              <div className="sm-table-wrap">
+                <table className="sm-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">#</th>
+                      <th scope="col">Due</th>
+                      <th scope="col">Amount</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {planPreview.map((row) => (
+                      <tr key={row.n}>
+                        <td>{row.n}</td>
+                        <td>{row.due}</td>
+                        <td>{formatMinorMoney(row.amount, "BDT")}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Card>
+          ) : null}
+          <p className="sm-hint">
+            The order starts awaiting payment. A first payment above is only a
+            claim — Payment Review still has to verify it.
+          </p>
+        </div>
+      ) : null}
     </Dialog>
   );
 }

@@ -46,6 +46,11 @@ export const subscriptions = pgTable(
     // per-period amount (copied from the source order item); previously no
     // column, so a reload lost the billing amount.
     unitAmountMinor: bigint("unit_amount_minor", { mode: "number" }).notNull().default(0),
+    // Migration 0009: renewal grace in days — the window after
+    // current_period_end during which the license keeps working before the
+    // subscription goes past_due → expired and the license is suspended
+    // (ADR-0009). Copied from the source order at fulfillment; default 3.
+    graceDays: integer("grace_days").notNull().default(3),
     currentPeriodStart: timestamp("current_period_start", { withTimezone: true }),
     currentPeriodEnd: timestamp("current_period_end", { withTimezone: true }),
     nextRenewalAt: timestamp("next_renewal_at", { withTimezone: true }),

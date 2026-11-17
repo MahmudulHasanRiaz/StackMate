@@ -5,6 +5,8 @@ import {
   text,
   integer,
   bigint,
+  boolean,
+  date,
   jsonb,
   timestamp,
   unique,
@@ -15,6 +17,8 @@ import { customers } from "./customers.ts";
 import { currencies, products } from "./catalog.ts";
 import { productPackages, packageVersions, packagePrices } from "./entitlements.ts";
 import { integratedSites } from "./integrations.ts";
+import { paymentMethods } from "./payments.ts";
+import { leads } from "./leads.ts";
 
 export const orders = pgTable(
   "orders",
@@ -30,7 +34,19 @@ export const orders = pgTable(
       onDelete: "restrict",
     }),
     status: text("status").notNull().default("awaiting_payment"), // draft | awaiting_payment | processing | completed | cancelled | failed
-    paymentStatus: text("payment_status").notNull().default("unpaid"), // unpaid | pending_verification | paid | partially_refunded | refunded
+    paymentStatus: text("payment_status").notNull().default("unpaid"), // unpaid | pending_verification | partially_paid | paid | partially_refunded | refunded
+    // Migration 0009: license activation policy per order (ADR-0009) —
+    // on_full_payment | on_percent | on_date; percent 1–100; date YYYY-MM-DD.
+    activationMode: text("activation_mode").notNull().default("on_full_payment"),
+    activationPercent: integer("activation_percent"),
+    activationDate: date("activation_date"),
+    suspendOnMissedSchedule: boolean("suspend_on_missed_schedule").notNull().default(false),
+    // Renewal grace (days) for subscriptions created from this order.
+    graceDays: integer("grace_days").notNull().default(3),
+    paymentMethodId: uuid("payment_method_id").references(() => paymentMethods.id, {
+      onDelete: "set null",
+    }),
+    leadId: uuid("lead_id").references(() => leads.id, { onDelete: "set null" }),
     currencyCode: varchar("currency_code", { length: 3 })
       .notNull()
       .references(() => currencies.code, { onDelete: "restrict" }),
@@ -155,3 +171,32 @@ export const orderAdjustments = pgTable("order_adjustments", {
   calculationMetadata: jsonb("calculation_metadata").notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+// Migration 0009: payment plan — one row per installment of an order's
+// payment plan (ADR-0009). Amounts in minor units; due_date is a calendar
+// date (YYYY-MM-DD, stored as date, displayed DD/MM/YYYY). Status:
+// pending | partially_paid | paid | overdue (overdue is maintained by the
+// renewal/expiry sweep and re-derived on read — a due date that passed with
+// a remaining balance is overdue even before the sweep runs).
+export const orderInstallments = pgTable(
+  "order_installments",
+  {
+    id: uuid("id").primaryKey(),
+    orderId: uuid("order_id")
+      .notNull()
+      .references(() => orders.id, { onDelete: "cascade" }),
+    installmentNumber: integer("installment_number").notNull(),
+    amountMinor: bigint("amount_minor", { mode: "number" }).notNull(),
+    dueDate: date("due_date").notNull(),
+    status: text("status").notNull().default("pending"),
+    paidAmountMinor: bigint("paid_amount_minor", { mode: "number" }).notNull().default(0),
+    paidAt: timestamp("paid_at", { withTimezone: true }),
+    notes: text("notes"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique("uq_order_installments_number").on(table.orderId, table.installmentNumber),
+    index("idx_order_installments_order_due").on(table.orderId, table.dueDate),
+  ]
+);

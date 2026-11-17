@@ -73,6 +73,8 @@ function makeCustomer(tag: string): CustomerRecord {
     normalized_email: `perf-${tag.toLowerCase()}@stackmate.local`,
     phone: null,
     normalized_phone: null,
+    whatsapp: null,
+    credit_balance_minor: 0,
     company_name: null,
     country_code: "BD",
     status: "active",

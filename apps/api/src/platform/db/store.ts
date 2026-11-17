@@ -196,10 +196,67 @@ export interface CustomerRecord {
   normalized_email: string | null;
   phone: string | null;
   normalized_phone: string | null;
+  // Migration 0009: WhatsApp number + overpayment credit balance (minor units).
+  whatsapp: string | null;
+  credit_balance_minor: number;
   company_name: string | null;
   country_code: string;
   status: "active" | "inactive" | "blocked";
   registration_source: string;
+  notes: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Secondary email/phone of a customer (migration 0009, dedupe — ADR-0009). */
+export interface CustomerContactRecord {
+  id: string;
+  customer_id: string;
+  kind: "email" | "phone";
+  value: string;
+  normalized_value: string;
+  created_at: string;
+}
+
+/** Billing/shipping address (table since 0000; wired up in 0009). */
+export interface CustomerAddressRecord {
+  id: string;
+  customer_id: string;
+  address_type: "billing" | "shipping" | "other";
+  contact_name: string | null;
+  phone: string | null;
+  address_line_1: string | null;
+  address_line_2: string | null;
+  city: string | null;
+  state_or_region: string | null;
+  postal_code: string | null;
+  country_code: string;
+  is_default: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Staff report filed on a customer (migration 0009). */
+export interface CustomerReportRecord {
+  id: string;
+  customer_id: string;
+  author_user_id: string;
+  type: "note" | "concern";
+  detail: string;
+  created_at: string;
+}
+
+/** One installment of an order's payment plan (migration 0009). */
+export interface OrderInstallmentRecord {
+  id: string;
+  order_id: string;
+  installment_number: number;
+  amount_minor: number;
+  /** Calendar date, ISO YYYY-MM-DD. */
+  due_date: string;
+  status: "pending" | "partially_paid" | "paid" | "overdue";
+  paid_amount_minor: number;
+  paid_at: string | null;
   notes: string | null;
   created_at: string;
   updated_at: string;
@@ -256,7 +313,7 @@ export interface OrderRecord {
   source: "admin" | "website" | "api" | "import";
   integrated_site_id: string | null;
   status: "draft" | "awaiting_payment" | "processing" | "completed" | "cancelled" | "failed";
-  payment_status: "unpaid" | "pending_verification" | "paid" | "partially_refunded" | "refunded";
+  payment_status: "unpaid" | "pending_verification" | "partially_paid" | "paid" | "partially_refunded" | "refunded";
   currency_code: string;
   subtotal_minor: number;
   discount_minor: number;
@@ -267,6 +324,16 @@ export interface OrderRecord {
   items: OrderItemRecord[];
   attribution: Record<string, string | undefined> | null;
   created_by_user_id: string | null;
+  // Migration 0009: license activation policy + renewal grace + payment
+  // method + lead link (ADR-0009).
+  activation_mode: "on_full_payment" | "on_percent" | "on_date";
+  activation_percent: number | null;
+  /** Calendar date, ISO YYYY-MM-DD, or null. */
+  activation_date: string | null;
+  suspend_on_missed_schedule: boolean;
+  grace_days: number;
+  payment_method_id: string | null;
+  lead_id: string | null;
   created_at: string;
   updated_at: string;
   completed_at: string | null;
@@ -338,6 +405,7 @@ export interface PaymentSubmissionRecord {
   order_id: string;
   customer_id: string;
   payment_method_id: string;
+  installment_id: string | null;
   amount_minor: number;
   currency_code: string;
   sender_name: string | null;
@@ -411,6 +479,8 @@ export interface SubscriptionRecord {
   interval_count: number | null;
   currency_code: string;
   unit_amount_minor: number;
+  // Migration 0009: renewal grace in days (ADR-0009).
+  grace_days: number;
   current_period_start: string | null;
   current_period_end: string | null;
   next_renewal_at: string | null;
@@ -604,6 +674,101 @@ export interface AuditLogRecord {
   created_at: string;
 }
 
+/** License lifecycle event (table since 0000; wired up in 0009 — ADR-0009). */
+export interface LicenseEventRecord {
+  id: string;
+  license_id: string;
+  event_type: string;
+  actor_type: "system" | "staff" | "client";
+  actor_user_id: string | null;
+  activation_id: string | null;
+  metadata: Record<string, unknown>;
+  created_at: string;
+}
+
+/** Reminder rules singleton (migration 0009; load-only in state). */
+export interface ReminderSettingsRecord {
+  id: string;
+  due_offsets_days: number[];
+  overdue_offsets_days: number[];
+  overdue_enabled: boolean;
+  updated_at: string;
+}
+
+/** One reminder actually sent (migration 0009; sweep idempotency). */
+export interface SentReminderRecord {
+  id: string;
+  kind: SentReminderKind;
+  reference_id: string;
+  offset_days: number;
+  sent_at: string;
+}
+
+export type SentReminderKind =
+  | "installment_due"
+  | "installment_overdue"
+  | "subscription_renewal"
+  | "subscription_overdue";
+
+/** Support ticket (migration 0009). */
+export interface SupportTicketRecord {
+  id: string;
+  ticket_number: string;
+  customer_id: string | null;
+  order_id: string | null;
+  subscription_id: string | null;
+  license_id: string | null;
+  product_id: string | null;
+  title: string;
+  description: string;
+  status: "open" | "in_progress" | "waiting_on_customer" | "resolved" | "closed";
+  priority: "low" | "medium" | "high" | "urgent";
+  category: "billing" | "technical" | "license" | "order" | "other";
+  reporter_user_id: string;
+  source_note: string | null;
+  assignee_user_id: string | null;
+  created_at: string;
+  updated_at: string;
+  resolved_at: string | null;
+  closed_at: string | null;
+}
+
+export interface TicketCommentRecord {
+  id: string;
+  ticket_id: string;
+  author_user_id: string;
+  body: string;
+  is_internal: boolean;
+  created_at: string;
+}
+
+/** Lead (migration 0009). */
+export interface LeadRecord {
+  id: string;
+  lead_number: string;
+  name: string;
+  email: string | null;
+  normalized_email: string | null;
+  phone: string | null;
+  normalized_phone: string | null;
+  whatsapp: string | null;
+  source_site_id: string | null;
+  utm_source: string | null;
+  utm_medium: string | null;
+  utm_campaign: string | null;
+  interest: string | null;
+  product_id: string | null;
+  message: string | null;
+  notes: string | null;
+  status: "new" | "contacted" | "qualified" | "converted" | "lost";
+  assignee_user_id: string | null;
+  created_at: string;
+  updated_at: string;
+  converted_at: string | null;
+  converted_customer_id: string | null;
+  converted_order_id: string | null;
+}
+
 export interface DatabaseState {
   users: UserRecord[];
   sessions: SessionRecord[];
@@ -617,7 +782,11 @@ export interface DatabaseState {
   package_versions: PackageVersionRecord[];
   package_prices: PackagePriceRecord[];
   customers: CustomerRecord[];
+  customer_contacts: CustomerContactRecord[];
+  customer_addresses: CustomerAddressRecord[];
+  customer_reports: CustomerReportRecord[];
   orders: OrderRecord[];
+  order_installments: OrderInstallmentRecord[];
   invoices: InvoiceRecord[];
   payment_providers: PaymentProviderRecord[];
   payment_methods: PaymentMethodRecord[];
@@ -626,6 +795,12 @@ export interface DatabaseState {
   payment_verification_logs: PaymentVerificationLogRecord[];
   subscriptions: SubscriptionRecord[];
   licenses: LicenseRecord[];
+  license_events: LicenseEventRecord[];
+  reminder_settings: ReminderSettingsRecord[];
+  sent_reminders: SentReminderRecord[];
+  support_tickets: SupportTicketRecord[];
+  ticket_comments: TicketCommentRecord[];
+  leads: LeadRecord[];
   integrated_sites: IntegratedSiteRecord[];
   site_credentials: SiteCredentialRecord[];
   request_nonces: Array<{ credential_id: string; nonce: string; expires_at: string }>;
@@ -656,6 +831,8 @@ export interface DatabaseState {
     invoice: number;
     subscription: number;
     license: number;
+    ticket: number;
+    lead: number;
   };
 }
 
@@ -707,7 +884,11 @@ export class StackMateDataStore {
       package_versions: [],
       package_prices: [],
       customers: [],
+      customer_contacts: [],
+      customer_addresses: [],
+      customer_reports: [],
       orders: [],
+      order_installments: [],
       invoices: [],
       payment_providers: SEED_PAYMENT_PROVIDERS.map((p) => ({ ...p })),
       payment_methods: [],
@@ -716,6 +897,12 @@ export class StackMateDataStore {
       payment_verification_logs: [],
       subscriptions: [],
       licenses: [],
+      license_events: [],
+      reminder_settings: [],
+      sent_reminders: [],
+      support_tickets: [],
+      ticket_comments: [],
+      leads: [],
       integrated_sites: [],
       site_credentials: [],
       request_nonces: [],
@@ -733,6 +920,8 @@ export class StackMateDataStore {
         invoice: 20000,
         subscription: 30000,
         license: 40000,
+        ticket: 50000,
+        lead: 60000,
       },
     };
   }
