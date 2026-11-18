@@ -1648,10 +1648,25 @@ function CreateOrderWizard({
                 activation_limit: 1,
                 features: customFeatures
                   .filter((f) => f.featureId)
-                  .map((f) => ({
-                    product_feature_id: f.featureId,
-                    entitlement_value: parseFeatureValue(f.value),
-                  })),
+                  .map((f) => {
+                    // Entitlement values are STRUCTURED { value_type, value }
+                    // (validateFeatureEntitlementValue, contracts catalog.ts):
+                    // the wizard used to send the bare parseFeatureValue
+                    // result, which the server rejected with a plain-Error
+                    // 500 on every custom-offer create (live defect
+                    // 2026-11-18). The feature's value_type comes from the
+                    // loaded product features; quota/metered defaults
+                    // (period month, overage block) are filled server-side.
+                    const feat = (featuresQuery.data ?? []).find(
+                      (x) => x.id === f.featureId,
+                    );
+                    return {
+                      product_feature_id: f.featureId,
+                      entitlement_value: feat
+                        ? { value_type: feat.value_type, value: parseFeatureValue(f.value) }
+                        : parseFeatureValue(f.value),
+                    };
+                  }),
               },
             }),
         quantity: qty,

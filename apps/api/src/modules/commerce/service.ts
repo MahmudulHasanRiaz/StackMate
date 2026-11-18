@@ -487,10 +487,19 @@ export async function createOrderByAdmin(
             422
           );
         }
-        const validatedVal = validateFeatureEntitlementValue(
-          featureDef.value_type,
-          f.entitlement_value
-        );
+        // The validator throws a plain Error for a malformed value; a
+        // client-sent bad entitlement is a 422, never a 500 (live defect
+        // 2026-11-18: the wizard's bare values 500'd every custom-offer
+        // create). Same wrap as the catalog service.
+        let validatedVal: unknown;
+        try {
+          validatedVal = validateFeatureEntitlementValue(
+            featureDef.value_type,
+            f.entitlement_value
+          );
+        } catch (err) {
+          throw new AppError("VALIDATION_ERROR", (err as Error).message, 422);
+        }
         return {
           feature_key_snapshot: featureDef.feature_key,
           value_type_snapshot: featureDef.value_type,
