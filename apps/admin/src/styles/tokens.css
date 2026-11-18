@@ -1042,6 +1042,53 @@ a:hover {
   font-size: 12px;
   color: var(--sm-text-muted);
 }
+/* search-person: start (staff result widget, 2026-11-18 — owner: name +
+   email + role showed as three loose fragments; they are one person
+   widget now: initials tile + name/email stack + role pill, inside the
+   same row button, so the eye reads one staff member, not three strings) */
+.sm-quicknav-person {
+  display: flex;
+  align-items: center;
+  gap: var(--sm-space-2);
+  min-width: 0;
+  flex: 1;
+}
+.sm-quicknav-person-main {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+.sm-quicknav-person-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--sm-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sm-quicknav-person-sub {
+  font-size: 12px;
+  color: var(--sm-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sm-quicknav-person-role {
+  flex: none;
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
+  color: var(--sm-accent);
+  background: var(--sm-accent-soft);
+  border: 1px solid var(--sm-accent);
+  border-radius: var(--sm-radius-md);
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+/* search-person: end */
 .sm-sidebar-backdrop {
   display: none;
 }
@@ -1440,6 +1487,326 @@ a:hover {
   text-underline-offset: 2px;
 }
 /* dashboard-kpi: end */
+
+/* media-library: start — Media Library + MediaPicker (PLAN §31 /
+   ADR-0011, 2026-11-18). Neon system only: Inter, single green
+   #00E599 accent (tints), 4px radius, ~30px controls, compact
+   density, dark default + light alternate. The grid is responsive
+   from 390px (2 columns) to 1920px+ (auto-fill). The folder sidebar
+   collapses to a horizontal chip row under 900px. */
+.sm-media-layout {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+.sm-media-folders {
+  flex: none;
+  width: 200px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  position: sticky;
+  top: 64px;
+}
+.sm-media-folders-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--sm-text-muted);
+  padding: 6px 8px 4px;
+}
+.sm-media-folder {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: var(--sm-radius-sm);
+  background: transparent;
+  color: var(--sm-text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  transition: background-color var(--sm-transition);
+}
+.sm-media-folder:hover {
+  background: var(--sm-surface-hover);
+}
+.sm-media-folder-active {
+  /* Same grey ladder as the nav (owner 2026-11-16): active is the
+     strongest step, never weaker than hover. */
+  background: var(--sm-nav-active-bg);
+  font-weight: 600;
+}
+.sm-media-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.sm-media-toolbar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sm-media-kind-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.sm-media-kind-chip {
+  padding: 4px 10px;
+  border: 1px solid var(--sm-border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--sm-text-muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition:
+    background-color var(--sm-transition),
+    border-color var(--sm-transition),
+    color var(--sm-transition);
+}
+.sm-media-kind-chip:hover {
+  color: var(--sm-text);
+  border-color: var(--sm-accent);
+}
+.sm-media-kind-chip-active {
+  background: var(--sm-accent-10);
+  border-color: var(--sm-accent);
+  color: var(--sm-accent);
+  font-weight: 600;
+}
+.sm-media-bulkbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--sm-border);
+  border-radius: var(--sm-radius-sm);
+  background: var(--sm-accent-10);
+  font-size: 13px;
+}
+.sm-media-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 12px;
+}
+.sm-media-card-wrap {
+  position: relative;
+}
+.sm-media-card {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  padding: 0;
+  border: 1px solid var(--sm-border);
+  border-radius: var(--sm-radius-sm);
+  background: var(--sm-surface);
+  color: var(--sm-text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  transition: border-color var(--sm-transition);
+}
+.sm-media-card:hover {
+  border-color: var(--sm-accent);
+}
+.sm-media-card-selected .sm-media-card {
+  border-color: var(--sm-accent);
+  box-shadow: inset 0 0 0 1px var(--sm-accent);
+}
+.sm-media-thumb {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 4 / 3;
+  background: var(--sm-surface-muted);
+  color: var(--sm-text-muted);
+  overflow: hidden;
+}
+.sm-media-thumb img,
+.sm-media-thumb video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.sm-media-thumb-img {
+  object-fit: cover;
+  border-radius: var(--sm-radius-sm);
+  background: var(--sm-surface-muted);
+}
+.sm-media-card-name {
+  display: block;
+  padding: 8px 10px 0;
+  font-size: 13px;
+  font-weight: 500;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.sm-media-card-meta {
+  display: block;
+  padding: 2px 10px 8px;
+  font-size: 12px;
+  color: var(--sm-text-muted);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.sm-media-card-check {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  display: flex;
+  padding: 2px;
+  border-radius: var(--sm-radius-sm);
+  background: var(--sm-surface);
+  border: 1px solid var(--sm-border);
+}
+.sm-media-card-menu {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  display: flex;
+  padding: 2px;
+  border-radius: var(--sm-radius-sm);
+  background: var(--sm-surface);
+  border: 1px solid var(--sm-border);
+}
+.sm-media-row-file {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--sm-text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.sm-media-row-thumb {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  overflow: hidden;
+  color: var(--sm-text-muted);
+}
+.sm-media-detail-preview {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 120px;
+  border: 1px solid var(--sm-border);
+  border-radius: var(--sm-radius-sm);
+  background: var(--sm-surface-muted);
+  overflow: hidden;
+}
+.sm-media-detail-preview img,
+.sm-media-detail-preview video {
+  max-width: 100%;
+  max-height: 320px;
+  display: block;
+}
+.sm-media-detail-icon {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 32px;
+  color: var(--sm-text-muted);
+}
+.sm-media-facts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+}
+.sm-media-facts > div {
+  display: flex;
+  gap: 12px;
+}
+.sm-media-facts dt {
+  flex: none;
+  width: 96px;
+  color: var(--sm-text-muted);
+}
+.sm-media-facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* MediaPicker dialog (shared chooser): wider than the default md
+   dialog so the grid breathes; the mobile sheet rules still apply. */
+.sm-media-picker-dialog {
+  max-width: 880px;
+}
+.sm-media-picker-toolbar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.sm-media-picker-toolbar > :first-child {
+  flex: 1;
+  min-width: 0;
+}
+.sm-media-grid-picker {
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+}
+.sm-media-picker-upload {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--sm-border);
+}
+.sm-media-picker-dragover .sm-media-grid,
+.sm-media-picker-dragover .sm-media-picker-upload {
+  outline: 2px dashed var(--sm-accent);
+  outline-offset: 4px;
+  border-radius: var(--sm-radius-sm);
+}
+@media (max-width: 900px) {
+  .sm-media-layout {
+    flex-direction: column;
+  }
+  .sm-media-folders {
+    position: static;
+    width: 100%;
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .sm-media-folders-title {
+    width: 100%;
+  }
+  .sm-media-folder {
+    width: auto;
+  }
+  .sm-media-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .sm-media-picker-toolbar {
+    flex-direction: column;
+  }
+}
+/* media-library: end */
 
 .sm-table-wrap {
   background: var(--sm-surface-raised);

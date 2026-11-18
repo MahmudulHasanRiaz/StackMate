@@ -22,7 +22,8 @@ import {
   UpdatePaymentMethodSchema,
   UpdatePaymentProviderSchema,
 } from "../../../../../packages/contracts/src/index.ts";
-import { storeValidatedPrivateR2Object } from "../../platform/storage/r2.ts";
+import { storeValidatedPrivateObject } from "../../platform/storage/driver.ts";
+import type { StorageDriver } from "../../platform/storage/driver.ts";
 import type {
   DatabaseState,
   LicenseRecord,
@@ -182,12 +183,14 @@ export async function uploadPrivatePaymentEvidence(
     contentType: string;
     bytes: Uint8Array;
     bucketName: string;
+    /** Resolved storage driver (R2 or Local, per Settings → Storage). */
+    driver: StorageDriver;
   }
 ): Promise<UploadedAssetRecord> {
   const assetId = randomUUID();
   const objectKey = `payment-evidence/${input.orderId}/${assetId}`;
-  const stored = await storeValidatedPrivateR2Object({
-    bucket: store.r2Bucket,
+  const stored = await storeValidatedPrivateObject({
+    driver: input.driver,
     bucketName: input.bucketName,
     objectKey,
     originalFilename: input.filename,

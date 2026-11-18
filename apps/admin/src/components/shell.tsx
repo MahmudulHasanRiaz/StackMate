@@ -50,6 +50,7 @@ import {
   BarChart3,
   ChevronDown,
   ClipboardCheck,
+  Images,
   KeyRound,
   LayoutDashboard,
   LifeBuoy,
@@ -179,6 +180,7 @@ export const NAVIGATION_GROUPS: ReadonlyArray<{
       { to: "/products", label: "Products", icon: Package, permission: "products.read" },
       { to: "/features", label: "Features", icon: ListChecks, permission: "products.read" },
       { to: "/packages", label: "Packages & Pricing", icon: Tags, permission: "products.read" },
+      { to: "/media", label: "Media Library", icon: Images, permission: "media.view" },
     ],
   },
   {
@@ -727,10 +729,35 @@ function QuickNav() {
                         onClick={() => go(item.to)}
                         onMouseEnter={() => setActive(i)}
                       >
-                        {item.label}
-                        {item.sublabel ? (
-                          <span className="sm-quicknav-group">{item.sublabel}</span>
-                        ) : null}
+                        {item.type === "staff" ? (
+                          <span className="sm-quicknav-person">
+                            <Avatar name={item.label} />
+                            <span className="sm-quicknav-person-main">
+                              <span className="sm-quicknav-person-name">
+                                {item.label}
+                              </span>
+                              {item.sublabel ? (
+                                <span className="sm-quicknav-person-sub">
+                                  {item.sublabel}
+                                </span>
+                              ) : null}
+                            </span>
+                            {item.badge ? (
+                              <span className="sm-quicknav-person-role">
+                                {item.badge}
+                              </span>
+                            ) : null}
+                          </span>
+                        ) : (
+                          <>
+                            {item.label}
+                            {item.sublabel ? (
+                              <span className="sm-quicknav-group">
+                                {item.sublabel}
+                              </span>
+                            ) : null}
+                          </>
+                        )}
                       </button>
                     );
                   })}

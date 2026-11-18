@@ -287,7 +287,15 @@ export function OrdersSection() {
         const o = row.original;
         return (
           <span className="sm-cell-line">
-            <span className="sm-mono sm-cell-text">{o.order_number}</span>
+            <span className="sm-mono sm-cell-text">
+              {/* Order number is the row link (owner 2026-11-18: needing
+                 the View button is annoying) — plain anchor, the same
+                 pattern as the customer name link (the detail routes are
+                 built by makeDetailRoute helpers, so the typed Link's
+                 `to` union does not carry them; see goTo's `as never`
+                 cast). View stays as a secondary action. */}
+              <a href={`/orders/${o.id}`}>{o.order_number}</a>
+            </span>
             <CopyButton value={o.order_number} label="Copy order number" />
             <span className="sm-hint sm-cell-text">{o.source}</span>
           </span>

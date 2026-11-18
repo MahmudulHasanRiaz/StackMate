@@ -21,8 +21,8 @@ import { generalSettings } from "../../../../../db/schema/general-settings.ts";
 import * as schema from "../../../../../db/schema/index.ts";
 import { AppError } from "../../shared/errors.ts";
 import { sha256Hex } from "../../platform/crypto/index.ts";
-import { storeValidatedPrivateR2Object } from "../../platform/storage/r2.ts";
-import type { R2BucketBinding } from "../../env.ts";
+import { storeValidatedPrivateObject } from "../../platform/storage/driver.ts";
+import type { StorageDriver } from "../../platform/storage/driver.ts";
 
 export type GeneralSettingsDb = NodePgDatabase<typeof schema>;
 
@@ -268,7 +268,7 @@ function faviconExtension(mime: string): string {
  */
 export async function storeFavicon(
   db: GeneralSettingsDb,
-  bucket: R2BucketBinding,
+  driver: StorageDriver,
   input: {
     filename: string;
     contentType: string;
@@ -286,8 +286,8 @@ export async function storeFavicon(
   verifyFaviconBytes(input.bytes, input.contentType);
   const mime = input.contentType.trim().toLowerCase();
   const key = `branding/favicon-${sha256Hex(input.bytes)}.${faviconExtension(mime)}`;
-  const stored = await storeValidatedPrivateR2Object({
-    bucket,
+  const stored = await storeValidatedPrivateObject({
+    driver,
     bucketName: input.bucketName,
     objectKey: key,
     originalFilename: input.filename,

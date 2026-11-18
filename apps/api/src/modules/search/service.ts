@@ -220,7 +220,8 @@ export function searchGlobal(
         type: "staff" as const,
         id: u.id,
         label: u.name,
-        sublabel: [u.email, roles.join(", ")].filter(Boolean).join(" · ") || null,
+        sublabel: u.email || null,
+        badge: roles.join(", ") || null,
         to: `/staff/${u.id}`,
       };
     });

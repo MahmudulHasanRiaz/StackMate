@@ -1377,6 +1377,31 @@ Every admin list endpoint accepts `?q=<query>` (trimmed, case-insensitive substr
 
 Groups: Customers (`customers.read` → /customers/:id), Orders (`orders.read` → /orders/:id), Products (`products.read` → /products/:id), Licenses (`licenses.read` → /licenses/:id), Subscriptions (`subscriptions.read` → /subscriptions/:id), Tickets (`tickets.view` → /tickets/:id), Leads (`leads.view` → /leads/:id), Staff (`users.manage` → /staff/:id), Sites (`integrations.manage` → /settings/websites/:id). Contract: `packages/contracts/src/domains/search.ts` (`GlobalSearchResponse`, `MIN_QUERY_LENGTH = 2`, `MAX_PER_GROUP = 8`). The header search (⌘K) calls it debounced 250ms and renders entity groups first, then the Pages group (quick navigation).
 
+### 18.13 Media library (media batch, 2026-11-18)
+
+Media files are private objects — never a public URL or a raw storage key. Every response carries an authenticated same-origin `content_url` (`GET /api/v1/admin/media/:id/content`, session cookie); objects stay private in R2 or under the Local root. Each row stores its own `driver` (`r2` | `local`); reads always use the row's driver. Contract: `packages/contracts/src/domains/media.ts` (`MediaAssetView`, `MediaListQuery`, `MediaListResponse`, `MediaLibraryKind`).
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/media?q=&kind=&folder=&mime=&limit=&offset= | List, `media.view`. `q` filters server-side over the FULL `media_assets` dataset (filename + tags); `kind` is one of `image` / `video` / `audio` / `document` / `archive` / `other`; `folder` is an exact folder name; `mime` is a comma-separated list of exact MIME types. `limit` (default 50, max 100) caps AFTER filtering; `offset` pages. Bad kind/mime → 422. Response: `{ items: MediaAssetView[], total, limit, offset }`. |
+| GET | /api/v1/admin/media/folders | Distinct folder names (non-empty), `media.view`. Response: `{ folders: string[] }`. |
+| POST | /api/v1/admin/media | Upload, `media.manage`, multipart `FormData` — field `file` (required), `folder` (optional), repeated `tags` fields. Allowlist: images PNG/JPEG/WEBP/GIF/SVG, video MP4/WebM, audio MP3/WAV/OGG, PDF, ZIP, plain text + CSV — MIME + magic-byte validated; anything else → 415; oversize (> 100 MB) → 413; no `file` → 422. SVG is sanitized (scripts / event handlers / `javascript:` hrefs / `<foreignObject>` / DOCTYPE stripped) and must parse as SVG. Server-generated key `media/<yyyy>/<mm>/<uuid>-<sanitized>`. Stored on the CURRENT driver setting; the row records that driver. 201 with the `MediaAssetView`. Audited (`media.uploaded`). On insert failure the uploaded object is deleted (no orphan). |
+| GET | /api/v1/admin/media/:id | Detail, `media.view`. 404 when missing. |
+| PATCH | /api/v1/admin/media/:id | Rename / move / retag, `media.manage`. Body: any of `original_filename`, `folder`, `tags` (max 10, 1–30 chars each); at least one present or 422; bad values → 422. Audited (`media.updated`). |
+| DELETE | /api/v1/admin/media/:id | Delete, `media.manage`. Row first, then the stored object (best-effort). Audited (`media.deleted`). |
+| GET | /api/v1/admin/media/:id/content | File bytes, `media.view`. `Content-Type` is the row's MIME; `Content-Disposition: inline` with the original filename; `Cache-Control: private, max-age=3600, immutable`; `X-Content-Type-Options: nosniff`. SVG additionally gets `Content-Security-Policy: sandbox` and is never served as HTML. 404 when the row or the object is missing. |
+
+Permissions: `media.view` / `media.manage` (migration 0012). Grants: super_admin + admin + support_staff get both; read_only gets view only; finance_manager / license_manager / product_manager / marketing_manager get none. No thumbnails in this batch — the SPA previews images via the authenticated content URL (browser-scaled, `loading="lazy"`). The `?download=1` attachment param was planned and NOT implemented — downloads use the `download` attribute on the anchor + the inline content URL.
+
+### 18.14 Storage settings (media batch, 2026-11-18)
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/storage-settings | Current driver settings, `users.manage`. Returns the singleton row or the default (`{ driver: "r2", local_path: null, updated_at }`). |
+| PUT | /api/v1/admin/storage-settings | Update, `users.manage`. Body: `driver` (`r2` | `local`) and/or `local_path` (1–500 chars, no `..`; `null` clears it to the default). Runtime-applied, no redeploy. Audited (`storage.settings.updated`). |
+
+Driver rule: the setting picks the driver for NEW uploads. Library files keep working per-row after a switch (each row stores its driver). Favicon + payment evidence (legacy rows, no driver column) follow the CURRENT driver — switching drivers orphans previously stored favicon/evidence objects until switched back; the Settings → Storage page warns about this explicitly. Local root resolution: settings `local_path` → env `STORAGE_LOCAL_PATH` → `./data/media`. On Workers the Local driver refuses with an honest 503 (no filesystem); in staging/production an in-memory R2 bucket also refuses uploads (503, fail-closed). See ADR-0011.
+
 ---
 
 ## 19. Inbound Payment Provider Callbacks

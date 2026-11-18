@@ -22,6 +22,13 @@ export interface GlobalSearchItem {
   id: string;
   label: string;
   sublabel: string | null;
+  /**
+   * Optional trailing badge (staff role, e.g. "Super Admin") — rendered
+   * as a pill inside the staff person widget, never jammed into the
+   * sublabel string (owner 2026-11-18: name + email + role read as
+   * three loose fragments; they are one widget now).
+   */
+  badge?: string | null;
   /** SPA route for the record's detail page. */
   to: string;
 }

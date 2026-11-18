@@ -103,6 +103,24 @@ export interface UploadedAssetRecord {
   created_at: string;
 }
 
+/** Media library asset (PLAN §31 / ADR-0011). The `driver` is stored per row — reads always use the row's driver. */
+export interface MediaAssetRecord {
+  id: string;
+  object_key: string;
+  driver: "r2" | "local";
+  original_filename: string;
+  mime_type: string;
+  byte_size: number;
+  checksum_sha256: string;
+  width: number | null;
+  height: number | null;
+  folder: string;
+  tags: string[];
+  uploaded_by_user_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface ProductRecord {
   id: string;
   code: string;
@@ -780,6 +798,7 @@ export interface DatabaseState {
   staff_invitations: StaffInvitationRecord[];
   user_roles: Array<{ user_id: string; role_id: string; assigned_at: string }>;
   uploaded_assets: UploadedAssetRecord[];
+  media_assets: MediaAssetRecord[];
   products: ProductRecord[];
   product_features: ProductFeatureRecord[];
   product_packages: ProductPackageRecord[];
@@ -882,6 +901,7 @@ export class StackMateDataStore {
       user_roles: [],
       staff_invitations: [],
       uploaded_assets: [],
+      media_assets: [],
       products: [],
       product_features: [],
       product_packages: [],

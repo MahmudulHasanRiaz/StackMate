@@ -14,9 +14,13 @@
  *   App Title ........ the browser tab (document.title).
  *   App Description .. meta description + the login page tagline.
  *   Support Email .... the login page contact for staff who cannot sign in.
- *   Favicon .......... PNG/ICO/SVG, ≤256KB, stored in R2 (server-side key)
- *                      and served publicly at /api/v1/favicon; the tab icon
- *                      updates when it is uploaded or removed.
+ *   Favicon .......... PNG/ICO/SVG, ≤256KB, stored in the selected
+ *                      storage driver (server-side key) and served
+ *                      publicly at /api/v1/favicon; the tab icon
+ *                      updates when it is uploaded or removed. Pick
+ *                      from the media library (PNG/SVG) or upload
+ *                      directly — the library picker is the shared
+ *                      MediaPicker (PLAN §31).
  * A save invalidates the public general-config query, so the new values
  * apply immediately with no reload and no redeploy.
  */
@@ -38,6 +42,8 @@ import {
   Textarea,
   useToast,
 } from "../components/primitives";
+import { MediaPicker } from "../components/media-picker";
+import { fetchMediaFile, type MediaAssetView } from "../lib/media";
 
 interface GeneralSettingsView extends GeneralConfig {
   favicon_content_type: string | null;
@@ -87,6 +93,7 @@ function GeneralSettingsForm({ initial }: { initial: GeneralSettingsView }) {
       : null
   );
   const [uploading, setUploading] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const queryClient = useQueryClient();
@@ -160,6 +167,27 @@ function GeneralSettingsForm({ initial }: { initial: GeneralSettingsView }) {
     }
   }
 
+  // Library pick (PLAN §31): fetch the picked file's bytes back
+  // through its authenticated content URL, then run the unchanged
+  // favicon upload — the favicon keeps its own storage key
+  // (branding/favicon-<sha256>), it is NOT the library row. ICO is
+  // not a library type, so the picker offers PNG/SVG only; ICO still
+  // works via direct upload.
+  async function handleLibraryPick(asset: MediaAssetView) {
+    try {
+      const file = await fetchMediaFile(asset);
+      await handleFaviconFile(file);
+    } catch (err) {
+      setFormError(
+        err instanceof ApiClientError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : "Could not use the selected file."
+      );
+    }
+  }
+
   function handleSubmit(event: FormEvent) {
     event.preventDefault();
     setFormError(null);
@@ -211,8 +239,8 @@ function GeneralSettingsForm({ initial }: { initial: GeneralSettingsView }) {
             placeholder="support@example.com"
           />
         </Field>
-        <Field label="Favicon" hint="PNG, ICO, or SVG, up to 256 KB. Stored in R2 and served at /api/v1/favicon.">
-          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+        <Field label="Favicon" hint="PNG, ICO, or SVG, up to 256 KB. Stored in the selected storage driver (Settings → Storage) and served at /api/v1/favicon.">
+          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
             {faviconUrl ? (
               <img
                 src={faviconUrl}
@@ -242,6 +270,14 @@ function GeneralSettingsForm({ initial }: { initial: GeneralSettingsView }) {
             >
               {uploading ? "Uploading…" : faviconUrl ? "Replace favicon" : "Upload favicon"}
             </Button>
+            <Button
+              type="button"
+              variant="secondary"
+              disabled={uploading}
+              onClick={() => setPickerOpen(true)}
+            >
+              Choose from library
+            </Button>
             {faviconUrl ? (
               <Button
                 type="button"
@@ -261,6 +297,14 @@ function GeneralSettingsForm({ initial }: { initial: GeneralSettingsView }) {
           </Button>
         </div>
       </form>
+      <MediaPicker
+        open={pickerOpen}
+        onClose={() => setPickerOpen(false)}
+        onSelect={(asset) => void handleLibraryPick(asset)}
+        kinds={["image"]}
+        mimes={["image/png", "image/svg+xml"]}
+        title="Choose favicon from media library"
+      />
     </div>
   );
 }
