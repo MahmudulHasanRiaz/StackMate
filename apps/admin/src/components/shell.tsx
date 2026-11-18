@@ -411,7 +411,22 @@ function MainNav({
         // must not clear the suppression (it re-introduced the live
         // bug the first time this handler was written without the
         // guard). A real re-entry comes from outside the aside.
-        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+        // relatedTarget is NOT always an element: null when the
+        // pointer enters from outside the document, and the WINDOW
+        // object when it enters from outside the window — and
+        // contains(window) throws ("Failed to execute 'contains' on
+        // 'Node'", caught by the responsive audit 2026-11-18).
+        // A non-Node relatedTarget is treated as NOT fresh intent:
+        // it also fires for the layout shift / reload artifacts, and
+        // clearing suppression on it re-opens the peek right after
+        // an unpin click (focus stays on the toggle, so :focus-within
+        // holds it open) — the sidebar-hover audit caught that
+        // regression 36/41. The old code's throw accidentally
+        // preserved the suppression; the guard below preserves it
+        // WITHOUT throwing. Genuine re-entry still re-arms: moving
+        // in from the main content gives a Node relatedTarget
+        // outside the aside.
+        if (e.relatedTarget instanceof Node && !e.currentTarget.contains(e.relatedTarget)) {
           setPeekSuppressed(false);
         }
       }}
@@ -427,7 +442,11 @@ function MainNav({
         }
       }}
       onBlur={(e) => {
-        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+        // Same guard as onMouseEnter: only a Node relatedTarget
+        // outside the aside is a blur-out that re-arms. A non-Node
+        // relatedTarget (null, or the window when focus leaves the
+        // document) is a no-op — never passed to contains().
+        if (e.relatedTarget instanceof Node && !e.currentTarget.contains(e.relatedTarget)) {
           setPeekSuppressed(false);
         }
       }}
@@ -1050,6 +1069,25 @@ function AccountMenu() {
 /* ------------------------------------------------------------------ */
 /* MainShell — operational area                                        */
 /* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* TopbarBrand — centered brand in the mobile topbar (owner           */
+/* 2026-11-18, Neon screenshots 111–113): the same mark + app name    */
+/* as the sidebar brand. Hidden on desktop (the sidebar carries the   */
+/* brand there); shown ≤900px between the two equal-width topbar       */
+/* clusters, so it sits exactly centered.                              */
+/* ------------------------------------------------------------------ */
+function TopbarBrand() {
+  const { data: generalConfig } = useGeneralConfig();
+  return (
+    <div className="sm-topbar-brand">
+      <span className="sm-brand-mark">
+        <Package size={20} strokeWidth={2} />
+      </span>
+      <span className="sm-brand-name">{generalConfig?.app_name ?? "StackMate"}</span>
+    </div>
+  );
+}
+
 export function MainShell() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [navCollapsed, toggleNavCollapsed] = useNavCollapsed(false);
@@ -1083,16 +1121,21 @@ export function MainShell() {
 
       <div className="sm-main">
         <header className="sm-topbar">
-          <IconButton
-            label="Open navigation menu"
-            icon={drawerOpen ? X : MenuIcon}
-            className="sm-hamburger"
-            onClick={() => setDrawerOpen((v) => !v)}
-          />
-          <div className="sm-topbar-spacer" />
-          <QuickNav />
-          <div className="sm-topbar-spacer" />
-          <AccountMenu />
+          <div className="sm-topbar-cluster sm-topbar-cluster-start">
+            <IconButton
+              label="Open navigation menu"
+              icon={drawerOpen ? X : MenuIcon}
+              className="sm-hamburger"
+              onClick={() => setDrawerOpen((v) => !v)}
+            />
+            <div className="sm-topbar-spacer" />
+          </div>
+          <TopbarBrand />
+          <div className="sm-topbar-cluster sm-topbar-cluster-end">
+            <div className="sm-topbar-spacer" />
+            <QuickNav />
+            <AccountMenu />
+          </div>
         </header>
         <main className="sm-content">
           <Outlet />
@@ -1213,15 +1256,20 @@ export function SettingsShell() {
 
       <div className="sm-main">
         <header className="sm-topbar">
-          <IconButton
-            label="Open settings menu"
-            icon={navOpen ? X : MenuIcon}
-            className="sm-hamburger"
-            onClick={() => setNavOpen((v) => !v)}
-          />
-          <div className="sm-topbar-spacer" />
-          <QuickNav />
-          <AccountMenu />
+          <div className="sm-topbar-cluster sm-topbar-cluster-start">
+            <IconButton
+              label="Open settings menu"
+              icon={navOpen ? X : MenuIcon}
+              className="sm-hamburger"
+              onClick={() => setNavOpen((v) => !v)}
+            />
+            <div className="sm-topbar-spacer" />
+          </div>
+          <TopbarBrand />
+          <div className="sm-topbar-cluster sm-topbar-cluster-end">
+            <QuickNav />
+            <AccountMenu />
+          </div>
         </header>
         <main className="sm-content">
           <Outlet />
