@@ -464,6 +464,9 @@ a:hover {
   display: grid;
   grid-template-columns: var(--sm-sidebar-width) 1fr;
   min-height: 100vh;
+  /* The hover-peek grows the first column (64px → 248px) instead of
+     overlaying the canvas — this transition is what animates it. */
+  transition: grid-template-columns var(--sm-transition-slow);
 }
 .sm-shell[data-sidebar="rail"] {
   grid-template-columns: var(--sm-sidebar-rail-width) 1fr;
@@ -483,9 +486,14 @@ a:hover {
   top: 0;
   height: 100vh;
   overflow-y: auto;
-  /* Width + shadow animate for the hover-peek (desktop rail → overlay
-     panel). The transition tokens are zeroed by the global
-     prefers-reduced-motion block, so reduced motion gets no slide. */
+  /* Labels appear the instant the peek starts while the column is
+     still growing — clip them to the sidebar's box so they never spill
+     over the canvas mid-animation. */
+  overflow-x: clip;
+  /* The peek animates the shell's grid column now, not the aside's
+     width; this stays for the drawer / breakpoint width changes. The
+     transition tokens are zeroed by the global prefers-reduced-motion
+     block, so reduced motion gets no slide. */
   transition: width var(--sm-transition-slow), box-shadow var(--sm-transition-slow);
 }
 .sm-sidebar-brand {
@@ -640,120 +648,106 @@ a:hover {
 }
 
 /* ------------------------------------------------------------------ */
-/* Smart hover-peek (owner 2026-11-16): when the nav is a pinned 64px  */
-/* rail, hovering (or keyboard-focusing) it TEMPORARILY expands it to   */
-/* full 248px WITH labels as an OVERLAY over the main content. The grid  */
-/* template never changes, so the main content does not reflow or       */
-/* shift. Mouse-leave / blur collapses it back. Click still PINS via    */
-/* the persisted sm-nav-collapsed state — the toggle keeps reading      */
-/* "Expand menu" mid-peek because the persisted state is untouched.     */
-/* CSS-only (:hover / :focus-within), so no JS state can desync — with  */
-/* ONE transient exception: after clicking "Collapse menu" the pointer  */
-/* is still over the toggle and the button keeps focus, so both :hover  */
-/* and :focus-within would keep the peek open even though the pinned    */
-/* state is collapsed (live bug 2026-11-16: the rail only returned      */
-/* after a fresh navigation). MainNav therefore adds a transient        */
-/* `sm-peek-off` class on the unpin click, cleared ONLY on a fresh      */
-/* intent to use the nav — pointer ENTERS the aside, focus moves to a  */
-/* different element inside it, focus leaves it, or the toggle is      */
-/* clicked again (pin). NEVER cleared on mouse-leave: the first fix did */
-/* that, and moving the mouse to the main content re-armed the          */
-/* :focus-within peek while the toggle kept focus (live re-test fail,   */
-/* fix batch #2). Every peek selector below is gated with               */
-/* `:not(.sm-peek-off)` so the rail returns at once with focus still    */
-/* on the button, and hover/focus peek keep working afterwards.         */
-/* Desktop ≥900px only; the <900px drawer is untouched (its own rules   */
-/* below). The width transition uses --sm-transition-slow, which the    */
-/* global prefers-reduced-motion block already zeroes — no slide there. */
+/* ------------------------------------------------------------------ */
+/* Smart hover-peek (owner 2026-11-16, reworked 2026-11-18): when the  */
+/* nav is a pinned 64px rail, hovering it (or keyboard-focusing it)   */
+/* TEMPORARILY expands it to full 248px WITH labels — as a LAYOUT      */
+/* expansion, not an overlay (owner 2026-11-18: in the expanded state  */
+/* the app canvas must sit BESIDE the sidebar, never underneath it).   */
+/* The shell's first grid column grows 64px → 248px, so the topbar +   */
+/* main content shift right with it; nothing is ever covered. The      */
+/* column transition uses --sm-transition-slow, which the global       */
+/* prefers-reduced-motion block already zeroes — no slide there.        */
+/* Click still PINS via the persisted sm-nav-collapsed state — the      */
+/* toggle keeps reading "Expand menu" mid-peek because the persisted    */
+/* state is untouched.                                                  */
+/* Keyboard peek uses :has(:focus-visible), NOT :focus-within: a mouse  */
+/* click ALSO moves focus (into the toggle or the clicked link), so     */
+/* :focus-within latched the peek open after the mouse left (live repro */
+/* 2026-11-18 20:46–20:51, Steps A/B) — the sidebar stayed expanded     */
+/* until the user clicked empty main content. :focus-visible matches    */
+/* keyboard Tab focus but not mouse-click focus, so the peek opens for  */
+/* keyboard users and never latches for mouse users.                    */
+/* CSS-only (:hover / :has(:focus-visible)), so no JS state can desync  */
+/* — with ONE transient exception: after clicking "Collapse menu" the   */
+/* pointer is still over the toggle and the button keeps focus, so      */
+/* :hover would keep the peek open even though the pinned state is      */
+/* collapsed (live bug 2026-11-16: the rail only returned after a fresh */
+/* navigation). MainNav therefore adds a transient `sm-peek-off` class  */
+/* on the unpin click, cleared ONLY on a fresh intent to use the nav —  */
+/* pointer ENTERS the aside, focus moves to a different element inside  */
+/* it, focus leaves it, or the toggle is clicked again (pin). NEVER     */
+/* cleared on mouse-leave: the first fix did that, and moving the mouse */
+/* to the main content re-armed the peek while the toggle kept focus    */
+/* (live re-test fail, fix batch #2). Every peek selector below is      */
+/* gated with `:not(.sm-peek-off)` so the rail returns at once with     */
+/* focus still on the button, and hover/focus peek keep working         */
+/* afterwards. Desktop ≥900px only; the <900px drawer is untouched     */
+/* (its own rules below).                                               */
 /* ------------------------------------------------------------------ */
 @media (min-width: 901px) {
-  /* Pin the content columns: when the rail peeks it becomes
-     position: fixed (out of flow) — without an explicit column the
-     remaining grid items auto-place into the 64px first track and the
-     whole content collapses into it (caught by the headless audit:
-     main x 64→0, w 1376→64 mid-peek). With the columns pinned, the
-     empty 64px track stays put and nothing moves. */
-  .sm-shell .sm-main {
-    grid-column: 2;
+  /* The first grid column grows with the peek, so the canvas shifts
+     aside instead of sliding under an overlay. */
+  .sm-shell[data-nav-collapsed="true"]:has(.sm-sidebar:not(.sm-peek-off):hover),
+  .sm-shell[data-nav-collapsed="true"]:has(.sm-sidebar:not(.sm-peek-off) :focus-visible) {
+    grid-template-columns: var(--sm-sidebar-width) 1fr;
   }
-  .sm-settings-shell .sm-settings-nav {
-    grid-column: 2;
+  .sm-settings-shell[data-nav-collapsed="true"]:has(.sm-main-rail:not(.sm-peek-off):hover),
+  .sm-settings-shell[data-nav-collapsed="true"]:has(.sm-main-rail:not(.sm-peek-off) :focus-visible) {
+    grid-template-columns: var(--sm-sidebar-width) 240px 1fr;
   }
-  .sm-settings-shell .sm-main {
-    grid-column: 3;
-  }
-  /* MainShell, pinned-collapsed. */
-  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover,
-  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):focus-within {
-    position: fixed;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    width: var(--sm-sidebar-width);
-    z-index: var(--sm-z-drawer);
-    box-shadow: var(--sm-shadow-md);
-  }
+  /* MainShell, pinned-collapsed. In-flow: the column does the work,
+     so there is no position:fixed, no z-index, no shadow here. */
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-nav-btn,
-  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):focus-within .sm-nav-btn {
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-btn {
     justify-content: flex-start;
     padding: 0 var(--sm-space-2-5);
   }
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-nav-btn .sm-nav-label,
-  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):focus-within .sm-nav-btn .sm-nav-label,
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-btn .sm-nav-label,
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-sidebar-brand .sm-brand-name,
-  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):focus-within .sm-sidebar-brand .sm-brand-name {
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-sidebar-brand .sm-brand-name {
     display: inline;
     visibility: visible;
   }
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-nav-group-label,
-  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):focus-within .sm-nav-group-label {
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-group-label {
     visibility: visible;
   }
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-nav-collapse-btn,
-  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):focus-within .sm-nav-collapse-btn {
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-collapse-btn {
     justify-content: flex-start;
     padding: 0 var(--sm-space-2-5);
   }
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-nav-collapse-btn .sm-nav-label,
-  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):focus-within .sm-nav-collapse-btn .sm-nav-label {
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-collapse-btn .sm-nav-label {
     display: inline;
   }
-  /* SettingsShell main rail, pinned-collapsed. Same treatment; the rail
-     overlays the settings nav's left 184px while the grid stays
-     64px 240px 1fr, so nothing shifts. */
-  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover,
-  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):focus-within {
-    position: fixed;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    width: var(--sm-sidebar-width);
-    z-index: var(--sm-z-drawer);
-    box-shadow: var(--sm-shadow-md);
-  }
+  /* SettingsShell main rail, pinned-collapsed. Same treatment; the
+     rail expands in place and the settings nav + main shift right. */
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-nav-btn,
-  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):focus-within .sm-nav-btn {
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):has(:focus-visible) .sm-nav-btn {
     justify-content: flex-start;
     padding: 0 var(--sm-space-2-5);
   }
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-nav-btn .sm-nav-label,
-  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):focus-within .sm-nav-btn .sm-nav-label,
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):has(:focus-visible) .sm-nav-btn .sm-nav-label,
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-sidebar-brand .sm-brand-name,
-  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):focus-within .sm-sidebar-brand .sm-brand-name {
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):has(:focus-visible) .sm-sidebar-brand .sm-brand-name {
     display: inline;
     visibility: visible;
   }
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-nav-group-label,
-  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):focus-within .sm-nav-group-label {
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):has(:focus-visible) .sm-nav-group-label {
     visibility: visible;
   }
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-nav-collapse-btn,
-  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):focus-within .sm-nav-collapse-btn {
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):has(:focus-visible) .sm-nav-collapse-btn {
     justify-content: flex-start;
     padding: 0 var(--sm-space-2-5);
   }
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-nav-collapse-btn .sm-nav-label,
-  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):focus-within .sm-nav-collapse-btn .sm-nav-label {
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):has(:focus-visible) .sm-nav-collapse-btn .sm-nav-label {
     display: inline;
   }
 }
@@ -2825,6 +2819,8 @@ a:hover {
   display: grid;
   grid-template-columns: var(--sm-sidebar-rail-width) 240px 1fr;
   min-height: 100vh;
+  /* Same as .sm-shell: the hover-peek grows the first column. */
+  transition: grid-template-columns var(--sm-transition-slow);
 }
 .sm-settings-shell[data-nav-collapsed="false"] {
   grid-template-columns: var(--sm-sidebar-width) 240px 1fr;
@@ -3085,50 +3081,59 @@ a:hover {
   .sm-shell {
     grid-template-columns: var(--sm-sidebar-rail-width) 1fr;
   }
+  /* Same layout-expansion peek as the ≥901px block: the column grows,
+     the canvas shifts aside, nothing is overlaid. */
+  .sm-shell:has(.sm-sidebar:not(.sm-peek-off):hover),
+  .sm-shell:has(.sm-sidebar:not(.sm-peek-off) :focus-visible) {
+    grid-template-columns: var(--sm-sidebar-width) 1fr;
+  }
   .sm-shell .sm-nav-btn {
     justify-content: center;
     padding: var(--sm-space-2);
   }
-  .sm-shell .sm-nav-btn .sm-nav-label,
+  /* Row labels hide completely (the fixed 32px row height does not
+     depend on them). Group labels + the brand name keep their height
+     while invisible (visibility, not display:none) — display:none
+     here used to collapse them in the rail, and the peek's
+     display:block pushed every row below them down (the
+     geometry-parity bug, 901–1280px edition). NOTE: the
+     [data-sidebar="rail"] rules elsewhere are dead — the JSX never
+     sets data-sidebar="rail" — so this block is what hides them at
+     this width; do not remove these two rules. */
+  .sm-shell .sm-nav-btn .sm-nav-label {
+    display: none;
+  }
   .sm-shell .sm-nav-group-label,
   .sm-shell .sm-sidebar-brand .sm-brand-name {
-    display: none;
+    visibility: hidden;
   }
   /* Smart hover-peek applies here too: the rail is FORCED at this width
      whatever the persisted state is, so the peek is scoped to the
-     media query, not to data-nav-collapsed. */
-  .sm-shell .sm-sidebar:not(.sm-peek-off):hover,
-  .sm-shell .sm-sidebar:not(.sm-peek-off):focus-within {
-    position: fixed;
-    left: 0;
-    top: 0;
-    bottom: 0;
-    width: var(--sm-sidebar-width);
-    z-index: var(--sm-z-drawer);
-    box-shadow: var(--sm-shadow-md);
-  }
+     media query, not to data-nav-collapsed. Keyboard peek is
+     :has(:focus-visible), not :focus-within — see the ≥901px block. */
   .sm-shell .sm-sidebar:not(.sm-peek-off):hover .sm-nav-btn,
-  .sm-shell .sm-sidebar:not(.sm-peek-off):focus-within .sm-nav-btn {
+  .sm-shell .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-btn {
     justify-content: flex-start;
-    padding: var(--sm-space-1-5) var(--sm-space-2-5);
+    padding: 0 var(--sm-space-2-5);
   }
   .sm-shell .sm-sidebar:not(.sm-peek-off):hover .sm-nav-btn .sm-nav-label,
-  .sm-shell .sm-sidebar:not(.sm-peek-off):focus-within .sm-nav-btn .sm-nav-label,
+  .sm-shell .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-btn .sm-nav-label,
   .sm-shell .sm-sidebar:not(.sm-peek-off):hover .sm-sidebar-brand .sm-brand-name,
-  .sm-shell .sm-sidebar:not(.sm-peek-off):focus-within .sm-sidebar-brand .sm-brand-name {
+  .sm-shell .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-sidebar-brand .sm-brand-name {
     display: inline;
+    visibility: visible;
   }
   .sm-shell .sm-sidebar:not(.sm-peek-off):hover .sm-nav-group-label,
-  .sm-shell .sm-sidebar:not(.sm-peek-off):focus-within .sm-nav-group-label {
-    display: block;
+  .sm-shell .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-group-label {
+    visibility: visible;
   }
   .sm-shell .sm-sidebar:not(.sm-peek-off):hover .sm-nav-collapse-btn,
-  .sm-shell .sm-sidebar:not(.sm-peek-off):focus-within .sm-nav-collapse-btn {
+  .sm-shell .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-collapse-btn {
     justify-content: flex-start;
-    padding: var(--sm-space-1-5) var(--sm-space-2-5);
+    padding: 0 var(--sm-space-2-5);
   }
   .sm-shell .sm-sidebar:not(.sm-peek-off):hover .sm-nav-collapse-btn .sm-nav-label,
-  .sm-shell .sm-sidebar:not(.sm-peek-off):focus-within .sm-nav-collapse-btn .sm-nav-label {
+  .sm-shell .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-collapse-btn .sm-nav-label {
     display: inline;
   }
 }
