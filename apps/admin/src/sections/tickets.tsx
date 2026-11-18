@@ -187,7 +187,11 @@ export function TicketsSection() {
       accessorKey: "ticket_number",
       header: "Ticket",
       cell: ({ row }) => (
-        <span>
+        <span className="sm-cell-line">
+          {/* Single-line (tickets density follow-up 2026-11-18): the
+             number is NOT .sm-cell-text — it must never truncate
+             (TKT-50001 stays readable in full); the mono span + copy
+             button are flex:none via the .sm-cell-line rule. */}
           <span className="sm-mono">{row.original.ticket_number}</span>
           <CopyButton value={row.original.ticket_number} label="Copy ticket number" />
         </span>
@@ -205,7 +209,16 @@ export function TicketsSection() {
     {
       accessorKey: "customer",
       header: "Customer",
-      cell: ({ row }) => row.original.customer?.name ?? "—",
+      cell: ({ row }) => {
+        const c = row.original.customer;
+        if (!c) return "—";
+        return (
+          <span className="sm-cell-line">
+            <span className="sm-cell-text">{c.name}</span>
+            <span className="sm-hint sm-cell-text">{c.customer_number}</span>
+          </span>
+        );
+      },
     },
     {
       accessorKey: "status",
@@ -220,7 +233,11 @@ export function TicketsSection() {
     {
       accessorKey: "assignee_name",
       header: "Assignee",
-      cell: ({ row }) => row.original.assignee_name ?? "Unassigned",
+      cell: ({ row }) => (
+        <span className="sm-cell-line">
+          <span className="sm-cell-text">{row.original.assignee_name ?? "Unassigned"}</span>
+        </span>
+      ),
     },
     {
       accessorKey: "updated_at",
