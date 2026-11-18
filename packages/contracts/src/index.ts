@@ -11,3 +11,4 @@ export * from "./domains/integrations-tracking.ts";
 export * from "./domains/tickets.ts";
 export * from "./domains/leads.ts";
 export * from "./domains/reminders.ts";
+export * from "./domains/search.ts";

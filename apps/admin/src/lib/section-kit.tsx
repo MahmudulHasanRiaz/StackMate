@@ -48,6 +48,7 @@ import {
   TableSkeleton,
   Toolbar,
   useToast,
+  type SearchableOption,
 } from "../components/primitives";
 
 /* ------------------------------------------------------------------ */
@@ -118,6 +119,60 @@ export function useAdminDetail<T>(section: string, id: string, path: string) {
     queryKey: detailKey(section, id),
     queryFn: () => apiRequest<T>(path),
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* Server-side option loading for SearchableSelect (PLAN §29).         */
+/* The query runs against the list endpoint's ?q= (server-side over    */
+/* the full dataset, first 25 matches) — never a filter over a loaded  */
+/* page. The caller's abort signal is combined with the 30s client     */
+/* bound, so a hung search still settles.                              */
+/* ------------------------------------------------------------------ */
+export async function loadListOptions<T>(
+  path: string,
+  query: string,
+  toOption: (item: T) => SearchableOption,
+  signal?: AbortSignal,
+  opts?: { limit?: number },
+): Promise<SearchableOption[]> {
+  const params = new URLSearchParams({ limit: String(opts?.limit ?? 25) });
+  const trimmed = query.trim();
+  if (trimmed) params.set("q", trimmed);
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), 30_000);
+  const onAbort = () => controller.abort();
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const res = await apiRequest<{ items: T[] }>(`${path}?${params}`, {
+      signal: controller.signal,
+    });
+    return res.items.map(toOption);
+  } finally {
+    window.clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Label resolution for SearchableSelect (PLAN §29).                   */
+/* When a value is preset but its label is not among the loaded        */
+/* options (e.g. a filter value restored from the URL), the combobox   */
+/* fetches the single record's detail once and shows its label — never */
+/* a raw id. A 404/empty result resolves to null (the input falls back */
+/* to its placeholder) instead of showing a UUID.                      */
+/* ------------------------------------------------------------------ */
+export function detailLabelResolver<T>(
+  pathFor: (id: string) => string,
+  toLabel: (item: T) => string | null,
+): (value: string, signal: AbortSignal) => Promise<string | null> {
+  return async (value, signal) => {
+    try {
+      const item = await apiRequest<T>(pathFor(value), { signal });
+      return toLabel(item);
+    } catch {
+      return null;
+    }
+  };
 }
 
 export function useAdminMutation<TData, TVariables>(options: {

@@ -46,6 +46,7 @@ import {
   DetailLayout,
   ListTable,
   PageHeader,
+  loadListOptions,
   parseListSearch,
   useAdminDetail,
   useAdminList,
@@ -63,6 +64,7 @@ import {
   Field,
   Input,
   RowMenu,
+  SearchableSelect,
   Select,
   StatusBadge,
   TableSkeleton,
@@ -984,7 +986,6 @@ function SiteProductsTab({ site }: { site: IntegratedSite }) {
         open={assignOpen}
         onClose={() => setAssignOpen(false)}
         site={site}
-        products={products.filter((p) => !site.product_ids.includes(p.id))}
       />
     </div>
   );
@@ -994,12 +995,10 @@ function AssignProductDialog({
   open,
   onClose,
   site,
-  products,
 }: {
   open: boolean;
   onClose: () => void;
   site: IntegratedSite;
-  products: Product[];
 }) {
   const [productId, setProductId] = useState("");
   const [error, setError] = useState("");
@@ -1050,23 +1049,27 @@ function AssignProductDialog({
     >
       <form onSubmit={submit}>
         <Field label="Product" required error={error || ""} htmlFor="assign-product">
-          <Select
+          {/* Searchable (PLAN §29): products are unbounded — the
+             query runs server-side. Already-assigned products are
+             filtered out in the loader (a site holds only a handful,
+             so they cannot crowd out the first 25 matches). */}
+          <SearchableSelect
             id="assign-product"
             value={productId}
-            onChange={(e) => setProductId(e.target.value)}
-            aria-invalid={Boolean(error) || undefined}
-          >
-            <option value="">Select a product…</option>
-            {products.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name} ({p.code})
-              </option>
-            ))}
-          </Select>
+            onChange={(v) => setProductId(v)}
+            loadOptions={async (q, signal) => {
+              const all = await loadListOptions<Product>(
+                "/api/v1/admin/products",
+                q,
+                (p) => ({ value: p.id, label: `${p.name} (${p.code})` }),
+                signal,
+              );
+              return all.filter((o) => !site.product_ids.includes(o.value));
+            }}
+            placeholder="Type a product name…"
+            ariaLabel="Product"
+          />
         </Field>
-        {products.length === 0 ? (
-          <p className="sm-hint">All products are already assigned to this site.</p>
-        ) : null}
       </form>
     </Dialog>
   );

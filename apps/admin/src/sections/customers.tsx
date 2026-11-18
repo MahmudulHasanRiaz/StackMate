@@ -77,6 +77,7 @@ import {
   Field,
   Input,
   MoneyCell,
+  SearchableSelect,
   Select,
   StatusBadge,
   TableSkeleton,
@@ -2198,13 +2199,18 @@ function SplitContactDialog({
           customer profile. Orders stay with this customer.
         </p>
         <Field label="Contact to split off" required>
-          <Select value={contactId} onChange={(e) => setContactId(e.target.value)}>
-            {secondary.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.kind === "email" ? "Email" : "Phone"} — {c.value}
-              </option>
-            ))}
-          </Select>
+          {/* Local mode: secondary contacts are this customer's own
+             complete set — client-side filtering cannot miss one. */}
+          <SearchableSelect
+            value={contactId}
+            onChange={(v) => setContactId(v)}
+            options={secondary.map((c) => ({
+              value: c.id,
+              label: `${c.kind === "email" ? "Email" : "Phone"} — ${c.value}`,
+            }))}
+            placeholder="Select a contact…"
+            ariaLabel="Contact to split off"
+          />
         </Field>
         <Field label="New customer name" required>
           <Input
@@ -2218,15 +2224,21 @@ function SplitContactDialog({
           label="Phone for the new profile"
           hint="Defaults to the most recently added secondary phone, else the primary phone. Pick a different one if needed."
         >
-          <Select value={phone} onChange={(e) => setPhone(e.target.value)}>
-            {[...secondaryPhones, ...(primaryPhone ? [primaryPhone] : [])].map((c) => (
-              <option key={c.id} value={c.value}>
-                {c.value}
-                {c.is_primary ? " (primary)" : ""}
-              </option>
-            ))}
-            <option value="">No phone</option>
-          </Select>
+          {/* Local mode: the phone options are this customer's own
+             complete set — client-side filtering cannot miss one. */}
+          <SearchableSelect
+            value={phone}
+            onChange={(v) => setPhone(v)}
+            options={[
+              ...[...secondaryPhones, ...(primaryPhone ? [primaryPhone] : [])].map((c) => ({
+                value: c.value,
+                label: `${c.value}${c.is_primary ? " (primary)" : ""}`,
+              })),
+              { value: "", label: "No phone" },
+            ]}
+            placeholder="No phone"
+            ariaLabel="Phone for the new profile"
+          />
         </Field>
       </form>
     </Dialog>

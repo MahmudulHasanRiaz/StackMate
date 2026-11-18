@@ -47,6 +47,8 @@ import {
   DetailLayout,
   ListTable,
   PageHeader,
+  detailLabelResolver,
+  loadListOptions,
   parseListSearch,
   useAdminDetail,
   useAdminList,
@@ -66,8 +68,8 @@ import {
   ErrorState,
   Field,
   Input,
-  MenuSelect,
   MoneyCell,
+  SearchableSelect,
   Select,
   StatusBadge,
   TableSkeleton,
@@ -1358,22 +1360,15 @@ function CreateOrderWizard({
   const [creating, setCreating] = useState(false);
   const [createdOrderId, setCreatedOrderId] = useState<string | null>(null);
 
-  /* Step 1 — customer */
+  /* Step 1 — customer (PLAN §29): ONE SearchableSelect — the old
+   * separate search box + native select filtered only the loaded page.
+   * The query runs server-side over the full customer set; the
+   * prefilled customer (lead conversion) resolves its label via the
+   * detail endpoint. */
   const [customerMode, setCustomerMode] = useState<"existing" | "new">("existing");
   const [customerId, setCustomerId] = useState(prefill?.customerId ?? "");
-  const [customerSearch, setCustomerSearch] = useState("");
   const [newCustomer, setNewCustomer] = useState<CustomerFormValues>(emptyCustomerForm);
   const [customerErrors, setCustomerErrors] = useState<Record<string, string>>({});
-  const customersQuery = useAdminList<CustomerDto>("customers", "/api/v1/admin/customers");
-  const customerOptions = (customersQuery.data ?? []).filter((c) => {
-    const q = customerSearch.trim().toLowerCase();
-    if (!q) return true;
-    return (
-      c.name.toLowerCase().includes(q) ||
-      (c.email ?? "").toLowerCase().includes(q) ||
-      (c.phone ?? "").includes(q)
-    );
-  });
 
   /* Step 2 — item */
   const [itemKind, setItemKind] = useState<"package" | "custom">("package");
@@ -1393,7 +1388,9 @@ function CreateOrderWizard({
   const [tax, setTax] = useState("0");
   const [notes, setNotes] = useState("");
   const [itemErrors, setItemErrors] = useState<Record<string, string>>({});
-  const productsQuery = useAdminList<WizardProductDto>("products", "/api/v1/admin/products");
+  // The product picker below is a SearchableSelect (server mode) — no
+  // full product list is loaded here. Packages/prices/features stay
+  // per-product queries: they are that product's complete subcollection.
   const packagesQuery = useQuery({
     queryKey: ["admin", "products", productId, "packages"],
     queryFn: async () => {
@@ -1458,11 +1455,8 @@ function CreateOrderWizard({
   const [firstPaymentRef, setFirstPaymentRef] = useState("");
   const [firstPaymentDate, setFirstPaymentDate] = useState("");
   const [step4Errors, setStep4Errors] = useState<Record<string, string>>({});
-  const methodsQuery = useAdminList<WizardPaymentMethodDto>(
-    "payment-methods",
-    "/api/v1/admin/payment-methods",
-  );
-  const enabledMethods = (methodsQuery.data ?? []).filter((m) => m.is_enabled);
+  // The payment-method picker below is a SearchableSelect (server mode)
+  // — no full method list is loaded here.
 
   /* Derived totals (same formula the server uses: unit × qty − discount
    * + tax). The review shows the estimated total; the created order's
@@ -1750,10 +1744,14 @@ function CreateOrderWizard({
     "Activation & payment",
     "Review",
   ];
-  const selectedCustomer =
-    customerMode === "existing"
-      ? (customersQuery.data ?? []).find((c) => c.id === customerId) ?? null
-      : null;
+  // Review step display name for the chosen customer — fetched once
+  // via the detail endpoint (the picker no longer loads the full list).
+  const selectedCustomerQuery = useQuery({
+    queryKey: ["admin", "customers", customerId],
+    queryFn: () => apiRequest<CustomerDto>(`/api/v1/admin/customers/${customerId}`),
+    enabled: customerMode === "existing" && customerId !== "",
+  });
+  const selectedCustomer = selectedCustomerQuery.data ?? null;
 
   return (
     <Dialog
@@ -1820,32 +1818,36 @@ function CreateOrderWizard({
           </Field>
           {customerMode === "existing" ? (
             <>
-              <Field label="Search customers">
-                <Input
-                  value={customerSearch}
-                  onChange={(e) => setCustomerSearch(e.target.value)}
-                  placeholder="Name, email or phone"
-                  autoComplete="off"
-                />
-              </Field>
               <Field
                 label="Customer"
                 required
                 error={customerErrors.customer ?? ""}
               >
-                <Select
+                {/* One typable picker (PLAN §29): type a name, email or
+                   phone — the query runs server-side over the full
+                   customer set, so a customer beyond any loaded page
+                   is still found. */}
+                <SearchableSelect
                   value={customerId}
-                  onChange={(e) => setCustomerId(e.target.value)}
-                  disabled={customersQuery.isPending}
-                >
-                  <option value="">Select a customer…</option>
-                  {customerOptions.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.name}
-                      {c.email ? ` — ${c.email}` : ""}
-                    </option>
-                  ))}
-                </Select>
+                  onChange={(v) => setCustomerId(v)}
+                  loadOptions={(q, signal) =>
+                    loadListOptions<CustomerDto>(
+                      "/api/v1/admin/customers",
+                      q,
+                      (c) => ({
+                        value: c.id,
+                        label: c.email ? `${c.name} — ${c.email}` : c.name,
+                      }),
+                      signal,
+                    )
+                  }
+                  resolveLabel={detailLabelResolver<CustomerDto>(
+                    (id) => `/api/v1/admin/customers/${id}`,
+                    (c) => (c.email ? `${c.name} — ${c.email}` : c.name),
+                  )}
+                  placeholder="Type a name, email or phone…"
+                  ariaLabel="Customer"
+                />
               </Field>
               {prefill?.leadId ? (
                 <p className="sm-hint">
@@ -1881,10 +1883,12 @@ function CreateOrderWizard({
             </Select>
           </Field>
           <Field label="Product" required error={itemErrors.product ?? ""}>
-            <Select
+            {/* Searchable (PLAN §29): products are unbounded; only
+               active products are offered (the loader filters). */}
+            <SearchableSelect
               value={productId}
-              onChange={(e) => {
-                setProductId(e.target.value);
+              onChange={(v) => {
+                setProductId(v);
                 setPackageId("");
                 setPriceId("");
                 setCustomFeatures([{ featureId: "", value: "" }]);
@@ -1892,40 +1896,44 @@ function CreateOrderWizard({
                 clearItemError("package");
                 clearItemError("price");
               }}
-              disabled={productsQuery.isPending}
-            >
-              <option value="">Select a product…</option>
-              {(productsQuery.data ?? [])
-                .filter((p) => p.status === "active")
-                .map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
-            </Select>
+              loadOptions={async (q, signal) => {
+                const all = await loadListOptions<WizardProductDto>(
+                  "/api/v1/admin/products",
+                  q,
+                  (p) => ({ value: p.id, label: p.name, data: p }),
+                  signal,
+                );
+                return all.filter(
+                  (o) => (o.data as WizardProductDto | undefined)?.status === "active",
+                );
+              }}
+              placeholder="Type a product name…"
+              ariaLabel="Product"
+            />
           </Field>
           {itemKind === "package" ? (
             <>
               <Field label="Package" required error={itemErrors.package ?? ""}>
-                <Select
+                {/* Local mode: packages are this product's complete
+                   subcollection (loaded whole), so client-side
+                   filtering cannot miss one. */}
+                <SearchableSelect
                   value={packageId}
-                  onChange={(e) => {
-                    setPackageId(e.target.value);
+                  onChange={(v) => {
+                    setPackageId(v);
                     setPriceId("");
                     clearItemError("package");
                     clearItemError("price");
                   }}
-                  disabled={!productId || packagesQuery.isPending}
-                >
-                  <option value="">Select a package…</option>
-                  {(packagesQuery.data ?? [])
+                  options={(packagesQuery.data ?? [])
                     .filter((p) => p.status === "active")
-                    .map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.name}
-                      </option>
-                    ))}
-                </Select>
+                    .map((p) => ({ value: p.id, label: p.name }))}
+                  placeholder={
+                    packagesQuery.isPending ? "Loading packages…" : "Select a package…"
+                  }
+                  disabled={!productId || packagesQuery.isPending}
+                  ariaLabel="Package"
+                />
               </Field>
               {packageId && !publishedVersion ? (
                 <Alert variant="warning">
@@ -1934,12 +1942,12 @@ function CreateOrderWizard({
                 </Alert>
               ) : null}
               <Field label="Price" required error={itemErrors.price ?? ""}>
-                {/* MenuSelect, not the native Select: the native popup
-                    is OS-rendered and never opened on click in the
-                    user's extension-driven browser (live defect
-                    2026-11-17 — only type-ahead worked). The DOM
-                    listbox opens on an ordinary click. */}
-                <MenuSelect
+                {/* SearchableSelect, local mode (PLAN §29): prices are
+                   this version's complete set, so client-side filtering
+                   cannot miss one. Typable, unlike the MenuSelect it
+                   replaces (live defect 2026-11-17 — only type-ahead
+                   worked on the native select). */}
+                <SearchableSelect
                   value={priceId}
                   onChange={(v) => {
                     setPriceId(v);
@@ -2010,27 +2018,27 @@ function CreateOrderWizard({
                 <div>
                   {customFeatures.map((f, i) => (
                     <div key={i} className="sm-form-grid" style={{ marginTop: i > 0 ? 8 : 0 }}>
-                      <Select
+                      {/* Local mode: features are this product's complete
+                         set, so client-side filtering cannot miss one. */}
+                      <SearchableSelect
                         value={f.featureId}
-                        onChange={(e) =>
+                        onChange={(v) =>
                           setCustomFeatures((rows) =>
                             rows.map((r, j) =>
-                              j === i ? { ...r, featureId: e.target.value } : r,
+                              j === i ? { ...r, featureId: v } : r,
                             ),
                           )
                         }
-                        disabled={!productId || featuresQuery.isPending}
-                        aria-label="Feature"
-                      >
-                        <option value="">Select a feature…</option>
-                        {(featuresQuery.data ?? [])
+                        options={(featuresQuery.data ?? [])
                           .filter((feat) => feat.status === "active")
-                          .map((feat) => (
-                            <option key={feat.id} value={feat.id}>
-                              {feat.name} ({feat.value_type})
-                            </option>
-                          ))}
-                      </Select>
+                          .map((feat) => ({
+                            value: feat.id,
+                            label: `${feat.name} (${feat.value_type})`,
+                          }))}
+                        placeholder="Select a feature…"
+                        disabled={!productId || featuresQuery.isPending}
+                        ariaLabel="Feature"
+                      />
                       <Input
                         value={f.value}
                         onChange={(e) =>
@@ -2304,18 +2312,26 @@ function CreateOrderWizard({
           </Field>
           <CollapsibleSection title="Payment method & first payment (optional)">
             <Field label="Payment method" error={step4Errors.paymentMethod ?? ""}>
-              <Select
+              {/* Searchable (PLAN §29): payment methods are unbounded;
+                 only enabled methods are offered (the loader filters). */}
+              <SearchableSelect
                 value={paymentMethodId}
-                onChange={(e) => setPaymentMethodId(e.target.value)}
-                disabled={methodsQuery.isPending}
-              >
-                <option value="">No method yet</option>
-                {enabledMethods.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.display_name}
-                  </option>
-                ))}
-              </Select>
+                onChange={(v) => setPaymentMethodId(v)}
+                loadOptions={async (q, signal) => {
+                  const all = await loadListOptions<WizardPaymentMethodDto>(
+                    "/api/v1/admin/payment-methods",
+                    q,
+                    (m) => ({ value: m.id, label: m.display_name, data: m }),
+                    signal,
+                  );
+                  return all.filter(
+                    (o) => (o.data as WizardPaymentMethodDto | undefined)?.is_enabled,
+                  );
+                }}
+                leadingOptions={[{ value: "", label: "No method yet" }]}
+                placeholder="No method yet"
+                ariaLabel="Payment method"
+              />
             </Field>
             <Field
               label="First payment amount (minor units)"

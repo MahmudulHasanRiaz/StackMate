@@ -30,6 +30,7 @@ import {
   DetailLayout,
   ListTable,
   PageHeader,
+  loadListOptions,
   parseListSearch,
   useAdminDetail,
   useAdminList,
@@ -47,6 +48,7 @@ import {
   Dialog,
   Field,
   Input,
+  SearchableSelect,
   Select,
   Skeleton,
   StatusBadge,
@@ -300,8 +302,6 @@ export function PaymentMethodsSection() {
           title="Create payment method"
         >
           <MethodCreateForm
-            providers={providers.data ?? []}
-            providersLoading={providers.isPending}
             onDone={() => setCreateMethodOpen(false)}
             onCancel={() => setCreateMethodOpen(false)}
           />
@@ -552,13 +552,9 @@ function ProviderForm({
 /* Method create form                                                  */
 /* ------------------------------------------------------------------ */
 function MethodCreateForm({
-  providers,
-  providersLoading,
   onDone,
   onCancel,
 }: {
-  providers: PaymentProvider[];
-  providersLoading: boolean;
   onDone: () => void;
   onCancel: () => void;
 }) {
@@ -645,19 +641,25 @@ function MethodCreateForm({
     >
       <div className="sm-form-grid">
         <Field label="Provider" required error={errors.provider_id ?? ""}>
-          <Select
+          {/* Searchable (PLAN §29): providers are unbounded — the
+             query runs server-side over the full provider set. */}
+          <SearchableSelect
             value={providerId}
-            onChange={(e) => setProviderId(e.target.value)}
-            aria-invalid={Boolean(errors.provider_id) || undefined}
-            disabled={providersLoading}
-          >
-            <option value="">Select a provider…</option>
-            {providers.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.display_name} ({PROVIDER_TYPE_LABELS[p.provider_type]})
-              </option>
-            ))}
-          </Select>
+            onChange={(v) => setProviderId(v)}
+            loadOptions={(q, signal) =>
+              loadListOptions<PaymentProvider>(
+                "/api/v1/admin/payment-providers",
+                q,
+                (p) => ({
+                  value: p.id,
+                  label: `${p.display_name} (${PROVIDER_TYPE_LABELS[p.provider_type]})`,
+                }),
+                signal,
+              )
+            }
+            placeholder="Type a provider name…"
+            ariaLabel="Provider"
+          />
         </Field>
         <Field label="Method key" required hint="Lowercase, unique per provider." error={errors.method_key ?? ""}>
           <Input

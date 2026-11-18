@@ -31,6 +31,7 @@ import { apiRequest } from "../lib/api-client";
 import { detailKey } from "../lib/query";
 import {
   PageHeader,
+  loadListOptions,
   useAdminDetail,
   useAdminList,
   useAdminMutation,
@@ -47,6 +48,7 @@ import {
   Field,
   Input,
   RowMenu,
+  SearchableSelect,
   Select,
   StatusBadge,
   Switch,
@@ -124,18 +126,22 @@ export function TrackingConfigSection() {
       ) : (
         <>
           <Toolbar>
-            <Select
-              aria-label="Integrated site"
+            {/* Searchable (PLAN §29): integrated sites are unbounded —
+               the query runs server-side over the full site set. */}
+            <SearchableSelect
               value={siteId}
-              onChange={(e) => setSiteId(e.target.value)}
-            >
-              <option value="">Choose a site…</option>
-              {sites.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name}
-                </option>
-              ))}
-            </Select>
+              onChange={(v) => setSiteId(v)}
+              loadOptions={(q, signal) =>
+                loadListOptions<IntegratedSite>(
+                  "/api/v1/admin/integrated-sites",
+                  q,
+                  (s) => ({ value: s.id, label: s.name }),
+                  signal,
+                )
+              }
+              placeholder="Choose a site…"
+              ariaLabel="Integrated site"
+            />
           </Toolbar>
           {site ? (
             <TrackingGroups site={site} />

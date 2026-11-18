@@ -480,6 +480,370 @@ export function MenuSelect({
   );
 }
 
+/* ------------------------------------------------------------------ */
+/* SearchableSelect — typable combobox (PLAN §29, ADR-0010).            */
+/* Replaces every entity <Select>: a native select's OS popup has no    */
+/* type-to-search, and at scale the option list is unusable. The        */
+/* trigger is a typable <input> wearing the .sm-select look; the       */
+/* option list is a portaled listbox reusing .sm-row-menu (same        */
+/* open/close contract as MenuSelect: click toggles, Esc closes and     */
+/* restores the selected label, outside pointerdown / scroll / resize   */
+/* close, flips above the trigger near the viewport bottom).            */
+/*   Server mode — loadOptions(query, signal): the query runs           */
+/*   server-side over the FULL dataset (list ?q=), debounced 200ms;    */
+/*   opening with an empty query loads the first page (limit 25).      */
+/*   Local mode — options: filtered client-side as you type (small     */
+/*   bounded lists only: per-order installments, per-customer contacts, */
+/*   server-provided distinct filter values).                           */
+/*   leadingOptions: static first options that are never filtered      */
+/*   (All… / None / Unlinked). selectedLabel / resolveLabel: the label */
+/*   to show when closed while the value is not among the loaded       */
+/*   options (e.g. a filter value restored from the URL). Keyboard:    */
+/*   ArrowDown/Up moves, Enter chooses the active option, Esc closes.  */
+/* ------------------------------------------------------------------ */
+export interface SearchableOption {
+  value: string;
+  label: string;
+  disabled?: boolean;
+  /** Caller-attached record (e.g. the order row) — handed back as the
+   *  second onChange argument so auto-fill handlers (ticket linked
+   *  records) can read linked ids without a second fetch. */
+  data?: unknown;
+}
+
+export function SearchableSelect({
+  value,
+  onChange,
+  options,
+  loadOptions,
+  selectedLabel,
+  resolveLabel,
+  leadingOptions = [],
+  placeholder,
+  disabled,
+  ariaLabel,
+  id,
+}: {
+  value: string;
+  onChange: (value: string, option?: SearchableOption) => void;
+  options?: SearchableOption[];
+  loadOptions?: (query: string, signal: AbortSignal) => Promise<SearchableOption[]>;
+  selectedLabel?: string | undefined;
+  resolveLabel?: (
+    value: string,
+    signal: AbortSignal,
+  ) => Promise<string | null>;
+  leadingOptions?: SearchableOption[];
+  placeholder: string;
+  disabled?: boolean;
+  ariaLabel: string;
+  id?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState("");
+  const [results, setResults] = useState<SearchableOption[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const [pos, setPos] = useState<{ top: number; left: number; width: number } | null>(null);
+  const [chosenLabel, setChosenLabel] = useState<{ value: string; label: string } | null>(null);
+  const [resolvedLabel, setResolvedLabel] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const listId = useId();
+
+  const leading = leadingOptions;
+  const displayLabel =
+    leading.find((o) => o.value === value)?.label ??
+    results.find((o) => o.value === value)?.label ??
+    (options ?? []).find((o) => o.value === value)?.label ??
+    (chosenLabel !== null && chosenLabel.value === value ? chosenLabel.label : null) ??
+    selectedLabel ??
+    resolvedLabel ??
+    "";
+
+  // When closed the input shows the selected label; when open it shows
+  // what the user typed (empty on open — the placeholder carries the
+  // current selection as a hint).
+  useEffect(() => {
+    if (!open) setText(displayLabel);
+    // Runs on open/close + whenever the label resolves.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, displayLabel]);
+
+  // Resolve the label for a preset value that is not among the loaded
+  // options (e.g. a filter value restored from the URL). Runs once per
+  // value; a 404/empty result leaves the raw value hidden — the input
+  // falls back to the placeholder instead of showing a UUID.
+  useEffect(() => {
+    if (!resolveLabel || value === "") return;
+    if (
+      leading.some((o) => o.value === value) ||
+      (options ?? []).some((o) => o.value === value) ||
+      selectedLabel !== undefined
+    ) {
+      return;
+    }
+    let cancelled = false;
+    const controller = new AbortController();
+    resolveLabel(value, controller.signal)
+      .then((label) => {
+        if (!cancelled && label) setResolvedLabel(label);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value]);
+
+  const runSearch = useCallback(
+    async (query: string, typed: boolean) => {
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+      setLoading(true);
+      try {
+        let loaded: SearchableOption[];
+        if (loadOptions) {
+          loaded = await loadOptions(query, controller.signal);
+        } else {
+          const q = query.trim().toLowerCase();
+          loaded = (options ?? []).filter(
+            (o) => !q || o.label.toLowerCase().includes(q),
+          );
+        }
+        if (controller.signal.aborted) return;
+        setResults(loaded);
+        // Typing auto-highlights the first MATCH (past the static
+        // leading options) so Enter picks the top result; opening with
+        // an empty query highlights the current selection if present.
+        if (typed) {
+          setActiveIndex(loaded.length > 0 ? leading.length : -1);
+        } else if (loaded.length === 0) {
+          setActiveIndex(-1);
+        } else {
+          const selectedIdx = loaded.findIndex((o) => o.value === value);
+          setActiveIndex(selectedIdx >= 0 ? selectedIdx + leading.length : -1);
+        }
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        if (!controller.signal.aborted) setResults([]);
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
+      }
+    },
+    [loadOptions, options, leading.length, value],
+  );
+
+  const openMenu = useCallback(() => {
+    if (disabled) return;
+    const rect = inputRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    setPos({
+      top: rect.bottom + 4,
+      left: Math.max(8, Math.min(rect.left, window.innerWidth - 248)),
+      width: Math.max(240, Math.min(rect.width, window.innerWidth - 16)),
+    });
+    setText("");
+    setOpen(true);
+    void runSearch("", false);
+  }, [disabled, runSearch]);
+
+  const close = useCallback(() => {
+    abortRef.current?.abort();
+    setOpen(false);
+    setActiveIndex(-1);
+  }, []);
+
+  // Debounced search while typing (200ms); the opening search runs
+  // immediately in openMenu, so the effect skips the first run.
+  const firstRunRef = useRef(true);
+  useEffect(() => {
+    if (!open) {
+      firstRunRef.current = true;
+      return;
+    }
+    if (firstRunRef.current) {
+      firstRunRef.current = false;
+      return;
+    }
+    const timer = window.setTimeout(() => void runSearch(text, true), 200);
+    return () => window.clearTimeout(timer);
+  }, [open, text, runSearch]);
+
+  // Flip above the trigger when the menu would overflow the viewport bottom.
+  useLayoutEffect(() => {
+    if (!open || !pos) return;
+    const menu = menuRef.current;
+    const rect = inputRef.current?.getBoundingClientRect();
+    if (!menu || !rect) return;
+    const height = menu.getBoundingClientRect().height;
+    if (pos.top + height > window.innerHeight - 8) {
+      setPos({ ...pos, top: Math.max(8, rect.top - height - 4) });
+    }
+    // Runs once per open on purpose, like MenuSelect's flip.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const target = e.target as Node;
+      if (menuRef.current?.contains(target)) return;
+      if (inputRef.current?.contains(target)) return;
+      close();
+    };
+    const onScrollOrResize = () => close();
+    document.addEventListener("pointerdown", onPointerDown, true);
+    window.addEventListener("scroll", onScrollOrResize, true);
+    window.addEventListener("resize", onScrollOrResize);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      window.removeEventListener("scroll", onScrollOrResize, true);
+      window.removeEventListener("resize", onScrollOrResize);
+    };
+  }, [open, close]);
+
+  // Keep the active option visible inside the scrollable listbox.
+  useEffect(() => {
+    if (!open || activeIndex < 0) return;
+    // scrollIntoView is guarded: jsdom (and some embedded webviews) do
+    // not implement it, and an unguarded call crashes the whole app via
+    // the error boundary the moment a combobox highlights a match.
+    menuRef.current
+      ?.querySelector<HTMLElement>(`[data-index="${activeIndex}"]`)
+      ?.scrollIntoView?.({ block: "nearest" });
+  }, [open, activeIndex]);
+
+  const shown = useMemo(
+    () => [...leading, ...results.filter((r) => !leading.some((l) => l.value === r.value))],
+    [leading, results],
+  );
+
+  const choose = (option: SearchableOption) => {
+    setChosenLabel({ value: option.value, label: option.label });
+    setResolvedLabel(null);
+    onChange(option.value, option);
+    close();
+    inputRef.current?.focus();
+  };
+
+  const onInputKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!open) {
+        openMenu();
+        return;
+      }
+      if (shown.length === 0) return;
+      const next =
+        activeIndex === -1
+          ? e.key === "ArrowDown"
+            ? 0
+            : shown.length - 1
+          : (activeIndex + (e.key === "ArrowDown" ? 1 : -1) + shown.length) % shown.length;
+      setActiveIndex(next);
+    } else if (e.key === "Enter") {
+      if (open && activeIndex >= 0 && shown[activeIndex]) {
+        e.preventDefault();
+        choose(shown[activeIndex]!);
+      }
+    } else if (e.key === "Escape") {
+      if (open) {
+        e.preventDefault();
+        close();
+      }
+    }
+  };
+
+  return (
+    <>
+      <input
+        ref={inputRef}
+        id={id}
+        type="text"
+        role="combobox"
+        aria-expanded={open}
+        aria-controls={listId}
+        aria-activedescendant={
+          open && activeIndex >= 0 ? `${listId}-${activeIndex}` : undefined
+        }
+        aria-label={ariaLabel}
+        aria-autocomplete="list"
+        autoComplete="off"
+        className="sm-select sm-searchable-select"
+        placeholder={open ? displayLabel || placeholder : placeholder}
+        value={text}
+        disabled={disabled}
+        onFocus={() => {
+          if (!open) openMenu();
+        }}
+        onChange={(e) => {
+          setText(e.target.value);
+          if (!open) openMenu();
+        }}
+        onKeyDown={onInputKeyDown}
+        onBlur={(e) => {
+          // Focus moving into the listbox keeps it open; anywhere else
+          // closes it (the display label is restored by the effect).
+          if (menuRef.current?.contains(e.relatedTarget as Node)) return;
+          close();
+        }}
+      />
+      {open && pos
+        ? createPortal(
+            <div
+              ref={menuRef}
+              id={listId}
+              className="sm-row-menu sm-searchable-list"
+              role="listbox"
+              aria-label={ariaLabel}
+              style={{ top: pos.top, left: pos.left, width: pos.width, right: "auto" }}
+            >
+              {shown.length === 0 && !loading ? (
+                <div className="sm-menu-item" aria-disabled="true">
+                  No results — try a different search.
+                </div>
+              ) : (
+                shown.map((o, i) => (
+                  <button
+                    key={`${o.value}:${i}`}
+                    id={`${listId}-${i}`}
+                    type="button"
+                    role="option"
+                    aria-selected={o.value === value}
+                    data-index={i}
+                    className="sm-menu-item"
+                    data-active={i === activeIndex || undefined}
+                    disabled={o.disabled}
+                    // mousedown preventDefault keeps focus in the input so
+                    // the blur handler cannot close the list before click.
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => choose(o)}
+                    onMouseEnter={() => setActiveIndex(i)}
+                  >
+                    <span className="sm-menu-item-label">{o.label}</span>
+                    {o.value === value ? (
+                      <Check size={14} strokeWidth={2} aria-hidden="true" />
+                    ) : null}
+                  </button>
+                ))
+              )}
+              {loading ? (
+                <div className="sm-menu-item" aria-disabled="true">
+                  Searching…
+                </div>
+              ) : null}
+            </div>,
+            document.body,
+          )
+        : null}
+    </>
+  );
+}
+
 export function Textarea(props: TextareaHTMLAttributes<HTMLTextAreaElement>) {
   return (
     <textarea {...props} className={`sm-textarea ${props.className ?? ""}`.trim()} />

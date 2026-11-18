@@ -40,6 +40,7 @@ import {
   DetailLayout,
   ListTable,
   PageHeader,
+  loadListOptions,
   parseListSearch,
   useAdminDetail,
   useAdminList,
@@ -56,6 +57,7 @@ import {
   Field,
   Input,
   RowMenu,
+  SearchableSelect,
   Select,
   StatusBadge,
   TableSkeleton,
@@ -414,11 +416,6 @@ function RegisterWebhookDialog({
   const [events, setEvents] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
 
-  const sitesQuery = useAdminList<IntegratedSite>(
-    "integrated-sites",
-    "/api/v1/admin/integrated-sites",
-  );
-
   const create = useAdminMutation<RegisteredWebhook, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<RegisteredWebhook>("/api/v1/admin/webhooks", {
@@ -503,18 +500,24 @@ function RegisterWebhookDialog({
           />
         </Field>
         <Field label="Integrated site" htmlFor="wh-site">
-          <Select
+          {/* Searchable (PLAN §29): integrated sites are unbounded —
+             the query runs server-side over the full site set. */}
+          <SearchableSelect
             id="wh-site"
             value={siteId}
-            onChange={(e) => setSiteId(e.target.value)}
-          >
-            <option value="">All sites (no site)</option>
-            {(sitesQuery.data ?? []).map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.name}
-              </option>
-            ))}
-          </Select>
+            onChange={(v) => setSiteId(v)}
+            loadOptions={(q, signal) =>
+              loadListOptions<IntegratedSite>(
+                "/api/v1/admin/integrated-sites",
+                q,
+                (s) => ({ value: s.id, label: s.name }),
+                signal,
+              )
+            }
+            leadingOptions={[{ value: "", label: "All sites (no site)" }]}
+            placeholder="All sites (no site)"
+            ariaLabel="Integrated site"
+          />
         </Field>
         <Field
           label="Subscribed events"

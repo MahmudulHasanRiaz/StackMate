@@ -1349,6 +1349,34 @@ App-wide configuration from Settings → General (category group `General`, perm
 
 Rendering: App Name → sidebar/topbar brand + document-title fallback; App Title → `document.title`; Favicon → the tab icon (via the public `/api/v1/favicon` endpoint); App Description → meta description + the login page tagline; Support Email → the login page contact for staff who cannot sign in (hidden when empty). Currency/timezone/language are NOT settings — BDT + Asia/Dhaka are fixed by spec and the admin is English-only.
 
+### 18.11 Server-side list search — `q` + `limit` (search batch, 2026-11-18)
+
+Every admin list endpoint accepts `?q=<query>` (trimmed, case-insensitive substring match) and `?limit=<n>` (clamped 1..100; absent = no limit, list pages unchanged). The query runs server-side over the FULL dataset — the store loads the whole table snapshot per request by design, so `q` filtering over `store.state` is filtering over the full set, never over a loaded page. `limit` slices AFTER the filter. No-param calls return everything, exactly as before. (Caveat, ADR-0010: if the store ever paginates at the DB layer, the `q` filters must move into SQL — the endpoint contract does not change.)
+
+| Endpoint | `q` matches on |
+|---|---|
+| GET /api/v1/admin/customers | name, email, phone (digits-only query also matches `normalized_phone`), customer_number, company_name |
+| GET /api/v1/admin/orders | order_number, public_reference, customer name |
+| GET /api/v1/admin/products | name, code |
+| GET /api/v1/admin/licenses | license_number, customer name, product code |
+| GET /api/v1/admin/subscriptions | subscription_number, customer name |
+| GET /api/v1/admin/users | name, email |
+| GET /api/v1/admin/integrated-sites | name, site_key, domains |
+| GET /api/v1/admin/payment-methods | display_name |
+| GET /api/v1/admin/payment-providers | display_name |
+| GET /api/v1/admin/products/:productId/features | name, feature_key |
+| GET /api/v1/admin/products/:productId/packages | name |
+| GET /api/v1/admin/tickets | (pre-existing `q`, plus `limit`) |
+| GET /api/v1/admin/leads | (pre-existing `q`, plus `limit`) |
+
+### 18.12 Global search (search batch, 2026-11-18)
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/search?q=… | Grouped entity search for the header search bar. Staff session required (401 without one). `q` shorter than 2 characters returns empty groups (no full-table dump). Each group is searched server-side over the full table and capped at **8 items per group** — the cap is per group in the response, never a filter over a loaded page. Groups are **permission-gated by the caller's own permissions**: a group the caller cannot read is omitted from the response, never 403s the whole search. Response: `{ query, groups: [{ key, label, items: [{ type, id, label, sublabel, to }] }] }`; `to` is the SPA route for the record's detail page. |
+
+Groups: Customers (`customers.read` → /customers/:id), Orders (`orders.read` → /orders/:id), Products (`products.read` → /products/:id), Licenses (`licenses.read` → /licenses/:id), Subscriptions (`subscriptions.read` → /subscriptions/:id), Tickets (`tickets.view` → /tickets/:id), Leads (`leads.view` → /leads/:id), Staff (`users.manage` → /staff/:id), Sites (`integrations.manage` → /settings/websites/:id). Contract: `packages/contracts/src/domains/search.ts` (`GlobalSearchResponse`, `MIN_QUERY_LENGTH = 2`, `MAX_PER_GROUP = 8`). The header search (⌘K) calls it debounced 250ms and renders entity groups first, then the Pages group (quick navigation).
+
 ---
 
 ## 19. Inbound Payment Provider Callbacks

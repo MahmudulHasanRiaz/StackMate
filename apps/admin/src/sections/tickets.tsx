@@ -37,6 +37,8 @@ import {
   DetailLayout,
   ListTable,
   PageHeader,
+  detailLabelResolver,
+  loadListOptions,
   parseListSearch,
   useAdminDetail,
   useAdminList,
@@ -55,7 +57,7 @@ import {
   ErrorState,
   Field,
   Input,
-  MenuSelect,
+  SearchableSelect,
   Select,
   StatusBadge,
   TableSkeleton,
@@ -179,8 +181,6 @@ export function TicketsSection() {
   const customerFilter =
     typeof rawSearch.customer_id === "string" ? rawSearch.customer_id : "";
   const query = useAdminList<TicketDto>("tickets", "/api/v1/admin/tickets");
-  const staffQuery = useAdminList<StaffUserDto>("staff-users", "/api/v1/admin/users");
-  const customersQuery = useAdminList<CustomerDto>("customers", "/api/v1/admin/customers");
 
   const columns: ColumnDef<TicketDto, unknown>[] = [
     {
@@ -322,40 +322,59 @@ export function TicketsSection() {
                 </option>
               ))}
             </Select>
-            <Select
+            {/* Assignee + customer filters are SearchableSelects (PLAN
+               §29): staff and customers are unbounded — a native
+               <Select> loads every row and has no type-to-search.
+               Status (5) and priority (4) are fixed enums, so they stay
+               native (confirmed ≤8 exception). */}
+            <SearchableSelect
               value={assigneeFilter}
-              onChange={(e) =>
+              onChange={(v) =>
                 updateSearch({
-                  assignee_user_id: e.target.value === "" ? undefined : e.target.value,
+                  assignee_user_id: v === "" ? undefined : v,
                   page: 1,
                 })
               }
-              aria-label="Filter by assignee"
-            >
-              <option value="">All assignees</option>
-              {(staffQuery.data ?? []).map((u) => (
-                <option key={u.id} value={u.id}>
-                  {staffOptionLabel(u)}
-                </option>
-              ))}
-            </Select>
-            <Select
+              loadOptions={(q, signal) =>
+                loadListOptions<StaffUserDto>(
+                  "/api/v1/admin/users",
+                  q,
+                  (u) => ({ value: u.id, label: staffOptionLabel(u) }),
+                  signal,
+                )
+              }
+              resolveLabel={detailLabelResolver<StaffUserDto>(
+                (id) => `/api/v1/admin/users/${id}`,
+                (u) => staffOptionLabel(u),
+              )}
+              leadingOptions={[{ value: "", label: "All assignees" }]}
+              placeholder="All assignees"
+              ariaLabel="Filter by assignee"
+            />
+            <SearchableSelect
               value={customerFilter}
-              onChange={(e) =>
+              onChange={(v) =>
                 updateSearch({
-                  customer_id: e.target.value === "" ? undefined : e.target.value,
+                  customer_id: v === "" ? undefined : v,
                   page: 1,
                 })
               }
-              aria-label="Filter by customer"
-            >
-              <option value="">All customers</option>
-              {(customersQuery.data ?? []).map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.name}
-                </option>
-              ))}
-            </Select>
+              loadOptions={(q, signal) =>
+                loadListOptions<CustomerDto>(
+                  "/api/v1/admin/customers",
+                  q,
+                  (c) => ({ value: c.id, label: c.name }),
+                  signal,
+                )
+              }
+              resolveLabel={detailLabelResolver<CustomerDto>(
+                (id) => `/api/v1/admin/customers/${id}`,
+                (c) => c.name,
+              )}
+              leadingOptions={[{ value: "", label: "All customers" }]}
+              placeholder="All customers"
+              ariaLabel="Filter by customer"
+            />
           </>
         }
         getRowId={(row) => row.id}
@@ -377,13 +396,6 @@ export function TicketsSection() {
 /* ------------------------------------------------------------------ */
 /* Create ticket                                                       */
 /* ------------------------------------------------------------------ */
-interface LinkOption {
-  id: string;
-  label: string;
-  customer_id?: string | null;
-  product_id?: string | null;
-}
-
 function CreateTicketDialog({
   prefillCustomerId,
   onClose,
@@ -407,23 +419,41 @@ function CreateTicketDialog({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [formError, setFormError] = useState<string | null>(null);
 
-  const customersQuery = useAdminList<CustomerDto>("customers", "/api/v1/admin/customers");
-  const staffQuery = useAdminList<StaffUserDto>("staff-users", "/api/v1/admin/users");
-  const ordersQuery = useAdminList<LinkOption & { customer_id: string }>(
-    "orders",
-    "/api/v1/admin/orders",
-  );
-  const subsQuery = useAdminList<
-    LinkOption & { subscription_number: string; customer_id: string; product_id: string }
-  >("subscriptions", "/api/v1/admin/subscriptions");
-  const licensesQuery = useAdminList<
-    LinkOption & { license_number: string; customer_id: string; product_id: string }
-  >("licenses", "/api/v1/admin/licenses");
-  const productsQuery = useAdminList<LinkOption & { name: string }>(
-    "products",
-    "/api/v1/admin/products",
-  );
-
+  // No full-list queries here (PLAN §29): every picker below is a
+  // SearchableSelect whose query runs server-side over the full
+  // dataset. The auto-fill handlers read the picked record from the
+  // option's data payload (no second fetch, no loaded-page limit).
+  const onOrderChange = (id: string, option?: { data?: unknown }) => {
+    setOrderId(id);
+    if (id) {
+      const order = option?.data as { customer_id?: string | null } | undefined;
+      if (order?.customer_id) setCustomerId(order.customer_id);
+    }
+  };
+  const onSubscriptionChange = (id: string, option?: { data?: unknown }) => {
+    setSubscriptionId(id);
+    if (id) {
+      const sub = option?.data as
+        | { customer_id?: string | null; product_id?: string | null }
+        | undefined;
+      if (sub) {
+        if (sub.customer_id) setCustomerId(sub.customer_id);
+        if (sub.product_id) setProductId(sub.product_id);
+      }
+    }
+  };
+  const onLicenseChange = (id: string, option?: { data?: unknown }) => {
+    setLicenseId(id);
+    if (id) {
+      const lic = option?.data as
+        | { customer_id?: string | null; product_id?: string | null }
+        | undefined;
+      if (lic) {
+        if (lic.customer_id) setCustomerId(lic.customer_id);
+        if (lic.product_id) setProductId(lic.product_id);
+      }
+    }
+  };
   const mutation = useAdminMutation<TicketDto, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<TicketDto>("/api/v1/admin/tickets", {
@@ -462,37 +492,6 @@ function CreateTicketDialog({
           setFormError(err instanceof Error ? err.message : "Could not create the ticket."),
       },
     );
-  };
-
-  // Auto-fill (owner 2026-11-17): picking an order assigns its
-  // customer; picking a subscription/license assigns its customer AND
-  // product. The API enforces the same rules server-side.
-  const onOrderChange = (id: string) => {
-    setOrderId(id);
-    if (id) {
-      const order = (ordersQuery.data ?? []).find((o) => o.id === id);
-      if (order?.customer_id) setCustomerId(order.customer_id);
-    }
-  };
-  const onSubscriptionChange = (id: string) => {
-    setSubscriptionId(id);
-    if (id) {
-      const sub = (subsQuery.data ?? []).find((s) => s.id === id);
-      if (sub) {
-        if (sub.customer_id) setCustomerId(sub.customer_id);
-        if (sub.product_id) setProductId(sub.product_id);
-      }
-    }
-  };
-  const onLicenseChange = (id: string) => {
-    setLicenseId(id);
-    if (id) {
-      const lic = (licensesQuery.data ?? []).find((l) => l.id === id);
-      if (lic) {
-        if (lic.customer_id) setCustomerId(lic.customer_id);
-        if (lic.product_id) setProductId(lic.product_id);
-      }
-    }
   };
 
   return (
@@ -536,15 +535,31 @@ function CreateTicketDialog({
           />
         </Field>
         <Field label="Customer">
-          <Select value={customerId} onChange={(e) => setCustomerId(e.target.value)}>
-            <option value="">Unlinked</option>
-            {(customersQuery.data ?? []).map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-                {c.email ? ` — ${c.email}` : ""}
-              </option>
-            ))}
-          </Select>
+          {/* Searchable (PLAN §29): customers are unbounded. The
+             prefilled customer (lead conversion) resolves its label
+             via the detail endpoint — never a raw id. */}
+          <SearchableSelect
+            value={customerId}
+            onChange={(v) => setCustomerId(v)}
+            loadOptions={(q, signal) =>
+              loadListOptions<CustomerDto>(
+                "/api/v1/admin/customers",
+                q,
+                (c) => ({
+                  value: c.id,
+                  label: c.email ? `${c.name} — ${c.email}` : c.name,
+                }),
+                signal,
+              )
+            }
+            resolveLabel={detailLabelResolver<CustomerDto>(
+              (id) => `/api/v1/admin/customers/${id}`,
+              (c) => (c.email ? `${c.name} — ${c.email}` : c.name),
+            )}
+            leadingOptions={[{ value: "", label: "Unlinked" }]}
+            placeholder="Unlinked"
+            ariaLabel="Customer"
+          />
         </Field>
         <Field label="Priority">
           <Select
@@ -571,16 +586,26 @@ function CreateTicketDialog({
           </Select>
         </Field>
         <Field label="Assignee">
-          <Select value={assigneeId} onChange={(e) => setAssigneeId(e.target.value)}>
-            <option value="">Unassigned</option>
-            {(staffQuery.data ?? [])
-              .filter((u) => u.status === "active")
-              .map((u) => (
-                <option key={u.id} value={u.id}>
-                  {staffOptionLabel(u)}
-                </option>
-              ))}
-          </Select>
+          {/* Searchable (PLAN §29): staff grows; only active staff are
+             offered (the server query returns all, the loader filters). */}
+          <SearchableSelect
+            value={assigneeId}
+            onChange={(v) => setAssigneeId(v)}
+            loadOptions={async (q, signal) => {
+              const all = await loadListOptions<StaffUserDto>(
+                "/api/v1/admin/users",
+                q,
+                (u) => ({ value: u.id, label: staffOptionLabel(u), data: u }),
+                signal,
+              );
+              return all.filter(
+                (o) => (o.data as StaffUserDto | undefined)?.status === "active",
+              );
+            }}
+            leadingOptions={[{ value: "", label: "Unassigned" }]}
+            placeholder="Unassigned"
+            ariaLabel="Assignee"
+          />
         </Field>
         <Field label="Source note" hint="How the customer reported it — phone, email, WhatsApp.">
           <Input
@@ -595,53 +620,88 @@ function CreateTicketDialog({
             label="Order"
             hint="Picking an order sets the ticket's customer from that order."
           >
-            <Select value={orderId} onChange={(e) => onOrderChange(e.target.value)}>
-              <option value="">None</option>
-              {(ordersQuery.data ?? []).map((o) => (
-                <option key={o.id} value={o.id}>
-                  {(o as unknown as { order_number: string }).order_number}
-                </option>
-              ))}
-            </Select>
+            <SearchableSelect
+              value={orderId}
+              onChange={(v, option) => onOrderChange(v, option)}
+              loadOptions={(q, signal) =>
+                loadListOptions<{ id: string; order_number: string; customer_id: string }>(
+                  "/api/v1/admin/orders",
+                  q,
+                  (o) => ({ value: o.id, label: o.order_number, data: o }),
+                  signal,
+                )
+              }
+              leadingOptions={[{ value: "", label: "None" }]}
+              placeholder="None"
+              ariaLabel="Order"
+            />
           </Field>
           <Field
             label="Subscription"
             hint="Picking a subscription sets the customer and product from it."
           >
-            <Select
+            <SearchableSelect
               value={subscriptionId}
-              onChange={(e) => onSubscriptionChange(e.target.value)}
-            >
-              <option value="">None</option>
-              {(subsQuery.data ?? []).map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.subscription_number}
-                </option>
-              ))}
-            </Select>
+              onChange={(v, option) => onSubscriptionChange(v, option)}
+              loadOptions={(q, signal) =>
+                loadListOptions<{
+                  id: string;
+                  subscription_number: string;
+                  customer_id: string;
+                  product_id: string;
+                }>(
+                  "/api/v1/admin/subscriptions",
+                  q,
+                  (s) => ({ value: s.id, label: s.subscription_number, data: s }),
+                  signal,
+                )
+              }
+              leadingOptions={[{ value: "", label: "None" }]}
+              placeholder="None"
+              ariaLabel="Subscription"
+            />
           </Field>
           <Field
             label="License"
             hint="Picking a license sets the customer and product from it."
           >
-            <Select value={licenseId} onChange={(e) => onLicenseChange(e.target.value)}>
-              <option value="">None</option>
-              {(licensesQuery.data ?? []).map((l) => (
-                <option key={l.id} value={l.id}>
-                  {l.license_number}
-                </option>
-              ))}
-            </Select>
+            <SearchableSelect
+              value={licenseId}
+              onChange={(v, option) => onLicenseChange(v, option)}
+              loadOptions={(q, signal) =>
+                loadListOptions<{
+                  id: string;
+                  license_number: string;
+                  customer_id: string;
+                  product_id: string;
+                }>(
+                  "/api/v1/admin/licenses",
+                  q,
+                  (l) => ({ value: l.id, label: l.license_number, data: l }),
+                  signal,
+                )
+              }
+              leadingOptions={[{ value: "", label: "None" }]}
+              placeholder="None"
+              ariaLabel="License"
+            />
           </Field>
           <Field label="Product">
-            <Select value={productId} onChange={(e) => setProductId(e.target.value)}>
-              <option value="">None</option>
-              {(productsQuery.data ?? []).map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name}
-                </option>
-              ))}
-            </Select>
+            <SearchableSelect
+              value={productId}
+              onChange={(v) => setProductId(v)}
+              loadOptions={(q, signal) =>
+                loadListOptions<{ id: string; name: string }>(
+                  "/api/v1/admin/products",
+                  q,
+                  (p) => ({ value: p.id, label: p.name }),
+                  signal,
+                )
+              }
+              leadingOptions={[{ value: "", label: "None" }]}
+              placeholder="None"
+              ariaLabel="Product"
+            />
           </Field>
         </CollapsibleSection>
       </form>
@@ -659,7 +719,6 @@ export function TicketDetailSection({ id }: { id: string }) {
   const [commentError, setCommentError] = useState<string | null>(null);
   const [transitionNote, setTransitionNote] = useState("");
   const query = useAdminDetail<TicketDetailDto>("tickets", id, `/api/v1/admin/tickets/${id}`);
-  const staffQuery = useAdminList<StaffUserDto>("staff-users", "/api/v1/admin/users");
 
   const transitionMutation = useAdminMutation<TicketDetailDto, Record<string, unknown>>({
     mutationFn: (body) =>
@@ -826,24 +885,42 @@ export function TicketDetailSection({ id }: { id: string }) {
               {
                 label: "Assignee",
                 value: (
-                  // MenuSelect, not the native Select: the native popup
-                  // is OS-rendered and never opened on click in the
-                  // user's extension-driven browser (live defect
-                  // 2026-11-17). The assign endpoint itself already
-                  // exists (POST /tickets/:id/assign, tickets.manage).
-                  <MenuSelect
+                  // SearchableSelect, not the native Select or MenuSelect:
+                  // the native popup is OS-rendered and never opened on
+                  // click in the user's extension-driven browser (live
+                  // defect 2026-11-17), and staff is unbounded (PLAN
+                  // §29). The current assignee label comes from the
+                  // ticket detail (name + email + roles).
+                  <SearchableSelect
                     value={ticket.assignee_user_id ?? ""}
                     onChange={(v) =>
                       assignMutation.mutate({
                         assignee_user_id: v === "" ? null : v,
                       })
                     }
-                    options={[
-                      { value: "", label: "Unassigned" },
-                      ...(staffQuery.data ?? [])
-                        .filter((u) => u.status === "active")
-                        .map((u) => ({ value: u.id, label: staffOptionLabel(u) })),
-                    ]}
+                    loadOptions={async (q, signal) => {
+                      const all = await loadListOptions<StaffUserDto>(
+                        "/api/v1/admin/users",
+                        q,
+                        (u) => ({ value: u.id, label: staffOptionLabel(u), data: u }),
+                        signal,
+                      );
+                      return all.filter(
+                        (o) => (o.data as StaffUserDto | undefined)?.status === "active",
+                      );
+                    }}
+                    selectedLabel={
+                      ticket.assignee_user_id && ticket.assignee_name
+                        ? staffOptionLabel({
+                            id: ticket.assignee_user_id,
+                            name: ticket.assignee_name,
+                            email: ticket.assignee_email ?? "",
+                            status: "active",
+                            roles: ticket.assignee_roles ?? [],
+                          })
+                        : undefined
+                    }
+                    leadingOptions={[{ value: "", label: "Unassigned" }]}
                     placeholder="Unassigned"
                     disabled={assignMutation.isPending}
                     ariaLabel="Assign ticket"
