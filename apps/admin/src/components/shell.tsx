@@ -731,7 +731,7 @@ function QuickNav() {
                       >
                         {item.type === "staff" ? (
                           <span className="sm-quicknav-person">
-                            <Avatar name={item.label} />
+                            <Avatar name={item.label} email={item.sublabel} />
                             <span className="sm-quicknav-person-main">
                               <span className="sm-quicknav-person-name">
                                 {item.label}
@@ -1139,14 +1139,14 @@ function AccountMenu() {
         triggerClassName="sm-account-btn"
         trigger={
           <>
-            <Avatar name={principal.user.name} />
+            <Avatar name={principal.user.name} email={principal.user.email} />
             <span className="sm-account-name">{principal.user.name}</span>
             <ChevronDown size={14} strokeWidth={2} className="sm-account-chevron" />
           </>
         }
       >
         <MenuHeader>
-          <Avatar name={principal.user.name} size="lg" />
+          <Avatar name={principal.user.name} email={principal.user.email} size="lg" />
           <div className="sm-menu-header-body">
             <div className="sm-menu-header-name">{principal.user.name}</div>
             <div className="sm-menu-header-sub">{principal.user.email}</div>

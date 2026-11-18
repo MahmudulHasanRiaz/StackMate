@@ -22,6 +22,7 @@ import {
   type TextareaHTMLAttributes,
 } from "react";
 import { createPortal } from "react-dom";
+import { gravatarUrl } from "../lib/gravatar";
 import {
   AlertCircle,
   AlertTriangle,
@@ -1226,13 +1227,30 @@ function getInitials(name: string): string {
   return (first + second).toUpperCase();
 }
 
-export function Avatar({ name, size = "md" }: { name: string; size?: "md" | "lg" }) {
+/* Avatar — Gravatar photo when the email has one (d=404 → the <img>
+   errors and the initials tile shows instead), initials otherwise.
+   The photo is square (4px radius, never circular — radius rules). */
+export function Avatar({
+  name,
+  email,
+  size = "md",
+}: {
+  name: string;
+  email?: string | null;
+  size?: "md" | "lg";
+}) {
+  const [failed, setFailed] = useState(false);
+  // A new email retries the photo (e.g. switching accounts).
+  useEffect(() => {
+    setFailed(false);
+  }, [email]);
+  const url = failed ? null : gravatarUrl(email, size === "lg" ? 72 : 56);
   return (
     <span
       className={`sm-avatar${size === "lg" ? " sm-avatar-lg" : ""}`}
       aria-hidden="true"
     >
-      {getInitials(name)}
+      {url ? <img src={url} alt="" onError={() => setFailed(true)} /> : getInitials(name)}
     </span>
   );
 }
