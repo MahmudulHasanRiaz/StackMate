@@ -507,6 +507,11 @@ a:hover {
   color: var(--sm-text-muted);
   margin: var(--sm-space-1) 0 var(--sm-space-1);
   padding: 0 var(--sm-space-2-5);
+  /* One line, always: a long label ("Recurring & Access") wraps to 3
+     lines in the 64px rail, so the rail row would be 54px tall while
+     the expanded row is 18px — the exact drift this parity fix exists
+     to kill. It fits on one line at full width. */
+  white-space: nowrap;
 }
 /* 1px divider BETWEEN nav groups (Neon separates sections with a line,
    not just a label). Hidden labels in rail mode leave the line as the
@@ -518,13 +523,14 @@ a:hover {
 }
 .sm-nav-btn {
   width: 100%;
+  height: 32px;
   display: flex;
   align-items: center;
   gap: var(--sm-space-2);
   text-align: left;
   background: transparent;
   border: none;
-  padding: var(--sm-space-1-5) var(--sm-space-2-5);
+  padding: 0 var(--sm-space-2-5);
   border-radius: var(--sm-radius-md);
   /* Neon nav: resting items are MUTED (dark #B0B1B2, light slate) — the
      hover lift is text brightening + fill, not fill alone (fix batch
@@ -558,14 +564,26 @@ a:hover {
 .sm-nav-btn svg {
   flex: none;
 }
+/* Rail rows keep the expanded row's height (32px): only the horizontal
+   centering changes, so a row never moves vertically between states. */
 .sm-shell[data-sidebar="rail"] .sm-nav-btn {
   justify-content: center;
-  padding: var(--sm-space-2);
 }
+/* The label spans inside rows hide completely (the fixed 32px row
+   height does not depend on them). Group labels + the brand name keep
+   their height while invisible (visibility, not display:none) — the
+   rail and the expanded sidebar share the same vertical geometry, so
+   the hover-peek never moves an item under the pointer (owner
+   2026-11-18: re-aiming after a peek is bad UX). */
 .sm-shell[data-sidebar="rail"] .sm-nav-btn .sm-nav-label,
-.sm-shell[data-sidebar="rail"] .sm-nav-group-label,
-.sm-shell[data-sidebar="rail"] .sm-sidebar-brand .sm-brand-name {
+.sm-shell[data-nav-collapsed="true"] .sm-nav-btn .sm-nav-label {
   display: none;
+}
+.sm-shell[data-sidebar="rail"] .sm-nav-group-label,
+.sm-shell[data-sidebar="rail"] .sm-sidebar-brand .sm-brand-name,
+.sm-shell[data-nav-collapsed="true"] .sm-nav-group-label,
+.sm-shell[data-nav-collapsed="true"] .sm-sidebar-brand .sm-brand-name {
+  visibility: hidden;
 }
 /* Manual collapse (persisted, `sm-nav-collapsed`): the same rail
    treatment as the 900–1280px breakpoint. */
@@ -574,17 +592,14 @@ a:hover {
 }
 .sm-shell[data-nav-collapsed="true"] .sm-nav-btn {
   justify-content: center;
-  padding: var(--sm-space-2);
-}
-.sm-shell[data-nav-collapsed="true"] .sm-nav-btn .sm-nav-label,
-.sm-shell[data-nav-collapsed="true"] .sm-nav-group-label,
-.sm-shell[data-nav-collapsed="true"] .sm-sidebar-brand .sm-brand-name {
-  display: none;
 }
 
-/* "Collapse menu" button — sidebar bottom (Neon parity). */
+/* "Collapse menu" button — sidebar bottom (Neon parity). Same fixed
+   32px row height as the nav rows, so it never moves either. */
 .sm-nav-collapse-btn {
   width: 100%;
+  height: 32px;
+  flex: none;
   display: flex;
   align-items: center;
   gap: var(--sm-space-2);
@@ -592,7 +607,7 @@ a:hover {
   background: transparent;
   border: none;
   border-top: 1px solid var(--sm-border);
-  padding: var(--sm-space-1-5) var(--sm-space-2-5);
+  padding: 0 var(--sm-space-2-5);
   border-radius: var(--sm-radius-md);
   color: var(--sm-text-muted);
   font-size: 13px;
@@ -611,7 +626,6 @@ a:hover {
 .sm-shell[data-nav-collapsed="true"] .sm-nav-collapse-btn,
 .sm-settings-shell .sm-main-rail .sm-nav-collapse-btn {
   justify-content: center;
-  padding: var(--sm-space-2);
 }
 .sm-shell[data-nav-collapsed="true"] .sm-nav-collapse-btn .sm-nav-label,
 .sm-settings-shell .sm-main-rail .sm-nav-collapse-btn .sm-nav-label {
@@ -619,7 +633,7 @@ a:hover {
 }
 .sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-nav-collapse-btn {
   justify-content: flex-start;
-  padding: var(--sm-space-2) var(--sm-space-3);
+  padding: 0 var(--sm-space-3);
 }
 .sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-nav-collapse-btn .sm-nav-label {
   display: inline;
@@ -682,22 +696,23 @@ a:hover {
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-nav-btn,
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):focus-within .sm-nav-btn {
     justify-content: flex-start;
-    padding: var(--sm-space-1-5) var(--sm-space-2-5);
+    padding: 0 var(--sm-space-2-5);
   }
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-nav-btn .sm-nav-label,
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):focus-within .sm-nav-btn .sm-nav-label,
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-sidebar-brand .sm-brand-name,
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):focus-within .sm-sidebar-brand .sm-brand-name {
     display: inline;
+    visibility: visible;
   }
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-nav-group-label,
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):focus-within .sm-nav-group-label {
-    display: block;
+    visibility: visible;
   }
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-nav-collapse-btn,
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):focus-within .sm-nav-collapse-btn {
     justify-content: flex-start;
-    padding: var(--sm-space-1-5) var(--sm-space-2-5);
+    padding: 0 var(--sm-space-2-5);
   }
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-nav-collapse-btn .sm-nav-label,
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):focus-within .sm-nav-collapse-btn .sm-nav-label {
@@ -719,22 +734,23 @@ a:hover {
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-nav-btn,
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):focus-within .sm-nav-btn {
     justify-content: flex-start;
-    padding: var(--sm-space-1-5) var(--sm-space-2-5);
+    padding: 0 var(--sm-space-2-5);
   }
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-nav-btn .sm-nav-label,
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):focus-within .sm-nav-btn .sm-nav-label,
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-sidebar-brand .sm-brand-name,
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):focus-within .sm-sidebar-brand .sm-brand-name {
     display: inline;
+    visibility: visible;
   }
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-nav-group-label,
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):focus-within .sm-nav-group-label {
-    display: block;
+    visibility: visible;
   }
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-nav-collapse-btn,
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):focus-within .sm-nav-collapse-btn {
     justify-content: flex-start;
-    padding: var(--sm-space-1-5) var(--sm-space-2-5);
+    padding: 0 var(--sm-space-2-5);
   }
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-nav-collapse-btn .sm-nav-label,
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):focus-within .sm-nav-collapse-btn .sm-nav-label {
@@ -931,6 +947,13 @@ a:hover {
   font-size: 12px;
   font-weight: 600;
   line-height: 1;
+  overflow: hidden;
+}
+.sm-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
 }
 .sm-avatar-lg {
   width: 36px;
