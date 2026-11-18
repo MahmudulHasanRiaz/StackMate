@@ -775,6 +775,30 @@ a:hover {
      UNDER any open dialog. */
   z-index: var(--sm-z-popover);
 }
+/* search-combobox: start (PLAN §29, 2026-11-18 — searchable selects +
+   real global search). ALL search/combobox styles live in this ONE
+   block; do not scatter them. Dashboard KPI styles live elsewhere. */
+/* SearchableSelect trigger: a typable <input> wearing the .sm-select
+   look — the chevron background comes from .sm-select, the text cursor
+   marks it as typable, and the muted placeholder carries the current
+   selection as a hint while the list is open. */
+.sm-searchable-select {
+  cursor: text;
+}
+/* SearchableSelect listbox: the portaled .sm-row-menu, scrollable so
+   25 results never run off the viewport. */
+.sm-searchable-list {
+  max-height: 280px;
+  overflow-y: auto;
+}
+/* Global search group heading: small muted label above each result
+   group (entity groups first, Pages last). */
+.sm-quicknav-heading {
+  padding: var(--sm-space-2) var(--sm-space-3) var(--sm-space-1);
+  font-size: 12px;
+  color: var(--sm-text-muted);
+}
+/* search-combobox: end */
 /* Info popover — the (i) button beside a page title. The page
    description lives here, hidden until opened (clean header rule,
    2026-11-16). Styled as Neon's TOOLTIP (images 85/95 dark,
@@ -1018,7 +1042,6 @@ a:hover {
   font-size: 12px;
   color: var(--sm-text-muted);
 }
-
 .sm-sidebar-backdrop {
   display: none;
 }
@@ -1289,6 +1312,134 @@ a:hover {
 .sm-kpi-card .sm-label {
   color: var(--sm-text-muted);
 }
+
+/* dashboard-kpi: start — Dashboard redesign (2026-11-18, owner: ONE
+   green #00E599 only, varied like Neon — never a second hue).
+   KPI cards carry a restrained green wash of decreasing strength
+   (hero strongest); the expired/revoked card stays neutral grey.
+   The icon chip sits top-right of each card. Panels + rows below. */
+.sm-kpi-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+.sm-kpi-icon {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--sm-radius-sm);
+  background: var(--sm-accent-10);
+  color: var(--sm-accent);
+}
+.sm-kpi-icon svg {
+  width: 16px;
+  height: 16px;
+}
+/* Two classes (0,2,0) so the tints beat the light-theme
+   `[data-theme="light"] .sm-kpi-card { background: #ffffff }` rule. */
+.sm-kpi-card.sm-kpi-tint-hero {
+  background: linear-gradient(180deg, var(--sm-accent-15) 0%, var(--sm-accent-04) 100%);
+}
+.sm-kpi-tint-hero .sm-kpi-icon {
+  background: var(--sm-accent-20);
+}
+.sm-kpi-card.sm-kpi-tint-strong {
+  background: var(--sm-accent-10);
+}
+.sm-kpi-card.sm-kpi-tint-mid {
+  background: var(--sm-accent-08);
+}
+.sm-kpi-card.sm-kpi-tint-soft {
+  background: var(--sm-accent-05);
+}
+.sm-kpi-tint-muted .sm-kpi-icon {
+  background: transparent;
+  border: 1px solid var(--sm-border);
+  color: var(--sm-text-muted);
+}
+/* Report panels: same raised surface + 4px radius as the other cards. */
+.sm-dash-panel {
+  background: var(--sm-surface-raised);
+  border: 1px solid var(--sm-border);
+  border-radius: var(--sm-radius-lg);
+  padding: var(--sm-space-3) var(--sm-space-4);
+}
+.sm-dash-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.sm-dash-panel-head .sm-section-title {
+  font-size: 14px;
+  line-height: 20px;
+}
+.sm-dash-group-label {
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 16px;
+  color: var(--sm-text-muted);
+  padding: 10px 0 2px;
+}
+.sm-dash-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 8px;
+  margin: 0 -8px;
+  background: none;
+  border: 0;
+  border-top: 1px solid var(--sm-border);
+  border-radius: var(--sm-radius-sm);
+  cursor: pointer;
+  text-align: left;
+  color: var(--sm-text);
+  font: inherit;
+}
+.sm-dash-row:hover {
+  background: var(--sm-accent-04);
+}
+.sm-dash-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.sm-dash-row-sub {
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--sm-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sm-dash-row-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  flex: none;
+  font-size: 13px;
+  line-height: 16px;
+}
+.sm-link-btn {
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  font: inherit;
+  color: var(--sm-accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+/* dashboard-kpi: end */
 
 .sm-table-wrap {
   background: var(--sm-surface-raised);

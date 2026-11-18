@@ -33,6 +33,7 @@ import {
   DetailLayout,
   ListTable,
   PageHeader,
+  loadListOptions,
   parseListSearch,
   useAdminDetail,
   useAdminList,
@@ -52,6 +53,7 @@ import {
   Field,
   Input,
   MoneyCell,
+  SearchableSelect,
   Select,
   Skeleton,
   StatusBadge,
@@ -347,8 +349,6 @@ function readFileAsBase64(file: File): Promise<string> {
 }
 
 function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel: () => void }) {
-  const orders = useAdminList<OrderSummary>("orders", "/api/v1/admin/orders");
-  const methods = useAdminList<PaymentMethod>("payment-methods", "/api/v1/admin/payment-methods");
   const goDetail = useGoDetail("/payment-review", "submissionId");
 
   const [orderId, setOrderId] = useState("");
@@ -368,35 +368,35 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  const openOrders = useMemo(
-    () =>
-      (orders.data ?? []).filter(
-        (o) => o.payment_status !== "paid" && o.status !== "cancelled",
-      ),
-    [orders.data],
-  );
-  const selectedOrder = openOrders.find((o) => o.id === orderId) ?? null;
-  const enabledMethods = useMemo(
-    () => (methods.data ?? []).filter((m) => m.is_enabled),
-    [methods.data],
-  );
-  const selectedMethod = enabledMethods.find((m) => m.id === methodId) ?? null;
+  // The picked records come from the SearchableSelect option's data
+  // payload (PLAN §29) — the form no longer loads the full order /
+  // method lists. `selectedOrder`/`selectedMethod` drive the amount
+  // default, the currency check and the transfer-rail rules.
+  const [selectedOrder, setSelectedOrder] = useState<OrderSummary | null>(null);
+  const [selectedMethod, setSelectedMethod] = useState<PaymentMethod | null>(null);
   const amountNum = Number(amountMinor);
   const amountPreview =
     amountMinor.trim() !== "" && Number.isInteger(amountNum) && amountNum > 0
       ? formatMinorMoney(amountNum, currency.trim().toUpperCase() || "BDT")
       : null;
 
-  const onOrderChange = (nextId: string) => {
+  const onOrderChange = (nextId: string, option?: { data?: unknown }) => {
     setOrderId(nextId);
     setInstallmentId("");
-    const order = openOrders.find((o) => o.id === nextId);
+    const order = (option?.data as OrderSummary | undefined) ?? null;
+    setSelectedOrder(order);
     if (order) {
       // Default to the remaining amount (ADR-0009: partial payments
       // are allowed; the claim no longer has to match the full total).
       setAmountMinor(String(order.remaining_minor ?? order.total_minor));
       setCurrency(order.currency_code);
     }
+  };
+
+  const onMethodChange = (nextId: string, option?: { data?: unknown }) => {
+    setMethodId(nextId);
+    setSelectedMethod((option?.data as PaymentMethod | undefined) ?? null);
+    setTransferRail("");
   };
 
   // Installments for the picked order (ADR-0009): the claim may name
@@ -530,34 +530,55 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
       </Alert>
       <div className="sm-form-grid" style={{ marginTop: 16 }}>
         <Field label="Order" required hint="Unpaid orders only." error={errors.order_id ?? ""}>
-          <Select
+          {/* Searchable (PLAN §29): the query runs server-side over
+             the full order set (by number, reference or customer
+             name). Unpaid-only filtering happens in the loader over
+             the first 100 matches — the typed query narrows first, so
+             the open order is among them (see ADR-0010). */}
+          <SearchableSelect
             value={orderId}
-            onChange={(e) => onOrderChange(e.target.value)}
-            aria-invalid={Boolean(errors.order_id) || undefined}
-            disabled={orders.isPending}
-          >
-            <option value="">Select an order…</option>
-            {openOrders.map((o) => (
-              <option key={o.id} value={o.id}>
-                {o.order_number} — {formatMinorMoney(o.total_minor, o.currency_code)} ({o.payment_status})
-              </option>
-            ))}
-          </Select>
+            onChange={(v, option) => onOrderChange(v, option)}
+            loadOptions={async (q, signal) => {
+              const all = await loadListOptions<OrderSummary>(
+                "/api/v1/admin/orders",
+                q,
+                (o) => ({
+                  value: o.id,
+                  label: `${o.order_number} — ${formatMinorMoney(o.total_minor, o.currency_code)} (${o.payment_status})`,
+                  data: o,
+                }),
+                signal,
+                { limit: 100 },
+              );
+              return all.filter((o) => {
+                const d = o.data as OrderSummary | undefined;
+                return d !== undefined && d.payment_status !== "paid" && d.status !== "cancelled";
+              });
+            }}
+            placeholder="Type an order number or customer…"
+            ariaLabel="Order"
+          />
         </Field>
         <Field label="Payment method" required error={errors.payment_method_id ?? ""}>
-          <Select
+          {/* Searchable (PLAN §29): only enabled methods are offered
+             (the loader filters). */}
+          <SearchableSelect
             value={methodId}
-            onChange={(e) => setMethodId(e.target.value)}
-            aria-invalid={Boolean(errors.payment_method_id) || undefined}
-            disabled={methods.isPending}
-          >
-            <option value="">Select a method…</option>
-            {enabledMethods.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.display_name}
-              </option>
-            ))}
-          </Select>
+            onChange={(v, option) => onMethodChange(v, option)}
+            loadOptions={async (q, signal) => {
+              const all = await loadListOptions<PaymentMethod>(
+                "/api/v1/admin/payment-methods",
+                q,
+                (m) => ({ value: m.id, label: m.display_name, data: m }),
+                signal,
+              );
+              return all.filter(
+                (o) => (o.data as PaymentMethod | undefined)?.is_enabled,
+              );
+            }}
+            placeholder="Type a method name…"
+            ariaLabel="Payment method"
+          />
         </Field>
         <Field
           label="Amount (minor units)"
@@ -578,22 +599,21 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
         </Field>
         {orderId !== "" ? (
           <Field label="Apply to installment" hint="Optional — oldest unpaid first when left blank.">
-            <Select
+            {/* Local mode: installments are this order's complete set. */}
+            <SearchableSelect
               value={installmentId}
-              onChange={(e) => setInstallmentId(e.target.value)}
-              disabled={installmentsQuery.isPending}
-            >
-              <option value="">Oldest unpaid first</option>
-              {(installmentsQuery.data ?? [])
+              onChange={(v) => setInstallmentId(v)}
+              options={(installmentsQuery.data ?? [])
                 .filter((i) => i.status !== "paid")
-                .map((i) => (
-                  <option key={i.id} value={i.id}>
-                    #{i.installment_number} —{" "}
-                    {formatMinorMoney(i.amount_minor - i.paid_amount_minor, currency.trim().toUpperCase() || "BDT")}{" "}
-                    due {i.due_date} ({i.status.replace(/_/g, " ")})
-                  </option>
-                ))}
-            </Select>
+                .map((i) => ({
+                  value: i.id,
+                  label: `#${i.installment_number} — ${formatMinorMoney(i.amount_minor - i.paid_amount_minor, currency.trim().toUpperCase() || "BDT")} due ${i.due_date} (${i.status.replace(/_/g, " ")})`,
+                }))}
+              leadingOptions={[{ value: "", label: "Oldest unpaid first" }]}
+              placeholder="Oldest unpaid first"
+              disabled={installmentsQuery.isPending}
+              ariaLabel="Apply to installment"
+            />
           </Field>
         ) : null}
         <Field label="Currency" required error={errors.currency_code ?? ""}>
@@ -654,13 +674,6 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
           <Textarea value={customerNote} onChange={(e) => setCustomerNote(e.target.value)} />
         </Field>
       </div>
-      {orders.isError ? (
-        <div style={{ marginTop: 16 }}>
-          <Alert variant="danger">
-            Could not load orders: {orders.error instanceof Error ? orders.error.message : "Request failed"}
-          </Alert>
-        </div>
-      ) : null}
       {formError ? (
         <div style={{ marginTop: 16 }}>
           <Alert variant="danger">{formError}</Alert>

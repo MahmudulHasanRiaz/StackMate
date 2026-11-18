@@ -45,6 +45,8 @@ import {
   DetailLayout,
   ListTable,
   PageHeader,
+  detailLabelResolver,
+  loadListOptions,
   parseListSearch,
   useAdminDetail,
   useAdminList,
@@ -64,6 +66,7 @@ import {
   Field,
   Input,
   MoneyCell,
+  SearchableSelect,
   Select,
   StatusBadge,
   Tabs,
@@ -641,21 +644,30 @@ function CreatePackageDialog({
             hint="Packages belong to one product — the features in step 3 come from this product only."
             htmlFor="cpk-product"
           >
-            <Select
+            {/* Searchable (PLAN §29): products are unbounded — the
+               query runs server-side. The preset product (the wizard
+               opens pre-filled from the list) shows its name from the
+               already-loaded product list. */}
+            <SearchableSelect
               id="cpk-product"
               value={wizardProductId}
-              onChange={(e) => {
-                setWizardProductId(e.target.value);
+              onChange={(v) => {
+                setWizardProductId(v);
                 setDrafts({});
                 setErrors({});
               }}
-            >
-              {products.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name}
-                </option>
-              ))}
-            </Select>
+              loadOptions={(q, signal) =>
+                loadListOptions<ProductListItem>(
+                  "/api/v1/admin/products",
+                  q,
+                  (p) => ({ value: p.id, label: p.name }),
+                  signal,
+                )
+              }
+              selectedLabel={wizardProduct?.name}
+              placeholder="Type a product name…"
+              ariaLabel="Product"
+            />
           </Field>
         ) : null}
         {step === "details" ? (
@@ -977,18 +989,28 @@ export function PackagesSection() {
           getRowId={(row) => row.id}
           toolbar={
             <>
-              <Select
+              {/* Searchable (PLAN §29): products are unbounded — the
+                 query runs server-side. The product picker table below
+                 still lists every product (it is a table, not a
+                 dropdown), so the full list stays loaded for it. */}
+              <SearchableSelect
                 value={productId ?? ""}
-                aria-label="Product"
-                style={{ width: "auto", minWidth: 200 }}
-                onChange={(e) => updateSearch({ product: e.target.value, page: 1 })}
-              >
-                {products.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
-              </Select>
+                loadOptions={(q, signal) =>
+                  loadListOptions<ProductListItem>(
+                    "/api/v1/admin/products",
+                    q,
+                    (p) => ({ value: p.id, label: p.name }),
+                    signal,
+                  )
+                }
+                resolveLabel={detailLabelResolver<ProductListItem>(
+                  (id) => `/api/v1/admin/products/${id}`,
+                  (p) => p.name,
+                )}
+                onChange={(v) => updateSearch({ product: v, page: 1 })}
+                placeholder="Select a product…"
+                ariaLabel="Product"
+              />
               {STATUS_FILTERS.map((s) => (
                 <button
                   key={s}

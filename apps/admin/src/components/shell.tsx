@@ -18,12 +18,12 @@
  *    real categories — the main menu carries no config items
  *    (restructure batch, owner decision 2026-11-16).
  *
- * Topbar (both shells): ⌘K QuickNav (client-side section/action
- * search) + ONE account button (avatar initials + name + chevron)
- * opening the account menu. The theme choice (System / Dark / Light)
- * lives ONLY in the account menu — there is no standalone topbar
- * toggle. Theme choice persists in localStorage key `sm-theme`
- * (default dark); "system" follows prefers-color-scheme live.
+ * Topbar (both shells): ⌘K global search (server-side entity search +
+ * quick navigation to pages) + ONE account button (avatar initials +
+ * name + chevron) opening the account menu. The theme choice
+ * (System / Dark / Light) lives ONLY in the account menu — there is no
+ * standalone topbar toggle. Theme choice persists in localStorage key
+ * `sm-theme` (default dark); "system" follows prefers-color-scheme live.
  */
 import {
   createContext,
@@ -35,6 +35,10 @@ import {
   type ReactNode,
 } from "react";
 import { useGeneralConfig } from "../lib/general-config";
+import type {
+  GlobalSearchGroup,
+  GlobalSearchResponse,
+} from "../../../../packages/contracts/src/index.ts";
 import {
   Link,
   Outlet,
@@ -511,10 +515,14 @@ function MainNav({
 }
 
 /* ------------------------------------------------------------------ */
-/* QuickNav — ⌘K client-side navigation (sections + common actions).    */
-/* Navigation only: it never searches record data and never triggers    */
-/* create dialogs — an action item navigates to the page where the      */
-/* action lives.                                                         */
+/* Global search — ⌘K (PLAN §29, ADR-0010).                            */
+/* A REAL search bar, not only quick navigation: typing ≥2 characters  */
+/* queries GET /api/v1/admin/search (debounced 250ms) — each group is  */
+/* searched server-side over the full table (≤8 per group, never a     */
+/* filter over a loaded page). Entity results render first, grouped;   */
+/* quick navigation to pages stays as the "Pages" group below them.    */
+/* Keyboard: arrows move through the flat result list, Enter opens     */
+/* the active result, Esc closes.                                      */
 /* ------------------------------------------------------------------ */
 interface QuickNavItem {
   to: string;
@@ -529,6 +537,9 @@ function QuickNav() {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState(false);
+  const [searchGroups, setSearchGroups] = useState<GlobalSearchGroup[]>([]);
 
   const can = (permission?: string) =>
     !permission || principal.permissions.includes(permission);
@@ -557,13 +568,49 @@ function QuickNav() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [principal.permissions]);
 
-  const filtered = useMemo(() => {
+  const pageResults = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return items;
     return items.filter(
       (i) => i.label.toLowerCase().includes(q) || i.group.toLowerCase().includes(q),
     );
   }, [items, query]);
+
+  // Server-side entity search (debounced 250ms, aborted on retype).
+  // Queries under 2 characters return nothing — no full-table dump.
+  useEffect(() => {
+    if (!open) return;
+    const q = query.trim();
+    if (q.length < 2) {
+      setSearchGroups([]);
+      setSearching(false);
+      setSearchError(false);
+      return;
+    }
+    setSearching(true);
+    setSearchError(false);
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      void apiRequest<GlobalSearchResponse>(
+        `/api/v1/admin/search?q=${encodeURIComponent(q)}`,
+        { signal: controller.signal },
+      )
+        .then((res) => {
+          setSearchGroups(res.groups);
+          setSearching(false);
+        })
+        .catch((err) => {
+          if (err instanceof DOMException && err.name === "AbortError") return;
+          setSearchGroups([]);
+          setSearching(false);
+          setSearchError(true);
+        });
+    }, 250);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [open, query]);
 
   useEffect(() => {
     setActive(0);
@@ -580,13 +627,49 @@ function QuickNav() {
     return () => document.removeEventListener("keydown", onKey);
   }, []);
 
+  // Flat keyboard order: entity results (group order) first, then pages.
+  const flat = useMemo(() => {
+    const list: { to: string; key: string }[] = [];
+    for (const group of searchGroups) {
+      for (const item of group.items) {
+        list.push({ to: item.to, key: `entity:${group.key}:${item.id}` });
+      }
+    }
+    for (const item of pageResults) {
+      list.push({ to: item.to, key: `page:${item.to}:${item.label}` });
+    }
+    return list;
+  }, [searchGroups, pageResults]);
+
   const go = (to: string) => {
     setOpen(false);
     setQuery("");
+    setSearchGroups([]);
     // `to` is a runtime string (the item list is built dynamically);
     // the codebase's established pattern for this is a `never` cast
     // (see tracking.tsx useRouteNavigate).
     void navigate({ to } as never);
+  };
+
+  const onListKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActive((a) => Math.min(a + 1, flat.length - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActive((a) => Math.max(a - 1, 0));
+    } else if (e.key === "Enter") {
+      const item = flat[active];
+      if (item) go(item.to);
+    }
+  };
+
+  // Index into the flat list while rendering, so arrows/Enter track the
+  // grouped buttons exactly.
+  let flatIndex = -1;
+  const nextIndex = () => {
+    flatIndex += 1;
+    return flatIndex;
   };
 
   return (
@@ -594,8 +677,8 @@ function QuickNav() {
       <button
         type="button"
         className="sm-quicknav-btn"
-        aria-label="Quick navigation (Ctrl+K)"
-        title="Quick navigation (Ctrl+K)"
+        aria-label="Search (Ctrl+K)"
+        title="Search (Ctrl+K)"
         onClick={() => setOpen(true)}
       >
         <Search size={16} strokeWidth={2} />
@@ -607,49 +690,76 @@ function QuickNav() {
         onClose={() => {
           setOpen(false);
           setQuery("");
+          setSearchGroups([]);
         }}
-        title="Quick navigation"
+        title="Search"
       >
         <div className="sm-stack-sm">
           <Input
             autoFocus
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "ArrowDown") {
-                e.preventDefault();
-                setActive((a) => Math.min(a + 1, filtered.length - 1));
-              } else if (e.key === "ArrowUp") {
-                e.preventDefault();
-                setActive((a) => Math.max(a - 1, 0));
-              } else if (e.key === "Enter") {
-                const item = filtered[active];
-                if (item) go(item.to);
-              }
-            }}
-            placeholder="Search sections and actions…"
-            aria-label="Search sections and actions"
+            onKeyDown={onListKeyDown}
+            placeholder="Search customers, orders, products…"
+            aria-label="Search everything"
           />
-          {filtered.length === 0 ? (
-            <p className="sm-hint">No matching section or action.</p>
+          {searching ? <p className="sm-hint">Searching…</p> : null}
+          {searchError ? (
+            <p className="sm-hint">Search failed — try again.</p>
+          ) : null}
+          {flat.length === 0 && !searching && query.trim().length >= 2 ? (
+            <p className="sm-hint">No results for “{query.trim()}”.</p>
           ) : (
-            <div className="sm-quicknav-list" role="listbox" aria-label="Sections and actions">
-              {filtered.map((item, i) => (
-                <button
-                  key={`${item.to}:${item.label}`}
-                  type="button"
-                  role="option"
-                  aria-selected={i === active}
-                  data-active={i === active || undefined}
-                  className="sm-quicknav-item"
-                  onClick={() => go(item.to)}
-                  onMouseEnter={() => setActive(i)}
-                >
-                  <item.icon size={16} strokeWidth={2} />
-                  {item.label}
-                  <span className="sm-quicknav-group">{item.group}</span>
-                </button>
+            <div className="sm-quicknav-list" role="listbox" aria-label="Search results">
+              {searchGroups.map((group) => (
+                <div key={group.key}>
+                  <div className="sm-quicknav-heading">{group.label}</div>
+                  {group.items.map((item) => {
+                    const i = nextIndex();
+                    return (
+                      <button
+                        key={item.id}
+                        type="button"
+                        role="option"
+                        aria-selected={i === active}
+                        data-active={i === active || undefined}
+                        className="sm-quicknav-item"
+                        onClick={() => go(item.to)}
+                        onMouseEnter={() => setActive(i)}
+                      >
+                        {item.label}
+                        {item.sublabel ? (
+                          <span className="sm-quicknav-group">{item.sublabel}</span>
+                        ) : null}
+                      </button>
+                    );
+                  })}
+                </div>
               ))}
+              {pageResults.length > 0 ? (
+                <div>
+                  <div className="sm-quicknav-heading">Pages</div>
+                  {pageResults.map((item) => {
+                    const i = nextIndex();
+                    return (
+                      <button
+                        key={`${item.to}:${item.label}`}
+                        type="button"
+                        role="option"
+                        aria-selected={i === active}
+                        data-active={i === active || undefined}
+                        className="sm-quicknav-item"
+                        onClick={() => go(item.to)}
+                        onMouseEnter={() => setActive(i)}
+                      >
+                        <item.icon size={16} strokeWidth={2} />
+                        {item.label}
+                        <span className="sm-quicknav-group">{item.group}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
             </div>
           )}
         </div>

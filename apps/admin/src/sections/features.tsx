@@ -35,6 +35,8 @@ import {
   DetailLayout,
   ListTable,
   PageHeader,
+  detailLabelResolver,
+  loadListOptions,
   parseListSearch,
   useAdminList,
   useAdminMutation,
@@ -52,6 +54,7 @@ import {
   ErrorState,
   Field,
   Input,
+  SearchableSelect,
   Select,
   StatusBadge,
   Tabs,
@@ -1077,20 +1080,28 @@ export function FeaturesSection() {
           getRowId={(row) => row.id}
           toolbar={
             <>
-              <Select
+              {/* Searchable (PLAN §29): products are unbounded — the
+                 query runs server-side. The product picker table below
+                 still lists every product (it is a table, not a
+                 dropdown), so the full list stays loaded for it. */}
+              <SearchableSelect
                 value={productId ?? ""}
-                aria-label="Product"
-                style={{ width: "auto", minWidth: 200 }}
-                onChange={(e) =>
-                  updateSearch({ product: e.target.value, page: 1 })
+                loadOptions={(q, signal) =>
+                  loadListOptions<ProductListItem>(
+                    "/api/v1/admin/products",
+                    q,
+                    (p) => ({ value: p.id, label: p.name }),
+                    signal,
+                  )
                 }
-              >
-                {products.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
-              </Select>
+                resolveLabel={detailLabelResolver<ProductListItem>(
+                  (id) => `/api/v1/admin/products/${id}`,
+                  (p) => p.name,
+                )}
+                onChange={(v) => updateSearch({ product: v, page: 1 })}
+                placeholder="Select a product…"
+                ariaLabel="Product"
+              />
               {STATUS_FILTERS.map((s) => (
                 <button
                   key={s}

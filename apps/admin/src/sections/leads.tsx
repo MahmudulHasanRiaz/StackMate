@@ -37,6 +37,8 @@ import {
   DetailLayout,
   ListTable,
   PageHeader,
+  detailLabelResolver,
+  loadListOptions,
   parseListSearch,
   useAdminDetail,
   useAdminList,
@@ -52,6 +54,7 @@ import {
   ErrorState,
   Field,
   Input,
+  SearchableSelect,
   Select,
   StatusBadge,
   TableSkeleton,
@@ -148,11 +151,6 @@ export function LeadsSection() {
   const fromFilter = typeof rawSearch.from === "string" ? rawSearch.from : "";
   const toFilter = typeof rawSearch.to === "string" ? rawSearch.to : "";
   const query = useAdminList<LeadDto>("leads", "/api/v1/admin/leads");
-  const sitesQuery = useAdminList<IntegratedSiteOption>(
-    "integrated-sites",
-    "/api/v1/admin/integrated-sites",
-  );
-  const staffQuery = useAdminList<StaffUserDto>("staff-users", "/api/v1/admin/users");
 
   const columns: ColumnDef<LeadDto, unknown>[] = [
     {
@@ -275,23 +273,32 @@ export function LeadsSection() {
                 </option>
               ))}
             </Select>
-            <Select
+            {/* Searchable (PLAN §29): integrated sites are unbounded.
+               Status (5) stays a native select (fixed-enum exception). */}
+            <SearchableSelect
               value={siteFilter}
-              onChange={(e) =>
+              onChange={(v) =>
                 updateSearch({
-                  source_site_id: e.target.value === "" ? undefined : e.target.value,
+                  source_site_id: v === "" ? undefined : v,
                   page: 1,
                 })
               }
-              aria-label="Filter by source website"
-            >
-              <option value="">All sources</option>
-              {(sitesQuery.data ?? []).map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name}
-                </option>
-              ))}
-            </Select>
+              loadOptions={(q, signal) =>
+                loadListOptions<IntegratedSiteOption>(
+                  "/api/v1/admin/integrated-sites",
+                  q,
+                  (s) => ({ value: s.id, label: s.name }),
+                  signal,
+                )
+              }
+              resolveLabel={detailLabelResolver<IntegratedSiteOption>(
+                (id) => `/api/v1/admin/integrated-sites/${id}`,
+                (s) => s.name,
+              )}
+              leadingOptions={[{ value: "", label: "All sources" }]}
+              placeholder="All sources"
+              ariaLabel="Filter by source website"
+            />
             <Input
               value={campaignFilter}
               onChange={(e) =>
@@ -359,7 +366,6 @@ function CreateLeadDialog({
   const [notes, setNotes] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [formError, setFormError] = useState<string | null>(null);
-  const productsQuery = useAdminList<ProductOption>("products", "/api/v1/admin/products");
 
   const mutation = useAdminMutation<LeadDto, Record<string, unknown>>({
     mutationFn: (body) =>
@@ -466,14 +472,22 @@ function CreateLeadDialog({
           <Input value={interest} onChange={(e) => setInterest(e.target.value)} maxLength={300} />
         </Field>
         <Field label="Product">
-          <Select value={productId} onChange={(e) => setProductId(e.target.value)}>
-            <option value="">None</option>
-            {(productsQuery.data ?? []).map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name}
-              </option>
-            ))}
-          </Select>
+          {/* Searchable (PLAN §29): products are unbounded. */}
+          <SearchableSelect
+            value={productId}
+            onChange={(v) => setProductId(v)}
+            loadOptions={(q, signal) =>
+              loadListOptions<ProductOption>(
+                "/api/v1/admin/products",
+                q,
+                (p) => ({ value: p.id, label: p.name }),
+                signal,
+              )
+            }
+            leadingOptions={[{ value: "", label: "None" }]}
+            placeholder="None"
+            ariaLabel="Product"
+          />
         </Field>
         <Field label="Message">
           <Textarea value={message} onChange={(e) => setMessage(e.target.value)} maxLength={5000} />
@@ -494,7 +508,6 @@ export function LeadDetailSection({ id }: { id: string }) {
   const [converting, setConverting] = useState(false);
   const [convertError, setConvertError] = useState<string | null>(null);
   const query = useAdminDetail<LeadDetailDto>("leads", id, `/api/v1/admin/leads/${id}`);
-  const staffQuery = useAdminList<StaffUserDto>("staff-users", "/api/v1/admin/users");
 
   const transitionMutation = useAdminMutation<LeadDetailDto, Record<string, unknown>>({
     mutationFn: (body) =>
@@ -675,25 +688,33 @@ export function LeadDetailSection({ id }: { id: string }) {
             {
               label: "Assignee",
               value: (
-                <Select
+                /* Searchable (PLAN §29): staff grows; only active staff
+                   are offered (the loader filters). The current
+                   assignee label comes from the lead detail. */
+                <SearchableSelect
                   value={lead.assignee_user_id ?? ""}
-                  onChange={(e) =>
+                  onChange={(v) =>
                     assignMutation.mutate({
-                      assignee_user_id: e.target.value === "" ? null : e.target.value,
+                      assignee_user_id: v === "" ? null : v,
                     })
                   }
+                  loadOptions={async (q, signal) => {
+                    const all = await loadListOptions<StaffUserDto>(
+                      "/api/v1/admin/users",
+                      q,
+                      (u) => ({ value: u.id, label: u.name, data: u }),
+                      signal,
+                    );
+                    return all.filter(
+                      (o) => (o.data as StaffUserDto | undefined)?.status === "active",
+                    );
+                  }}
+                  selectedLabel={lead.assignee_name ?? undefined}
+                  leadingOptions={[{ value: "", label: "Unassigned" }]}
+                  placeholder="Unassigned"
                   disabled={assignMutation.isPending}
-                  aria-label="Assign lead"
-                >
-                  <option value="">Unassigned</option>
-                  {(staffQuery.data ?? [])
-                    .filter((u) => u.status === "active")
-                    .map((u) => (
-                      <option key={u.id} value={u.id}>
-                        {u.name}
-                      </option>
-                    ))}
-                </Select>
+                  ariaLabel="Assign lead"
+                />
               ),
             },
           ]}

@@ -203,6 +203,7 @@ import {
   getReminderSettings,
   saveReminderSettings,
 } from "./modules/reminders/service.ts";
+import { searchGlobal } from "./modules/search/service.ts";
 import {
   markSweepRemindersSent,
   runRenewalExpirySweep,
@@ -532,6 +533,41 @@ export function createStackMateApp(
         status,
         headers: buildStandardHeaders(requestId, originHeader, trustedOrigins),
       });
+
+    // Server-side list search (PLAN §29 / ADR-0010): `?q=` filters a list
+    // over the FULL dataset on the server — never over a loaded page —
+    // and `?limit=` caps the result AFTER filtering. The store loads the
+    // full table snapshot per request by design, so filtering `store.state`
+    // here is filtering the whole table; if the store ever paginates at
+    // the DB layer, these filters must move into SQL.
+    // `q` is trimmed + lowercased once here; every caller matches with
+    // `includes` on already-lowercased haystacks.
+    const parseListQuery = (params: URLSearchParams): { q: string; limit: number | null } => {
+      const q = params.get("q")?.trim().toLowerCase() ?? "";
+      const rawLimit = Number(params.get("limit"));
+      const limit =
+        Number.isFinite(rawLimit) && rawLimit >= 1
+          ? Math.min(Math.floor(rawLimit), 100)
+          : null;
+      return { q, limit };
+    };
+    const applyListLimit = <T>(items: T[], limit: number | null): T[] =>
+      limit === null ? items : items.slice(0, limit);
+    const includesQuery = (haystack: string | null | undefined, q: string): boolean =>
+      !q ? true : (haystack ?? "").toLowerCase().includes(q);
+    // Digits-only queries (e.g. a phone fragment) also match the digit
+    // form of a stored phone, so "0170000" finds "+880 1700-000…" rows.
+    const matchesPhoneQuery = (
+      phone: string | null | undefined,
+      normalizedPhone: string | null | undefined,
+      q: string,
+    ): boolean => {
+      if (!q) return true;
+      if (includesQuery(phone, q)) return true;
+      const digits = q.replace(/\D/g, "");
+      if (!digits) return false;
+      return (normalizedPhone ?? "").replace(/\D/g, "").includes(digits);
+    };
 
     try {
       // Reject oversized JSON bodies (> 6 MB)
@@ -2212,23 +2248,29 @@ export function createStackMateApp(
 
         if (method === "GET" && pathname === "/api/v1/admin/users") {
           assertStaffPermission(principal, "users.manage");
-          const users = store.state.users.map((u) => {
-            const roleIds = new Set(
-              store.state.user_roles.filter((ur) => ur.user_id === u.id).map((ur) => ur.role_id)
-            );
-            const roleKeys = store.state.roles
-              .filter((r) => roleIds.has(r.id))
-              .map((r) => r.key);
-            return {
-              id: u.id,
-              name: u.name,
-              email: u.email,
-              status: u.status,
-              roles: roleKeys,
-              created_at: u.created_at,
-              created_date_display: formatDisplayDateDDMMYYYY(u.created_at, env.DEFAULT_TIMEZONE),
-            };
-          });
+          const { q, limit } = parseListQuery(url.searchParams);
+          const users = applyListLimit(
+            store.state.users
+              .filter((u) => includesQuery(u.name, q) || includesQuery(u.email, q))
+              .map((u) => {
+                const roleIds = new Set(
+                  store.state.user_roles.filter((ur) => ur.user_id === u.id).map((ur) => ur.role_id)
+                );
+                const roleKeys = store.state.roles
+                  .filter((r) => roleIds.has(r.id))
+                  .map((r) => r.key);
+                return {
+                  id: u.id,
+                  name: u.name,
+                  email: u.email,
+                  status: u.status,
+                  roles: roleKeys,
+                  created_at: u.created_at,
+                  created_date_display: formatDisplayDateDDMMYYYY(u.created_at, env.DEFAULT_TIMEZONE),
+                };
+              }),
+            limit,
+          );
           return collectionResponse(users);
         }
 
@@ -2378,14 +2420,27 @@ export function createStackMateApp(
         // Products, Features, Packages & Prices
         if (method === "GET" && pathname === "/api/v1/admin/products") {
           assertStaffPermission(principal, "products.read");
-          const items = store.state.products.map((p) => ({
-            ...p,
-            features_count: store.state.product_features.filter((f) => f.product_id === p.id)
-              .length,
-            packages_count: store.state.product_packages.filter((pkg) => pkg.product_id === p.id)
-              .length,
-            created_date_display: formatDisplayDateDDMMYYYY(p.created_at, env.DEFAULT_TIMEZONE),
-          }));
+          const { q, limit } = parseListQuery(url.searchParams);
+          const items = applyListLimit(
+            store.state.products
+              .filter(
+                (p) => includesQuery(p.name, q) || includesQuery(p.code, q),
+              )
+              .map((p) => ({
+                ...p,
+                features_count: store.state.product_features.filter(
+                  (f) => f.product_id === p.id,
+                ).length,
+                packages_count: store.state.product_packages.filter(
+                  (pkg) => pkg.product_id === p.id,
+                ).length,
+                created_date_display: formatDisplayDateDDMMYYYY(
+                  p.created_at,
+                  env.DEFAULT_TIMEZONE,
+                ),
+              })),
+            limit,
+          );
           return collectionResponse(items);
         }
 
@@ -2448,9 +2503,14 @@ export function createStackMateApp(
         const mProductFeatures = matchPath("/api/v1/admin/products/:productId/features", pathname);
         if (method === "GET" && mProductFeatures) {
           assertStaffPermission(principal, "products.read");
-          const items = store.state.product_features
-            .filter((f) => f.product_id === mProductFeatures.params.productId)
-            .map((f) => withFeatureUsage(store.state, f));
+          const { q, limit } = parseListQuery(url.searchParams);
+          const items = applyListLimit(
+            store.state.product_features
+              .filter((f) => f.product_id === mProductFeatures.params.productId)
+              .filter((f) => includesQuery(f.name, q) || includesQuery(f.feature_key, q))
+              .map((f) => withFeatureUsage(store.state, f)),
+            limit,
+          );
           return collectionResponse(items);
         }
 
@@ -2489,19 +2549,24 @@ export function createStackMateApp(
         const mProductPackages = matchPath("/api/v1/admin/products/:productId/packages", pathname);
         if (method === "GET" && mProductPackages) {
           assertStaffPermission(principal, "products.read");
-          const pkgs = store.state.product_packages
-            .filter((p) => p.product_id === mProductPackages.params.productId)
-            .map((p) => ({
-              ...p,
-              versions: store.state.package_versions
-                .filter((v) => v.package_id === p.id)
-                .map((v) => ({
-                  ...v,
-                  prices: store.state.package_prices.filter(
-                    (pr) => pr.package_version_id === v.id
-                  ),
-                })),
-            }));
+          const { q, limit } = parseListQuery(url.searchParams);
+          const pkgs = applyListLimit(
+            store.state.product_packages
+              .filter((p) => p.product_id === mProductPackages.params.productId)
+              .filter((p) => includesQuery(p.name, q))
+              .map((p) => ({
+                ...p,
+                versions: store.state.package_versions
+                  .filter((v) => v.package_id === p.id)
+                  .map((v) => ({
+                    ...v,
+                    prices: store.state.package_prices.filter(
+                      (pr) => pr.package_version_id === v.id,
+                    ),
+                  })),
+              })),
+            limit,
+          );
           return collectionResponse(pkgs);
         }
 
@@ -2707,21 +2772,53 @@ export function createStackMateApp(
           return jsonResponse(disabled);
         }
 
+        // Global search (PLAN §29 / ADR-0010): the header search bar.
+        // Any staff session may call it; each group is gated by the
+        // caller's own permissions inside searchGlobal, so a caller
+        // without orders.read simply gets no Orders group — never a 403
+        // for the whole search.
+        if (method === "GET" && pathname === "/api/v1/admin/search") {
+          if (!principal) {
+            throw new AppError("UNAUTHORIZED", "Authentication required.", 401);
+          }
+          const q = url.searchParams.get("q") ?? "";
+          return jsonResponse({
+            query: q.trim(),
+            groups: searchGlobal(store.state, principal, q),
+          });
+        }
+
         // Customers, Orders & Invoices
         if (method === "GET" && pathname === "/api/v1/admin/customers") {
           assertStaffPermission(principal, "customers.read");
-          const items = store.state.customers.map((c) => ({
-            ...c,
-            // Staff-report flag (ADR-0009): a warning badge when a concern
-            // report exists; the count lets the list row show it plainly.
-            report_count: store.state.customer_reports.filter(
-              (r) => r.customer_id === c.id
-            ).length,
-            has_concern_report: store.state.customer_reports.some(
-              (r) => r.customer_id === c.id && r.type === "concern"
-            ),
-            created_date_display: formatDisplayDateDDMMYYYY(c.created_at, env.DEFAULT_TIMEZONE),
-          }));
+          const { q, limit } = parseListQuery(url.searchParams);
+          const items = applyListLimit(
+            store.state.customers
+              .filter(
+                (c) =>
+                  includesQuery(c.name, q) ||
+                  includesQuery(c.email, q) ||
+                  includesQuery(c.customer_number, q) ||
+                  includesQuery(c.company_name, q) ||
+                  matchesPhoneQuery(c.phone, c.normalized_phone, q),
+              )
+              .map((c) => ({
+                ...c,
+                // Staff-report flag (ADR-0009): a warning badge when a concern
+                // report exists; the count lets the list row show it plainly.
+                report_count: store.state.customer_reports.filter(
+                  (r) => r.customer_id === c.id,
+                ).length,
+                has_concern_report: store.state.customer_reports.some(
+                  (r) => r.customer_id === c.id && r.type === "concern",
+                ),
+                created_date_display: formatDisplayDateDDMMYYYY(
+                  c.created_at,
+                  env.DEFAULT_TIMEZONE,
+                ),
+              })),
+            limit,
+          );
           return collectionResponse(items);
         }
 
@@ -2831,17 +2928,33 @@ export function createStackMateApp(
         if (method === "GET" && pathname === "/api/v1/admin/orders") {
           assertStaffPermission(principal, "orders.read");
           const statusFilter = url.searchParams.get("payment_status");
-          const items = store.state.orders
-            .filter((o) => (!statusFilter ? true : o.payment_status === statusFilter))
-            .map((o) => ({
-              ...o,
-              customer: store.state.customers.find((c) => c.id === o.customer_id) ?? null,
-              // Paid/remaining are computed from verified payments
-              // (ADR-0009) — never denormalized, so they cannot drift.
-              paid_amount_minor: computeOrderPaid(store.state, o.id),
-              remaining_minor: computeOrderRemaining(store.state, o),
-              created_date_display: formatDisplayDateDDMMYYYY(o.created_at, env.DEFAULT_TIMEZONE),
-            }));
+          const { q, limit } = parseListQuery(url.searchParams);
+          const items = applyListLimit(
+            store.state.orders
+              .filter((o) => (!statusFilter ? true : o.payment_status === statusFilter))
+              .filter(
+                (o) =>
+                  includesQuery(o.order_number, q) ||
+                  includesQuery(o.public_reference, q) ||
+                  includesQuery(
+                    store.state.customers.find((c) => c.id === o.customer_id)?.name,
+                    q,
+                  ),
+              )
+              .map((o) => ({
+                ...o,
+                customer: store.state.customers.find((c) => c.id === o.customer_id) ?? null,
+                // Paid/remaining are computed from verified payments
+                // (ADR-0009) — never denormalized, so they cannot drift.
+                paid_amount_minor: computeOrderPaid(store.state, o.id),
+                remaining_minor: computeOrderRemaining(store.state, o),
+                created_date_display: formatDisplayDateDDMMYYYY(
+                  o.created_at,
+                  env.DEFAULT_TIMEZONE,
+                ),
+              })),
+            limit,
+          );
           return collectionResponse(items);
         }
 
@@ -3276,29 +3389,33 @@ export function createStackMateApp(
           const customerFilter = url.searchParams.get("customer_id");
           const assigneeFilter = url.searchParams.get("assignee_user_id");
           const q = url.searchParams.get("q")?.trim().toLowerCase() ?? "";
-          const items = store.state.support_tickets
-            .filter((t) => (!statusFilter ? true : t.status === statusFilter))
-            .filter((t) => (!priorityFilter ? true : t.priority === priorityFilter))
-            .filter((t) => (!customerFilter ? true : t.customer_id === customerFilter))
-            .filter((t) => (!assigneeFilter ? true : t.assignee_user_id === assigneeFilter))
-            .filter((t) =>
-              !q
-                ? true
-                : t.ticket_number.toLowerCase().includes(q) ||
-                  t.title.toLowerCase().includes(q) ||
-                  (t.description ?? "").toLowerCase().includes(q)
-            )
-            .map((t) => ({
-              ...t,
-              customer: t.customer_id
-                ? (store.state.customers.find((c) => c.id === t.customer_id) ?? null)
-                : null,
-              assignee_name: t.assignee_user_id
-                ? (store.state.users.find((u) => u.id === t.assignee_user_id)?.name ?? null)
-                : null,
-              assignee_email: staffContactFor(t.assignee_user_id).email,
-              assignee_roles: staffContactFor(t.assignee_user_id).roles,
-            }));
+          const { limit } = parseListQuery(url.searchParams);
+          const items = applyListLimit(
+            store.state.support_tickets
+              .filter((t) => (!statusFilter ? true : t.status === statusFilter))
+              .filter((t) => (!priorityFilter ? true : t.priority === priorityFilter))
+              .filter((t) => (!customerFilter ? true : t.customer_id === customerFilter))
+              .filter((t) => (!assigneeFilter ? true : t.assignee_user_id === assigneeFilter))
+              .filter((t) =>
+                !q
+                  ? true
+                  : t.ticket_number.toLowerCase().includes(q) ||
+                    t.title.toLowerCase().includes(q) ||
+                    (t.description ?? "").toLowerCase().includes(q)
+              )
+              .map((t) => ({
+                ...t,
+                customer: t.customer_id
+                  ? (store.state.customers.find((c) => c.id === t.customer_id) ?? null)
+                  : null,
+                assignee_name: t.assignee_user_id
+                  ? (store.state.users.find((u) => u.id === t.assignee_user_id)?.name ?? null)
+                  : null,
+                assignee_email: staffContactFor(t.assignee_user_id).email,
+                assignee_roles: staffContactFor(t.assignee_user_id).roles,
+              })),
+            limit,
+          );
           return collectionResponse(items);
         }
         if (method === "POST" && pathname === "/api/v1/admin/tickets") {
@@ -3416,29 +3533,33 @@ export function createStackMateApp(
           const fromFilter = url.searchParams.get("from");
           const toFilter = url.searchParams.get("to");
           const q = url.searchParams.get("q")?.trim().toLowerCase() ?? "";
-          const items = store.state.leads
-            .filter((l) => (!statusFilter ? true : l.status === statusFilter))
-            .filter((l) => (!siteFilter ? true : l.source_site_id === siteFilter))
-            .filter((l) => (!campaignFilter ? true : l.utm_campaign === campaignFilter))
-            .filter((l) => (!fromFilter ? true : l.created_at.slice(0, 10) >= fromFilter))
-            .filter((l) => (!toFilter ? true : l.created_at.slice(0, 10) <= toFilter))
-            .filter((l) =>
-              !q
-                ? true
-                : l.name.toLowerCase().includes(q) ||
-                  (l.email ?? "").toLowerCase().includes(q) ||
-                  (l.phone ?? "").includes(q) ||
-                  (l.interest ?? "").toLowerCase().includes(q)
-            )
-            .map((l) => ({
-              ...l,
-              source_site: l.source_site_id
-                ? (store.state.integrated_sites.find((s) => s.id === l.source_site_id) ?? null)
-                : null,
-              assignee_name: l.assignee_user_id
-                ? (store.state.users.find((u) => u.id === l.assignee_user_id)?.name ?? null)
-                : null,
-            }));
+          const { limit } = parseListQuery(url.searchParams);
+          const items = applyListLimit(
+            store.state.leads
+              .filter((l) => (!statusFilter ? true : l.status === statusFilter))
+              .filter((l) => (!siteFilter ? true : l.source_site_id === siteFilter))
+              .filter((l) => (!campaignFilter ? true : l.utm_campaign === campaignFilter))
+              .filter((l) => (!fromFilter ? true : l.created_at.slice(0, 10) >= fromFilter))
+              .filter((l) => (!toFilter ? true : l.created_at.slice(0, 10) <= toFilter))
+              .filter((l) =>
+                !q
+                  ? true
+                  : l.name.toLowerCase().includes(q) ||
+                    (l.email ?? "").toLowerCase().includes(q) ||
+                    (l.phone ?? "").includes(q) ||
+                    (l.interest ?? "").toLowerCase().includes(q)
+              )
+              .map((l) => ({
+                ...l,
+                source_site: l.source_site_id
+                  ? (store.state.integrated_sites.find((s) => s.id === l.source_site_id) ?? null)
+                  : null,
+                assignee_name: l.assignee_user_id
+                  ? (store.state.users.find((u) => u.id === l.assignee_user_id)?.name ?? null)
+                  : null,
+              })),
+            limit,
+          );
           return collectionResponse(items);
         }
         if (method === "POST" && pathname === "/api/v1/admin/leads") {
@@ -3617,12 +3738,24 @@ export function createStackMateApp(
         // Payment Providers, Methods, Submissions & Verification
         if (method === "GET" && pathname === "/api/v1/admin/payment-providers") {
           assertStaffPermission(principal, "payments.read");
-          return collectionResponse(store.state.payment_providers);
+          const { q, limit } = parseListQuery(url.searchParams);
+          return collectionResponse(
+            applyListLimit(
+              store.state.payment_providers.filter((p) => includesQuery(p.display_name, q)),
+              limit,
+            ),
+          );
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/payment-methods") {
           assertStaffPermission(principal, "payments.read");
-          return collectionResponse(store.state.payment_methods);
+          const { q, limit } = parseListQuery(url.searchParams);
+          return collectionResponse(
+            applyListLimit(
+              store.state.payment_methods.filter((m) => includesQuery(m.display_name, q)),
+              limit,
+            ),
+          );
         }
 
         if (method === "POST" && pathname === "/api/v1/admin/payment-methods") {
@@ -3847,14 +3980,27 @@ export function createStackMateApp(
         // Subscriptions & Licenses
         if (method === "GET" && pathname === "/api/v1/admin/subscriptions") {
           assertStaffPermission(principal, "subscriptions.read");
-          const items = store.state.subscriptions.map((s) => ({
-            ...s,
-            customer: store.state.customers.find((c) => c.id === s.customer_id) ?? null,
-            product: store.state.products.find((p) => p.id === s.product_id) ?? null,
-            next_renewal_display: s.next_renewal_at
-              ? formatDisplayDateDDMMYYYY(s.next_renewal_at, env.DEFAULT_TIMEZONE)
-              : null,
-          }));
+          const { q, limit } = parseListQuery(url.searchParams);
+          const items = applyListLimit(
+            store.state.subscriptions
+              .filter(
+                (s) =>
+                  includesQuery(s.subscription_number, q) ||
+                  includesQuery(
+                    store.state.customers.find((c) => c.id === s.customer_id)?.name,
+                    q,
+                  ),
+              )
+              .map((s) => ({
+                ...s,
+                customer: store.state.customers.find((c) => c.id === s.customer_id) ?? null,
+                product: store.state.products.find((p) => p.id === s.product_id) ?? null,
+                next_renewal_display: s.next_renewal_at
+                  ? formatDisplayDateDDMMYYYY(s.next_renewal_at, env.DEFAULT_TIMEZONE)
+                  : null,
+              })),
+            limit,
+          );
           return collectionResponse(items);
         }
 
@@ -3920,7 +4066,22 @@ export function createStackMateApp(
         if (method === "GET" && pathname === "/api/v1/admin/licenses") {
           assertStaffPermission(principal, "licenses.read");
           // Never expose license_key_hash or raw keys in list responses (API Spec §12.3)
-          const items = store.state.licenses.map((l) => {
+          const { q, limit } = parseListQuery(url.searchParams);
+          const items = applyListLimit(
+            store.state.licenses
+              .filter(
+                (l) =>
+                  includesQuery(l.license_number, q) ||
+                  includesQuery(
+                    store.state.customers.find((c) => c.id === l.customer_id)?.name,
+                    q,
+                  ) ||
+                  includesQuery(
+                    store.state.products.find((p) => p.id === l.product_id)?.code,
+                    q,
+                  ),
+              )
+              .map((l) => {
             const { license_key_hash: _h, issued_raw_key_once: _r, ...safe } = l;
             const customer = store.state.customers.find((c) => c.id === l.customer_id);
             const product = store.state.products.find((p) => p.id === l.product_id);
@@ -3933,8 +4094,10 @@ export function createStackMateApp(
               expires_date_display: l.expires_at
                 ? formatDisplayDateDDMMYYYY(l.expires_at, env.DEFAULT_TIMEZONE)
                 : "Lifetime",
-            };
-          });
+              };
+            }),
+            limit,
+          );
           return collectionResponse(items);
         }
 
@@ -4058,15 +4221,26 @@ export function createStackMateApp(
         // Integrated Sites, Credentials, Tracking, Webhooks
         if (method === "GET" && pathname === "/api/v1/admin/integrated-sites") {
           assertStaffPermission(principal, "integrations.manage");
-          const sites = store.state.integrated_sites.map((s) => ({
-            ...s,
-            credentials: store.state.site_credentials
-              .filter((c) => c.integrated_site_id === s.id)
-              .map(({ secret_ciphertext: _c, secret_hash: _h, ...safeCred }) => safeCred),
-            tracking: store.state.tracking_configurations
-              .filter((tc) => tc.integrated_site_id === s.id)
-              .map(({ access_token_ciphertext: _a, ...safeTc }) => safeTc),
-          }));
+          const { q, limit } = parseListQuery(url.searchParams);
+          const sites = applyListLimit(
+            store.state.integrated_sites
+              .filter(
+                (s) =>
+                  includesQuery(s.name, q) ||
+                  includesQuery(s.site_key, q) ||
+                  s.domains.some((d) => includesQuery(d.domain, q)),
+              )
+              .map((s) => ({
+                ...s,
+                credentials: store.state.site_credentials
+                  .filter((c) => c.integrated_site_id === s.id)
+                  .map(({ secret_ciphertext: _c, secret_hash: _h, ...safeCred }) => safeCred),
+                tracking: store.state.tracking_configurations
+                  .filter((tc) => tc.integrated_site_id === s.id)
+                  .map(({ access_token_ciphertext: _a, ...safeTc }) => safeTc),
+              })),
+            limit,
+          );
           return collectionResponse(sites);
         }
 

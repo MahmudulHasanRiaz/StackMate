@@ -21,6 +21,7 @@ import {
   DateTimeCell,
   Drawer,
   IconButton,
+  SearchableSelect,
   Select,
   StatusBadge,
 } from "../components/primitives";
@@ -324,40 +325,41 @@ export function AuditLogsSection() {
           : {})}
         toolbar={
           <>
-            <Select
-              aria-label="Filter by action"
+            {/* Searchable, local mode (PLAN §29): the action vocabulary
+               grows with the product (100+ event names), so a plain
+               dropdown is unusable. The options are the COMPLETE
+               distinct set from the loaded collection — client-side
+               filtering cannot miss one. A URL-restored value shows
+               itself (selectedLabel) even before its rows load. */}
+            <SearchableSelect
               value={search.action ?? ""}
-              onChange={(e) =>
+              onChange={(v) =>
                 updateSearch(
-                  { action: e.target.value === "" ? undefined : e.target.value },
+                  { action: v === "" ? undefined : v },
                   true,
                 )
               }
-            >
-              <option value="">All actions</option>
-              {actions.map((a) => (
-                <option key={a} value={a}>
-                  {a}
-                </option>
-              ))}
-            </Select>
-            <Select
-              aria-label="Filter by resource type"
+              options={actions.map((a) => ({ value: a, label: a }))}
+              selectedLabel={search.action ?? undefined}
+              leadingOptions={[{ value: "", label: "All actions" }]}
+              placeholder="All actions"
+              ariaLabel="Filter by action"
+            />
+            {/* Same: resource types are a fixed but >8 vocabulary. */}
+            <SearchableSelect
               value={search.resource_type ?? ""}
-              onChange={(e) =>
+              onChange={(v) =>
                 updateSearch(
-                  { resource_type: e.target.value === "" ? undefined : e.target.value },
+                  { resource_type: v === "" ? undefined : v },
                   true,
                 )
               }
-            >
-              <option value="">All resources</option>
-              {resourceTypes.map((r) => (
-                <option key={r} value={r}>
-                  {r}
-                </option>
-              ))}
-            </Select>
+              options={resourceTypes.map((r) => ({ value: r, label: r }))}
+              selectedLabel={search.resource_type ?? undefined}
+              leadingOptions={[{ value: "", label: "All resources" }]}
+              placeholder="All resources"
+              ariaLabel="Filter by resource type"
+            />
             <Select
               aria-label="Filter by outcome"
               value={search.outcome ?? ""}
@@ -373,23 +375,22 @@ export function AuditLogsSection() {
               <option value="denied">Denied</option>
               <option value="failed">Failed</option>
             </Select>
-            <Select
-              aria-label="Filter by actor type"
+            {/* Same: actor types are few, but the same searchable
+               treatment keeps the toolbar consistent. */}
+            <SearchableSelect
               value={search.actor_type ?? ""}
-              onChange={(e) =>
+              onChange={(v) =>
                 updateSearch(
-                  { actor_type: e.target.value === "" ? undefined : e.target.value },
+                  { actor_type: v === "" ? undefined : v },
                   true,
                 )
               }
-            >
-              <option value="">All actors</option>
-              {actorTypes.map((a) => (
-                <option key={a} value={a}>
-                  {a}
-                </option>
-              ))}
-            </Select>
+              options={actorTypes.map((a) => ({ value: a, label: a }))}
+              selectedLabel={search.actor_type ?? undefined}
+              leadingOptions={[{ value: "", label: "All actors" }]}
+              placeholder="All actors"
+              ariaLabel="Filter by actor type"
+            />
             {filtersActive ? (
               <Button variant="ghost" onClick={clearFilters}>
                 Clear filters
