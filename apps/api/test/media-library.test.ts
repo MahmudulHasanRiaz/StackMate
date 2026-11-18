@@ -240,6 +240,7 @@ describe.skipIf(!DATABASE_URL)("media library — upload, search, drivers", () =
     assert.equal(res.status, 200, JSON.stringify(res.body));
     assert.equal(dataOf(res).driver, "r2");
     assert.equal(dataOf(res).local_path, null);
+    assert.equal(dataOf(res).r2_bucket, "stackmate-private-assets");
   });
 
   it("upload with a disallowed type is rejected with 415", async () => {

@@ -17,6 +17,7 @@ import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import { storageSettings } from "../../../../../db/schema/media.ts";
 import * as schema from "../../../../../db/schema/index.ts";
 import { AppError } from "../../shared/errors.ts";
+import { R2_BUCKET_NAME } from "./r2.ts";
 
 export type StorageSettingsDb = NodePgDatabase<typeof schema>;
 
@@ -27,12 +28,19 @@ export type StorageDriverName = "r2" | "local";
 export interface StorageSettingsView {
   driver: StorageDriverName;
   local_path: string | null;
+  /**
+   * Name of the bound R2 bucket (R2_BUCKET_NAME — mirrors wrangler.jsonc).
+   * Shown read-only on Settings → Storage so the admin can see where
+   * files actually live; null is never returned, the name is config.
+   */
+  r2_bucket: string;
   updated_at: string;
 }
 
 export const DEFAULT_STORAGE_SETTINGS: StorageSettingsView = {
   driver: "r2",
   local_path: null,
+  r2_bucket: R2_BUCKET_NAME,
   updated_at: new Date(0).toISOString(),
 };
 
@@ -40,6 +48,7 @@ function viewOf(row: typeof storageSettings.$inferSelect): StorageSettingsView {
   return {
     driver: row.driver === "local" ? "local" : "r2",
     local_path: row.localPath,
+    r2_bucket: R2_BUCKET_NAME,
     updated_at: row.updatedAt.toISOString(),
   };
 }

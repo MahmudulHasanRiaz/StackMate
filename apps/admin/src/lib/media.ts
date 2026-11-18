@@ -51,6 +51,9 @@ export const MEDIA_ACCEPT_BY_KIND: Record<MediaLibraryKind, string> = {
   other: "text/plain,text/csv,.txt,.csv",
 };
 
+/** Accept string for the library upload (all allowlisted types). */
+export const MEDIA_UPLOAD_ACCEPT = MEDIA_KINDS.map((k) => MEDIA_ACCEPT_BY_KIND[k]).join(",");
+
 /** Accept string for a kind restriction, or undefined (all types) when unrestricted. */
 export function mediaAcceptForKinds(kinds?: MediaLibraryKind[]): string | undefined {
   if (!kinds || kinds.length === 0) return undefined;

@@ -82,6 +82,8 @@ export interface MediaUploadResponse {
 export interface StorageSettingsView {
   driver: "r2" | "local";
   local_path: string | null;
+  /** Name of the bound R2 bucket (mirrors wrangler.jsonc) — shown read-only on Settings → Storage. */
+  r2_bucket: string;
   updated_at: string;
 }
 
