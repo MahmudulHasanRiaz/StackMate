@@ -598,28 +598,19 @@ const customerColumns: ColumnDef<CustomerDto, unknown>[] = [
     cell: ({ row }) => {
       const c = row.original;
       return (
-        <div>
-          {/* The name is a real link on the row's own id — the single id
-             source for this row, matching the View button and the
-             products/packages lists. (Live defect 2026-11-18: the list
-             showed a name that led to a different customer id and a
-             "Customer not found" page; the code audit found no divergent
-             id source in the tree — the name was plain text, so the live
-             link came from a stale cached row. A real link on
-             row.original.id removes any other id from the path.) */}
-          <div>
+        <span className="sm-cell-line">
+          {/* Single-line (Neon density batch 2): name + number + copy +
+             badge on ONE line — the stacked two-line version made
+             Customers rows ~65px; Neon rows are one line (46-47px). */}
+          <span className="sm-cell-text">
             <a href={`/customers/${c.id}`}>{c.name}</a>
-          </div>
-          <div>
-            <span className="sm-mono">{c.customer_number}</span>
-            <CopyButton value={c.customer_number} label="Copy customer number" />
-            {c.has_concern_report ? (
-              <span style={{ marginLeft: 8 }}>
-                <StatusBadge status="warning" label="Concern reported" />
-              </span>
-            ) : null}
-          </div>
-        </div>
+          </span>
+          <span className="sm-mono sm-cell-text">{c.customer_number}</span>
+          <CopyButton value={c.customer_number} label="Copy customer number" />
+          {c.has_concern_report ? (
+            <StatusBadge status="warning" label="Concern reported" />
+          ) : null}
+        </span>
       );
     },
   },
@@ -629,10 +620,10 @@ const customerColumns: ColumnDef<CustomerDto, unknown>[] = [
     cell: ({ row }) => {
       const c = row.original;
       return (
-        <div>
-          <div>{c.email ?? "—"}</div>
-          <div className="sm-hint">{c.phone ?? "No phone"}</div>
-        </div>
+        <span className="sm-cell-line">
+          <span className="sm-cell-text">{c.email ?? "—"}</span>
+          <span className="sm-hint sm-cell-text">{c.phone ?? "No phone"}</span>
+        </span>
       );
     },
   },
