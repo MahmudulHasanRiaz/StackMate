@@ -1289,6 +1289,16 @@ export function RowMenu({
 /* ------------------------------------------------------------------ */
 function useFocusTrap(active: boolean, onClose: () => void) {
   const ref = useRef<HTMLDivElement>(null);
+  // onClose is almost always an inline arrow in the caller, so its
+  // identity changes on every parent render. If it stayed in the effect
+  // deps, the trap re-ran on EVERY render: the cleanup refocused the
+  // pre-dialog element and the body refocused the first focusable item —
+  // yanking focus out of a form field after its first keystroke (live
+  // defect 2026-11-18: the dashboard Custom-range From field kept only
+  // "0" of a typed/pasted date). The trap must run once per open, so
+  // onClose is read through a ref and only `active` is a dep.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
     if (!active || !ref.current) return;
     const el = ref.current;
@@ -1304,7 +1314,7 @@ function useFocusTrap(active: boolean, onClose: () => void) {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.stopPropagation();
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (e.key !== "Tab") return;
@@ -1326,7 +1336,7 @@ function useFocusTrap(active: boolean, onClose: () => void) {
       document.removeEventListener("keydown", onKey, true);
       prev?.focus();
     };
-  }, [active, onClose]);
+  }, [active]);
   return ref;
 }
 

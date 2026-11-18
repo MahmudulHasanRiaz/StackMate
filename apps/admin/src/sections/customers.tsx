@@ -599,7 +599,17 @@ const customerColumns: ColumnDef<CustomerDto, unknown>[] = [
       const c = row.original;
       return (
         <div>
-          <div>{c.name}</div>
+          {/* The name is a real link on the row's own id — the single id
+             source for this row, matching the View button and the
+             products/packages lists. (Live defect 2026-11-18: the list
+             showed a name that led to a different customer id and a
+             "Customer not found" page; the code audit found no divergent
+             id source in the tree — the name was plain text, so the live
+             link came from a stale cached row. A real link on
+             row.original.id removes any other id from the path.) */}
+          <div>
+            <a href={`/customers/${c.id}`}>{c.name}</a>
+          </div>
           <div>
             <span className="sm-mono">{c.customer_number}</span>
             <CopyButton value={c.customer_number} label="Copy customer number" />

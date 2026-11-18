@@ -225,6 +225,13 @@
   --sm-z-dropdown: 40;
   --sm-z-drawer: 50;
   --sm-z-dialog: 60;
+  /* Popover above dialogs, below toasts: the portaled MenuSelect/RowMenu
+     listbox (position: fixed, child of body) must paint above a dialog
+     overlay when opened from inside a dialog — at 40 it rendered UNDER
+     the overlay (invisible, clicks intercepted by the dialog; live
+     defect 2026-11-18, wizard Price menu). The account .sm-menu stays
+     at 40: it lives inside the topbar's stacking context. */
+  --sm-z-popover: 65;
   --sm-z-toast: 70;
 }
 
@@ -760,6 +767,10 @@ a:hover {
 .sm-row-menu {
   position: fixed;
   min-width: 200px;
+  /* Above the dialog overlay (see --sm-z-popover): this listbox is
+     portaled to document.body, so the shared 40 above would paint it
+     UNDER any open dialog. */
+  z-index: var(--sm-z-popover);
 }
 /* Info popover — the (i) button beside a page title. The page
    description lives here, hidden until opened (clean header rule,
