@@ -21,3 +21,4 @@ export * from "./sequence-counters.ts";
 export * from "./reminders.ts";
 export * from "./tickets.ts";
 export * from "./leads.ts";
+export * from "./media.ts";

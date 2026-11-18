@@ -316,29 +316,31 @@ describe.skipIf(!DATABASE_URL)("DrizzleStore (Postgres) integration", () => {
     const byRole = new Map<string, number>(
       grants.rows.map((row) => [row.role_key as string, row.n as number])
     );
-    // seed-reference.ts matrix: super_admin 29, admin 28, finance_manager 13,
-    // license_manager 7, product_manager 6, support_staff 11, marketing_manager 4,
-    // read_only 9 = 107 total. Before migration 0003 only super_admin had any.
+    // seed-reference.ts matrix: super_admin 31, admin 30, finance_manager 13,
+    // license_manager 7, product_manager 6, support_staff 13, marketing_manager 4,
+    // read_only 10 = 114 total. Before migration 0003 only super_admin had any.
     // (ADR-0009 added 4 permissions — tickets.view/manage, leads.view/manage:
-    // super_admin +4, admin +4, support_staff +4, read_only +2 = +14 total.)
-    assert.equal(byRole.get("super_admin"), 29);
-    assert.equal(byRole.get("admin"), 28);
+    // super_admin +4, admin +4, support_staff +4, read_only +2 = +14 total.
+    // Migration 0012 added 2 — media.view/manage: super_admin +2, admin +2,
+    // support_staff +2, read_only +1 = +7 total.)
+    assert.equal(byRole.get("super_admin"), 31);
+    assert.equal(byRole.get("admin"), 30);
     assert.equal(byRole.get("finance_manager"), 13);
     assert.equal(byRole.get("license_manager"), 7);
     assert.equal(byRole.get("product_manager"), 6);
-    assert.equal(byRole.get("support_staff"), 11);
+    assert.equal(byRole.get("support_staff"), 13);
     assert.equal(byRole.get("marketing_manager"), 4);
-    assert.equal(byRole.get("read_only"), 9);
+    assert.equal(byRole.get("read_only"), 10);
     const total = [...byRole.values()].reduce((a, b) => a + b, 0);
-    assert.equal(total, 107);
+    assert.equal(total, 114);
 
     // The grants must also be visible through the store's loaded roles.
     const reloaded = await store.loadState();
     const admin = reloaded.roles.find((r) => r.key === "admin");
     assert.ok(admin, "admin role missing from loadState");
-    assert.equal(admin?.permission_keys.length, 28); // ADR-0009: +4 tickets/leads grants
+    assert.equal(admin?.permission_keys.length, 30); // ADR-0009: +4 tickets/leads grants; 0012: +2 media grants
     assert.ok(!admin?.permission_keys.includes("users.manage"));
     const readOnly = reloaded.roles.find((r) => r.key === "read_only");
-    assert.equal(readOnly?.permission_keys.length, 9); // ADR-0009: +2 tickets/leads view grants
+    assert.equal(readOnly?.permission_keys.length, 10); // ADR-0009: +2 tickets/leads view grants; 0012: +1 media.view
   });
 });

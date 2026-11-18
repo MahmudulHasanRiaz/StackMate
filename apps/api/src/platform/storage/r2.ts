@@ -162,26 +162,62 @@ export interface StoredObjectMetadata {
   checksumSha256: string;
 }
 
-export async function storeValidatedPrivateR2Object(
-  input: StorePrivateObjectInput
-): Promise<StoredObjectMetadata> {
+export interface ValidatedPrivateObject {
+  sanitizedName: string;
+  checksumSha256: string;
+  contentType: string;
+  byteSize: number;
+}
+
+/**
+ * Shared validation for the private-object stores (favicon, payment
+ * evidence): size cap + allowlisted MIME + magic bytes, filename
+ * sanitization, SHA-256. Pure — it writes nothing, so both the
+ * R2-specific store below and the driver-aware store in driver.ts
+ * (PLAN §31) use the same gate and cannot drift apart.
+ */
+export function validatePrivateObjectUpload(input: {
+  bytes: Uint8Array;
+  contentType: string;
+  originalFilename: string;
+  // `| undefined`: exactOptionalPropertyTypes — callers pass
+  // `input.maxBytes` through, which is `number | undefined`.
+  maxBytes?: number | undefined;
+}): ValidatedPrivateObject {
   const maxBytes = input.maxBytes ?? MAX_EVIDENCE_BYTES;
   if (input.bytes.byteLength > maxBytes) {
     throw new AppError(
       "PAYLOAD_TOO_LARGE",
       `Uploaded file exceeds maximum allowed size of ${maxBytes} bytes.`,
-      413
+      413,
     );
   }
   verifyFileMagicBytes(input.bytes, input.contentType);
   const sanitizedName = sanitizeFilename(input.originalFilename);
   const checksum = sha256Hex(input.bytes);
+  return {
+    sanitizedName,
+    checksumSha256: checksum,
+    contentType: input.contentType.trim().toLowerCase(),
+    byteSize: input.bytes.byteLength,
+  };
+}
+
+export async function storeValidatedPrivateR2Object(
+  input: StorePrivateObjectInput
+): Promise<StoredObjectMetadata> {
+  const validated = validatePrivateObjectUpload({
+    bytes: input.bytes,
+    contentType: input.contentType,
+    originalFilename: input.originalFilename,
+    maxBytes: input.maxBytes,
+  });
 
   await input.bucket.put(input.objectKey, input.bytes, {
-    httpMetadata: { contentType: input.contentType.toLowerCase() },
+    httpMetadata: { contentType: validated.contentType },
     customMetadata: {
-      sha256: checksum,
-      originalFilename: sanitizedName,
+      sha256: validated.checksumSha256,
+      originalFilename: validated.sanitizedName,
       visibility: "private",
     },
   });
@@ -189,9 +225,9 @@ export async function storeValidatedPrivateR2Object(
   return {
     objectKey: input.objectKey,
     bucketName: input.bucketName,
-    originalFilename: sanitizedName,
-    contentType: input.contentType.toLowerCase(),
-    byteSize: input.bytes.byteLength,
-    checksumSha256: checksum,
+    originalFilename: validated.sanitizedName,
+    contentType: validated.contentType,
+    byteSize: validated.byteSize,
+    checksumSha256: validated.checksumSha256,
   };
 }

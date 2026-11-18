@@ -298,6 +298,19 @@ describe.skipIf(!DATABASE_URL)(
       }
     });
 
+    it("global search staff item carries email + role as separate widget fields", async () => {
+      const res = await authed("/api/v1/admin/search?q=search%20test");
+      assert.equal(res.status, 200, JSON.stringify(res.body));
+      const data = dataOf(res);
+      const staff = data.groups.find((g: any) => g.key === "staff");
+      assert.ok(staff, "staff group must be present");
+      const item = staff.items.find((i: any) => i.label === "Search Test Admin");
+      assert.ok(item, "bootstrapped admin must be in the staff group");
+      assert.equal(item.sublabel, "search-test@example.com");
+      assert.equal(item.badge, "Super Admin");
+      assert.equal(item.to, `/staff/${item.id}`);
+    });
+
     it("global search returns empty groups for a 1-char query and for no match", async () => {
       const short = await authed("/api/v1/admin/search?q=a");
       assert.equal(short.status, 200, JSON.stringify(short.body));

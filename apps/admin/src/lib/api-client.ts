@@ -76,7 +76,10 @@ export async function apiRequest<T>(
   options: RequestInit & { idempotencyKey?: string } = {}
 ): Promise<T> {
   const headers = new Headers(options.headers);
-  if (options.body && !headers.has("Content-Type")) {
+  // FormData bodies must NOT get a JSON content-type — the browser sets
+  // multipart/form-data with its own boundary. (Media library uploads,
+  // PLAN §31; previously every body was JSON, so this was unreachable.)
+  if (options.body && !(options.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
   if (options.idempotencyKey) {
@@ -121,7 +124,9 @@ export async function rawApiRequest<T>(
   options: RequestInit & { idempotencyKey?: string } = {}
 ): Promise<T> {
   const headers = new Headers(options.headers);
-  if (options.body && !headers.has("Content-Type")) {
+  // Same FormData rule as apiRequest (PLAN §31) — the browser sets the
+  // multipart boundary; a JSON content-type here would break the body.
+  if (options.body && !(options.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
   if (options.idempotencyKey) {

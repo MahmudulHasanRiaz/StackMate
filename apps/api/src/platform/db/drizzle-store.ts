@@ -173,6 +173,7 @@ import {
   type LicenseEntitlementSnapshotRecord,
   type LicenseEventRecord,
   type LicenseRecord,
+  type MediaAssetRecord,
   type OrderInstallmentRecord,
   type OrderItemRecord,
   type OrderItemSnapshotRecord,
@@ -561,6 +562,7 @@ const REQUIRED_TABLES: readonly string[] = [
   "staff_profiles",
   "customers",
   "uploaded_assets",
+  "media_assets",
   "currencies",
   "products",
   "product_distribution_channels",
@@ -1600,6 +1602,10 @@ function buildLoadStateQuery(caps: StoreCapabilities): string {
             byte_size, checksum_sha256, visibility, uploaded_by_user_id,
             owner_customer_id, created_at
        FROM uploaded_assets` },
+    { key: "mediaAssets", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, object_key, driver, original_filename, mime_type,
+            byte_size, checksum_sha256, width, height, folder, tags,
+            uploaded_by_user_id, created_at, updated_at
+       FROM media_assets` },
     { key: "customers", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, customer_number, customer_type, name, email, normalized_email,
             phone, normalized_phone, whatsapp, credit_balance_minor,
             company_name, website, country_code, status,
@@ -1931,6 +1937,25 @@ async function loadStateInternalImpl(
     uploaded_by_user_id: str(row, "uploaded_by_user_id"),
     owner_customer_id: str(row, "owner_customer_id"),
     created_at: reqIso(row, "created_at", "uploaded_assets"),
+  }));
+
+  // -- Media library ---------------------------------------------------------
+  const mediaAssetRows = loadRows(combined, "mediaAssets");
+  const media_assets: MediaAssetRecord[] = mediaAssetRows.map((row) => ({
+    id: reqStr(row, "id", "media_assets"),
+    object_key: reqStr(row, "object_key", "media_assets"),
+    driver: asEnum(str(row, "driver"), ["r2", "local"] as const, "r2"),
+    original_filename: reqStr(row, "original_filename", "media_assets"),
+    mime_type: reqStr(row, "mime_type", "media_assets"),
+    byte_size: reqNum(row, "byte_size", "media_assets"),
+    checksum_sha256: reqStr(row, "checksum_sha256", "media_assets"),
+    width: num(row, "width"),
+    height: num(row, "height"),
+    folder: str(row, "folder") ?? "",
+    tags: asJsonArray<string>(row, "tags"),
+    uploaded_by_user_id: str(row, "uploaded_by_user_id"),
+    created_at: reqIso(row, "created_at", "media_assets"),
+    updated_at: reqIso(row, "updated_at", "media_assets"),
   }));
 
   const customerRows = loadRows(combined, "customers");
@@ -3118,6 +3143,7 @@ async function loadStateInternalImpl(
     staff_invitations,
     user_roles,
     uploaded_assets,
+    media_assets,
     products,
     product_features,
     product_packages,
@@ -3578,6 +3604,87 @@ async function persistStateDiff(
     },
     remove: async (c, r) => {
       await del("uploaded_assets", idWhere(1), [r.id]);
+    },
+  };
+
+  // Media library (PLAN §31): per-row driver so a driver switch never orphans files.
+  const mediaSpec: SyncSpec<MediaAssetRecord> = {
+    keyOf: (r) => r.id,
+    scalarOf: (r) => r,
+    insert: async (c, r) => {
+      await ins(
+        "media_assets",
+        [
+          "id",
+          "object_key",
+          "driver",
+          "original_filename",
+          "mime_type",
+          "byte_size",
+          "checksum_sha256",
+          "width",
+          "height",
+          "folder",
+          "tags",
+          "uploaded_by_user_id",
+          "created_at",
+          "updated_at",
+        ],
+        [
+          r.id,
+          r.object_key,
+          r.driver,
+          r.original_filename,
+          r.mime_type,
+          r.byte_size,
+          r.checksum_sha256,
+          r.width,
+          r.height,
+          r.folder,
+          r.tags,
+          r.uploaded_by_user_id,
+          r.created_at,
+          r.updated_at,
+        ]
+      );
+    },
+    update: async (c, _b, r) => {
+      const cols = [
+        "object_key",
+        "driver",
+        "original_filename",
+        "mime_type",
+        "byte_size",
+        "checksum_sha256",
+        "width",
+        "height",
+        "folder",
+        "tags",
+        "uploaded_by_user_id",
+      ];
+      await upd(
+        "media_assets",
+        cols,
+        [
+          r.object_key,
+          r.driver,
+          r.original_filename,
+          r.mime_type,
+          r.byte_size,
+          r.checksum_sha256,
+          r.width,
+          r.height,
+          r.folder,
+          r.tags,
+          r.uploaded_by_user_id,
+          r.id,
+        ],
+        idWhere(cols.length + 1),
+        true
+      );
+    },
+    remove: async (c, r) => {
+      await del("media_assets", idWhere(1), [r.id]);
     },
   };
 
@@ -6541,6 +6648,7 @@ async function persistStateDiff(
   await deleteDerivedForMissing("product_distribution_channels", "product_id", before.products.map((p) => p.id), new Set(after.products.map((p) => p.id)));
   await syncDeletes(client, before.products, after.products, productSpec, "products");
   await syncDeletes(client, before.uploaded_assets, after.uploaded_assets, assetSpec, "uploaded_assets");
+  await syncDeletes(client, before.media_assets, after.media_assets, mediaSpec, "media_assets");
   await syncDeletes(client, before.sessions, after.sessions, sessionSpec, "sessions");
   await syncDeletes(client, before.user_roles, after.user_roles, userRoleSpec, "user_roles");
   await deleteDerivedForMissing("role_permissions", "role_id", before.roles.map((r) => r.id), new Set(after.roles.map((r) => r.id)));
@@ -6569,6 +6677,7 @@ async function persistStateDiff(
   await syncUpserts(client, before.customer_addresses, after.customer_addresses, customerAddressSpec, "customer_addresses");
   await syncUpserts(client, before.customer_reports, after.customer_reports, customerReportSpec, "customer_reports");
   await syncUpserts(client, before.uploaded_assets, after.uploaded_assets, assetSpec, "uploaded_assets");
+  await syncUpserts(client, before.media_assets, after.media_assets, mediaSpec, "media_assets");
   await syncUpserts(client, before.products, after.products, productSpec, "products");
   await syncUpserts(client, before.product_features, after.product_features, featureSpec, "product_features");
   const touchedPackages = await syncUpserts(client, before.product_packages, after.product_packages, packageSpec, "product_packages");

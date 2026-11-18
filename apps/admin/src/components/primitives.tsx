@@ -1677,6 +1677,22 @@ function useFocusTrap(active: boolean, onClose: () => void) {
     first?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        // An open combobox owns Escape: it closes its own listbox, and
+        // the dialog must stay open (live defect 2026-11-18: Esc with
+        // the wizard's price listbox open closed the whole wizard, so
+        // the step had to be driven twice). This listener runs in the
+        // capture phase, before the input's own handler, so the check
+        // has to happen here — stopPropagation in the combobox is too
+        // late. A closed combobox (aria-expanded=false) still lets Esc
+        // close the dialog.
+        const target = e.target as HTMLElement | null;
+        if (
+          target?.closest(
+            '[role="combobox"][aria-expanded="true"], .sm-searchable-list',
+          )
+        ) {
+          return;
+        }
         e.stopPropagation();
         onCloseRef.current();
         return;

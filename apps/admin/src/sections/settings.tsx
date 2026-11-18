@@ -14,7 +14,7 @@
  * /settings (e.g. /settings/websites) with its own detail routes;
  * the settings index redirects to the first category.
  */
-import { BarChart3, BookOpen, CreditCard, Globe, Mail, Settings2, ShieldCheck, Webhook, type LucideIcon } from "lucide-react";
+import { BarChart3, BookOpen, CreditCard, Globe, HardDrive, Mail, Settings2, ShieldCheck, Webhook, type LucideIcon } from "lucide-react";
 
 export interface SettingsCategory {
   slug: string;
@@ -46,6 +46,17 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
     label: "Email",
     icon: Mail,
     to: "/settings/email",
+    group: "General",
+    permission: "users.manage",
+  },
+  {
+    // Media library batch (PLAN §31 / ADR-0011): the storage driver
+    // (R2 vs Local) is Settings config, never main-menu. Same
+    // `users.manage` gate as General/Email — the endpoints require it.
+    slug: "storage",
+    label: "Storage",
+    icon: HardDrive,
+    to: "/settings/storage",
     group: "General",
     permission: "users.manage",
   },

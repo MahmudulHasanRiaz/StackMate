@@ -55,6 +55,27 @@ import {
   saveGeneralSettings,
   storeFavicon,
 } from "./modules/general-settings/service.ts";
+import {
+  deleteMediaAsset,
+  getMediaAssetContent,
+  listMediaAssets,
+  listMediaFolders,
+  mediaViewOf,
+  moveMediaAsset,
+  renameMediaAsset,
+  requireMediaAsset,
+  setMediaAssetTags,
+  uploadMediaAsset,
+} from "./modules/media/service.ts";
+import {
+  DEFAULT_STORAGE_SETTINGS,
+  loadStorageSettings,
+  saveStorageSettings,
+} from "./platform/storage/settings.ts";
+import {
+  resolveStorageDriver,
+  type DriverDeps,
+} from "./platform/storage/driver.ts";
 import { AppError } from "./shared/errors.ts";
 import {
   isTimestampInOverviewRange,
@@ -460,6 +481,31 @@ export function createStackMateApp(
       },
       message
     );
+  }
+
+  /**
+   * Storage-driver deps for one request (PLAN §31 / ADR-0011): the
+   * drizzle DB (null when the store has none), the runtime env, the R2
+   * bucket binding, and the in-memory-bucket flag. `resolveStorageDriver`
+   * applies the fail-closed rule (staging/prod + in-memory bucket →
+   * 503) and the Settings → Storage selection. Used by the favicon,
+   * payment-evidence, and media-library routes.
+   */
+  function driverDepsForRequest(
+    store: StackMateDataStore,
+    env: StackMateBindings
+  ): DriverDeps {
+    const maybeDrizzle = store as unknown as { drizzleDb?: unknown };
+    const maybeBucket = store as unknown as {
+      r2Bucket?: unknown;
+      usesInMemoryBucket?: boolean;
+    };
+    return {
+      db: (maybeDrizzle.drizzleDb ?? null) as DriverDeps["db"],
+      appEnv: env.APP_ENV,
+      r2Bucket: maybeBucket.r2Bucket as DriverDeps["r2Bucket"],
+      usesInMemoryBucket: maybeBucket.usesInMemoryBucket,
+    };
   }
 
   async function handleRequest(
@@ -1520,30 +1566,18 @@ export function createStackMateApp(
             );
           }
           const bytes = new Uint8Array(Buffer.from(body.content_base64, "base64"));
-          // Fail closed in staging/production: payment evidence must land in
-          // the real R2 bucket. A DrizzleStore without a bucket serves an
-          // in-memory bucket (usesInMemoryBucket) where evidence would be
-          // lost on restart and invisible to every other instance.
-          const maybeBucket = store as unknown as {
-            usesInMemoryBucket?: boolean;
-          };
-          if (
-            (env.APP_ENV === "production" || env.APP_ENV === "staging") &&
-            maybeBucket.usesInMemoryBucket
-          ) {
-            throw new AppError(
-              "INTERNAL_ERROR",
-              "Payment-evidence upload is unavailable: no real R2 bucket is configured for this environment.",
-              503
-            );
-          }
+          // Storage driver (PLAN §31): evidence lands on the selected
+          // driver (R2 or Local); resolveStorageDriver fails closed in
+          // staging/production when no real R2 bucket is configured.
+          const evidenceDriver = await resolveStorageDriver(driverDepsForRequest(store, env));
           const asset = await uploadPrivatePaymentEvidence(store, {
             orderId: order.id,
             customerId: order.customer_id,
             filename: body.filename,
             contentType: body.content_type,
             bytes,
-            bucketName: env.R2_BUCKET_NAME,
+            bucketName: evidenceDriver.name === "r2" ? env.R2_BUCKET_NAME : "local",
+            driver: evidenceDriver,
           });
           return jsonResponse(
             {
@@ -2214,36 +2248,231 @@ export function createStackMateApp(
               422
             );
           }
-          // Fail closed in staging/production: the favicon must land in
-          // the real R2 bucket, not the in-memory bucket (same rule as
-          // payment evidence — it would be lost on restart and invisible
-          // to every other instance).
-          const maybeBucket = store as unknown as { usesInMemoryBucket?: boolean };
-          if (
-            (env.APP_ENV === "production" || env.APP_ENV === "staging") &&
-            maybeBucket.usesInMemoryBucket
-          ) {
-            throw new AppError(
-              "INTERNAL_ERROR",
-              "Favicon upload is unavailable: no real R2 bucket is configured for this environment.",
-              503
-            );
-          }
-          const bucket = (store as unknown as { r2Bucket?: unknown }).r2Bucket as
-            | import("./env.ts").R2BucketBinding
-            | undefined;
-          if (!bucket) {
-            throw new AppError("INTERNAL_ERROR", "No R2 bucket is configured for this environment.", 503);
-          }
+          // Storage driver (PLAN §31): the favicon lands on the selected
+          // driver (R2 or Local); resolveStorageDriver fails closed in
+          // staging/production when no real R2 bucket is configured.
+          const faviconDriver = await resolveStorageDriver(driverDepsForRequest(store, env));
           const bytes = new Uint8Array(Buffer.from(body.content_base64, "base64"));
-          const stored = await storeFavicon(requireGeneralSettingsDb(), bucket, {
+          const stored = await storeFavicon(requireGeneralSettingsDb(), faviconDriver, {
             filename: body.filename,
             contentType: body.content_type,
             bytes,
-            bucketName: env.R2_BUCKET_NAME,
+            bucketName: faviconDriver.name === "r2" ? env.R2_BUCKET_NAME : "local",
           });
           await auditGeneralSettingsChange({ favicon_uploaded: true, content_type: stored.content_type });
           return jsonResponse(stored, 201);
+        }
+
+        // Media library + storage driver settings (PLAN §31 / ADR-0011).
+        // Objects stay private; the API never returns raw storage keys or
+        // public URLs — downloads go through the authenticated content
+        // endpoint below. Uploads are multipart FormData (files can be
+        // 100 MB); the favicon / payment-evidence JSON+base64 flows are
+        // unchanged, only the storage driver underneath moved.
+        const requireMediaDb = () => {
+          const maybeDrizzle = store as unknown as { drizzleDb?: unknown };
+          if (!maybeDrizzle.drizzleDb) {
+            throw new AppError("STORE_UNAVAILABLE", "Media library requires a database.", 503);
+          }
+          return maybeDrizzle.drizzleDb as Parameters<typeof listMediaAssets>[0];
+        };
+        const auditMediaChange = (
+          action: string,
+          resourceId: string,
+          changes: Record<string, unknown>
+        ) =>
+          store
+            .withTransaction((state) => {
+              appendAuditLog(state, {
+                actor_type: "staff",
+                actor_user_id: principal.user.id,
+                action,
+                resource_type: "media_asset",
+                resource_id: resourceId,
+                outcome: "success",
+                request_id: requestId,
+                changes,
+              });
+            })
+            .catch(() => {});
+
+        if (method === "GET" && pathname === "/api/v1/admin/media") {
+          assertStaffPermission(principal, "media.view");
+          const result = await listMediaAssets(requireMediaDb(), {
+            q: url.searchParams.get("q") ?? undefined,
+            kind: (url.searchParams.get("kind") ?? undefined) as
+              | "image"
+              | "video"
+              | "audio"
+              | "document"
+              | "archive"
+              | "other"
+              | undefined,
+            folder: url.searchParams.get("folder") ?? undefined,
+            mimes: url.searchParams.get("mime")
+              ? url.searchParams.get("mime")!.split(",")
+              : undefined,
+            limit: url.searchParams.get("limit") ? Number(url.searchParams.get("limit")) : undefined,
+            offset: url.searchParams.get("offset")
+              ? Number(url.searchParams.get("offset"))
+              : undefined,
+          });
+          return jsonResponse(result);
+        }
+
+        // Folders BEFORE the :id match — "folders" would otherwise match :id.
+        if (method === "GET" && pathname === "/api/v1/admin/media/folders") {
+          assertStaffPermission(principal, "media.view");
+          const folders = await listMediaFolders(requireMediaDb());
+          return jsonResponse({ folders });
+        }
+
+        if (method === "POST" && pathname === "/api/v1/admin/media") {
+          assertStaffPermission(principal, "media.manage");
+          const form = await request.formData();
+          const file = form.get("file");
+          if (!(file instanceof File)) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              "A file upload is required (multipart field 'file').",
+              422
+            );
+          }
+          const tags = form.getAll("tags").map((t) => String(t));
+          const asset = await uploadMediaAsset(
+            requireMediaDb(),
+            driverDepsForRequest(store, env),
+            {
+              bytes: new Uint8Array(await file.arrayBuffer()),
+              declaredMimeType: file.type || "application/octet-stream",
+              filename: file.name,
+              folder:
+                typeof form.get("folder") === "string"
+                  ? (form.get("folder") as string)
+                  : undefined,
+              tags: tags.length > 0 ? tags : undefined,
+            },
+            principal.user.id
+          );
+          await auditMediaChange("media.uploaded", asset.id, {
+            filename: asset.original_filename,
+            mime_type: asset.mime_type,
+            byte_size: asset.byte_size,
+            folder: asset.folder,
+            driver: asset.driver,
+          });
+          return jsonResponse(asset, 201);
+        }
+
+        const mMediaDetail = matchPath("/api/v1/admin/media/:id", pathname);
+        if (mMediaDetail) {
+          const mediaId = mMediaDetail.params.id!;
+          if (method === "GET") {
+            assertStaffPermission(principal, "media.view");
+            const row = await requireMediaAsset(requireMediaDb(), mediaId);
+            return jsonResponse(mediaViewOf(row));
+          }
+          if (method === "PATCH") {
+            assertStaffPermission(principal, "media.manage");
+            const body = (await request.json().catch(() => ({}))) as {
+              original_filename?: string;
+              folder?: string;
+              tags?: string[];
+            };
+            const db = requireMediaDb();
+            let view = mediaViewOf(await requireMediaAsset(db, mediaId));
+            const changes: Record<string, unknown> = {};
+            if (body.original_filename !== undefined) {
+              view = await renameMediaAsset(db, mediaId, body.original_filename);
+              changes.original_filename = view.original_filename;
+            }
+            if (body.folder !== undefined) {
+              view = await moveMediaAsset(db, mediaId, body.folder);
+              changes.folder = view.folder;
+            }
+            if (body.tags !== undefined) {
+              view = await setMediaAssetTags(db, mediaId, body.tags);
+              changes.tags = view.tags;
+            }
+            if (Object.keys(changes).length === 0) {
+              throw new AppError(
+                "VALIDATION_ERROR",
+                "Nothing to update — pass original_filename, folder, or tags.",
+                422
+              );
+            }
+            await auditMediaChange("media.updated", mediaId, changes);
+            return jsonResponse(view);
+          }
+          if (method === "DELETE") {
+            assertStaffPermission(principal, "media.manage");
+            const db = requireMediaDb();
+            const row = await requireMediaAsset(db, mediaId);
+            await deleteMediaAsset(db, driverDepsForRequest(store, env), mediaId);
+            await auditMediaChange("media.deleted", mediaId, {
+              filename: row.originalFilename,
+              mime_type: row.mimeType,
+              byte_size: Number(row.byteSize),
+            });
+            return jsonResponse({ deleted: true, id: mediaId });
+          }
+        }
+
+        const mMediaContent = matchPath("/api/v1/admin/media/:id/content", pathname);
+        if (method === "GET" && mMediaContent) {
+          assertStaffPermission(principal, "media.view");
+          const { row, bytes, mimeType } = await getMediaAssetContent(
+            requireMediaDb(),
+            driverDepsForRequest(store, env),
+            mMediaContent.params.id!
+          );
+          const safeFilename = row.originalFilename.replace(/["\\\r\n]/g, "");
+          const headers: Record<string, string> = {
+            "Content-Type": mimeType,
+            "Content-Disposition": `inline; filename="${safeFilename}"`,
+            "Cache-Control": "private, max-age=3600, immutable",
+            "X-Content-Type-Options": "nosniff",
+          };
+          if (mimeType === "image/svg+xml") {
+            // Stored SVGs are sanitized on upload, but never let one
+            // execute even if opened top-level directly.
+            headers["Content-Security-Policy"] = "sandbox";
+          }
+          return new Response(bytes, { status: 200, headers });
+        }
+
+        // Storage driver settings (PLAN §31 / ADR-0011): Settings → Storage.
+        // The selected driver is runtime-applied. Switching never orphans
+        // library files (rows carry their own driver) but DOES orphan the
+        // favicon + payment evidence stored under the previous driver
+        // until switched back — the UI warns about this explicitly.
+        if (method === "GET" && pathname === "/api/v1/admin/storage-settings") {
+          assertStaffPermission(principal, "users.manage");
+          const settings = await loadStorageSettings(requireMediaDb()).catch(() => null);
+          return jsonResponse(settings ?? DEFAULT_STORAGE_SETTINGS);
+        }
+        if (method === "PUT" && pathname === "/api/v1/admin/storage-settings") {
+          assertStaffPermission(principal, "users.manage");
+          const body = (await request.json().catch(() => ({}))) as {
+            driver?: "r2" | "local";
+            local_path?: string | null;
+          };
+          const saved = await saveStorageSettings(requireMediaDb(), body);
+          await store
+            .withTransaction((state) => {
+              appendAuditLog(state, {
+                actor_type: "staff",
+                actor_user_id: principal.user.id,
+                action: "storage.settings.updated",
+                resource_type: "storage_settings",
+                resource_id: "storage-settings",
+                outcome: "success",
+                request_id: requestId,
+                changes: { driver: saved.driver, local_path: saved.local_path },
+              });
+            })
+            .catch(() => {});
+          return jsonResponse(saved);
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/users") {
@@ -3724,13 +3953,22 @@ export function createStackMateApp(
             );
           }
           const bytes = Uint8Array.from(Buffer.from(body.file_base64, "base64"));
+          // Storage driver (PLAN §31): evidence lands on the selected
+          // driver (R2 or Local); resolveStorageDriver fails closed in
+          // staging/production when no real R2 bucket is configured.
+          // (This route previously had no fail-closed check — the resolver
+          // now applies the rule uniformly to both evidence routes.)
+          const adminEvidenceDriver = await resolveStorageDriver(
+            driverDepsForRequest(store, env)
+          );
           const asset = await uploadPrivatePaymentEvidence(store, {
             orderId: order.id,
             customerId: order.customer_id,
             filename: body.filename,
             contentType: body.content_type,
             bytes,
-            bucketName: env.R2_BUCKET_NAME,
+            bucketName: adminEvidenceDriver.name === "r2" ? env.R2_BUCKET_NAME : "local",
+            driver: adminEvidenceDriver,
           });
           return jsonResponse(asset, 201);
         }

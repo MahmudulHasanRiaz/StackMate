@@ -165,6 +165,12 @@ const LeadsSection = lazy(() =>
 const LeadDetailSection = lazy(() =>
   import("./sections/leads").then((m) => ({ default: m.LeadDetailSection })),
 );
+const MediaLibrarySection = lazy(() =>
+  import("./sections/media-library").then((m) => ({ default: m.MediaLibrarySection })),
+);
+const StorageSettingsSection = lazy(() =>
+  import("./sections/storage-settings").then((m) => ({ default: m.StorageSettingsSection })),
+);
 const IntegrationGuideSection = lazy(() =>
   import("./sections/integration-guide").then((m) => ({
     default: m.IntegrationGuideSection,
@@ -376,6 +382,8 @@ const ticketsRoute = makeListRoute("/tickets", TicketsSection);
 const ticketDetailRoute = makeDetailRoute("/tickets/$ticketId", "ticketId", TicketDetailSection);
 const leadsRoute = makeListRoute("/leads", LeadsSection);
 const leadDetailRoute = makeDetailRoute("/leads/$leadId", "leadId", LeadDetailSection);
+// Media library (PLAN §31): main-menu section under Product.
+const mediaRoute = makeListRoute("/media", MediaLibrarySection);
 
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -451,6 +459,7 @@ const settingsTrackingRoute = makeSettingsListRoute("/tracking", TrackingConfigS
 const settingsAuthRoute = makeSettingsListRoute("/authentication", AuthSettingsSection);
 const settingsEmailRoute = makeSettingsListRoute("/email", EmailSettingsSection);
 const settingsGeneralRoute = makeSettingsListRoute("/general", GeneralSettingsSection);
+const settingsStorageRoute = makeSettingsListRoute("/storage", StorageSettingsSection);
 const settingsIntegrationGuideRoute = makeSettingsListRoute(
   "/integration-guide",
   IntegrationGuideSection,
@@ -490,6 +499,7 @@ const routeTree = rootRoute.addChildren([
     ticketDetailRoute,
     leadsRoute,
     leadDetailRoute,
+    mediaRoute,
   ]),
   settingsRoute.addChildren([
     settingsIndexRoute,
@@ -503,6 +513,7 @@ const routeTree = rootRoute.addChildren([
     settingsAuthRoute,
     settingsEmailRoute,
     settingsGeneralRoute,
+    settingsStorageRoute,
     settingsIntegrationGuideRoute,
   ]),
 ]);

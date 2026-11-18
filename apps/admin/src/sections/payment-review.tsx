@@ -17,16 +17,21 @@
  *  - POST /api/v1/admin/payment-submissions/:id/approve   payments.approve
  *  - POST /api/v1/admin/payment-submissions/:id/reject    payments.reject
  *  - POST /api/v1/admin/orders/:id/payment-submissions    payments.approve (201, staff-recorded claim)
- *  - POST /api/v1/admin/orders/:id/payment-evidence       (JSON+base64; 503 fail-closed without R2)
+ *  - POST /api/v1/admin/orders/:id/payment-evidence       (JSON+base64; 503 fail-closed without a real bucket; PNG/JPEG/WEBP/PDF)
  *  - GET  /api/v1/admin/orders                            orders.read (order picker)
  *  - GET  /api/v1/admin/payment-methods                   payments.read (method picker)
+ *
+ * Evidence can be picked from the media library (PNG/JPEG/WEBP/PDF)
+ * via the shared MediaPicker (PLAN §31) or uploaded directly — the
+ * picked file's bytes are fetched back and sent through the unchanged
+ * base64 evidence endpoint.
  */
 import { useMemo, useState } from "react";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import type { ColumnDef } from "@tanstack/react-table";
 import { AlertTriangle, ClipboardCheck, Plus } from "lucide-react";
-import { apiRequest, formatMinorMoney } from "../lib/api-client";
+import { ApiClientError, apiRequest, formatMinorMoney } from "../lib/api-client";
 import { detailKey, listKey } from "../lib/query";
 import {
   DetailFacts,
@@ -40,6 +45,8 @@ import {
   useAdminMutation,
   type ListSearch,
 } from "../lib/section-kit";
+import { MediaPicker } from "../components/media-picker";
+import { fetchMediaFile, type MediaAssetView } from "../lib/media";
 import {
   Alert,
   Button,
@@ -364,6 +371,7 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
   const [paymentDate, setPaymentDate] = useState("");
   const [customerNote, setCustomerNote] = useState("");
   const [evidenceFile, setEvidenceFile] = useState<File | null>(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -517,7 +525,27 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
     }
   };
 
+  // Library pick (PLAN §31): fetch the picked file's bytes back
+  // through its authenticated content URL, then run the unchanged
+  // evidence upload — the evidence keeps its own storage key
+  // (payment-evidence/<order>/<uuid>), it is NOT the library row.
+  async function handleLibraryPick(asset: MediaAssetView) {
+    try {
+      const file = await fetchMediaFile(asset);
+      setEvidenceFile(file);
+    } catch (err) {
+      setFormError(
+        err instanceof ApiClientError
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : "Could not use the selected file."
+      );
+    }
+  }
+
   return (
+    <>
     <form
       onSubmit={(e) => {
         e.preventDefault();
@@ -662,11 +690,18 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
           <Input value={paymentDate} onChange={(e) => setPaymentDate(e.target.value)} placeholder="15/11/2026" />
         </Field>
         <Field label="Evidence file" hint="Screenshot or receipt. Uploaded to private storage.">
-          <Input
-            type="file"
-            accept="image/*,.pdf"
-            onChange={(e) => setEvidenceFile(e.target.files?.[0] ?? null)}
-          />
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <Input
+              type="file"
+              accept="image/*,.pdf"
+              onChange={(e) => setEvidenceFile(e.target.files?.[0] ?? null)}
+            />
+            <div>
+              <Button type="button" variant="secondary" size="sm" onClick={() => setPickerOpen(true)}>
+                Choose from library
+              </Button>
+            </div>
+          </div>
         </Field>
       </div>
       <div style={{ marginTop: 16 }}>
@@ -692,6 +727,15 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
         </Button>
       </div>
     </form>
+    <MediaPicker
+      open={pickerOpen}
+      onClose={() => setPickerOpen(false)}
+      onSelect={(asset) => void handleLibraryPick(asset)}
+      kinds={["image", "document"]}
+      mimes={["image/png", "image/jpeg", "image/webp", "application/pdf"]}
+      title="Choose evidence from media library"
+    />
+    </>
   );
 }
 
