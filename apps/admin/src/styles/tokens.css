@@ -1405,6 +1405,7 @@ a:hover {
 }
 .sm-cell-line > .sm-copy-btn,
 .sm-cell-line > .sm-badge,
+.sm-cell-line > .sm-mono,
 .sm-cell-line > button {
   flex: none;
 }
