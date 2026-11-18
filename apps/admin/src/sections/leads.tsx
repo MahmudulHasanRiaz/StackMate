@@ -171,12 +171,12 @@ export function LeadsSection() {
       cell: ({ row }) => {
         const l = row.original;
         return (
-          <div>
-            <div>{l.name}</div>
-            <div className="sm-hint">
+          <span className="sm-cell-line">
+            <span className="sm-cell-text">{l.name}</span>
+            <span className="sm-hint sm-cell-text">
               {l.email ?? l.phone ?? "No contact"}
-            </div>
-          </div>
+            </span>
+          </span>
         );
       },
     },

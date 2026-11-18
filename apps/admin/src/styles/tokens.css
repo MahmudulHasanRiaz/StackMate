@@ -1375,6 +1375,39 @@ a:hover {
   box-shadow: var(--sm-focus-ring);
   border-radius: var(--sm-radius-sm);
 }
+/* Single-line list cells (Neon density batch 2, 2026-11-18): Neon list
+   rows are ONE line of content — sampled 46-47px rows in image-76
+   (Branches), image-73/75 (dashboard) and image-77 (Branch overview),
+   divider color (43,44,45), DPR ~1 (32px nav pitch + 32px "Create
+   branch" button are self-consistent at DPR 1; at DPR 1.25 they would
+   imply 25.6px nav rows, which cannot hold 13px text). Neon never
+   stacks a primary + secondary line in a cell: name + status pill sit
+   inline, long values truncate with an ellipsis ("producti…", "Com…").
+   Our text-only rows were already 37px and control rows 43px (denser
+   than Neon's 46px) — the tall rows were the STACKED cells (Customers
+   ~65px, Orders ~82px). So: collapse stacked cells into one flex line
+   (primary + muted secondary inline, ellipsis truncation, max-width so
+   a long value cannot stretch the column). Controls stay 26px — already
+   smaller than Neon's 32px buttons — and cell padding stays 8px. */
+.sm-cell-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 480px;
+  white-space: nowrap;
+}
+.sm-cell-line > .sm-cell-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sm-cell-line > .sm-copy-btn,
+.sm-cell-line > .sm-badge,
+.sm-cell-line > button {
+  flex: none;
+}
 
 /* ------------------------------------------------------------------ */
 /* Buttons — three variants + ghost text forms (Neon, images 80/81/82). */

@@ -196,7 +196,11 @@ export function TicketsSection() {
     {
       accessorKey: "title",
       header: "Title",
-      cell: ({ row }) => row.original.title,
+      cell: ({ row }) => (
+        <span className="sm-cell-line">
+          <span className="sm-cell-text">{row.original.title}</span>
+        </span>
+      ),
     },
     {
       accessorKey: "customer",

@@ -218,16 +218,18 @@ export function AuditLogsSection() {
               resourceMaps,
             );
           return (
-            <div>
+            <span className="sm-cell-line">
               {display ? (
-                <span className="sm-break">{display}</span>
+                <span className="sm-break sm-cell-text">{display}</span>
               ) : (
-                <span className="sm-mono">{shortId(row.original.resource_id)}</span>
+                <span className="sm-mono sm-cell-text">
+                  {shortId(row.original.resource_id)}
+                </span>
               )}
-              <div className="sm-hint">
+              <span className="sm-hint sm-cell-text">
                 {humanizeType(row.original.resource_type)}
-              </div>
-            </div>
+              </span>
+            </span>
           );
         },
       },
@@ -239,14 +241,16 @@ export function AuditLogsSection() {
             ? staffNames.get(row.original.actor_user_id)
             : undefined;
           return (
-            <div>
-              {name ?? humanizeType(row.original.actor_type)}
+            <span className="sm-cell-line">
+              <span className="sm-cell-text">
+                {name ?? humanizeType(row.original.actor_type)}
+              </span>
               {row.original.actor_user_id ? (
-                <div className="sm-mono sm-hint">
+                <span className="sm-mono sm-hint sm-cell-text">
                   {shortId(row.original.actor_user_id)}
-                </div>
+                </span>
               ) : null}
-            </div>
+            </span>
           );
         },
       },

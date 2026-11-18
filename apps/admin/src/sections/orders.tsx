@@ -284,13 +284,11 @@ export function OrdersSection() {
       cell: ({ row }) => {
         const o = row.original;
         return (
-          <div>
-            <div>
-              <span className="sm-mono">{o.order_number}</span>
-              <CopyButton value={o.order_number} label="Copy order number" />
-            </div>
-            <div className="sm-hint">{o.source}</div>
-          </div>
+          <span className="sm-cell-line">
+            <span className="sm-mono sm-cell-text">{o.order_number}</span>
+            <CopyButton value={o.order_number} label="Copy order number" />
+            <span className="sm-hint sm-cell-text">{o.source}</span>
+          </span>
         );
       },
     },
@@ -301,10 +299,12 @@ export function OrdersSection() {
         const c = row.original.customer;
         if (!c) return "—";
         return (
-          <div>
-            <div>{c.name}</div>
-            <div className="sm-hint">{c.email ?? c.customer_number}</div>
-          </div>
+          <span className="sm-cell-line">
+            <span className="sm-cell-text">{c.name}</span>
+            <span className="sm-hint sm-cell-text">
+              {c.email ?? c.customer_number}
+            </span>
+          </span>
         );
       },
     },
