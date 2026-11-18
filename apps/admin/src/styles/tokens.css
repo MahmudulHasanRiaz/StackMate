@@ -472,10 +472,13 @@ a:hover {
 .sm-sidebar {
   background: var(--sm-surface);
   border-right: 1px solid var(--sm-border);
-  padding: var(--sm-space-3);
+  /* Density (owner 2026-11-18): sidebar padding + gaps 12px → 8px —
+     the 12px shell made every nav row sit further apart than Neon's
+     ~32px rows; 8px keeps the groups distinct without the air. */
+  padding: var(--sm-space-2);
   display: flex;
   flex-direction: column;
-  gap: var(--sm-space-3);
+  gap: var(--sm-space-2);
   position: sticky;
   top: 0;
   height: 100vh;
@@ -1045,6 +1048,53 @@ a:hover {
   flex: 1;
   min-width: 0;
 }
+/* Centered topbar brand (owner 2026-11-18, Neon screenshots 111–113):
+   ≤900px the topbar is three slots — hamburger left, brand centered,
+   search + account right. The two side clusters are equal-width flex
+   slots (flex: 1 1 0), so the brand sits exactly centered whatever the
+   controls measure. On desktop the brand is hidden and the clusters
+   are display:contents, so the topbar layout is identical to before
+   (the spacers stay, keeping QuickNav centered and AccountMenu right). */
+.sm-topbar-brand {
+  display: none;
+}
+.sm-topbar-cluster {
+  display: contents;
+}
+@media (max-width: 900px) {
+  .sm-topbar-brand {
+    display: flex;
+    align-items: center;
+    gap: var(--sm-space-2);
+    font-weight: 700;
+    font-size: 16px;
+    letter-spacing: -0.02em;
+    flex: 0 0 auto;
+    min-width: 0;
+    white-space: nowrap;
+  }
+  .sm-topbar-brand .sm-brand-mark {
+    color: var(--sm-accent);
+    display: inline-flex;
+    flex: none;
+  }
+  .sm-topbar-cluster {
+    display: flex;
+    align-items: center;
+    gap: var(--sm-space-4);
+    flex: 1 1 0;
+    min-width: 0;
+  }
+  .sm-topbar-cluster-start {
+    justify-content: flex-start;
+  }
+  .sm-topbar-cluster-end {
+    justify-content: flex-end;
+  }
+  .sm-topbar-cluster .sm-topbar-spacer {
+    display: none;
+  }
+}
 /* Hamburger: only on small screens (sidebar is a drawer <900px). */
 /* The topbar hamburger opens the nav drawer on mobile only — on
    desktop the sidebar's own "Collapse menu" does that job (owner
@@ -1260,7 +1310,10 @@ a:hover {
 }
 .sm-table th,
 .sm-table td {
-  padding: 10px var(--sm-space-4);
+  /* Density (owner 2026-11-18): cell padding 10px → 8px top/bottom —
+     table rows were 40px (10+20+10); now 36px (8+20+8), Neon-dense,
+     with the 30px in-row buttons still fitting. */
+  padding: var(--sm-space-2) var(--sm-space-4);
   border-bottom: 1px solid var(--sm-border);
   text-align: left;
   font-size: 14px;
@@ -2077,10 +2130,11 @@ a:hover {
 .sm-settings-nav {
   background: var(--sm-surface);
   border-right: 1px solid var(--sm-border);
-  padding: var(--sm-space-3);
+  /* Same density as the main sidebar (owner 2026-11-18): 12px → 8px. */
+  padding: var(--sm-space-2);
   display: flex;
   flex-direction: column;
-  gap: var(--sm-space-3);
+  gap: var(--sm-space-2);
   position: sticky;
   top: 0;
   height: 100vh;
@@ -2248,7 +2302,7 @@ a:hover {
 }
 .sm-settings-back {
   border-top: 1px solid var(--sm-border);
-  padding-top: var(--sm-space-3);
+  padding-top: var(--sm-space-2);
 }
 /* Account-menu header (owner 2026-11-16 ~13:06 +06, images 108/109):
    name / email / role ran together with no hierarchy. The body is a
@@ -2455,15 +2509,18 @@ a:hover {
     width: 100%;
   }
   /* Topbar search collapses to an icon (owner 2026-11-16): the label
-     and the ⌘K hint hide; the 40px icon button keeps the topbar
+     and the ⌘K hint hide; the 36px icon button keeps the topbar
      fitting at 390px (hamburger + search icon + avatar). It must read
      as a clean SQUARE icon button like the hamburger — NOT as a
-     broken empty input field: no input border, no surface fill, 40x40
-     like .sm-btn-icon (owner 2026-11-16, image-102). */
+     broken empty input field: no input border, no surface fill, 36x36
+     like .sm-btn-icon (owner 2026-11-16, image-102). Density
+     (owner 2026-11-18): the mobile floor was 40px — desktop buttons
+     are 30px and Neon rows are ~32px, so 40px still read as tall;
+     36px keeps a real touch target without the air. */
   .sm-quicknav-btn {
-    width: 40px;
-    min-width: 40px;
-    height: 40px;
+    width: 36px;
+    min-width: 36px;
+    height: 36px;
     padding: 0;
     border-color: transparent;
     background: transparent;
@@ -2513,24 +2570,25 @@ a:hover {
     animation: sm-dialog-sheet-in var(--sm-transition-slow);
   }
   /* Touch targets (owner 2026-11-16): primary actions are at least
-     ~40px on mobile. Buttons are 30px on desktop; the min-height
+     ~36px on mobile. Buttons are 30px on desktop; the min-height
      wins over the fixed height. Icon buttons, menu rows, nav rows,
      tabs, copy buttons, the QuickNav button, and the account button
-     get the same floor. */
+     get the same floor. (Was 40px — owner 2026-11-18: still too tall
+     vs Neon's ~32px rows; 36px is the floor, never 32px on mobile.) */
   .sm-btn,
   .sm-quicknav-btn,
   .sm-account-btn {
-    min-height: 40px;
+    min-height: 36px;
   }
   .sm-btn-icon,
   .sm-copy-btn {
-    width: 40px;
-    height: 40px;
+    width: 36px;
+    height: 36px;
   }
   .sm-menu-item,
   .sm-nav-btn,
   .sm-tab {
-    min-height: 40px;
+    min-height: 36px;
   }
 }
 
