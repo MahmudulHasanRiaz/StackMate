@@ -10,6 +10,17 @@ import { sha256Hex } from "../crypto/index.ts";
 
 export const MAX_EVIDENCE_BYTES = 5 * 1024 * 1024; // 5 MB
 
+/**
+ * Name of the bound R2 bucket (Settings → Storage shows it — the live
+ * re-test 2026-11-18 found it appears nowhere in the admin UI). The
+ * Workers runtime cannot introspect a binding's name, so this mirrors
+ * `r2_buckets[0].bucket_name` in apps/api/wrangler.jsonc — keep the two
+ * in sync if the bucket is ever renamed. Preview uses
+ * `stackmate-private-assets-preview`; the deployed staging worker uses
+ * this name, and the display is informational only (never a credential).
+ */
+export const R2_BUCKET_NAME = "stackmate-private-assets";
+
 export const ALLOWED_EVIDENCE_MIME_TYPES = new Set([
   "image/png",
   "image/jpeg",

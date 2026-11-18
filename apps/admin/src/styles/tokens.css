@@ -1806,6 +1806,154 @@ a:hover {
     flex-direction: column;
   }
 }
+/* media-upload-dialog: start (2026-11-18 owner feedback: the old native
+   file input + one-line file list was a weak design/UX — replaced with a
+   drag-and-drop zone, per-file rows with remove, a searchable folder
+   picker with a create-new path, and tag chips). */
+.sm-media-dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 20px 16px;
+  border: 1px dashed var(--sm-border);
+  border-radius: var(--sm-radius-md);
+  color: var(--sm-text-muted);
+  cursor: pointer;
+  text-align: center;
+}
+.sm-media-dropzone:hover,
+.sm-media-dropzone:focus-visible {
+  border-color: var(--sm-accent);
+  outline: none;
+}
+.sm-media-dropzone-over {
+  border-color: var(--sm-accent);
+  background: var(--sm-accent-soft);
+}
+.sm-media-dropzone-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--sm-text);
+}
+.sm-media-dropzone-sub {
+  font-size: 12px;
+}
+.sm-media-dropzone-browse {
+  color: var(--sm-accent);
+  font-weight: 600;
+}
+.sm-media-dropzone-hint {
+  font-size: 12px;
+}
+.sm-media-upload-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--sm-border);
+  border-radius: var(--sm-radius-md);
+  overflow: hidden;
+}
+.sm-media-upload-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--sm-text);
+}
+.sm-media-upload-row + .sm-media-upload-row {
+  border-top: 1px solid var(--sm-border);
+}
+.sm-media-upload-row[data-state="error"] {
+  background: var(--sm-danger-bg);
+}
+.sm-media-upload-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.sm-media-upload-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sm-media-upload-error {
+  font-size: 12px;
+  color: var(--sm-danger-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sm-media-upload-size {
+  flex: none;
+  font-size: 12px;
+  color: var(--sm-text-muted);
+}
+.sm-media-upload-done {
+  flex: none;
+  color: var(--sm-accent);
+}
+.sm-media-upload-remove {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: var(--sm-radius-sm);
+  background: transparent;
+  color: var(--sm-text-muted);
+  cursor: pointer;
+}
+.sm-media-upload-remove:hover:not(:disabled) {
+  background: var(--sm-surface-hover);
+  color: var(--sm-text);
+}
+.sm-media-upload-remove:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+.sm-media-tag-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.sm-media-tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px 2px 8px;
+  border: 1px solid var(--sm-border);
+  border-radius: var(--sm-radius-sm);
+  background: var(--sm-surface-hover);
+  font-size: 12px;
+  color: var(--sm-text);
+}
+.sm-media-tag-chip button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: var(--sm-radius-sm);
+  background: transparent;
+  color: var(--sm-text-muted);
+  cursor: pointer;
+}
+.sm-media-tag-chip button:hover {
+  color: var(--sm-text);
+}
+/* media-upload-dialog: end */
 /* media-library: end */
 
 .sm-table-wrap {

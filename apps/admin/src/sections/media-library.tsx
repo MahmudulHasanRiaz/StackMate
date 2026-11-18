@@ -18,9 +18,10 @@
  * sidebar, preview drawer, bulk delete, empty states stay empty
  * (never invented).
  */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Check,
   Download,
   Folder,
   Images,
@@ -30,6 +31,7 @@ import {
   Tag,
   Trash2,
   Upload,
+  X,
 } from "lucide-react";
 import { apiErrorMessage, PageHeader, useAdminMutation } from "../lib/section-kit";
 import { ApiClientError } from "../lib/api-client";
@@ -45,6 +47,7 @@ import {
   Input,
   Pagination,
   RowMenu,
+  SearchableSelect,
   TableSkeleton,
   useConfirm,
   useToast,
@@ -57,6 +60,7 @@ import {
   formatBytes,
   MEDIA_KIND_LABELS,
   MEDIA_KINDS,
+  MEDIA_UPLOAD_ACCEPT,
   patchMediaAsset,
   uploadMediaFile,
   type MediaAssetView,
@@ -585,6 +589,24 @@ export function MediaLibrarySection() {
   );
 }
 
+type FileUploadStatus = {
+  status: "queued" | "uploading" | "done" | "error";
+  error?: string;
+};
+
+/** Icon kind for a not-yet-uploaded local File (MIME prefix + extension). */
+function kindOfFile(file: File): MediaLibraryKind {
+  const type = file.type.toLowerCase();
+  const name = file.name.toLowerCase();
+  if (type.startsWith("image/")) return "image";
+  if (type.startsWith("video/")) return "video";
+  if (type.startsWith("audio/")) return "audio";
+  if (type === "application/zip" || name.endsWith(".zip")) return "archive";
+  if (type === "application/pdf" || type.startsWith("text/") || name.endsWith(".csv"))
+    return "document";
+  return "other";
+}
+
 function UploadDialog({
   open,
   onClose,
@@ -597,103 +619,271 @@ function UploadDialog({
   folders: string[];
 }) {
   const [files, setFiles] = useState<File[]>([]);
+  const [states, setStates] = useState<FileUploadStatus[]>([]);
   const [targetFolder, setTargetFolder] = useState(folder);
-  const [tagsText, setTagsText] = useState("");
+  const [creatingFolder, setCreatingFolder] = useState(false);
+  const [newFolder, setNewFolder] = useState("");
+  const [tags, setTags] = useState<string[]>([]);
+  const [tagInput, setTagInput] = useState("");
+  const [dragOver, setDragOver] = useState(false);
   const [uploading, setUploading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
   const queryClient = useQueryClient();
   const { toast } = useToast();
 
   useEffect(() => {
     if (open) {
       setFiles([]);
+      setStates([]);
       setTargetFolder(folder);
-      setTagsText("");
-      setError(null);
+      setCreatingFolder(false);
+      setNewFolder("");
+      setTags([]);
+      setTagInput("");
+      setDragOver(false);
     }
   }, [open, folder]);
 
+  function addFiles(list: FileList | File[]) {
+    const incoming = Array.from(list);
+    if (incoming.length === 0) return;
+    setFiles((prev) => {
+      const seen = new Set(prev.map((f) => `${f.name}\0${f.size}\0${f.lastModified}`));
+      const fresh = incoming.filter(
+        (f) => !seen.has(`${f.name}\0${f.size}\0${f.lastModified}`),
+      );
+      if (fresh.length === 0) return prev;
+      setStates((prevStates) => [
+        ...prevStates,
+        ...fresh.map(() => ({ status: "queued" as const })),
+      ]);
+      return [...prev, ...fresh];
+    });
+  }
+
+  function removeFile(index: number) {
+    setFiles((prev) => prev.filter((_, i) => i !== index));
+    setStates((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  function addTag(value: string) {
+    const tag = value.trim();
+    if (tag === "") return;
+    setTags((prev) =>
+      prev.some((t) => t.toLowerCase() === tag.toLowerCase()) ? prev : [...prev, tag],
+    );
+  }
+
+  const failedCount = states.filter((s) => s.status === "error").length;
+  const doneCount = states.filter((s) => s.status === "done").length;
+
   async function handleUpload() {
-    if (files.length === 0) return;
+    // Retry covers only the failed files; a fresh upload covers everything
+    // not already done (a second click after a partial failure re-tries).
+    const pending = files
+      .map((file, index) => ({ file, index }))
+      .filter(({ index }) => states[index]?.status !== "done");
+    if (pending.length === 0 || uploading) return;
     setUploading(true);
-    setError(null);
-    const tags = tagsText
-      .split(",")
-      .map((t) => t.trim())
-      .filter(Boolean);
+    const uploadFolder = (creatingFolder ? newFolder.trim() : targetFolder.trim()) || undefined;
     let done = 0;
-    let lastError: string | null = null;
-    for (const file of files) {
+    let failed = 0;
+    for (const { file, index } of pending) {
+      setStates((prev) =>
+        prev.map((s, i) => (i === index ? { status: "uploading" } : s)),
+      );
       try {
         await uploadMediaFile(file, {
-          folder: targetFolder.trim() || undefined,
+          folder: uploadFolder,
           tags: tags.length > 0 ? tags : undefined,
         });
+        setStates((prev) => prev.map((s, i) => (i === index ? { status: "done" } : s)));
         done += 1;
       } catch (err) {
-        lastError =
+        const message =
           err instanceof ApiClientError
             ? err.message
             : err instanceof Error
               ? err.message
               : `Could not upload ${file.name}.`;
+        setStates((prev) =>
+          prev.map((s, i) => (i === index ? { status: "error", error: message } : s)),
+        );
+        failed += 1;
       }
     }
     setUploading(false);
     if (done > 0) {
       await queryClient.invalidateQueries({ queryKey: MEDIA_QUERY_KEY });
       await queryClient.invalidateQueries({ queryKey: FOLDERS_QUERY_KEY });
+    }
+    // Close only when everything succeeded; a failed file stays visible
+    // with its own error row, and the button becomes Retry.
+    if (failed === 0 && done > 0) {
       toast({
         title: done === 1 ? "File uploaded" : `${done} files uploaded`,
-        message:
-          lastError !== null
-            ? `The last error: ${lastError}`
-            : "The new files are at the top of the library.",
+        message: "The new files are at the top of the library.",
         variant: "success",
       });
       onClose();
-    } else if (lastError) {
-      setError(lastError);
     }
   }
 
   return (
     <Dialog open={open} onClose={onClose} title="Upload files" size="md">
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        {error ? <Alert variant="danger">{error}</Alert> : null}
-        <Field label="Files" hint="Images, video, audio, PDF, ZIP, text, CSV — up to 100 MB each.">
-          <Input
+        <Field label="Files">
+          <div
+            className={`sm-media-dropzone${dragOver ? " sm-media-dropzone-over" : ""}`}
+            role="button"
+            tabIndex={0}
+            aria-label="Choose files to upload"
+            onClick={() => inputRef.current?.click()}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                inputRef.current?.click();
+              }
+            }}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragOver(true);
+            }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragOver(false);
+              addFiles(e.dataTransfer.files);
+            }}
+          >
+            <Upload size={20} strokeWidth={2} />
+            <span className="sm-media-dropzone-title">Drop files here</span>
+            <span className="sm-media-dropzone-sub">
+              or <span className="sm-media-dropzone-browse">browse</span> to choose files
+            </span>
+            <span className="sm-media-dropzone-hint">
+              Images, video, audio, PDF, ZIP, text, CSV — up to 100 MB each.
+            </span>
+          </div>
+          <input
+            ref={inputRef}
             type="file"
             multiple
-            onChange={(e) => setFiles(Array.from(e.target.files ?? []))}
+            accept={MEDIA_UPLOAD_ACCEPT}
+            style={{ display: "none" }}
+            tabIndex={-1}
+            aria-hidden="true"
+            onChange={(e) => {
+              addFiles(e.target.files ?? []);
+              e.target.value = "";
+            }}
           />
         </Field>
         {files.length > 0 ? (
-          <div className="sm-muted">
-            {files.length} file{files.length === 1 ? "" : "s"} selected:{" "}
-            {files.map((f) => f.name).join(", ")}
-          </div>
+          <ul className="sm-media-upload-list">
+            {files.map((file, i) => {
+              const state = states[i] ?? { status: "queued" as const };
+              const Icon = mediaKindIcon(kindOfFile(file));
+              return (
+                <li
+                  key={`${file.name}-${file.size}-${file.lastModified}`}
+                  className="sm-media-upload-row"
+                  data-state={state.status}
+                >
+                  <Icon size={16} strokeWidth={2} />
+                  <span className="sm-media-upload-main">
+                    <span className="sm-media-upload-name" title={file.name}>
+                      {file.name}
+                    </span>
+                    {state.status === "error" && state.error ? (
+                      <span className="sm-media-upload-error">{state.error}</span>
+                    ) : null}
+                  </span>
+                  <span className="sm-media-upload-size">{formatBytes(file.size)}</span>
+                  {state.status === "done" ? (
+                    <Check size={16} strokeWidth={2} className="sm-media-upload-done" />
+                  ) : null}
+                  <button
+                    type="button"
+                    className="sm-media-upload-remove"
+                    aria-label={`Remove ${file.name}`}
+                    disabled={uploading || state.status === "uploading"}
+                    onClick={() => removeFile(i)}
+                  >
+                    <X size={14} strokeWidth={2} />
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
         ) : null}
-        <Field label="Folder" hint="Leave empty for the root folder. Type a new name to create a folder.">
-          <Input
-            value={targetFolder}
-            onChange={(e) => setTargetFolder(e.target.value)}
-            placeholder="e.g. brand/logos"
-            list="media-folders"
-            autoComplete="off"
+        <Field label="Folder">
+          <SearchableSelect
+            value={creatingFolder ? "__new__" : targetFolder}
+            onChange={(value) => {
+              if (value === "__new__") {
+                setCreatingFolder(true);
+                return;
+              }
+              setCreatingFolder(false);
+              setTargetFolder(value);
+            }}
+            options={[
+              { value: "", label: "Root folder" },
+              ...folders
+                .filter((f) => f !== "")
+                .map((f) => ({ value: f, label: f })),
+            ]}
+            leadingOptions={[{ value: "__new__", label: "New folder…" }]}
+            placeholder="Choose a folder"
+            ariaLabel="Target folder"
           />
-          <datalist id="media-folders">
-            {folders.map((f) => (
-              <option key={f || "(root)"} value={f} />
-            ))}
-          </datalist>
+          {creatingFolder ? (
+            <Input
+              value={newFolder}
+              onChange={(e) => setNewFolder(e.target.value)}
+              placeholder="e.g. brand/logos"
+              autoComplete="off"
+              aria-label="New folder name"
+            />
+          ) : null}
         </Field>
-        <Field label="Tags" hint="Optional — comma-separated, e.g. logo, brand. Tags are searchable.">
+        <Field label="Tags">
+          {tags.length > 0 ? (
+            <span className="sm-media-tag-chips">
+              {tags.map((tag) => (
+                <span key={tag} className="sm-media-tag-chip">
+                  {tag}
+                  <button
+                    type="button"
+                    aria-label={`Remove tag ${tag}`}
+                    onClick={() => setTags((prev) => prev.filter((t) => t !== tag))}
+                  >
+                    <X size={12} strokeWidth={2} />
+                  </button>
+                </span>
+              ))}
+            </span>
+          ) : null}
           <Input
-            value={tagsText}
-            onChange={(e) => setTagsText(e.target.value)}
-            placeholder="logo, brand"
+            value={tagInput}
+            onChange={(e) => setTagInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === ",") {
+                e.preventDefault();
+                addTag(tagInput);
+                setTagInput("");
+              }
+            }}
+            onBlur={() => {
+              if (tagInput.trim() !== "") {
+                addTag(tagInput);
+                setTagInput("");
+              }
+            }}
+            placeholder="Add a tag…"
             autoComplete="off"
+            aria-label="Add a tag"
           />
         </Field>
         <div className="sm-dialog-footer" style={{ padding: 0, border: 0 }}>
@@ -703,10 +893,14 @@ function UploadDialog({
           <Button
             type="button"
             variant="primary"
-            disabled={files.length === 0 || uploading}
+            disabled={files.length === 0 || uploading || doneCount === files.length}
             onClick={() => void handleUpload()}
           >
-            {uploading ? "Uploading…" : `Upload ${files.length > 0 ? `${files.length} file${files.length === 1 ? "" : "s"}` : ""}`}
+            {uploading
+              ? "Uploading…"
+              : failedCount > 0
+                ? `Retry ${failedCount} failed file${failedCount === 1 ? "" : "s"}`
+                : `Upload ${files.length > 0 ? `${files.length} file${files.length === 1 ? "" : "s"}` : ""}`}
           </Button>
         </div>
       </div>
