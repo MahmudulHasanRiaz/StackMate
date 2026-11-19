@@ -449,3 +449,19 @@ export function mediaObjectKey(filename: string, now = new Date()): string {
   const id = crypto.randomUUID();
   return `media/${yyyy}/${mm}/${id}-${sanitizeFilename(filename)}`;
 }
+
+export type MediaThumbnailVariant = "thumb" | "small";
+
+/**
+ * Sibling thumbnail key, derived deterministically from the original
+ * object's key (PLAN §34 / ADR-0012): the thumbnail always lives next
+ * to the original, so a regenerate overwrites the same object and a
+ * delete removes both without a second lookup. The thumbnail is
+ * always WebP, whatever the original format was.
+ */
+export function mediaThumbnailKey(objectKey: string, variant: MediaThumbnailVariant): string {
+  const slash = objectKey.lastIndexOf("/");
+  const dot = objectKey.lastIndexOf(".");
+  const base = dot > slash ? objectKey.slice(0, dot) : objectKey;
+  return `${base}-thumb-${variant === "thumb" ? "320" : "64"}.webp`;
+}

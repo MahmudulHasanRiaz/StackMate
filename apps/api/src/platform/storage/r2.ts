@@ -128,7 +128,61 @@ export class InMemoryR2Bucket implements R2BucketBinding {
     return { key, size: bytes.byteLength };
   }
 
-  async get(key: string): Promise<R2ObjectBodyLike | null> {
+  async get(
+    key: string,
+    options?: {
+      range?: { offset?: number; length?: number; suffix?: number };
+    }
+  ): Promise<R2ObjectBodyLike | null> {
+    const entry = this.objects.get(key);
+    if (!entry) return null;
+    const total = entry.bytes.byteLength;
+    let slice = entry.bytes;
+    let range: { offset: number; length: number } | undefined;
+    const r = options?.range;
+    if (r !== undefined) {
+      let start: number;
+      let end: number; // exclusive
+      if (r.suffix !== undefined) {
+        const n = Math.max(0, Math.floor(r.suffix));
+        start = Math.max(0, total - n);
+        end = total;
+      } else {
+        start = Math.max(0, Math.floor(r.offset ?? 0));
+        end = r.length !== undefined ? Math.min(total, start + Math.floor(r.length)) : total;
+      }
+      if (start > total) start = total;
+      if (end < start) end = start;
+      slice = entry.bytes.subarray(start, end);
+      range = { offset: start, length: end - start };
+    }
+    const bytes = slice;
+    return {
+      key,
+      size: total,
+      ...(entry.httpMetadata !== undefined
+        ? { httpMetadata: entry.httpMetadata }
+        : {}),
+      ...(entry.customMetadata !== undefined
+        ? { customMetadata: entry.customMetadata }
+        : {}),
+      ...(range !== undefined ? { range } : {}),
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(bytes);
+          controller.close();
+        },
+      }),
+      async arrayBuffer(): Promise<ArrayBuffer> {
+        return bytes.buffer.slice(
+          bytes.byteOffset,
+          bytes.byteOffset + bytes.byteLength
+        ) as ArrayBuffer;
+      },
+    };
+  }
+
+  async head(key: string): Promise<{ key: string; size: number; httpMetadata?: { contentType?: string }; customMetadata?: Record<string, string> } | null> {
     const entry = this.objects.get(key);
     if (!entry) return null;
     return {
@@ -140,12 +194,6 @@ export class InMemoryR2Bucket implements R2BucketBinding {
       ...(entry.customMetadata !== undefined
         ? { customMetadata: entry.customMetadata }
         : {}),
-      async arrayBuffer(): Promise<ArrayBuffer> {
-        return entry.bytes.buffer.slice(
-          entry.bytes.byteOffset,
-          entry.bytes.byteOffset + entry.bytes.byteLength
-        ) as ArrayBuffer;
-      },
     };
   }
 

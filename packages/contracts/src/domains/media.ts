@@ -44,6 +44,18 @@ export interface MediaAssetView {
   updated_at: string;
   /** Authenticated content URL (same origin, session cookie) for preview/download. */
   content_url: string;
+  /**
+   * 320px WebP thumbnail URL (`?variant=thumb`) for grid / picker /
+   * detail-thumb cells — null when the asset has no thumbnail yet
+   * (uploaded before migration 0013, or the browser could not
+   * generate one); the UI falls back to `content_url` then.
+   */
+  thumb_url: string | null;
+  /**
+   * 64px WebP thumbnail URL (`?variant=small`) for the 32px list
+   * thumb — null under the same conditions as `thumb_url`.
+   */
+  thumb_small_url: string | null;
 }
 
 export interface MediaListQuery {

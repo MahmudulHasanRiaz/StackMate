@@ -62,6 +62,7 @@ import {
   listMediaFolders,
   mediaViewOf,
   moveMediaAsset,
+  regenerateMediaThumbnail,
   renameMediaAsset,
   requireMediaAsset,
   setMediaAssetTags,
@@ -2339,6 +2340,12 @@ export function createStackMateApp(
             );
           }
           const tags = form.getAll("tags").map((t) => String(t));
+          // Browser-generated thumbnails (PLAN §34): 320px + 64px WebP
+          // variants, uploaded together with the original. Absent when
+          // the browser could not generate them — the upload proceeds
+          // without thumbnails and the UI falls back to the original.
+          const thumbFile = form.get("thumbnail");
+          const thumbSmallFile = form.get("thumbnail_small");
           const asset = await uploadMediaAsset(
             requireMediaDb(),
             driverDepsForRequest(store, env),
@@ -2351,6 +2358,22 @@ export function createStackMateApp(
                   ? (form.get("folder") as string)
                   : undefined,
               tags: tags.length > 0 ? tags : undefined,
+              thumbnails: {
+                thumb:
+                  thumbFile instanceof File
+                    ? {
+                        bytes: new Uint8Array(await thumbFile.arrayBuffer()),
+                        declaredMimeType: thumbFile.type || "image/webp",
+                      }
+                    : undefined,
+                small:
+                  thumbSmallFile instanceof File
+                    ? {
+                        bytes: new Uint8Array(await thumbSmallFile.arrayBuffer()),
+                        declaredMimeType: thumbSmallFile.type || "image/webp",
+                      }
+                    : undefined,
+              },
             },
             principal.user.id
           );
@@ -2418,27 +2441,124 @@ export function createStackMateApp(
           }
         }
 
+        const mMediaThumbnail = matchPath("/api/v1/admin/media/:id/thumbnail", pathname);
+        if (method === "POST" && mMediaThumbnail) {
+          // PLAN §34: regenerate thumbnails for an existing image —
+          // the backfill path for pre-0013 files (the browser
+          // generates the variants from the loaded original).
+          assertStaffPermission(principal, "media.manage");
+          const form = await request.formData();
+          const thumbFile = form.get("thumbnail");
+          const thumbSmallFile = form.get("thumbnail_small");
+          const asset = await regenerateMediaThumbnail(
+            requireMediaDb(),
+            driverDepsForRequest(store, env),
+            mMediaThumbnail.params.id!,
+            {
+              thumb:
+                thumbFile instanceof File
+                  ? {
+                      bytes: new Uint8Array(await thumbFile.arrayBuffer()),
+                      declaredMimeType: thumbFile.type || "image/webp",
+                    }
+                  : undefined,
+              small:
+                thumbSmallFile instanceof File
+                  ? {
+                      bytes: new Uint8Array(await thumbSmallFile.arrayBuffer()),
+                      declaredMimeType: thumbSmallFile.type || "image/webp",
+                    }
+                  : undefined,
+            },
+          );
+          await auditMediaChange("media.thumbnail_regenerated", asset.id, {
+            original_filename: asset.original_filename,
+            thumb_url: asset.thumb_url,
+            thumb_small_url: asset.thumb_small_url,
+          });
+          return jsonResponse(asset);
+        }
+
         const mMediaContent = matchPath("/api/v1/admin/media/:id/content", pathname);
         if (method === "GET" && mMediaContent) {
           assertStaffPermission(principal, "media.view");
-          const { row, bytes, mimeType } = await getMediaAssetContent(
-            requireMediaDb(),
-            driverDepsForRequest(store, env),
-            mMediaContent.params.id!
-          );
-          const safeFilename = row.originalFilename.replace(/["\\\r\n]/g, "");
+          const url = new URL(request.url);
+          const variantRaw = url.searchParams.get("variant");
+          const variant =
+            variantRaw === null
+              ? "original"
+              : variantRaw === "thumb"
+                ? "thumb"
+                : variantRaw === "small"
+                  ? "small"
+                  : null;
+          if (variant === null) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              "Unknown variant. Use variant=thumb or variant=small.",
+              422,
+            );
+          }
+          let content;
+          try {
+            content = await getMediaAssetContent(
+              requireMediaDb(),
+              driverDepsForRequest(store, env),
+              mMediaContent.params.id!,
+              { variant, rangeHeader: request.headers.get("range") },
+            );
+          } catch (err) {
+            if (err instanceof AppError && err.code === "RANGE_NOT_SATISFIABLE") {
+              // 416 needs Content-Range: bytes */<size> — build it here
+              // rather than letting the generic envelope swallow it.
+              const size = (err.details as { size?: unknown } | null)?.size;
+              return new Response("Requested range not satisfiable.", {
+                status: 416,
+                headers: {
+                  "Content-Range": `bytes */${typeof size === "number" ? size : "*"}`,
+                  "Accept-Ranges": "bytes",
+                  "Cache-Control": "no-store",
+                },
+              });
+            }
+            throw err;
+          }
+          const safeFilename = content.row.originalFilename.replace(/["\\\r\n]/g, "");
           const headers: Record<string, string> = {
-            "Content-Type": mimeType,
+            "Content-Type": content.mimeType,
             "Content-Disposition": `inline; filename="${safeFilename}"`,
             "Cache-Control": "private, max-age=3600, immutable",
             "X-Content-Type-Options": "nosniff",
+            "Accept-Ranges": "bytes",
+            ETag: content.etag,
+            "Content-Length": String(
+              content.range !== null
+                ? content.range.end - content.range.start + 1
+                : content.size,
+            ),
           };
-          if (mimeType === "image/svg+xml") {
+          if (content.mimeType === "image/svg+xml") {
             // Stored SVGs are sanitized on upload, but never let one
             // execute even if opened top-level directly.
             headers["Content-Security-Policy"] = "sandbox";
           }
-          return new Response(bytes, { status: 200, headers });
+          // Conditional request: the ETag is derived from the stored
+          // checksum, so a client that already has the bytes gets a
+          // 304 without the Worker streaming anything.
+          const ifNoneMatch = request.headers.get("if-none-match");
+          if (
+            ifNoneMatch !== null &&
+            (ifNoneMatch.trim() === "*" ||
+              ifNoneMatch.split(",").some((tag) => tag.trim() === content.etag))
+          ) {
+            return new Response(null, { status: 304, headers });
+          }
+          if (content.range !== null) {
+            headers["Content-Range"] =
+              `bytes ${content.range.start}-${content.range.end}/${content.size}`;
+            return new Response(content.body, { status: 206, headers });
+          }
+          return new Response(content.body, { status: 200, headers });
         }
 
         // Storage driver settings (PLAN §31 / ADR-0011): Settings → Storage.

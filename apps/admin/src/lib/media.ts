@@ -14,6 +14,7 @@
  * (unchanged) base64 endpoint then stores under its own key.
  */
 import { apiRequest } from "./api-client";
+import type { GeneratedThumbnails } from "./thumbnails";
 import type {
   MediaAssetView,
   MediaLibraryKind,
@@ -107,13 +108,43 @@ const MEDIA_UPLOAD_TIMEOUT_MS = 300_000;
 
 export async function uploadMediaFile(
   file: File,
-  opts?: { folder?: string | undefined; tags?: string[] | undefined },
+  opts?: {
+    folder?: string | undefined;
+    tags?: string[] | undefined;
+    /** Browser-generated thumbnails (PLAN §34) — sent alongside the
+     * original; absent when generation was skipped or failed. */
+    thumbnails?: GeneratedThumbnails | undefined;
+  },
 ): Promise<MediaAssetView> {
   const form = new FormData();
   form.append("file", file);
   if (opts?.folder) form.append("folder", opts.folder);
   for (const tag of opts?.tags ?? []) form.append("tags", tag);
+  if (opts?.thumbnails?.thumb) {
+    form.append("thumbnail", opts.thumbnails.thumb, "thumbnail.webp");
+  }
+  if (opts?.thumbnails?.small) {
+    form.append("thumbnail_small", opts.thumbnails.small, "thumbnail-small.webp");
+  }
   return apiRequest<MediaAssetView>("/api/v1/admin/media", {
+    method: "POST",
+    body: form,
+    signal: AbortSignal.timeout(MEDIA_UPLOAD_TIMEOUT_MS),
+  });
+}
+
+/**
+ * Regenerate thumbnails for an existing image (PLAN §34 — the
+ * backfill path for pre-0013 files, e.g. the one staging file).
+ */
+export async function regenerateMediaThumbnail(
+  id: string,
+  thumbnails: GeneratedThumbnails,
+): Promise<MediaAssetView> {
+  const form = new FormData();
+  if (thumbnails.thumb) form.append("thumbnail", thumbnails.thumb, "thumbnail.webp");
+  if (thumbnails.small) form.append("thumbnail_small", thumbnails.small, "thumbnail-small.webp");
+  return apiRequest<MediaAssetView>(`/api/v1/admin/media/${id}/thumbnail`, {
     method: "POST",
     body: form,
     signal: AbortSignal.timeout(MEDIA_UPLOAD_TIMEOUT_MS),

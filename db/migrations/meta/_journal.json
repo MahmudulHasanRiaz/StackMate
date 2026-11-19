@@ -92,6 +92,13 @@
       "when": 1795002762000,
       "tag": "0012_media_library_storage",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "8",
+      "when": 1795002763000,
+      "tag": "0013_media_thumbnails",
+      "breakpoints": true
     }
   ]
 }
