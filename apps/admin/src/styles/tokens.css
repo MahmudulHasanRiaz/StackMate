@@ -486,9 +486,9 @@ a:hover {
   top: 0;
   height: 100vh;
   overflow-y: auto;
-  /* Labels appear the instant the peek starts while the column is
-     still growing — clip them to the sidebar's box so they never spill
-     over the canvas mid-animation. */
+  /* Labels fade in over the same 200ms (PLAN §35) instead of popping
+     the instant the peek starts — clip them to the sidebar's box so
+     they never spill over the canvas mid-animation. */
   overflow-x: clip;
   /* The peek animates the shell's grid column now, not the aside's
      width; this stays for the drawer / breakpoint width changes. The
@@ -549,7 +549,13 @@ a:hover {
   font-size: 13px;
   font-weight: 500;
   cursor: pointer;
-  transition: background var(--sm-transition), color var(--sm-transition);
+  transition:
+    background var(--sm-transition),
+    color var(--sm-transition),
+    /* Icon glide (PLAN §35): the rail centers the icon with a
+       padding-left that animates to the expanded 10px, instead of a
+       justify-content flip (not animatable — the icon snapped). */
+    padding-left var(--sm-transition-slow);
   text-decoration: none;
 }
 .sm-nav-btn:hover {
@@ -572,10 +578,31 @@ a:hover {
 .sm-nav-btn svg {
   flex: none;
 }
+/* Label fade (PLAN §35): labels fade in sync with the column
+   transition instead of popping instantly. `display`/`visibility`
+   flip with `allow-discrete` — at the START of the transition when
+   showing, at the END when hiding — while `opacity` animates over
+   --sm-transition-slow in both directions. The global
+   prefers-reduced-motion block zeroes the duration, so reduced
+   motion still gets no fade. */
+.sm-nav-label,
+.sm-nav-group-label,
+.sm-sidebar-brand .sm-brand-name {
+  transition:
+    opacity var(--sm-transition-slow),
+    display var(--sm-transition-slow) allow-discrete,
+    visibility var(--sm-transition-slow) allow-discrete;
+}
 /* Rail rows keep the expanded row's height (32px): only the horizontal
-   centering changes, so a row never moves vertically between states. */
+   centering changes, so a row never moves vertically between states.
+   The icon is centered NOT with justify-content (not animatable — it
+   snapped) but with a padding-left that animates to the expanded 10px
+   (PLAN §35): 16px centers the 16px icon in the 48px button box
+   (8px sidebar pad + 16px = icon x 24, same as the old centered
+   position), so the icon glides instead of jumping. */
 .sm-shell[data-sidebar="rail"] .sm-nav-btn {
-  justify-content: center;
+  justify-content: flex-start;
+  padding: 0 var(--sm-space-2-5) 0 16px;
 }
 /* The label spans inside rows hide completely (the fixed 32px row
    height does not depend on them). Group labels + the brand name keep
@@ -586,12 +613,14 @@ a:hover {
 .sm-shell[data-sidebar="rail"] .sm-nav-btn .sm-nav-label,
 .sm-shell[data-nav-collapsed="true"] .sm-nav-btn .sm-nav-label {
   display: none;
+  opacity: 0;
 }
 .sm-shell[data-sidebar="rail"] .sm-nav-group-label,
 .sm-shell[data-sidebar="rail"] .sm-sidebar-brand .sm-brand-name,
 .sm-shell[data-nav-collapsed="true"] .sm-nav-group-label,
 .sm-shell[data-nav-collapsed="true"] .sm-sidebar-brand .sm-brand-name {
   visibility: hidden;
+  opacity: 0;
 }
 /* Manual collapse (persisted, `sm-nav-collapsed`): the same rail
    treatment as the 900–1280px breakpoint. */
@@ -599,7 +628,8 @@ a:hover {
   grid-template-columns: var(--sm-sidebar-rail-width) 1fr;
 }
 .sm-shell[data-nav-collapsed="true"] .sm-nav-btn {
-  justify-content: center;
+  justify-content: flex-start;
+  padding: 0 var(--sm-space-2-5) 0 16px;
 }
 
 /* "Collapse menu" button — sidebar bottom (Neon parity). Same fixed
@@ -622,6 +652,8 @@ a:hover {
   font-weight: 500;
   font-family: var(--sm-font-sans);
   cursor: pointer;
+  /* Icon glide (PLAN §35), same as .sm-nav-btn. */
+  transition: padding-left var(--sm-transition-slow);
 }
 .sm-nav-collapse-btn:hover {
   background: var(--sm-nav-hover-bg);
@@ -633,11 +665,13 @@ a:hover {
 }
 .sm-shell[data-nav-collapsed="true"] .sm-nav-collapse-btn,
 .sm-settings-shell .sm-main-rail .sm-nav-collapse-btn {
-  justify-content: center;
+  justify-content: flex-start;
+  padding: 0 var(--sm-space-2-5) 0 16px;
 }
 .sm-shell[data-nav-collapsed="true"] .sm-nav-collapse-btn .sm-nav-label,
 .sm-settings-shell .sm-main-rail .sm-nav-collapse-btn .sm-nav-label {
   display: none;
+  opacity: 0;
 }
 .sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-nav-collapse-btn {
   justify-content: flex-start;
@@ -645,6 +679,7 @@ a:hover {
 }
 .sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-nav-collapse-btn .sm-nav-label {
   display: inline;
+  opacity: 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -709,10 +744,12 @@ a:hover {
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-sidebar-brand .sm-brand-name {
     display: inline;
     visibility: visible;
+    opacity: 1;
   }
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-nav-group-label,
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-group-label {
     visibility: visible;
+    opacity: 1;
   }
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-nav-collapse-btn,
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-collapse-btn {
@@ -722,6 +759,7 @@ a:hover {
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-nav-collapse-btn .sm-nav-label,
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-collapse-btn .sm-nav-label {
     display: inline;
+    opacity: 1;
   }
   /* SettingsShell main rail, pinned-collapsed. Same treatment; the
      rail expands in place and the settings nav + main shift right. */
@@ -736,10 +774,12 @@ a:hover {
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):has(:focus-visible) .sm-sidebar-brand .sm-brand-name {
     display: inline;
     visibility: visible;
+    opacity: 1;
   }
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-nav-group-label,
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):has(:focus-visible) .sm-nav-group-label {
     visibility: visible;
+    opacity: 1;
   }
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-nav-collapse-btn,
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):has(:focus-visible) .sm-nav-collapse-btn {
@@ -749,6 +789,7 @@ a:hover {
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-nav-collapse-btn .sm-nav-label,
   .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):has(:focus-visible) .sm-nav-collapse-btn .sm-nav-label {
     display: inline;
+    opacity: 1;
   }
 }
 
@@ -2825,15 +2866,19 @@ a:hover {
 .sm-settings-shell[data-nav-collapsed="false"] {
   grid-template-columns: var(--sm-sidebar-width) 240px 1fr;
 }
-/* Main rail inside Settings: icon-only while collapsed. */
+/* Main rail inside Settings: icon-only while collapsed. The icon is
+   centered with the same animatable padding-left glide as the main
+   shell (PLAN §35): 16px left pad centers the 16px icon in the 48px
+   button box (icon x 24, same as the old centered position). */
 .sm-settings-shell .sm-main-rail .sm-nav-btn {
-  justify-content: center;
-  padding: var(--sm-space-2);
+  justify-content: flex-start;
+  padding: var(--sm-space-2) var(--sm-space-2) var(--sm-space-2) 16px;
 }
 .sm-settings-shell .sm-main-rail .sm-nav-btn .sm-nav-label,
 .sm-settings-shell .sm-main-rail .sm-nav-group-label,
 .sm-settings-shell .sm-main-rail .sm-sidebar-brand .sm-brand-name {
   display: none;
+  opacity: 0;
 }
 .sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-nav-btn {
   justify-content: flex-start;
@@ -2841,10 +2886,12 @@ a:hover {
 }
 .sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-nav-group-label {
   display: block;
+  opacity: 1;
 }
 .sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-nav-btn .sm-nav-label,
 .sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-sidebar-brand .sm-brand-name {
   display: inline;
+  opacity: 1;
 }
 .sm-settings-nav {
   background: var(--sm-surface);
@@ -3088,8 +3135,10 @@ a:hover {
     grid-template-columns: var(--sm-sidebar-width) 1fr;
   }
   .sm-shell .sm-nav-btn {
-    justify-content: center;
-    padding: var(--sm-space-2);
+    /* Icon glide (PLAN §35): same padding-left centering as the
+       ≥901px rail — 16px left pad centers the 16px icon (x 24). */
+    justify-content: flex-start;
+    padding: var(--sm-space-2) var(--sm-space-2) var(--sm-space-2) 16px;
   }
   /* Row labels hide completely (the fixed 32px row height does not
      depend on them). Group labels + the brand name keep their height
@@ -3102,10 +3151,12 @@ a:hover {
      this width; do not remove these two rules. */
   .sm-shell .sm-nav-btn .sm-nav-label {
     display: none;
+    opacity: 0;
   }
   .sm-shell .sm-nav-group-label,
   .sm-shell .sm-sidebar-brand .sm-brand-name {
     visibility: hidden;
+    opacity: 0;
   }
   /* Smart hover-peek applies here too: the rail is FORCED at this width
      whatever the persisted state is, so the peek is scoped to the
@@ -3122,10 +3173,12 @@ a:hover {
   .sm-shell .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-sidebar-brand .sm-brand-name {
     display: inline;
     visibility: visible;
+    opacity: 1;
   }
   .sm-shell .sm-sidebar:not(.sm-peek-off):hover .sm-nav-group-label,
   .sm-shell .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-group-label {
     visibility: visible;
+    opacity: 1;
   }
   .sm-shell .sm-sidebar:not(.sm-peek-off):hover .sm-nav-collapse-btn,
   .sm-shell .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-collapse-btn {
@@ -3135,6 +3188,47 @@ a:hover {
   .sm-shell .sm-sidebar:not(.sm-peek-off):hover .sm-nav-collapse-btn .sm-nav-label,
   .sm-shell .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-collapse-btn .sm-nav-label {
     display: inline;
+    opacity: 1;
+  }
+}
+
+/* Entry fade (PLAN §35): a label flipping out of `display: none`
+   has no before-change style, so its opacity transition would jump
+   straight to 1 (measured: nav label at opacity 1 two ms after
+   hover, while the visibility-hidden group label faded 0 → 1).
+   @starting-style supplies the 0 it fades from — with TWO conditions
+   proven by minimal probes: (1) the selector must be IDENTICAL to
+   the rule that shows the label (a short `.sidebar:hover .lbl` form
+   does nothing; the exact peek selector fades 0 → 0.43 → 0.69 →
+   0.90 → 1); (2) this block must come AFTER every peek rule in
+   source order — the identical selectors tie on specificity, so an
+   earlier @starting-style loses the cascade to the peek rule's
+   `opacity: 1` and the label still jumps. Covers both shells: the
+   Settings rail is `.sm-sidebar.sm-main-rail` (shell.tsx:1352). One
+   harmless side effect: on first load with an expanded sidebar the
+   labels fade in once over 200ms. */
+@starting-style {
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-nav-btn .sm-nav-label,
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-btn .sm-nav-label,
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-sidebar-brand .sm-brand-name,
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-sidebar-brand .sm-brand-name,
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-nav-collapse-btn .sm-nav-label,
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-collapse-btn .sm-nav-label,
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-nav-btn .sm-nav-label,
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):has(:focus-visible) .sm-nav-btn .sm-nav-label,
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-sidebar-brand .sm-brand-name,
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):has(:focus-visible) .sm-sidebar-brand .sm-brand-name,
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-nav-group-label,
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):has(:focus-visible) .sm-nav-group-label,
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-nav-collapse-btn .sm-nav-label,
+  .sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):has(:focus-visible) .sm-nav-collapse-btn .sm-nav-label,
+  .sm-shell .sm-sidebar:not(.sm-peek-off):hover .sm-nav-btn .sm-nav-label,
+  .sm-shell .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-btn .sm-nav-label,
+  .sm-shell .sm-sidebar:not(.sm-peek-off):hover .sm-sidebar-brand .sm-brand-name,
+  .sm-shell .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-sidebar-brand .sm-brand-name,
+  .sm-shell .sm-sidebar:not(.sm-peek-off):hover .sm-nav-collapse-btn .sm-nav-label,
+  .sm-shell .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-collapse-btn .sm-nav-label {
+    opacity: 0;
   }
 }
 
@@ -3191,10 +3285,14 @@ a:hover {
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar .sm-sidebar-brand .sm-brand-name,
   .sm-shell[data-sidebar="rail"] .sm-sidebar .sm-sidebar-brand .sm-brand-name {
     display: inline;
+    /* The rail rules above set opacity: 0 — the drawer always shows
+       full labels, so it must reset it (PLAN §35). */
+    opacity: 1;
   }
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar .sm-nav-group-label,
   .sm-shell[data-sidebar="rail"] .sm-sidebar .sm-nav-group-label {
     display: block;
+    opacity: 1;
   }
   /* On mobile the main rail is hidden inside Settings — the settings
      nav is the drawer; the main menu is one "Back to admin" tap away. */
