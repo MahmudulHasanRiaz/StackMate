@@ -3,5 +3,16 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "scripts": {}
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./common/*": "./src/common/*.ts",
+    "./domains/*": "./src/domains/*.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node ../../scripts/run-tests.mjs"
+  },
+  "dependencies": {}
 }

@@ -402,7 +402,10 @@ Product code and slug uniqueness are server-enforced. Product type, distribution
 |---|---|---|
 | GET | /api/v1/admin/products/{productId}/features | List feature catalogue for one product |
 | POST | /api/v1/admin/products/{productId}/features | Create feature definition |
+| POST | /api/v1/admin/products/{productId}/features/bulk | Create 1–100 feature definitions in one transaction; per-row results `{created, errors: [{index, feature_key, error}]}`; 201 if ≥1 created, 422 with `details.errors` if none created; one summary audit entry `catalog.feature.bulk_created` when ≥1 created |
 | GET | /api/v1/admin/products/{productId}/features/{featureId} | Feature detail |
+
+Feature list and detail responses carry `used_by_packages[]` (real associations only — package id/key/name + the highest referencing version number + version status; empty means "Not used in any package").
 | PATCH | /api/v1/admin/products/{productId}/features/{featureId} | Update allowed metadata; stable key/value type protected after usage |
 | POST | /api/v1/admin/products/{productId}/features/{featureId}/archive | Archive feature |
 
@@ -442,28 +445,42 @@ Money uses integer minor units and currency code in API contracts. For example, 
 
 | Method | Endpoint | Behavior |
 |---|---|---|
-| GET | /api/v1/admin/customers | Search/list customers using authorized fields |
+| GET | /api/v1/admin/customers | Search/list customers using authorized fields; each row carries `report_count` and `has_concern_report` |
 | POST | /api/v1/admin/customers | Create customer |
-| GET | /api/v1/admin/customers/{customerId} | Customer detail |
+| GET | /api/v1/admin/customers/{customerId} | Customer detail: financials (`total_billed/paid/due`, `credit_balance`), contacts, addresses, reports, orders with per-order paid/remaining, subscriptions, licenses, payments, installations, tickets, activity |
 | PATCH | /api/v1/admin/customers/{customerId} | Update allowed contact/billing data; audit sensitive changes |
-| GET | /api/v1/admin/customers/{customerId}/orders | Customer order history |
+| GET | /api/v1/admin/customers/{customerId}/orders | Customer order history (every row carries billed / paid / due) |
 | GET | /api/v1/admin/customers/{customerId}/subscriptions | Customer subscriptions |
 | GET | /api/v1/admin/customers/{customerId}/licenses | Customer licenses |
+| GET | /api/v1/admin/customers/{customerId}/payments | Customer payment submissions + verified transactions |
+| GET | /api/v1/admin/customers/{customerId}/installations | Connected installations (license activations) |
+| GET | /api/v1/admin/customers/{customerId}/activity | Audit log filtered to the customer and their orders/subscriptions/licenses (last 100) |
+| GET | /api/v1/admin/customers/{customerId}/tickets | All tickets for the customer |
+| GET/POST | /api/v1/admin/customers/{customerId}/addresses | Billing/shipping address list + create |
+| PATCH/DELETE | /api/v1/admin/customers/{customerId}/addresses/{addressId} | Update / delete an address (one default; setting a new default clears the old one) |
+| GET/POST | /api/v1/admin/customers/{customerId}/reports | Staff reports on the customer (type note/concern, detail required) |
+| POST | /api/v1/admin/customers/{customerId}/split-contact | Detach a SECONDARY email/phone into its own customer; the picked phone moves with it; orders stay with the source |
 
 Customer identity resolution must be deliberate. Email or phone matches may suggest a possible existing customer; do not automatically merge records on an unverified client claim. Customer is not the same entity as a staff login account.
+
+**Dedupe (ADR-0009 §3, owner rules 2026-11-17):** normalized email and normalized phone each belong to at most ONE customer. Email match → that customer (new phone attaches as secondary); phone match + new email → that customer (email attaches as secondary); neither match → new customer; both match DIFFERENT customers → 409 `CUSTOMER_CONTACT_CONFLICT` naming both customers, admin resolves, never auto-merge. The rule applies to admin create, public checkout, and inline order creation. Secondary contacts live in `customer_contacts` (UNIQUE (kind, normalized_value)). A unique index on the primaries is NOT yet enforced at the DB level — staging holds duplicates from the old checkout path; the resolver enforces the rule on all write paths until a data-cleanup migration adds the indexes. Create validation: name required; AT LEAST ONE of email/phone (422 otherwise; WhatsApp alone does not satisfy it). Phone normalizes to E.164 (Bangladeshi `01…` → `+880…`). WhatsApp has a "same as phone" copy in the UI (still editable after).
 
 ### 10.2 Orders
 
 | Method | Endpoint | Behavior |
 |---|---|---|
-| GET | /api/v1/admin/orders | Filterable order list |
+| GET | /api/v1/admin/orders | Filterable order list (each row carries `paid_amount_minor` / `remaining_minor`) |
 | POST | /api/v1/admin/orders | Create an admin-originated order; permission required |
-| GET | /api/v1/admin/orders/{orderId} | Order detail with safe line-item snapshots |
+| GET | /api/v1/admin/orders/{orderId} | Order detail with safe line-item snapshots, installments, paid/remaining |
 | POST | /api/v1/admin/orders/{orderId}/cancel | Explicit cancellation command |
 | POST | /api/v1/admin/orders/{orderId}/complete | Only for fulfillment workflow; cannot bypass payment verification |
 | GET | /api/v1/admin/orders/{orderId}/invoices | Related invoices |
+| GET | /api/v1/admin/orders/{orderId}/installments | Payment plan installments |
+| PATCH | /api/v1/admin/orders/{orderId}/installments/{installmentId} | Change an installment due date / notes (audit-logged) |
 
 Order amount, discount, tax, and entitlement snapshots are computed/validated server-side. The Admin SPA must not send a trusted total as an instruction to persist.
+
+**Create order (ADR-0009):** accepts EITHER `customer_id` OR a `new_customer` object (validated + deduped exactly as §10.1); `payment_method_id` is stored on the order; the payment plan (§10.4) and the license activation policy (§12.2) travel with the order. `lead_id` links a converted lead. The order starts `awaiting_payment` / `unpaid`. A first payment is recorded as a separate staff-claim request after creation — the wizard never auto-approves; approval still happens via Payment Review.
 
 ### 10.3 Invoices
 
@@ -475,6 +492,67 @@ Order amount, discount, tax, and entitlement snapshots are computed/validated se
 | POST | /api/v1/admin/invoices/{invoiceId}/void | Void through an authorized financial workflow |
 
 Issued invoices are immutable financial documents except for explicit status transitions and correction/credit-note workflows. Do not regenerate historical invoice items from the current package catalogue.
+
+**Partial payments (ADR-0009 §1, §27 flipped 2026-11-17):** an invoice now moves `open → partially_paid → paid` as verified payments land (`amount_paid_minor` / `amount_due_minor` synced per approval, `paid_at` when fully paid).
+
+### 10.4 Payment plans, installments and credit (ADR-0009 §1–§2)
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/orders/{orderId}/installments | Installments: number, due date (DD/MM/YYYY display, ISO YYYY-MM-DD stored), amount, paid, remaining, status (pending/partially_paid/paid/overdue), timing (early/on-time/late vs due date) |
+| PATCH | /api/v1/admin/orders/{orderId}/installments/{installmentId} | Edit due date / notes (audit `orders.installment.updated`) |
+
+Plan kinds (set at order creation): `full` (one installment, due = clearance date), `advance_rest` (advance amount XOR percent + rest due date), `equal_installments` (N parts every X days from a start date; floor parts, remainder to the last). Claims + approvals accept ANY positive amount (422 only for amount <= 0 or currency mismatch); allocation is oldest-unpaid-installment first unless the claim names an `installment_id`. Order `payment_status` gains `partially_paid` (migration 0010 adds the value to the DB check constraint — the service set it before the constraint did). Paid/remaining are computed on read from verified payments — no denormalized drift. **Credit:** a payment above the remaining amount is accepted; the excess becomes the customer's `credit_balance_minor`, visible on the profile. Credit applies ONLY at approval, explicitly (`apply_credit_minor` in the approve body, capped at the credit balance AND at the remaining amount, else 422 `CREDIT_EXCEEDS_BALANCE`) — never silent auto-apply.
+
+### 10.5 Support tickets (ADR-0009 §7)
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/tickets | List; filters status / priority / customer_id / assignee_user_id / q |
+| POST | /api/v1/admin/tickets | Create (customer optional; see linkages) |
+| GET | /api/v1/admin/tickets/{ticketId} | Detail: customer, reporter/assignee, comments, linked records |
+| PATCH | /api/v1/admin/tickets/{ticketId} | Update title / description / priority / category |
+| POST | /api/v1/admin/tickets/{ticketId}/transition | Move status (enforced, 409 `INVALID_TICKET_TRANSITION`); optional note lands as an internal comment |
+| POST | /api/v1/admin/tickets/{ticketId}/assign | Assign to a staff user (must exist, else 404) |
+| POST | /api/v1/admin/tickets/{ticketId}/comments | Add a comment (`is_internal` flag) |
+
+Ticket number is server-generated (`TKT-<sequence>`). Status flow: open → in_progress → waiting_on_customer → resolved → closed, with reopen (closed/resolved → open, clears resolved/closed_at). Priority low/medium/high/urgent; category billing/technical/license/order/other. **Linkages:** `order_id`, `subscription_id`, `license_id`, `product_id` (all nullable). Picking an order auto-assigns its customer; picking a subscription/license auto-assigns customer + product; a manual customer disagreeing with the linked record's customer → 422 `TICKET_LINK_MISMATCH`. Status + assignment changes are audit-logged. Permissions: `tickets.view` / `tickets.manage`.
+
+### 10.6 Leads (ADR-0009 §8)
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/leads | List; filters status / source_site_id / utm_campaign / from / to / q |
+| POST | /api/v1/admin/leads | Manual create (staff) |
+| GET | /api/v1/admin/leads/{leadId} | Detail: source site, product, assignee, converted customer/order |
+| PATCH | /api/v1/admin/leads/{leadId} | Update contact / interest / notes |
+| POST | /api/v1/admin/leads/{leadId}/transition | Move status (enforced, 409 `INVALID_LEAD_TRANSITION`) |
+| POST | /api/v1/admin/leads/{leadId}/assign | Assign to a staff user |
+| POST | /api/v1/admin/leads/{leadId}/convert | Resolve/create the customer via the §10.1 dedupe rules and return it; the lead is NOT marked converted yet |
+
+Lead fields: name, email, phone, whatsapp (optional), source_site_id (nullable for manual), utm_source/medium/campaign, interest (free text + optional product_id), message/notes, status (new → contacted → qualified → converted / lost), assignee, converted_at / converted_customer_id / converted_order_id. Contact rule mirrors customers (at least one of email/phone). **Ingestion (the main source):** `POST /api/v1/integrations/sites/{siteKey}/leads` — S2S HMAC auth, scope `leads.create` (§15); 201 when created, 200 when dedupe-matched. **Dedupe window:** same normalized contact from the same site within 30 days → update the existing lead, never a duplicate. **Tracking:** every API-ingested lead emits a Lead event into the existing tracking pipeline (event_name `Lead`, status `queued`) + a `tracking.meta_capi.dispatch` outbox entry, on CREATE only; manual leads emit none. Meta CAPI real delivery is a KNOWN STUB — the event is recorded + queued, never claimed as delivered. **Conversion:** convert resolves the customer, then the Create Order wizard opens with the customer prefilled; order creation with `lead_id` marks the lead converted. Converting never deletes the lead. Permissions: `leads.view` / `leads.manage`.
+
+### 10.7 Reminder settings (ADR-0009 §5)
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/reminder-settings | `{ due_offsets_days: [7,1], overdue_offsets_days: [1,3], overdue_enabled: true }` (permission `users.manage`) |
+| PUT | /api/v1/admin/reminder-settings | Update offsets / toggle (audit-logged) |
+
+Stored DB-side (singleton `reminder_settings`, id `default`, migration 0009) and edited from Settings → Email. Due reminders fire when today == due_date − offset; overdue reminders when today == due_date + offset (only when enabled); renewal reminders use the same offsets against `current_period_end`. Each reminder is sent once per (kind, reference_id, offset) — tracked in `sent_reminders`. The sweep returns `reminders_due`; the caller sends each email and only then marks it sent, so a failed send retries on the next run.
+
+### 10.8 Dashboard analytics overview — date filter (PLAN §23)
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/analytics/overview | Analytics overview DTO (permission `products.read`) |
+| GET | /api/v1/admin/analytics/overview?from=YYYY-MM-DD&to=YYYY-MM-DD | Same DTO, flow metrics scoped to the inclusive range |
+
+Query params: `from` / `to` are ISO date-only values. Both absent = all time (response `range: null`). Exactly one present, an invalid date, `from` after `to`, or a span over 366 days → 400 `VALIDATION_ERROR`. The response echoes the applied range as `range: { from, to } | null` (additive field).
+
+Day boundaries are Asia/Dhaka (the fixed product timezone): a timestamp counts when its calendar date in that zone is within [from, to] inclusive.
+
+Per-metric semantics — the dashboard has no charts or recent-activity lists, only KPI cards. The range scopes the FLOW metrics: `verified_revenue_minor` = sum of `total_minor` over orders with `payment_status=paid` whose `completed_at` falls in the range (pending payments are never revenue; all time is the pre-filter computation, including a paid order with no `completed_at`); `total_orders` = orders with `created_at` in the range; `paid_orders` = orders with `created_at` in the range AND paid (cohort semantics, so "paid / total" stays a coherent ratio). Everything else is a current-state snapshot and is NOT range-scoped — history cannot be reconstructed from current state: `total_products` / `active_products` (inventory), `active_subscriptions` / `active_licenses` / `expired_or_revoked_licenses` (state now), `pending_payment_submissions` / `pending_outbox_events` (live queues), `total_customers` (all-time total).
 
 ---
 
@@ -512,7 +590,8 @@ Approval request example:
       "verified_amount_minor": 49900,
       "currency_code": "BDT",
       "verification_reference": "statement-line-reference",
-      "internal_note": "Verified against account statement."
+      "internal_note": "Verified against account statement.",
+      "apply_credit_minor": 0
     }
 
 Approval rules:
@@ -520,7 +599,7 @@ Approval rules:
 - The submission must still be pending/reviewable.
 - Verify actual account receipt independently of the customer's claim or screenshot.
 - Check amount, currency, destination account, transaction/reference, order/invoice, and duplicate indicators.
-- If the verified amount differs from the outstanding amount, reject or route to an explicit partial-payment/overpayment workflow; never silently mark the full order paid.
+- **Partial payments (ADR-0009, §27 flipped 2026-11-17):** the verified amount may be ANY positive amount — a partial approval sets the order `partially_paid` (and the invoice `partially_paid`) and allocates oldest-unpaid-installment first (or to the installment named in the claim). A payment above the remaining amount is accepted and the excess becomes customer credit. `apply_credit_minor` applies part of the customer's credit balance on top of the verified money (capped at the balance and at the remaining amount, else 422 `CREDIT_EXCEEDS_BALANCE`). Never silently mark the full order paid: the success message and the outbox `payment.approved` event carry the COMPUTED payment status, and the order completes only when fully paid.
 - Approval must be one atomic database transaction.
 - A second concurrent approval must receive 409 conflict.
 - Insert verification log, audit event, and outbox event in the same transaction.
@@ -562,6 +641,10 @@ Manual providers do not implement automated debit, automated balance check, or p
 | POST | /api/v1/admin/subscriptions/{subscriptionId}/resume | Resume where policy allows |
 
 Manual-payment renewal is a fresh invoice/order followed by a new customer payment submission and staff verification. The API must not expose an auto-debit flag for manual MFS/bank methods.
+
+**Renewal + expiry automation (ADR-0009 §5):** the every-minute cron runs a renewal/expiry sweep AFTER the outbox drain (never failing the drain): date-based license activation; missed-schedule suspension/reactivation; installments past due → overdue; renewal detection — a recurring active subscription whose period end is within the first reminder offset gets exactly ONE renewal invoice/order (`generateRenewalInvoiceInTx`, idempotent via the pending-period check); subscriptions past period end → `past_due` inside the grace window (license keeps working), `expired` after grace (licenses suspended at that moment until renewal payment verifies); licenses past `grace_until` → `expired` + `license.expired` outbox event. Renewal orders carry NO installments.
+
+**License activation policy (ADR-0009 §4):** per-order `activation_mode` (on_full_payment | on_percent | on_date), `activation_percent` (threshold `ceil(total × percent / 100)`), `activation_date`, `suspend_on_missed_schedule` (default false); `grace_days` on the subscription (default 3). Fulfillment follows the activation policy, not payment completion alone: on_full_payment activates when paid == total; on_percent when paid >= percent; on_date on that date regardless of payment. A missed scheduled installment (suspend toggle ON) suspends an active license until paid, then auto-reactivates (only missed-schedule suspensions auto-reactivate). Evaluated at payment approval and in the cron sweep. Every activation/suspension/reactivation writes a `license_event` + audit log entry, and pushes `license.activated` / `license.suspended` / `license.reactivated` / `license.expired` through the existing outbox (payload: license_number, product, status, expires_at, grace_until, reason). The in-app Integration Guide (Settings → Integration Guide) documents the receiver contract.
 
 ### 12.2 Licenses
 
@@ -841,6 +924,7 @@ These routes are called from the registered site's trusted server/runtime and re
 | GET | /api/v1/integrations/sites/{siteKey}/orders/{publicReference} | orders.read:own |
 | POST | /api/v1/integrations/sites/{siteKey}/orders/{publicReference}/cancel | orders.cancel:own |
 | POST | /api/v1/integrations/sites/{siteKey}/tracking/events | tracking.events.write |
+| POST | /api/v1/integrations/sites/{siteKey}/leads | leads.create |
 | POST | /api/v1/integrations/sites/{siteKey}/webhook-test | webhooks.test |
 
 Rules:
@@ -1072,6 +1156,22 @@ Rules:
 - Track delivery status separately from event acceptance.
 - Deduplication policy must follow current official Meta documentation and must be verified in test events before production.
 
+### 17.6 Admin API — tracking pixel groups
+
+A pixel group is one (provider, pixel_id) configuration for one integrated site. A site may have several groups per provider — for example two Meta pixels on the same store. Configuration is managed from Settings in the admin panel (UI-based, never via environment variables). Multi-platform ready: `provider` is a parameter on every call, never hardcoded to `meta`.
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/integrated-sites/{siteId}/tracking | List a site's pixel groups (CAPI token never returned) |
+| POST | /api/v1/admin/integrated-sites/{siteId}/tracking | Create a pixel group; 201; 409 on a duplicate (site, provider, pixel_id); 404 unknown site |
+| PATCH | /api/v1/admin/integrated-sites/{siteId}/tracking/{configId} | Update a group (partial); supplying `access_token` re-encrypts the token and bumps `rotated_at`; omitting it keeps the stored token; 422 on a no-op body; 409 when the update would collide with another group's (site, provider, pixel_id) |
+| DELETE | /api/v1/admin/integrated-sites/{siteId}/tracking/{configId} | Hard delete a group (stored token deleted with it); 404 unknown config |
+| PUT | /api/v1/admin/integrated-sites/{siteId}/tracking | Legacy single-config upsert: matches on (site, provider, pixel_id) — a new pixel creates a group, a known pixel updates in place |
+
+Enable/disable is `PATCH {status: "enabled" | "disabled"}` — no redundant toggle endpoint. Create body: `provider` (`meta` | `tiktok`), `label?` (human group name, max 120 chars; null falls back to the pixel ID in the UI), `pixel_id` (4–80 chars), `access_token` (write-only, encrypted at rest, min 8 chars), `test_event_code?`, `enabled_events` (≥1 of `PageView`, `ViewContent`, `Lead`, `InitiateCheckout`, `AddPaymentInfo`, `Purchase`), `status?` (default `enabled`). All calls require `tracking.manage` and are audit-logged (`tracking.configuration.created` / `.updated` / `.deleted`).
+
+Event intake accepts an event when ANY enabled group for the site enables it — not only the first group. Meta CAPI delivery is a stub in the current API (events are recorded, no call to Meta is made — Batch 4); TikTok has no delivery at all yet, its groups only store configuration. The admin UI says so plainly and never claims a delivery reached its destination.
+
 ---
 
 ## 18. Webhook Contract
@@ -1098,6 +1198,7 @@ Initial event names:
     license.created
     license.activated
     license.suspended
+    license.reactivated
     license.expired
     license.revoked
     entitlement.updated
@@ -1162,6 +1263,145 @@ Webhook URLs are user-controlled destinations. Before delivery, enforce HTTPS in
 ### 18.6 Secret rotation
 
 Support overlapping active/retiring endpoint secrets for a planned rotation window. List APIs return key IDs and status only. The raw secret is shown once at creation/rotation.
+
+### 18.7 Admin API — webhook endpoints
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/webhooks | List registered endpoints |
+| POST | /api/v1/admin/webhooks | Register an endpoint; returns the signing secret once (`raw_signing_secret_once`) |
+| DELETE | /api/v1/admin/webhooks/{webhookId} | Hard delete an endpoint (permission-gated, audit-logged `webhooks.endpoint.deleted`); the endpoint's deliveries are removed with it; outbox events stay as history |
+| POST | /api/v1/admin/webhooks/{webhookId}/test | Real test delivery (signed, 10s timeout); the result is shown verbatim |
+| GET | /api/v1/admin/webhooks/{webhookId}/deliveries | Delivery attempts for one endpoint |
+
+There is no `GET /api/v1/admin/webhooks/{webhookId}` — the admin detail page reads the endpoint from the list. Webhook endpoints are configuration and live under Settings in the admin panel; the outbox lives under Administration as its own section.
+
+### 18.8 Admin API — audit log
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/audit-logs | List audit events (permission `audit_logs.read`); newest first |
+
+Each row carries `resource_display_name` (additive, nullable): a human display name for the affected resource, resolved server-side from the live state — user/site/product/feature/package names, order/subscription/license/invoice numbers, webhook endpoint URL, invitation email, credential `key_id`, tracking group label (or `"{provider} pixel {pixel_id}"`), payment submission `"{amount} · Order {order_number}"`, package version `"v{N} · {package name}"`, package price `"{amount} [/ {n} {unit}] · {package} v{N}"`, session rows the actor's name (sign-in rows carry the attempted email or a 12-char session-token prefix, so the name is resolved from those when possible). `null` means the resource no longer exists (or the type has no display name) — the admin UI then falls back to its client-side name maps and, last, the short id; a bare raw id is never the primary display. No secrets are ever returned in a display name (only names, numbers, URLs, and public ids). The field is display-only: it changes no audit behaviour, no filtering, and no contract — clients that ignore it see the same rows as before.
+
+### 18.9 Admin API — authentication & email configuration (Auth + Email batch, 2026-11-16)
+
+All authentication configuration lives in the database and is edited from Settings — never via env vars, never in code. OAuth + 2FA policy live in Settings → Authentication; SMTP lives in its own Settings → Email menu (owner order, 2026-11-16 — SMTP was inside Authentication before; the move is UI-only, API paths are unchanged). A Settings save takes effect without a redeploy (the Better Auth instance is built per request from the current DB settings, with a 30s module-level cache keyed by connection string, invalidated on save; other isolates converge within the TTL). Every config change is audit-logged (`auth.oauth.updated`, `auth.two_factor_policy.updated`, `auth.smtp.updated`, `general.settings.updated`) with actor + what changed — never secret values.
+
+**Origin check (Better Auth, all `POST /api/auth/*` through `auth.handler`):** the check is pinned ON in every environment via `advanced.disableOriginCheck: false` (Auth + Email fix batch, 2026-11-16). Better Auth defaults it to `isTest() ? true : false`, and `isTest()` is true under vitest (via `NODE_ENV=test` AND via `TEST=true`, which vitest sets) — so the check was silently OFF in every test while ON in production, which hid a live 403 on the 2FA setup password gate. Explicit `false` changes nothing in production (the check was already on there); it only makes tests exercise the real check. `trustedOrigins` always includes the app's own deployment origins (`API_URL` / `APP_URL` origins) in addition to `TRUSTED_ORIGINS` and the `BETTER_AUTH_URL` origin, so a stale `BETTER_AUTH_URL` can never lock the same-origin SPA out of its own auth endpoints. **Normalization rule (2FA origin fix batch #2, 2026-11-16 — the batch-#1 fix did NOT hold live):** every trusted origin is normalized to its bare origin via `new URL().origin` before it reaches Better Auth, because Better Auth 1.7.23 compares a non-wildcard pattern with EXACT string equality against the request origin and pushes `options.trustedOrigins` RAW (verified in the installed dist) — a dashboard value copied with a trailing slash or a path (`https://host.workers.dev/`) could therefore never match the browser's bare Origin header (`https://host.workers.dev`) and the live 2FA gate kept 403ing with `INVALID_ORIGIN` even though the API_URL happy path passed in vitest. `BETTER_AUTH_URL` is included explicitly (never rely on Better Auth auto-trusting baseURL alone). Wildcard patterns (`*` / `?`) are kept verbatim — they are Better Auth's own matching syntax and `new URL()` rejects bare `*.example.com`. Tests that POST to `/api/auth/*` with a session cookie must therefore send an `Origin` header, exactly like the real SPA does; a request with a cookie and no Origin/Referer is 403 `MISSING_OR_NULL_ORIGIN`, a non-matching Origin is 403 `INVALID_ORIGIN`.
+
+**Deployment requirement (2FA origin diagnosis, 2026-11-16 — the live 2FA gate 403'd `INVALID_ORIGIN` through two code fixes because the vars below were not reaching the Worker):** the check trusts ONLY the origins named by the four deployment URL variables — `BETTER_AUTH_URL`, `API_URL`, `APP_URL`, `TRUSTED_ORIGINS` — each normalized to its bare origin. When all four are unset for an environment, `env.ts` silently falls back to `http://localhost:5173` / `http://localhost:8787` (no error, no log), and the live trusted list then contains only localhost origins: every same-origin SPA POST to `/api/auth/*` with a session cookie fails `INVALID_ORIGIN` while sign-in (no cookie yet) and the admin API keep working. **On every environment, all four variables must name that environment's deployment origin** (for staging: `https://stackmate-api-staging.ad-dawah.workers.dev`). **They live in `apps/api/wrangler.jsonc` `env.staging.vars` — NOT only in the Cloudflare dashboard:** dashboard-set plain vars are WIPED by every Git-build deploy (observed 2026-11-16: build `1544e07f` reverted the Worker from 15 vars to 11, dropping all four; they had to be re-added by hand). The four values are plain URLs, not secrets, so committing them is safe; the five real secrets stay dashboard-only. Any one of the four naming the origin suffices for the check; all four is belt-and-braces against a single stale var. This is a deployment fact, not an endpoint contract: no code change can substitute for it, and a vitest-passed origin fix is not live proof — the live gate must be re-tested after the values are set. (Related, same diagnosis — FIXED in the follow-up batch, ADR-0008 decision 10: the app's own CSRF gate for `/api/v1/admin/*` reads `env.TRUSTED_ORIGINS` and fires when `parseSessionCookie` finds a session cookie — it now recognises the `__Secure-better-auth.session_token` name staging/production actually sets, so a cookie-authenticated state-changing request from an untrusted Origin 403s with "blocked by CSRF policy". Before that fix the gate was blind live and admin POSTs passed whatever the vars held.)
+
+**Public config (no auth, no secrets, no user data):**
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/auth-config | `{ oauth_providers: string[] (enabled AND has a stored client id), email_configured: boolean }` — the login page renders OAuth buttons only for the listed providers. |
+| GET | /api/v1/general-config | `{ app_name, app_title, app_description, support_email, favicon_url }` — the SPA applies it at boot (brand, tab title, favicon, login-page tagline + support contact). |
+| GET | /api/v1/favicon | Streams the R2 favicon object (content type from storage, `Cache-Control: public, max-age=86400`); 404 when no favicon is uploaded. |
+
+**OAuth providers (Google, GitHub only — the only providers shipped; the same mechanism adds more, never invent one):**
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| PUT | /api/v1/admin/auth-config/oauth | `{ provider, enabled, client_id?, client_secret? }` (permission `users.manage`). Client secrets are encrypted at rest (AES-256-GCM, AAD `auth:oauth:<provider>`) and never returned — GET views expose only `has_client_secret`. Enabling requires a client id + secret (unless one is already stored); omitting the secret keeps the stored one. |
+| POST | /api/auth/sign-in/social | Better Auth social sign-in (exempt from the `sign-in/*` block). On callback, Better Auth links the OAuth account to an EXISTING staff user only when the provider email matches a staff record with a verified email (all three staff-provisioning paths set `email_verified: true`); `user.create.before` always returns false, so a non-staff Google/GitHub login can never mint a user, and `session.create.before` returns false for suspended staff, so OAuth can never mint a session for them. |
+
+**Two-factor authentication (TOTP, better-auth 1.7.23 `twoFactor` plugin; backup codes stored encrypted — the plugin default is plaintext JSON, so `storeBackupCodes: "encrypted"` is load-bearing):**
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/auth-config | Returns the full auth config VIEW — `{ oauth: [{ provider, enabled, client_id, has_client_secret, updated_at }], two_factor_policy: { global, roles }, smtp: { host, port, username, has_password, tls_mode, from_address, from_name, enabled, updated_at } }` — snake_case, with defaults even when nothing is configured yet (`oauth: []`, policy `off`, SMTP disabled), and secrets (OAuth `clientSecret`, SMTP `password`) NEVER returned (`users.manage`). The raw `ResolvedAuthConfig` (camelCase + decrypted secrets) must never be serialized to a client. |
+| PUT | /api/v1/admin/auth-config/two-factor-policy | `{ scope, mode }` — scope `global` (default for every role) or one of the 8 role keys; mode `off` / `optional` / `required` (default OFF). Resolution is strictest-wins across global + the user's roles (required > optional > off). |
+| POST | /api/auth/two-factor/enable | Password → `{ totpURI, backupCodes }` (raw plugin response, not the app envelope). |
+| POST | /api/auth/two-factor/verify-totp | `{ code }` — verifies setup or a sign-in challenge. **Rotates the session** (creates a new one, deletes the old, sets the cookie): clients must use the response's `set-cookie` afterwards. |
+| POST | /api/auth/two-factor/verify-backup-code | `{ code }` — one backup code, consumed on use. |
+| POST | /api/auth/two-factor/disable | Password → disables 2FA. Also rotates the session. |
+
+Sign-in with 2FA on: the plugin deletes the just-created session and returns `{ two_factor_redirect: true, twoFactorMethods: ["totp"] }` with a signed `twoFactor` verification cookie — no session exists until `/two-factor/verify-totp` succeeds. When the policy REQUIRES 2FA and the user has not set it up, the sign-in succeeds but the principal carries `two_factor_setup_required: true` and the session is restricted: every admin endpoint except `GET /api/v1/admin/me` returns 403 `TWO_FACTOR_SETUP_REQUIRED` until setup completes (the SPA shows the forced-setup wizard instead of the shell).
+
+**SMTP + email (provider-agnostic; the Worker sends via `cloudflare:sockets` — EHLO → STARTTLS → AUTH LOGIN → MAIL/RCPT/DATA/QUIT; port 25 is blocked by the platform, so the settings UI rejects it):** SMTP is configured from its own Settings → Email menu (owner order, 2026-11-16), not inside Authentication — the endpoints below are unchanged, the move is UI-only.
+
+**Timeouts (SMTP timeout fix batch, 2026-11-16 — the live "Send test email" button stuck on "Sending…" 90s+ with no success and no error, while the Worker held no request anywhere near 90s):** before this fix only the socket read had a timeout (`READ_TIMEOUT_MS` 10s); `connectImpl()`, every `writer.write()`, `socket.startTls()`, and `socket.close()` in `finally` could wait forever. Now every step is bounded at 10s (`STEP_TIMEOUT_MS = READ_TIMEOUT_MS`) and the whole send runs under a 60s total budget; every failure surfaces as an `SmtpError` with the real cause (never credentials in the message). The admin `apiRequest` helper also has a 30s client-side timeout (`AbortSignal.timeout`), so no button can stick forever — a timeout surfaces as `REQUEST_TIMEOUT` with the real message instead of a spinner.
+
+**Scheduled outbox drain (same batch):** the Worker's every-minute cron (`* * * * *`) drains the transactional outbox (webhook deliveries + Meta CAPI dispatch). Before this fix the drain NEVER ran: `handleScheduled` did `return processTransactionalOutboxBatch(...)` WITHOUT `await` inside a `try/finally` that closes the store — in an async function the `finally` runs before the returned promise settles, so the store's pg client was ended while the drain was still running and its first `BEGIN` threw "Client was closed and is not queryable" — the deterministic ~1/min uncaught exception in the Cloudflare metrics (2.59k invocations / 1.4k errors in 24h). The fix is one word: `return await processTransactionalOutboxBatch(...)`. The fetch path was never affected (`fetchHandler` already uses `return await handleRequest(...)`).
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| PUT | /api/v1/admin/auth-config/smtp | `{ host, port, username?, password?, tls_mode (starttls\|ssl\|none), from_address, from_name?, enabled? }` (`users.manage`). Password encrypted at rest (AAD `auth:smtp`), never returned. Enabling requires host + from address. |
+| POST | /api/v1/admin/auth-config/smtp/test | Sends a real test mail **only to the admin's own address** (never an open relay); failure returns 502 with the real error, never a fake success. |
+| POST | /api/auth/forgot-password | `{ email }` — always the same generic 200 (never says whether the email exists or whether email is configured). A reset token is created + emailed only for an active user when SMTP is configured. The forgot-password PAGE reads the public `email_configured` flag and says plainly when email is not configured (no fake "a reset link has been sent"); the endpoint itself stays generic-200 either way. |
+| POST | /api/auth/reset-password | `{ token, password }` — 422 for an invalid/expired/used token. Password ≥10 chars. **Reset alone never disables 2FA** (email compromise must not defeat 2FA). |
+| POST | /api/auth/two-factor/recover | `{ email }` — generic 200; a recovery token is emailed only when the user has 2FA on and SMTP is configured. |
+| POST | /api/auth/two-factor/recover/confirm | `{ token, password }` — verifies the password, disables 2FA (sets `users.two_factor_enabled=false`, deletes the `two_factor` row), consumes the token. |
+
+Reset/recovery tokens: raw token `smreset` + random bytes (emailed once, never persisted); only the SHA-256 hash is stored, 1-hour TTL, single-use, `purpose` separates `password_reset` from `two_factor_recovery` so a token from one flow cannot be used in the other. Staff invitations send the accept link by email when SMTP is configured (`email_sent` / `email_error` in the response); when it is not configured the current `token_once` return is kept and the UI says plainly that email is not configured.
+
+### 18.10 Admin API — general settings (Auth + Email batch, 2026-11-16)
+
+App-wide configuration from Settings → General (category group `General`, permission `users.manage`). Runtime-applied: a save reaches the UI immediately, no redeploy. Storage is the singleton `general_settings` row (migration 0008, id `default`); no seed writes it, so admin edits are never overwritten. Every value renders somewhere visible — no dead stored values.
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/general-settings | Full view: `app_name`, `app_title`, `app_description`, `support_email`, `favicon_url`, `favicon_content_type`, `favicon_byte_size`. |
+| PUT | /api/v1/admin/general-settings | Partial update (absent fields keep their value). Validation: name/title 1–120 chars, description ≤500 chars, support email empty or a valid address; `clear_favicon: true` removes the stored favicon. Audit-logged `general.settings.updated` (resource_type `general_settings`, resource_id `general-settings`). |
+| POST | /api/v1/admin/general-settings/favicon | `{ filename, content_type, content_base64 }` — PNG/ICO/SVG only, ≤256 KB, magic-byte checked (SVG must not contain `<script>`). Stored in R2 under the server-side key `branding/favicon-<sha256>.<ext>` (reusing the validated-private-object pattern); returns `{ favicon_url: "/api/v1/favicon", content_type, byte_size }`. Fail-closed in staging/production without a real R2 bucket (same rule as payment evidence). |
+
+Rendering: App Name → sidebar/topbar brand + document-title fallback; App Title → `document.title`; Favicon → the tab icon (via the public `/api/v1/favicon` endpoint); App Description → meta description + the login page tagline; Support Email → the login page contact for staff who cannot sign in (hidden when empty). Currency/timezone/language are NOT settings — BDT + Asia/Dhaka are fixed by spec and the admin is English-only.
+
+### 18.11 Server-side list search — `q` + `limit` (search batch, 2026-11-18)
+
+Every admin list endpoint accepts `?q=<query>` (trimmed, case-insensitive substring match) and `?limit=<n>` (clamped 1..100; absent = no limit, list pages unchanged). The query runs server-side over the FULL dataset — the store loads the whole table snapshot per request by design, so `q` filtering over `store.state` is filtering over the full set, never over a loaded page. `limit` slices AFTER the filter. No-param calls return everything, exactly as before. (Caveat, ADR-0010: if the store ever paginates at the DB layer, the `q` filters must move into SQL — the endpoint contract does not change.)
+
+| Endpoint | `q` matches on |
+|---|---|
+| GET /api/v1/admin/customers | name, email, phone (digits-only query also matches `normalized_phone`), customer_number, company_name |
+| GET /api/v1/admin/orders | order_number, public_reference, customer name |
+| GET /api/v1/admin/products | name, code |
+| GET /api/v1/admin/licenses | license_number, customer name, product code |
+| GET /api/v1/admin/subscriptions | subscription_number, customer name |
+| GET /api/v1/admin/users | name, email |
+| GET /api/v1/admin/integrated-sites | name, site_key, domains |
+| GET /api/v1/admin/payment-methods | display_name |
+| GET /api/v1/admin/payment-providers | display_name |
+| GET /api/v1/admin/products/:productId/features | name, feature_key |
+| GET /api/v1/admin/products/:productId/packages | name |
+| GET /api/v1/admin/tickets | (pre-existing `q`, plus `limit`) |
+| GET /api/v1/admin/leads | (pre-existing `q`, plus `limit`) |
+
+### 18.12 Global search (search batch, 2026-11-18)
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/search?q=… | Grouped entity search for the header search bar. Staff session required (401 without one). `q` shorter than 2 characters returns empty groups (no full-table dump). Each group is searched server-side over the full table and capped at **8 items per group** — the cap is per group in the response, never a filter over a loaded page. Groups are **permission-gated by the caller's own permissions**: a group the caller cannot read is omitted from the response, never 403s the whole search. Response: `{ query, groups: [{ key, label, items: [{ type, id, label, sublabel, to }] }] }`; `to` is the SPA route for the record's detail page. |
+
+Groups: Customers (`customers.read` → /customers/:id), Orders (`orders.read` → /orders/:id), Products (`products.read` → /products/:id), Licenses (`licenses.read` → /licenses/:id), Subscriptions (`subscriptions.read` → /subscriptions/:id), Tickets (`tickets.view` → /tickets/:id), Leads (`leads.view` → /leads/:id), Staff (`users.manage` → /staff/:id), Sites (`integrations.manage` → /settings/websites/:id). Contract: `packages/contracts/src/domains/search.ts` (`GlobalSearchResponse`, `MIN_QUERY_LENGTH = 2`, `MAX_PER_GROUP = 8`). The header search (⌘K) calls it debounced 250ms and renders entity groups first, then the Pages group (quick navigation).
+
+### 18.13 Media library (media batch, 2026-11-18)
+
+Media files are private objects — never a public URL or a raw storage key. Every response carries an authenticated same-origin `content_url` (`GET /api/v1/admin/media/:id/content`, session cookie); objects stay private in R2 or under the Local root. Each row stores its own `driver` (`r2` | `local`); reads always use the row's driver. Contract: `packages/contracts/src/domains/media.ts` (`MediaAssetView`, `MediaListQuery`, `MediaListResponse`, `MediaLibraryKind`).
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/media?q=&kind=&folder=&mime=&limit=&offset= | List, `media.view`. `q` filters server-side over the FULL `media_assets` dataset (filename + tags); `kind` is one of `image` / `video` / `audio` / `document` / `archive` / `other`; `folder` is an exact folder name; `mime` is a comma-separated list of exact MIME types. `limit` (default 50, max 100) caps AFTER filtering; `offset` pages. Bad kind/mime → 422. Response: `{ items: MediaAssetView[], total, limit, offset }`. |
+| GET | /api/v1/admin/media/folders | Distinct folder names (non-empty), `media.view`. Response: `{ folders: string[] }`. |
+| POST | /api/v1/admin/media | Upload, `media.manage`, multipart `FormData` — field `file` (required), `folder` (optional), repeated `tags` fields, plus optional browser-generated thumbnail fields `thumbnail` (320px WebP) + `thumbnail_small` (64px WebP) — see thumbnails below. Allowlist: images PNG/JPEG/WEBP/GIF/SVG, video MP4/WebM, audio MP3/WAV/OGG, PDF, ZIP, plain text + CSV — MIME + magic-byte validated; anything else → 415; oversize (> 100 MB) → 413; no `file` → 422. SVG is sanitized (scripts / event handlers / `javascript:` hrefs / `<foreignObject>` / DOCTYPE stripped) and must parse as SVG. Server-generated key `media/<yyyy>/<mm>/<uuid>-<sanitized>`. Stored on the CURRENT driver setting; the row records that driver. 201 with the `MediaAssetView`. Audited (`media.uploaded`). On insert failure the uploaded object is deleted (no orphan). |
+| GET | /api/v1/admin/media/:id | Detail, `media.view`. 404 when missing. |
+| PATCH | /api/v1/admin/media/:id | Rename / move / retag, `media.manage`. Body: any of `original_filename`, `folder`, `tags` (max 10, 1–30 chars each); at least one present or 422; bad values → 422. Audited (`media.updated`). |
+| DELETE | /api/v1/admin/media/:id | Delete, `media.manage`. Row first, then the stored object + both thumbnail objects (best-effort). Audited (`media.deleted`). |
+| POST | /api/v1/admin/media/:id/thumbnail | Regenerate thumbnails for an existing image, `media.manage`, multipart `thumbnail` and/or `thumbnail_small` (WebP, at least one required). Raster images only (PNG/JPEG/WebP/GIF) — SVG / non-image → 422; bad thumbnail bytes → 415. Overwrites the deterministic sibling keys. Audited (`media.thumbnail_regenerated`). Returns the updated `MediaAssetView`. |
+| GET | /api/v1/admin/media/:id/content | File bytes, `media.view`. `Content-Type` is the row's MIME; `Content-Disposition: inline` with the original filename; `Cache-Control: private, max-age=3600, immutable`; `X-Content-Type-Options: nosniff`; `Accept-Ranges: bytes`; `ETag` from the stored checksum (`"<sha256>"`). SVG additionally gets `Content-Security-Policy: sandbox` and is never served as HTML. 404 when the row or the object is missing. Streams the object (never buffers it); `Range: bytes=start-end` → 206 + `Content-Range` (suffix + open-ended supported; unsatisfiable → 416 `RANGE_NOT_SATISFIABLE` with `Content-Range: bytes */size`); `If-None-Match` match (or `*`) → 304 with no body. `?variant=thumb` serves the 320px WebP thumbnail (`Content-Type: image/webp`, ETag `"<sha256>-thumb-320"`), `?variant=small` the 64px one (`"<sha256>-thumb-64"`); unknown variant → 422; variant requested but no thumbnail stored → 404. |
+
+Permissions: `media.view` / `media.manage` (migration 0012). Grants: super_admin + admin + support_staff get both; read_only gets view only; finance_manager / license_manager / product_manager / marketing_manager get none. **Thumbnails (PLAN §34 / ADR-0012, migration 0013):** thumbnails are generated in the BROWSER at upload (canvas → WebP q80: 320px + 64px), stored as sibling objects (`<base>-thumb-320.webp` / `<base>-thumb-64.webp`) under the row's driver, and exposed as `thumb_url` / `thumb_small_url` on `MediaAssetView` (null when the asset has no thumbnail — pre-0013 uploads or a browser that could not generate one; the UI falls back to `content_url`). Sharp has NO opportunity on the Workers API (native libvips, no Workers target — verified from Sharp's own install docs), so no server-side image pipeline exists; if the owner later enables Cloudflare Images (`env.IMAGES`), only the thumbnail producer changes, not the contract. The detail drawer offers "Generate thumbnail" for thumb-less images (browser-generated, via the regenerate endpoint above) — the backfill path for existing files. The `?download=1` attachment param was planned and NOT implemented — downloads use the `download` attribute on the anchor + the inline content URL.
+
+### 18.14 Storage settings (media batch, 2026-11-18)
+
+| Method | Endpoint | Behavior |
+|---|---|---|
+| GET | /api/v1/admin/storage-settings | Current driver settings, `users.manage`. Returns the singleton row or the default (`{ driver: "r2", local_path: null, updated_at }`). |
+| PUT | /api/v1/admin/storage-settings | Update, `users.manage`. Body: `driver` (`r2` | `local`) and/or `local_path` (1–500 chars, no `..`; `null` clears it to the default). Runtime-applied, no redeploy. Audited (`storage.settings.updated`). |
+
+Driver rule: the setting picks the driver for NEW uploads. Library files keep working per-row after a switch (each row stores its driver). Favicon + payment evidence (legacy rows, no driver column) follow the CURRENT driver — switching drivers orphans previously stored favicon/evidence objects until switched back; the Settings → Storage page warns about this explicitly. Local root resolution: settings `local_path` → env `STORAGE_LOCAL_PATH` → `./data/media`. On Workers the Local driver refuses with an honest 503 (no filesystem); in staging/production an in-memory R2 bucket also refuses uploads (503, fail-closed). See ADR-0011.
 
 ---
 
@@ -1476,7 +1716,7 @@ Do not postpone security gates merely because a happy-path UI demo works.
 | Checkout access token | Opaque stateful or signed stateless token | Short-lived, single-order scope; select based on revocation and storage requirements |
 | HMAC nonce storage | Reuse idempotency storage or add dedicated nonce table | Add explicit uniqueness/TTL guarantee before enabling HMAC |
 | Currency scales | Currency registry and supported decimals | Store minor units with explicit scale policy |
-| Partial payment | Whether multiple verified payments may settle one invoice | Disabled for initial release unless product owner explicitly approves |
+| Partial payment | Whether multiple verified payments may settle one invoice | **APPROVED by the product owner 2026-11-17 (ADR-0009): multiple verified payments may settle one invoice — payment plans, partial approvals, and credit (see §10.4, §11.2).** |
 | Order contents | Single-product or multi-product checkout | Allow multiple items only when all products are assigned to the integration; test fulfillment per item |
 | License token format | JWS claims, TTL, refresh policy | EdDSA compact JWS after signing spike |
 | Meta Graph API version | Version used by CAPI adapter | Pin current supported version at implementation and review upgrades |

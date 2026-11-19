@@ -1,10 +1,10 @@
 # Repository Structure & Engineering Conventions
 
-**Version:** 1.0 | **Status:** Initial repository baseline | **Project:** StackMate
+**Version:** 1.1 | **Status:** Initial repository baseline | **Project:** StackMate
 
 ## 1. Current state
 
-At the time of writing, StackMate contains the four original foundation documents under docs/plan and no verified application source scaffold. The tree below is the target, not a claim that all files already exist. Preserve the existing document paths; do not rename or move them during scaffold work.
+The repository contains product/architecture specifications and initial workspace placeholders. The tree below is the target, not a claim that all files already exist. Preserve existing document paths; do not rename or move foundation documents during scaffold work.
 
 ## 2. Target repository tree
 
@@ -31,25 +31,11 @@ StackMate/
 │       │   ├── middleware/
 │       │   ├── routes/
 │       │   ├── modules/
-│       │   │   ├── identity/
-│       │   │   ├── customers/
-│       │   │   ├── catalog/
-│       │   │   ├── entitlements/
-│       │   │   ├── commerce/
-│       │   │   ├── payments/
-│       │   │   ├── subscriptions/
-│       │   │   ├── licensing/
-│       │   │   ├── integrations/
-│       │   │   ├── tracking/
-│       │   │   ├── webhooks/
-│       │   │   ├── notifications/
-│       │   │   └── audit/
 │       │   ├── platform/
 │       │   └── shared/
 │       └── wrangler.jsonc
 ├── packages/
-│   ├── contracts/
-│   └── config/                         # Only if shared config is useful
+│   └── contracts/
 ├── db/
 │   ├── schema/
 │   ├── migrations/
@@ -107,14 +93,18 @@ Dependency direction:
 - Feature keys: stable lowercase dotted or underscore identifiers; do not rename published keys without migration.
 - Use explicit names; avoid ambiguous abbreviations.
 
-## 5. Workspace rules
+## 5. Workspace and dependency currency rules
 
 - Use pnpm workspaces.
 - Keep the first workspace small: admin, API, contracts, database schema/migrations.
 - Do not add Nx/Turborepo until measured workflow complexity justifies it.
-- Commit the lockfile and pin toolchain versions deliberately.
-- Shared packages need a clear owner and consumer; avoid a generic dumping ground.
-- Do not publish internal packages without an actual external consumer.
+- At the time of implementation, select the latest stable, generally available major/minor and latest security-fixed patch compatible with the whole stack. Verify against official release notes/docs/package registry; never choose an old version from memory or a stale tutorial.
+- Do not use deprecated, end-of-life, prerelease, nightly, canary, or release-candidate dependencies in production unless explicitly approved.
+- If the newest major is incompatible, document evidence and select the newest secure compatible stable release temporarily, with an ADR and upgrade condition.
+- Pin exact dependency versions as appropriate and commit the lockfile for reproducible installs. Pinning does not excuse remaining on stale versions; keep dependencies updated.
+- Verify security advisories and peer/runtime compatibility. Record verification date, source links, versions, and exceptions.
+- For GitHub Actions, verify maintained releases and prefer full commit-SHA pins with release comments.
+- See ADR-0004 and AGENTS.md.
 
 ## 6. Database ownership
 
@@ -144,13 +134,14 @@ Use unit tests near modules or in a clear test directory; integration tests for 
 
 Update docs when behavior, architecture, API, schema, or operational steps change.
 
-## 10. Git rules
+## 10. Git and deployment rules
 
 - Never force-push or rewrite shared history.
 - Never discard user changes.
 - Check branch, remote, status, diff, and tests before commit/push.
 - Keep commits focused and reviewable.
 - Do not commit generated build output, dependencies, local DBs, secrets, or temporary logs.
+- The coding agent owns repository-side workflow/configuration implementation and verification. The product owner owns first-time Cloudflare account/resource setup, GitHub secrets/variables, production authorization, and triggering/approving the first live deployment. Never claim live deployment before a successful run and smoke check.
 
 ## 11. Stage 0 scaffold boundary
 
@@ -158,4 +149,4 @@ Stage 0 may create workspace config, minimal app entry points, placeholder modul
 
 ---
 
-**End of Repository Structure & Engineering Conventions — Version 1.0**
+**End of Repository Structure & Engineering Conventions — Version 1.1**
