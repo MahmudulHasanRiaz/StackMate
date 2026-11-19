@@ -15,7 +15,13 @@
  * escape the root.
  */
 import { AppError } from "../../shared/errors.ts";
-import type { StorageDriver, StorageDriverName, StorageObject } from "./driver.ts";
+import type {
+  StorageDriver,
+  StorageDriverName,
+  StorageObject,
+  StorageRange,
+  StorageStream,
+} from "./driver.ts";
 
 type FsPromises = typeof import("node:fs/promises");
 
@@ -86,6 +92,31 @@ export class LocalStorageDriver implements StorageDriver {
       bytes: new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
       contentType: "application/octet-stream",
       size: data.byteLength,
+    };
+  }
+
+  async getStream(key: string, range?: StorageRange): Promise<StorageStream | null> {
+    const fs = await loadFs();
+    const path = this.filePath(key);
+    let handle: Awaited<ReturnType<FsPromises["open"]>>;
+    try {
+      handle = await fs.open(path, "r");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+      throw err;
+    }
+    // FileHandle.createReadStream auto-closes the handle when the
+    // stream ends/errors (autoClose default) — no handle leak on the
+    // download path. The caller reads the stream to completion (the
+    // HTTP response owns it); on an early abort the runtime closes it.
+    const stream = handle.createReadStream(
+      range !== undefined ? { start: range.start, end: range.end } : {},
+    );
+    return {
+      // Node's createReadStream yields Buffer chunks; the HTTP layer
+      // accepts any Uint8Array chunk type.
+      body: stream as unknown as ReadableStream<Uint8Array>,
+      contentType: "application/octet-stream",
     };
   }
 

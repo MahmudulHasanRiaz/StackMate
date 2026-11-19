@@ -29,6 +29,14 @@ export const mediaAssets = pgTable(
     checksumSha256: varchar("checksum_sha256", { length: 64 }).notNull(),
     width: integer("width"),
     height: integer("height"),
+    /** Sibling thumbnail objects (PLAN §34 / ADR-0012): 320px + 64px
+     * WebP variants generated in the browser at upload. Nullable —
+     * rows uploaded before migration 0013 have no thumbnail and the
+     * UI falls back to the full original. */
+    thumbObjectKey: text("thumb_object_key"),
+    thumbSmallObjectKey: text("thumb_small_object_key"),
+    thumbByteSize: integer("thumb_byte_size"),
+    thumbSmallByteSize: integer("thumb_small_byte_size"),
     folder: varchar("folder", { length: 120 }).notNull().default(""),
     tags: text("tags").array().notNull().default([]),
     uploadedByUserId: text("uploaded_by_user_id").references(() => users.id, {

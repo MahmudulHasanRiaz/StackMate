@@ -51,6 +51,24 @@ function pngBytes(): Uint8Array {
   return b;
 }
 
+/**
+ * Minimal valid WebP (PLAN §34): RIFF header + WEBP tag, the rest
+ * filled with "A" so range bodies are printable. Dimensions are
+ * optional — verifyMediaBytes accepts a WebP without a VP8 chunk
+ * (width/height null). The body is pure ASCII + NULs, so the test
+ * helper's res.text() round-trips it byte-for-byte.
+ */
+function webpBytes(size = 20): Uint8Array {
+  const b = new Uint8Array(size);
+  b.set([0x52, 0x49, 0x46, 0x46], 0); // "RIFF"
+  const riffSize = size - 8;
+  b[4] = riffSize & 0xff;
+  b[5] = (riffSize >> 8) & 0xff;
+  b.set([0x57, 0x45, 0x42, 0x50], 8); // "WEBP"
+  for (let i = 12; i < size; i++) b[i] = 0x41; // "A"
+  return b;
+}
+
 const NASTY_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" onload="alert(1)"><script>alert('xss')</script><circle cx="50" cy="50" r="40"/></svg>`;
 
 describe.skipIf(!DATABASE_URL)("media library — upload, search, drivers", () => {
@@ -67,12 +85,13 @@ describe.skipIf(!DATABASE_URL)("media library — upload, search, drivers", () =
 
   async function apiRequest(
     path: string,
-    options: { method?: string; body?: unknown; cookie?: string; rawBody?: BodyInit } = {},
+    options: { method?: string; body?: unknown; cookie?: string; rawBody?: BodyInit; headers?: Record<string, string> } = {},
   ): Promise<{ status: number; headers: Headers; body: any; text: string }> {
     const headers = new Headers();
     if (options.body !== undefined) headers.set("Content-Type", "application/json");
     if (options.cookie) headers.set("Cookie", options.cookie);
     headers.set("Origin", ORIGIN);
+    for (const [k, v] of Object.entries(options.headers ?? {})) headers.set(k, v);
     const init: RequestInit = { method: options.method ?? "GET", headers };
     if (options.body !== undefined) init.body = JSON.stringify(options.body);
     if (options.rawBody !== undefined) init.body = options.rawBody;
@@ -95,7 +114,7 @@ describe.skipIf(!DATABASE_URL)("media library — upload, search, drivers", () =
 
   async function authed(
     path: string,
-    options: { method?: string; body?: unknown; rawBody?: BodyInit } = {},
+    options: { method?: string; body?: unknown; rawBody?: BodyInit; headers?: Record<string, string> } = {},
   ) {
     return apiRequest(path, { ...options, cookie: sessionCookie });
   }
@@ -108,12 +127,33 @@ describe.skipIf(!DATABASE_URL)("media library — upload, search, drivers", () =
     filename: string,
     bytes: Uint8Array,
     mime: string,
-    extra?: { folder?: string; tags?: string[] },
+    extra?: {
+      folder?: string;
+      tags?: string[];
+      /** Browser-generated WebP thumbnails (PLAN §34). */
+      thumbnails?: { thumb?: Uint8Array; small?: Uint8Array };
+    },
   ) {
     const form = new FormData();
     form.append("file", new File([bytes as unknown as BlobPart], filename, { type: mime }));
     if (extra?.folder !== undefined) form.append("folder", extra.folder);
     for (const tag of extra?.tags ?? []) form.append("tags", tag);
+    if (extra?.thumbnails?.thumb) {
+      form.append(
+        "thumbnail",
+        new File([extra.thumbnails.thumb as unknown as BlobPart], "thumbnail.webp", {
+          type: "image/webp",
+        }),
+      );
+    }
+    if (extra?.thumbnails?.small) {
+      form.append(
+        "thumbnail_small",
+        new File([extra.thumbnails.small as unknown as BlobPart], "thumbnail-small.webp", {
+          type: "image/webp",
+        }),
+      );
+    }
     return authed("/api/v1/admin/media", { method: "POST", rawBody: form });
   }
 
@@ -376,6 +416,192 @@ describe.skipIf(!DATABASE_URL)("media library — upload, search, drivers", () =
     assert.ok(!svg.text.toLowerCase().includes("onload"), "stored SVG must not contain onload");
     assert.ok(svg.text.includes("<svg"), "stored SVG keeps its root");
     assert.ok(svg.text.includes("<circle"), "stored SVG keeps presentation markup");
+  });
+
+  // PLAN §34 fixtures (shared across the thumbnail tests below, in
+  // declaration order — the suite already depends on order).
+  let thumbAssetId = "";
+  let thumbEtag = "";
+  let noThumbAssetId = "";
+
+  it("upload with thumbnails stores them; variant content returns the WebP bytes", async () => {
+    const res = await uploadFile("thumb-probe.png", pngBytes(), "image/png", {
+      folder: "probes",
+      thumbnails: { thumb: webpBytes(20), small: webpBytes(16) },
+    });
+    assert.equal(res.status, 201, JSON.stringify(res.body));
+    const view = dataOf(res);
+    thumbAssetId = view.id as string;
+    assert.ok((view.thumb_url as string).endsWith("?variant=thumb"), view.thumb_url);
+    assert.ok((view.thumb_small_url as string).endsWith("?variant=small"), view.thumb_small_url);
+
+    const thumbRes = await authed(`/api/v1/admin/media/${thumbAssetId}/content?variant=thumb`);
+    assert.equal(thumbRes.status, 200, JSON.stringify(thumbRes.body));
+    assert.equal(thumbRes.headers.get("Content-Type"), "image/webp");
+    assert.equal(thumbRes.text.length, 20, "thumb must serve exactly the 20 thumbnail bytes");
+    assert.ok(thumbRes.text.startsWith("RIFF"), "thumb bytes must be the WebP fixture");
+    assert.ok(
+      (thumbRes.headers.get("ETag") ?? "").endsWith("-thumb-320\""),
+      `thumb ETag must end -thumb-320", got ${thumbRes.headers.get("ETag")}`,
+    );
+    assert.equal(thumbRes.headers.get("Accept-Ranges"), "bytes");
+
+    const smallRes = await authed(`/api/v1/admin/media/${thumbAssetId}/content?variant=small`);
+    assert.equal(smallRes.status, 200, JSON.stringify(smallRes.body));
+    assert.equal(smallRes.headers.get("Content-Type"), "image/webp");
+    assert.equal(smallRes.text.length, 16);
+    assert.ok(
+      (smallRes.headers.get("ETag") ?? "").endsWith("-thumb-64\""),
+      `small ETag must end -thumb-64", got ${smallRes.headers.get("ETag")}`,
+    );
+
+    const orig = await authed(`/api/v1/admin/media/${thumbAssetId}/content`);
+    assert.equal(orig.status, 200, JSON.stringify(orig.body));
+    assert.equal(orig.headers.get("Content-Type"), "image/png");
+    thumbEtag = orig.headers.get("ETag") ?? "";
+    assert.ok(
+      /^"[0-9a-f]{64}"$/.test(thumbEtag),
+      `original ETag must be the quoted checksum, got ${thumbEtag}`,
+    );
+
+    const bogus = await authed(`/api/v1/admin/media/${thumbAssetId}/content?variant=bogus`);
+    assert.equal(bogus.status, 422, JSON.stringify(bogus.body));
+  });
+
+  it("Range requests return 206 + Content-Range; unsatisfiable ranges get 416", async () => {
+    const first = await authed(`/api/v1/admin/media/${thumbAssetId}/content?variant=thumb`, {
+      headers: { Range: "bytes=0-3" },
+    });
+    assert.equal(first.status, 206, JSON.stringify(first.body));
+    assert.equal(first.headers.get("Content-Range"), "bytes 0-3/20");
+    assert.equal(first.headers.get("Content-Length"), "4");
+    assert.equal(first.text, "RIFF");
+
+    const tail = await authed(`/api/v1/admin/media/${thumbAssetId}/content?variant=thumb`, {
+      headers: { Range: "bytes=-4" },
+    });
+    assert.equal(tail.status, 206, JSON.stringify(tail.body));
+    assert.equal(tail.headers.get("Content-Range"), "bytes 16-19/20");
+    assert.equal(tail.text, "AAAA");
+
+    // Open-ended range on the 24-byte original: 20..23.
+    const openEnded = await authed(`/api/v1/admin/media/${thumbAssetId}/content`, {
+      headers: { Range: "bytes=20-" },
+    });
+    assert.equal(openEnded.status, 206, JSON.stringify(openEnded.body));
+    assert.equal(openEnded.headers.get("Content-Range"), "bytes 20-23/24");
+    assert.equal(openEnded.headers.get("Content-Length"), "4");
+
+    // Start at exactly the size of the 20-byte thumbnail: unsatisfiable.
+    const beyond = await authed(`/api/v1/admin/media/${thumbAssetId}/content?variant=thumb`, {
+      headers: { Range: "bytes=20-" },
+    });
+    assert.equal(beyond.status, 416, JSON.stringify(beyond.body));
+    assert.equal(beyond.headers.get("Content-Range"), "bytes */20");
+  });
+
+  it("If-None-Match returns 304 without a body", async () => {
+    assert.ok(thumbEtag.length > 0, "previous test must have captured the original ETag");
+    const res = await authed(`/api/v1/admin/media/${thumbAssetId}/content`, {
+      headers: { "If-None-Match": thumbEtag },
+    });
+    assert.equal(res.status, 304, JSON.stringify(res.body));
+    assert.equal(res.text, "");
+    const star = await authed(`/api/v1/admin/media/${thumbAssetId}/content`, {
+      headers: { "If-None-Match": "*" },
+    });
+    assert.equal(star.status, 304, JSON.stringify(star.body));
+    const miss = await authed(`/api/v1/admin/media/${thumbAssetId}/content`, {
+      headers: { "If-None-Match": "\"deadbeef\"" },
+    });
+    assert.equal(miss.status, 200, JSON.stringify(miss.body));
+  });
+
+  it("upload without thumbnails has null thumb URLs; variant content is 404; a bad thumbnail is dropped", async () => {
+    const plain = await uploadFile("no-thumb.png", pngBytes(), "image/png", { folder: "probes" });
+    assert.equal(plain.status, 201, JSON.stringify(plain.body));
+    noThumbAssetId = dataOf(plain).id as string;
+    assert.equal(dataOf(plain).thumb_url, null);
+    assert.equal(dataOf(plain).thumb_small_url, null);
+    const variant = await authed(`/api/v1/admin/media/${noThumbAssetId}/content?variant=thumb`);
+    assert.equal(variant.status, 404, JSON.stringify(variant.body));
+
+    const bad = await uploadFile("bad-thumb.png", pngBytes(), "image/png", {
+      folder: "probes",
+      thumbnails: { thumb: pngBytes() }, // PNG bytes declared as WebP — wrong magic
+    });
+    assert.equal(bad.status, 201, JSON.stringify(bad.body));
+    assert.equal(dataOf(bad).thumb_url, null, "a bad thumbnail must not fail the upload");
+  });
+
+  it("regenerate endpoint adds thumbnails to a thumb-less asset; rejects SVG and bad bytes", async () => {
+    const form = new FormData();
+    form.append(
+      "thumbnail",
+      new File([webpBytes(20) as unknown as BlobPart], "thumbnail.webp", { type: "image/webp" }),
+    );
+    form.append(
+      "thumbnail_small",
+      new File([webpBytes(16) as unknown as BlobPart], "thumbnail-small.webp", {
+        type: "image/webp",
+      }),
+    );
+    const res = await authed(`/api/v1/admin/media/${noThumbAssetId}/thumbnail`, {
+      method: "POST",
+      rawBody: form,
+    });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.ok((dataOf(res).thumb_url as string).endsWith("?variant=thumb"));
+    assert.ok((dataOf(res).thumb_small_url as string).endsWith("?variant=small"));
+    const after = await authed(`/api/v1/admin/media/${noThumbAssetId}/content?variant=thumb`);
+    assert.equal(after.status, 200, JSON.stringify(after.body));
+    assert.equal(after.text.length, 20);
+
+    const svgForm = new FormData();
+    svgForm.append(
+      "thumbnail",
+      new File([webpBytes(20) as unknown as BlobPart], "thumbnail.webp", { type: "image/webp" }),
+    );
+    const svgRes = await authed(`/api/v1/admin/media/${svgId}/thumbnail`, {
+      method: "POST",
+      rawBody: svgForm,
+    });
+    assert.equal(svgRes.status, 422, JSON.stringify(svgRes.body));
+
+    const badForm = new FormData();
+    badForm.append(
+      "thumbnail",
+      new File([pngBytes() as unknown as BlobPart], "thumbnail.webp", { type: "image/webp" }),
+    );
+    const badRes = await authed(`/api/v1/admin/media/${noThumbAssetId}/thumbnail`, {
+      method: "POST",
+      rawBody: badForm,
+    });
+    assert.equal(badRes.status, 415, JSON.stringify(badRes.body));
+  });
+
+  it("delete removes the thumbnail objects too", async () => {
+    const keyRow = await adminClient.query(
+      "SELECT thumb_object_key, thumb_small_object_key FROM media_assets WHERE id = $1",
+      [thumbAssetId],
+    );
+    const thumbKey = keyRow.rows[0].thumb_object_key as string;
+    const smallKey = keyRow.rows[0].thumb_small_object_key as string;
+    assert.ok(thumbKey.endsWith("-thumb-320.webp"), thumbKey);
+    assert.ok(smallKey.endsWith("-thumb-64.webp"), smallKey);
+    assert.ok((await store.r2Bucket.get(thumbKey)) !== null, "thumb object must exist before delete");
+    assert.ok(
+      (await store.r2Bucket.get(smallKey)) !== null,
+      "small thumb object must exist before delete",
+    );
+    const res = await authed(`/api/v1/admin/media/${thumbAssetId}`, { method: "DELETE" });
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    assert.equal(await store.r2Bucket.get(thumbKey), null, "thumb object must be gone after delete");
+    assert.equal(
+      await store.r2Bucket.get(smallKey),
+      null,
+      "small thumb object must be gone after delete",
+    );
   });
 
   it("delete removes the row AND the object", async () => {

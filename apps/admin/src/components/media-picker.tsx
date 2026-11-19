@@ -38,6 +38,7 @@ import {
   type MediaAssetView,
   type MediaLibraryKind,
 } from "../lib/media";
+import { generateThumbnails } from "../lib/thumbnails";
 
 export interface MediaPickerProps {
   open: boolean;
@@ -160,7 +161,12 @@ export function MediaPicker({ open, onClose, onSelect, kinds, mimes, title, fold
         continue;
       }
       try {
-        await uploadMediaFile(file, { folder: currentFolder || undefined });
+        // Browser-side thumbnails (PLAN §34) — never blocks the upload.
+        const thumbnails = await generateThumbnails(file);
+        await uploadMediaFile(file, {
+          folder: currentFolder || undefined,
+          thumbnails: thumbnails ?? undefined,
+        });
         done += 1;
       } catch (err) {
         failed += 1;
@@ -295,7 +301,14 @@ export function MediaPicker({ open, onClose, onSelect, kinds, mimes, title, fold
                   >
                     <span className="sm-media-thumb">
                       {asset.kind === "image" ? (
-                        <img src={asset.content_url} alt="" loading="lazy" />
+                        <img
+                          src={asset.thumb_url ?? asset.content_url}
+                          alt=""
+                          loading="lazy"
+                          decoding="async"
+                          width={asset.width ?? undefined}
+                          height={asset.height ?? undefined}
+                        />
                       ) : asset.kind === "video" ? (
                         <video src={asset.content_url} preload="metadata" muted />
                       ) : (

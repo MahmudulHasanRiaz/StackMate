@@ -24,6 +24,7 @@ import {
   Check,
   Download,
   Folder,
+  Image,
   Images,
   LayoutGrid,
   List,
@@ -55,6 +56,7 @@ import {
 import { mediaKindIcon } from "../components/media-picker";
 import {
   deleteMediaAsset,
+  fetchMediaFile,
   fetchMediaFolders,
   fetchMediaList,
   formatBytes,
@@ -62,10 +64,12 @@ import {
   MEDIA_KINDS,
   MEDIA_UPLOAD_ACCEPT,
   patchMediaAsset,
+  regenerateMediaThumbnail,
   uploadMediaFile,
   type MediaAssetView,
   type MediaLibraryKind,
 } from "../lib/media";
+import { generateThumbnails } from "../lib/thumbnails";
 
 const MEDIA_QUERY_KEY = ["admin", "media"] as const;
 const FOLDERS_QUERY_KEY = ["admin", "media-folders"] as const;
@@ -79,9 +83,12 @@ function MediaThumb({ asset, size = 32 }: { asset: MediaAssetView; size?: number
   if (asset.kind === "image") {
     return (
       <img
-        src={asset.content_url}
+        // 64px variant for the small list thumb — the full original
+        // was downloaded here before (PLAN §34).
+        src={asset.thumb_small_url ?? asset.content_url}
         alt=""
         loading="lazy"
+        decoding="async"
         width={size}
         height={size}
         className="sm-media-thumb-img"
@@ -170,6 +177,25 @@ export function MediaLibrarySection() {
       setRenameTarget(null);
       setMoveTarget(null);
       setTagsTarget(null);
+    },
+  });
+
+  // PLAN §34 — the backfill path for files uploaded before migration
+  // 0013 (e.g. the one staging file): load the original once, generate
+  // the thumbnails in the browser, POST them to the regenerate endpoint.
+  const thumbnailMutation = useAdminMutation<MediaAssetView, { asset: MediaAssetView }>({
+    mutationFn: async ({ asset }) => {
+      const file = await fetchMediaFile(asset);
+      const thumbnails = await generateThumbnails(file);
+      if (!thumbnails) {
+        throw new Error("Could not generate a thumbnail for this file.");
+      }
+      return regenerateMediaThumbnail(asset.id, thumbnails);
+    },
+    invalidateKeys: [MEDIA_QUERY_KEY],
+    successTitle: "Thumbnail generated",
+    onSuccess: (data) => {
+      if (detail?.id === data.id) setDetail(data);
     },
   });
 
@@ -383,7 +409,18 @@ export function MediaLibrarySection() {
                     >
                       <span className="sm-media-thumb">
                         {asset.kind === "image" ? (
-                          <img src={asset.content_url} alt="" loading="lazy" />
+                          <img
+                            // 320px variant — the grid cell shows ~160px,
+                            // the full original was downloaded here before
+                            // (PLAN §34). Falls back to the original when
+                            // the asset has no thumbnail yet.
+                            src={asset.thumb_url ?? asset.content_url}
+                            alt=""
+                            loading="lazy"
+                            decoding="async"
+                            width={asset.width ?? undefined}
+                            height={asset.height ?? undefined}
+                          />
                         ) : asset.kind === "video" ? (
                           <video src={asset.content_url} preload="metadata" muted />
                         ) : (
@@ -583,7 +620,7 @@ export function MediaLibrarySection() {
         pending={patchMutation.isPending}
       />
       <Drawer open={detail !== null} onClose={() => setDetail(null)} title={detail?.original_filename ?? "File"}>
-        {detail ? <MediaDetail asset={detail} onDelete={() => void handleDelete(detail)} onRename={() => setRenameTarget(detail)} onMove={() => setMoveTarget(detail)} onTags={() => setTagsTarget(detail)} /> : null}
+        {detail ? <MediaDetail asset={detail} onDelete={() => void handleDelete(detail)} onRename={() => setRenameTarget(detail)} onMove={() => setMoveTarget(detail)} onTags={() => setTagsTarget(detail)} onThumbnail={() => thumbnailMutation.mutate({ asset: detail })} thumbnailPending={thumbnailMutation.isPending} /> : null}
       </Drawer>
     </div>
   );
@@ -693,9 +730,14 @@ function UploadDialog({
         prev.map((s, i) => (i === index ? { status: "uploading" } : s)),
       );
       try {
+        // Generate the 320px + 64px WebP thumbnails in the browser
+        // before uploading (PLAN §34) — a failure here never blocks
+        // the upload; the file simply lands without thumbnails.
+        const thumbnails = await generateThumbnails(file);
         await uploadMediaFile(file, {
           folder: uploadFolder,
           tags: tags.length > 0 ? tags : undefined,
+          thumbnails: thumbnails ?? undefined,
         });
         setStates((prev) => prev.map((s, i) => (i === index ? { status: "done" } : s)));
         done += 1;
@@ -1044,12 +1086,17 @@ function MediaDetail({
   onRename,
   onMove,
   onTags,
+  onThumbnail,
+  thumbnailPending,
 }: {
   asset: MediaAssetView;
   onDelete: () => void;
   onRename: () => void;
   onMove: () => void;
   onTags: () => void;
+  /** Backfill for pre-0013 files: generate thumbnails in the browser. */
+  onThumbnail: () => void;
+  thumbnailPending: boolean;
 }) {
   const Icon = mediaKindIcon(asset.kind);
   return (
@@ -1125,6 +1172,11 @@ function MediaDetail({
         <Button type="button" variant="secondary" size="sm" onClick={onTags}>
           <Tag size={14} /> Tags
         </Button>
+        {asset.kind === "image" && asset.mime_type !== "image/svg+xml" && !asset.thumb_url ? (
+          <Button type="button" variant="secondary" size="sm" onClick={onThumbnail} disabled={thumbnailPending}>
+            <Image size={14} /> {thumbnailPending ? "Generating…" : "Generate thumbnail"}
+          </Button>
+        ) : null}
         <Button type="button" variant="secondary" size="sm" onClick={onDelete}>
           <Trash2 size={14} /> Delete
         </Button>

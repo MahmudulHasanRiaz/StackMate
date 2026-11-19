@@ -35,6 +35,7 @@ import {
   MEDIA_ALLOWED_MIME,
   mediaKindOfMime,
   mediaObjectKey,
+  mediaThumbnailKey,
   normalizeFilename,
   normalizeFolder,
   normalizeTags,
@@ -77,6 +78,17 @@ export function mediaViewOf(row: typeof mediaAssets.$inferSelect): MediaAssetVie
     created_at: row.createdAt.toISOString(),
     updated_at: row.updatedAt.toISOString(),
     content_url: `/api/v1/admin/media/${row.id}/content`,
+    // Thumbnails are opt-in per row: null means "no thumbnail yet"
+    // (pre-0013 upload, or the browser could not generate one) and
+    // the UI falls back to content_url — never a broken image.
+    thumb_url:
+      row.thumbObjectKey !== null
+        ? `/api/v1/admin/media/${row.id}/content?variant=thumb`
+        : null,
+    thumb_small_url:
+      row.thumbSmallObjectKey !== null
+        ? `/api/v1/admin/media/${row.id}/content?variant=small`
+        : null,
   };
 }
 
@@ -207,6 +219,54 @@ export interface MediaUploadInput {
   filename: string;
   folder?: string | undefined;
   tags?: string[] | undefined;
+  /**
+   * Browser-generated thumbnails (PLAN §34 / ADR-0012): 320px (`thumb`)
+   * + 64px (`small`) WebP variants, generated in the SPA at upload.
+   * Each is validated as WebP before storing; a bad thumbnail is
+   * DROPPED (the original upload never fails because of it) — the
+   * row simply has no thumbnail and the UI falls back to the original.
+   */
+  thumbnails?: {
+    thumb?: { bytes: Uint8Array; declaredMimeType: string } | undefined;
+    small?: { bytes: Uint8Array; declaredMimeType: string } | undefined;
+  } | undefined;
+}
+
+/** Raster image MIMEs the browser generates thumbnails for (never SVG — vector, served as-is). */
+const THUMBNAILABLE_MIMES: ReadonlySet<string> = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+]);
+
+/**
+ * Validate + store one thumbnail variant. Returns the stored key +
+ * size, or null when there is nothing to store (no input, wrong
+ * original kind, or validation failed — the caller never fails the
+ * upload over a thumbnail).
+ */
+async function storeThumbnail(
+  driver: { put(key: string, bytes: Uint8Array, contentType: string): Promise<unknown>; name: string },
+  objectKey: string,
+  variant: "thumb" | "small",
+  input: { bytes: Uint8Array; declaredMimeType: string } | undefined,
+  originalMime: string,
+): Promise<{ objectKey: string; byteSize: number } | null> {
+  if (!input || !THUMBNAILABLE_MIMES.has(originalMime)) return null;
+  let verified;
+  try {
+    verified = verifyMediaBytes(input.bytes, "image/webp");
+  } catch {
+    return null;
+  }
+  const key = mediaThumbnailKey(objectKey, variant);
+  try {
+    await driver.put(key, verified.bytes, "image/webp");
+  } catch {
+    return null;
+  }
+  return { objectKey: key, byteSize: verified.bytes.byteLength };
 }
 
 export async function uploadMediaAsset(
@@ -224,6 +284,8 @@ export async function uploadMediaAsset(
   const key = mediaObjectKey(filename);
   const checksum = sha256Hex(verified.bytes);
   await driver.put(key, verified.bytes, mime);
+  const thumb = await storeThumbnail(driver, key, "thumb", input.thumbnails?.thumb, mime);
+  const thumbSmall = await storeThumbnail(driver, key, "small", input.thumbnails?.small, mime);
   const now = new Date();
   let rows: (typeof mediaAssets.$inferSelect)[];
   try {
@@ -238,6 +300,10 @@ export async function uploadMediaAsset(
         checksumSha256: checksum,
         width: verified.width,
         height: verified.height,
+        thumbObjectKey: thumb?.objectKey ?? null,
+        thumbSmallObjectKey: thumbSmall?.objectKey ?? null,
+        thumbByteSize: thumb?.byteSize ?? null,
+        thumbSmallByteSize: thumbSmall?.byteSize ?? null,
         folder,
         tags,
         uploadedByUserId,
@@ -246,16 +312,84 @@ export async function uploadMediaAsset(
       })
       .returning();
   } catch (err) {
-    // The object is stored but the row is not — remove the orphan rather than leak it.
+    // The objects are stored but the row is not — remove the orphans rather than leak them.
     await driver.delete(key).catch(() => undefined);
+    if (thumb) await driver.delete(thumb.objectKey).catch(() => undefined);
+    if (thumbSmall) await driver.delete(thumbSmall.objectKey).catch(() => undefined);
     throw err;
   }
   const row = rows[0];
   if (!row) {
     await driver.delete(key).catch(() => undefined);
+    if (thumb) await driver.delete(thumb.objectKey).catch(() => undefined);
+    if (thumbSmall) await driver.delete(thumbSmall.objectKey).catch(() => undefined);
     throw new AppError("INTERNAL_ERROR", "Media upload failed to persist.", 500);
   }
   return mediaViewOf(row);
+}
+
+/**
+ * Regenerate thumbnails for an existing image (PLAN §34 — the
+ * backfill path for pre-0013 files: the admin opens the file in the
+ * library and generates in the browser). Unlike the upload path, a
+ * bad thumbnail IS the error here: the whole point of the call is
+ * the thumbnail. Keys are derived from the original key, so a
+ * regenerate overwrites the same objects — no stale keys, no extra
+ * columns to update beyond key + size.
+ */
+export async function regenerateMediaThumbnail(
+  db: MediaDb,
+  driverDeps: DriverDeps,
+  id: string,
+  thumbnails: {
+    thumb?: { bytes: Uint8Array; declaredMimeType: string } | undefined;
+    small?: { bytes: Uint8Array; declaredMimeType: string } | undefined;
+  },
+): Promise<MediaAssetView> {
+  const row = await requireMediaAsset(db, id);
+  if (!THUMBNAILABLE_MIMES.has(row.mimeType)) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "Thumbnails are only generated for raster images (PNG, JPEG, WebP, GIF).",
+      422,
+    );
+  }
+  if (!thumbnails.thumb && !thumbnails.small) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "Provide at least one thumbnail file (thumbnail and/or thumbnail_small).",
+      422,
+    );
+  }
+  const driver = await resolveStorageDriver(driverDeps, driverNameOf(row));
+  const stored: {
+    thumbObjectKey?: string | null;
+    thumbSmallObjectKey?: string | null;
+    thumbByteSize?: number | null;
+    thumbSmallByteSize?: number | null;
+  } = {};
+  if (thumbnails.thumb) {
+    const verified = verifyMediaBytes(thumbnails.thumb.bytes, "image/webp");
+    const key = mediaThumbnailKey(row.objectKey, "thumb");
+    await driver.put(key, verified.bytes, "image/webp");
+    stored.thumbObjectKey = key;
+    stored.thumbByteSize = verified.bytes.byteLength;
+  }
+  if (thumbnails.small) {
+    const verified = verifyMediaBytes(thumbnails.small.bytes, "image/webp");
+    const key = mediaThumbnailKey(row.objectKey, "small");
+    await driver.put(key, verified.bytes, "image/webp");
+    stored.thumbSmallObjectKey = key;
+    stored.thumbSmallByteSize = verified.bytes.byteLength;
+  }
+  const updated = await db
+    .update(mediaAssets)
+    .set({ ...stored, updatedAt: new Date() })
+    .where(eq(mediaAssets.id, row.id))
+    .returning();
+  const saved = updated[0];
+  if (!saved) throw new AppError("INTERNAL_ERROR", "Media thumbnail update failed to persist.", 500);
+  return mediaViewOf(saved);
 }
 
 export async function renameMediaAsset(
@@ -326,26 +460,126 @@ export async function deleteMediaAsset(
   await db.delete(mediaAssets).where(eq(mediaAssets.id, row.id));
   const driver = await resolveStorageDriver(driverDeps, driverNameOf(row));
   await driver.delete(row.objectKey).catch(() => undefined);
+  if (row.thumbObjectKey) await driver.delete(row.thumbObjectKey).catch(() => undefined);
+  if (row.thumbSmallObjectKey) await driver.delete(row.thumbSmallObjectKey).catch(() => undefined);
 }
 
-export interface MediaContent {
+export type MediaContentVariant = "original" | "thumb" | "small";
+
+export interface MediaContentStream {
   row: typeof mediaAssets.$inferSelect;
-  bytes: Uint8Array;
+  /** MIME of the bytes actually streamed (image/webp for thumbnails). */
   mimeType: string;
+  /** Quoted ETag, e.g. `"<sha256>"` or `"<sha256>-thumb-320"`. */
+  etag: string;
+  /** Total size of the object being served (from the row, not R2). */
+  size: number;
+  body: ReadableStream<Uint8Array>;
+  /** The satisfied range, or null for a full 200 response. */
+  range: { start: number; end: number } | null;
 }
 
+/**
+ * Parse a single HTTP `Range` header against a known object size.
+ * Returns null when there is no usable range (absent, malformed, or
+ * multi-range — the caller serves the full object, per RFC 7233 the
+ * server MAY ignore a range it cannot satisfy as a single range).
+ * Suffix (`bytes=-500`) and open-ended (`bytes=500-`) forms are
+ * supported; `end` is clamped to `size - 1`. An out-of-range start
+ * (start >= size) is reported as `unsatisfiable` so the route can
+ * answer 416 with `Content-Range: bytes *\/<size>`.
+ */
+export function parseHttpRange(
+  header: string | null | undefined,
+  size: number,
+): { range: { start: number; end: number } | null; unsatisfiable: boolean } {
+  if (!header) return { range: null, unsatisfiable: false };
+  const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!m) return { range: null, unsatisfiable: false };
+  const startRaw = m[1] ?? "";
+  const endRaw = m[2] ?? "";
+  let start: number;
+  let end: number;
+  if (startRaw === "" && endRaw === "") return { range: null, unsatisfiable: false };
+  if (startRaw === "") {
+    // Suffix: the last N bytes.
+    const n = Number(endRaw);
+    if (!Number.isFinite(n) || n <= 0) return { range: null, unsatisfiable: false };
+    start = Math.max(0, size - n);
+    end = size - 1;
+  } else {
+    start = Number(startRaw);
+    if (!Number.isFinite(start) || start < 0) return { range: null, unsatisfiable: false };
+    // RFC 7233: a first-byte-pos at or beyond the representation
+    // length is unsatisfiable (416) — checked BEFORE the end
+    // validation below, because an open-ended `bytes=<size>-` clamps
+    // its end to size−1, which is < start and must NOT mask the 416.
+    if (start >= size) return { range: null, unsatisfiable: true };
+    end = endRaw === "" ? size - 1 : Math.min(size - 1, Number(endRaw));
+    if (!Number.isFinite(end) || end < start) return { range: null, unsatisfiable: false };
+  }
+  return { range: { start, end }, unsatisfiable: false };
+}
+
+export interface MediaContentOptions {
+  variant?: MediaContentVariant | undefined;
+  /** Raw `Range` request header (parsed here — the service knows the size). */
+  rangeHeader?: string | null | undefined;
+}
+
+/**
+ * Resolve an asset to a STREAMED read (PLAN §34): the Worker never
+ * buffers the object — `driver.getStream` passes a Range straight to
+ * R2, so a video `preload="metadata"` request downloads only the
+ * requested bytes. Sizes come from the row, so no `head()` call is
+ * needed. The route turns the returned `range` into 206 +
+ * `Content-Range`; a 416 is thrown as `RANGE_NOT_SATISFIABLE` with
+ * the size in `details` so the route can set
+ * `Content-Range: bytes *\/<size>`.
+ */
 export async function getMediaAssetContent(
   db: MediaDb,
   driverDeps: DriverDeps,
   id: string,
-): Promise<MediaContent> {
+  opts: MediaContentOptions = {},
+): Promise<MediaContentStream> {
   const row = await requireMediaAsset(db, id);
+  const variant = opts.variant ?? "original";
+  let objectKey: string | null;
+  let size: number | null;
+  let mimeType: string;
+  let etag: string;
+  if (variant === "thumb") {
+    objectKey = row.thumbObjectKey;
+    size = row.thumbByteSize;
+    mimeType = "image/webp";
+    etag = `"${row.checksumSha256}-thumb-320"`;
+  } else if (variant === "small") {
+    objectKey = row.thumbSmallObjectKey;
+    size = row.thumbSmallByteSize;
+    mimeType = "image/webp";
+    etag = `"${row.checksumSha256}-thumb-64"`;
+  } else {
+    objectKey = row.objectKey;
+    size = Number(row.byteSize);
+    mimeType = row.mimeType;
+    etag = `"${row.checksumSha256}"`;
+  }
+  if (objectKey === null || size === null) {
+    throw new AppError("NOT_FOUND", "Thumbnail not available for this asset.", 404);
+  }
+  const { range, unsatisfiable } = parseHttpRange(opts.rangeHeader ?? null, size);
+  if (unsatisfiable) {
+    throw new AppError("RANGE_NOT_SATISFIABLE", "Requested range is not satisfiable.", 416, {
+      size,
+    });
+  }
   const driver = await resolveStorageDriver(driverDeps, driverNameOf(row));
-  const obj = await driver.get(row.objectKey);
-  if (!obj) {
+  const stream = await driver.getStream(objectKey, range ?? undefined);
+  if (!stream) {
     throw new AppError("NOT_FOUND", "Media file not found in storage.", 404);
   }
-  return { row, bytes: obj.bytes, mimeType: row.mimeType };
+  return { row, mimeType, etag, size, body: stream.body, range };
 }
 
 /** Distinct folders present in the library, sorted ("" = root is listed first when present). */

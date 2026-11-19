@@ -34,10 +34,32 @@ export interface StorageObject {
   size: number;
 }
 
+/** Inclusive byte range, as parsed from an HTTP `Range` header. */
+export interface StorageRange {
+  start: number;
+  end: number;
+}
+
+/** A streamed object read: the body is a `ReadableStream` — the caller
+ * never holds the whole object in Worker memory. `size` is the TOTAL
+ * object size (the caller knows it from the DB row); the stream
+ * carries only the requested range when one was given. */
+export interface StorageStream {
+  body: ReadableStream<Uint8Array>;
+  contentType: string;
+}
+
 export interface StorageDriver {
   readonly name: StorageDriverName;
   put(key: string, bytes: Uint8Array, contentType: string): Promise<{ size: number }>;
   get(key: string): Promise<StorageObject | null>;
+  /**
+   * Stream an object (whole, or the inclusive `range` when given).
+   * The R2 implementation passes the range straight to the bucket
+   * (`get(key, { range })`), so a video `preload="metadata"` request
+   * downloads only the requested bytes instead of the whole file.
+   */
+  getStream(key: string, range?: StorageRange): Promise<StorageStream | null>;
   delete(key: string): Promise<void>;
   exists(key: string): Promise<boolean>;
 }
@@ -63,6 +85,37 @@ export class R2StorageDriver implements StorageDriver {
       bytes: new Uint8Array(buf),
       contentType: obj.httpMetadata?.contentType ?? "application/octet-stream",
       size: obj.size,
+    };
+  }
+
+  async getStream(key: string, range?: StorageRange): Promise<StorageStream | null> {
+    const obj = await this.bucket.get(
+      key,
+      range !== undefined
+        ? { range: { offset: range.start, length: range.end - range.start + 1 } }
+        : undefined,
+    );
+    if (!obj) return null;
+    // A found object always carries a body stream on the real binding
+    // (and on the in-memory stand-in). If a future binding returns a
+    // metadata-only object here, fall back to buffering via arrayBuffer
+    // rather than crashing the download.
+    if (!obj.body) {
+      const buf = await obj.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      return {
+        body: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(bytes);
+            controller.close();
+          },
+        }),
+        contentType: obj.httpMetadata?.contentType ?? "application/octet-stream",
+      };
+    }
+    return {
+      body: obj.body,
+      contentType: obj.httpMetadata?.contentType ?? "application/octet-stream",
     };
   }
 

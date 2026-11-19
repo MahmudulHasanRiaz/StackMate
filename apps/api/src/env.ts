@@ -12,7 +12,26 @@ export interface R2ObjectBodyLike {
   readonly size: number;
   readonly httpMetadata?: { contentType?: string };
   readonly customMetadata?: Record<string, string>;
+  /**
+   * Present on ranged reads: the byte range actually returned
+   * (Cloudflare R2 Workers API — `get(key, { range })`).
+   */
+  readonly range?: { offset: number; length: number };
+  /**
+   * The object body as a stream. Absent only when a precondition
+   * (`onlyIf`) fails — not used by this codebase, so callers may
+   * treat a missing body on a found object as an internal error.
+   */
+  readonly body?: ReadableStream<Uint8Array>;
   arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+/** Metadata-only view of an object (what `head()` returns). */
+export interface R2ObjectLike {
+  readonly key: string;
+  readonly size: number;
+  readonly httpMetadata?: { contentType?: string };
+  readonly customMetadata?: Record<string, string>;
 }
 
 export interface R2BucketBinding {
@@ -24,7 +43,20 @@ export interface R2BucketBinding {
       customMetadata?: Record<string, string>;
     }
   ): Promise<{ key: string; size: number }>;
-  get(key: string): Promise<R2ObjectBodyLike | null>;
+  /**
+   * Whole object, or — with `range` — only the requested bytes
+   * (Cloudflare R2 Workers API, "Ranged reads": `{ offset, length }`,
+   * `{ offset }`, `{ length }` or `{ suffix }`). The returned body's
+   * `.body` stream carries only the range; `.range` reports it.
+   */
+  get(
+    key: string,
+    options?: {
+      range?: { offset?: number; length?: number; suffix?: number };
+    }
+  ): Promise<R2ObjectBodyLike | null>;
+  /** Metadata only, no body — for totals without downloading. */
+  head(key: string): Promise<R2ObjectLike | null>;
   delete(key: string): Promise<void>;
 }
 
