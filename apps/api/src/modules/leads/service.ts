@@ -11,12 +11,19 @@
  * updates the existing lead instead of creating a duplicate (the update
  * refreshes message/notes/UTM fields; the original created_at is kept).
  *
- * Tracking: every lead CAPTURE (ingested or manual) emits a Lead tracking
- * event into the existing tracking pipeline (tracking_events row +
- * outbox `tracking.meta_capi.dispatch`). HONESTY: Meta CAPI real delivery
- * is a known stub — the event is recorded + queued through the real
- * pipeline and visible in Tracking Events; nothing here claims a Meta
- * delivery happened.
+ * Tracking: every SITE-ATTRIBUTED lead capture (ingested or manual
+ * with a site) emits a Lead tracking event into the existing tracking
+ * pipeline (tracking_events row + outbox
+ * `tracking.meta_capi.dispatch`) — INCLUDING dedupe-hits, each with
+ * its own per-capture event id (`lead_<id>` for the first capture,
+ * `lead_<id>_c<n>` for repeats), because the dedup unique key
+ * (site, event_name, event_id) forbids reusing one id. Manual leads
+ * with NO site emit nothing: `tracking_events.integrated_site_id` is
+ * NOT NULL by schema (there is no site to attribute to), so the
+ * capture is recorded in the audit log instead. HONESTY: Meta CAPI
+ * real delivery is a known stub — the event is recorded + queued
+ * through the real pipeline and visible in Tracking Events; nothing
+ * here claims a Meta delivery happened.
  *
  * Conversion: POST /convert resolves/creates the customer via the §1
  * dedupe rules and returns it; the lead is NOT marked converted yet. The
@@ -75,13 +82,16 @@ export function findDuplicateLead(
   sourceSiteId: string | null,
   email: string | null,
   phone: string | null,
-  now: Date
+  now: Date,
+  /** F-09: the lead being updated never conflicts with itself. */
+  excludeLeadId?: string | null
 ): LeadRecord | null {
   const normalizedEmail = normalizeLeadEmail(email);
   const normalizedPhone = normalizePhoneE164(phone);
   const windowStart = new Date(now.getTime() - LEAD_DEDUPE_WINDOW_DAYS * 86400000).toISOString();
   return (
     state.leads.find((l) => {
+      if (excludeLeadId && l.id === excludeLeadId) return false;
       if (l.source_site_id !== sourceSiteId) return false;
       if (l.created_at < windowStart) return false;
       if (l.status === "converted" || l.status === "lost") return false;
@@ -92,7 +102,15 @@ export function findDuplicateLead(
   );
 }
 
-/** Emit the Lead tracking event (recorded + queued; CAPI delivery is a stub). */
+/**
+ * Emit the Lead tracking event (recorded + queued; CAPI delivery is a stub).
+ * F-08: every site-attributed CAPTURE emits — including dedupe-hits.
+ * The per-capture sequence keeps event ids unique under the
+ * (site, event_name, event_id) dedup key: the first capture of a lead
+ * uses `lead_<id>`, the n-th capture `lead_<id>_c<n>`, and the outbox
+ * key follows the same sequence so the unique `event_key` can never
+ * collide.
+ */
 export function emitLeadTrackingEventInTx(
   state: DatabaseState,
   lead: LeadRecord,
@@ -100,12 +118,20 @@ export function emitLeadTrackingEventInTx(
   opts: { fbp?: string | undefined; fbc?: string | undefined; eventSourceUrl?: string | undefined }
 ): void {
   if (!lead.source_site_id) return; // Manual leads have no site to attribute to.
+  const captureNumber =
+    state.tracking_events.filter(
+      (t) =>
+        t.integrated_site_id === lead.source_site_id &&
+        t.event_name === "Lead" &&
+        (t.event_id === `lead_${lead.id}` || t.event_id.startsWith(`lead_${lead.id}_c`))
+    ).length + 1;
+  const eventId = captureNumber === 1 ? `lead_${lead.id}` : `lead_${lead.id}_c${captureNumber}`;
   const trackId = randomUUID();
   state.tracking_events.push({
     id: trackId,
     integrated_site_id: lead.source_site_id,
     event_name: "Lead",
-    event_id: `lead_${lead.id}`,
+    event_id: eventId,
     event_time: nowIso,
     event_source_url: opts.eventSourceUrl ?? null,
     order_id: null,
@@ -129,14 +155,17 @@ export function emitLeadTrackingEventInTx(
   });
   state.outbox_events.push({
     id: randomUUID(),
-    event_key: `meta_capi.lead:${lead.id}`,
+    event_key:
+      captureNumber === 1
+        ? `meta_capi.lead:${lead.id}`
+        : `meta_capi.lead:${lead.id}:c${captureNumber}`,
     aggregate_type: "tracking_event",
     aggregate_id: trackId,
     event_type: "tracking.meta_capi.dispatch",
     payload: {
       tracking_event_id: trackId,
       event_name: "Lead",
-      event_id: `lead_${lead.id}`,
+      event_id: eventId,
       lead_number: lead.lead_number,
       interest: lead.interest,
       product_id: lead.product_id,
@@ -181,6 +210,15 @@ export function captureLeadInTx(
     if (input.product_id !== undefined) duplicate.product_id = input.product_id;
     if (input.whatsapp) duplicate.whatsapp = input.whatsapp.trim();
     duplicate.updated_at = nowIso;
+    // F-08: a repeat capture is still a capture — it emits its own
+    // Lead tracking event (per-capture event id; the emitter counts
+    // existing events for this lead). Manual (site-less) leads emit
+    // nothing — see emitLeadTrackingEventInTx.
+    emitLeadTrackingEventInTx(state, duplicate, nowIso, {
+      fbp: input.fbp ?? undefined,
+      fbc: input.fbc ?? undefined,
+      eventSourceUrl: input.event_source_url ?? undefined,
+    });
     return { lead: duplicate, created: false, replayed: false };
   }
 
@@ -227,12 +265,31 @@ export function captureLeadInTx(
 export async function ingestLead(
   store: StackMateDataStore,
   site: IntegratedSiteRecord,
-  rawBody: unknown
+  rawBody: unknown,
+  /** M-14: the HTTP request id, for the ingestion audit row. */
+  requestId: string
 ): Promise<IngestLeadResult> {
   const input = IngestLeadSchema.parse(rawBody);
-  return store.withTransaction((state) =>
-    captureLeadInTx(state, input, site.id, new Date())
-  );
+  return store.withTransaction((state) => {
+    const res = captureLeadInTx(state, input, site.id, new Date());
+    // M-14: lead ingestion is an external-site mutation — it belongs
+    // in the audit log (actor "integration", attributed to the site).
+    appendAuditLog(state, {
+      actor_type: "integration",
+      integrated_site_id: site.id,
+      action: "leads.lead.ingested",
+      resource_type: "lead",
+      resource_id: res.lead.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: {
+        lead_number: res.lead.lead_number,
+        created: res.created,
+        site_id: site.id,
+      },
+    });
+    return res;
+  });
 }
 
 export async function createLeadByAdmin(
@@ -272,6 +329,36 @@ export async function updateLeadByAdmin(
   return store.withTransaction((state) => {
     const lead = state.leads.find((l) => l.id === leadId);
     if (!lead) throw new AppError("NOT_FOUND", "Lead not found.", 404);
+    // F-09: the contact rule (at least one of email/phone) applies to
+    // updates as well as creation — and a contact change must not
+    // collide with another lead (same site, 30-day window). Validate
+    // the PROSPECTIVE contacts before mutating anything.
+    const nextEmail = input.email !== undefined ? (input.email ? input.email.trim() : null) : lead.email;
+    const nextPhone = input.phone !== undefined ? (input.phone ? input.phone.trim() : null) : lead.phone;
+    if (!nextEmail && !nextPhone) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        "A lead needs at least one contact — email and phone cannot both be cleared.",
+        422
+      );
+    }
+    if (input.email !== undefined || input.phone !== undefined) {
+      const conflict = findDuplicateLead(
+        state,
+        lead.source_site_id,
+        nextEmail,
+        nextPhone,
+        new Date(),
+        lead.id
+      );
+      if (conflict) {
+        throw new AppError(
+          "CONFLICT",
+          `The new contact already belongs to lead ${conflict.lead_number} (same site, within 30 days).`,
+          409
+        );
+      }
+    }
     const changes: Record<string, unknown> = {};
     if (input.name !== undefined) {
       lead.name = input.name.trim();

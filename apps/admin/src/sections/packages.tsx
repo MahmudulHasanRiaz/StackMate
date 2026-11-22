@@ -37,7 +37,7 @@ import { useNavigate, useRouterState } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
 import { Plus, Tags } from "lucide-react";
 import { PRICE_KINDS, INTERVAL_UNITS } from "../../../../packages/contracts/src/index.ts";
-import { apiRequest } from "../lib/api-client";
+import { apiRequest, formatDisplayDateDDMMYYYY, formatMinorMoney } from "../lib/api-client";
 import { detailKey } from "../lib/query";
 import {
   apiErrorMessage,
@@ -314,7 +314,7 @@ function FeatureGrantsEditor({
               }
             />
             {draft.included && f.value_type === "boolean" ? (
-              <div style={{ marginTop: 8, paddingLeft: 24 }}>
+              <div style={{ marginTop: 8, paddingLeft: "var(--sm-space-6)" }}>
                 <Checkbox
                   label="Granted"
                   checked={draft.boolValue}
@@ -331,7 +331,7 @@ function FeatureGrantsEditor({
               <div
                 style={{
                   marginTop: 8,
-                  paddingLeft: 24,
+                  paddingLeft: "var(--sm-space-6)",
                   display: "flex",
                   flexWrap: "wrap",
                   gap: 12,
@@ -796,6 +796,22 @@ export function PackagesSection() {
   );
   const products = productsQuery.data ?? [];
 
+  // M-06: picker search runs server-side (?q= over products, by name
+  // or code) so a product beyond any loaded page is still found.
+  const [productSearch, setProductSearch] = useState("");
+  const productSearchQuery = useQuery({
+    queryKey: ["admin", "products", "picker-search", productSearch],
+    queryFn: async () => {
+      const res = await apiRequest<{ items: ProductListItem[] }>(
+        `/api/v1/admin/products?q=${encodeURIComponent(productSearch.trim())}`,
+      );
+      return res.items;
+    },
+    enabled: productSearch.trim().length > 0,
+  });
+  const pickerProducts =
+    productSearch.trim().length > 0 ? (productSearchQuery.data ?? []) : products;
+
   const productParam =
     typeof raw.product === "string" && raw.product.length > 0
       ? raw.product
@@ -807,13 +823,39 @@ export function PackagesSection() {
   const productId = productParam;
   const selectedProduct = products.find((p) => p.id === productId);
 
+  const search = list.q ?? "";
+  // Server search + pagination: the product-scoped sub-endpoint
+  // reads ?q=, ?page= and ?limit= and reports data.total — the same
+  // contract as useAdminList. The query stays a custom useQuery
+  // (not useAdminList) because the product-scoped key
+  // ["admin","packages","list",productId] is the invalidation key
+  // the create mutations use; adding the search to the key keeps
+  // those prefix invalidations matching.
+  const [debouncedPackageSearch, setDebouncedPackageSearch] = useState(search);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedPackageSearch(search), 250);
+    return () => window.clearTimeout(timer);
+  }, [search]);
   const packagesQuery = useQuery({
-    queryKey: ["admin", "packages", "list", productId ?? "none"],
+    queryKey: [
+      "admin",
+      "packages",
+      "list",
+      productId ?? "none",
+      debouncedPackageSearch,
+      list.page ?? 1,
+      list.pageSize ?? 25,
+    ],
     queryFn: async () => {
-      const res = await apiRequest<{ items: PackageDto[] }>(
-        `/api/v1/admin/products/${productId}/packages`,
+      const params = new URLSearchParams({
+        limit: String(list.pageSize ?? 25),
+        page: String(list.page ?? 1),
+      });
+      if (debouncedPackageSearch.trim()) params.set("q", debouncedPackageSearch.trim());
+      const res = await apiRequest<{ items: PackageDto[]; total?: number }>(
+        `/api/v1/admin/products/${productId}/packages?${params}`,
       );
-      return res.items;
+      return res;
     },
     enabled: Boolean(productId),
   });
@@ -823,8 +865,7 @@ export function PackagesSection() {
     (STATUS_FILTERS as readonly string[]).includes(raw.status)
       ? raw.status
       : "all";
-  const search = list.q ?? "";
-  const rows = (packagesQuery.data ?? []).filter((p) =>
+  const rows = (packagesQuery.data?.items ?? []).filter((p) =>
     statusFilter === "all" ? true : p.status === statusFilter,
   );
 
@@ -870,6 +911,25 @@ export function PackagesSection() {
       cell: ({ row }) => (
         <span className="sm-tabular">{row.original.versions.length}</span>
       ),
+    },
+    {
+      id: "price",
+      header: "Price",
+      enableSorting: false,
+      cell: ({ row }) => {
+        const current = row.original.versions.find(
+          (v) => v.id === row.original.current_version_id,
+        );
+        const prices = (current?.prices ?? []).filter((pr) => pr.status === "active");
+        if (prices.length === 0) return "—";
+        return prices
+          .map((pr) =>
+            pr.price_kind === "free"
+              ? "Free"
+              : `${formatMinorMoney(pr.amount_minor, pr.currency_code)}${pr.price_kind === "recurring" && pr.interval_unit ? ` / ${pr.interval_count ?? 1} ${pr.interval_unit}${(pr.interval_count ?? 1) > 1 ? "s" : ""}` : ""}`,
+          )
+          .join(" · ");
+      },
     },
     {
       accessorKey: "created_at",
@@ -928,6 +988,23 @@ export function PackagesSection() {
           {/* F7 (2026-11-16): no description paragraph here — it repeated
               the header help text ("Packages live under a product — pick
               one"). The (i) button beside the title already carries it. */}
+          <div style={{ marginBottom: 12 }}>
+            <Input
+              id="packages-product-search"
+              name="q"
+              type="search"
+              value={productSearch}
+              onChange={(e) => setProductSearch(e.target.value)}
+              placeholder="Search products by name or code…"
+              aria-label="Search products"
+              autoComplete="off"
+            />
+            {productSearch.trim().length > 0 && productSearchQuery.isPending ? (
+              <p className="sm-hint">Searching…</p>
+            ) : productSearch.trim().length > 0 && pickerProducts.length === 0 ? (
+              <p className="sm-hint">No products match “{productSearch.trim()}”.</p>
+            ) : null}
+          </div>
           <div className="sm-table-flat">
             <table className="sm-table">
               <thead>
@@ -940,7 +1017,7 @@ export function PackagesSection() {
                 </tr>
               </thead>
               <tbody>
-                {products.map((p) => (
+                {pickerProducts.map((p) => (
                   <tr key={p.id}>
                     <td>{p.name}</td>
                     <td>
@@ -971,6 +1048,11 @@ export function PackagesSection() {
         <ListTable
           columns={columns}
           data={rows}
+          serverSearch
+          serverPagination
+          refreshSection="packages"
+          filtersActive={statusFilter !== "all"}
+          total={packagesQuery.data?.total ?? 0}
           search={search}
           onSearchChange={(q) => updateSearch({ q: q || undefined, page: 1 })}
           page={list.page ?? 1}
@@ -990,10 +1072,10 @@ export function PackagesSection() {
           toolbar={
             <>
               {/* Searchable (PLAN §29): products are unbounded — the
-                 query runs server-side. The product picker table below
-                 still lists every product (it is a table, not a
-                 dropdown), so the full list stays loaded for it. */}
+                 query runs server-side. The picker table below is
+                 searchable server-side too (audit M-06). */}
               <SearchableSelect
+                id="packages-product-picker"
                 value={productId ?? ""}
                 loadOptions={(q, signal) =>
                   loadListOptions<ProductListItem>(
@@ -1877,8 +1959,22 @@ export function PackageDetailSection({ id }: { id: string }) {
             label: "Versions",
             value: <span className="sm-tabular">{pkg.versions.length}</span>,
           },
-          { label: "Created", value: <DateCell value={pkg.created_at} /> },
-          { label: "Updated", value: <DateCell value={pkg.updated_at} /> },
+          {
+            label: "Created",
+            value: (
+              <span className="sm-tabular">
+                {formatDisplayDateDDMMYYYY(pkg.created_at, "Asia/Dhaka")}
+              </span>
+            ),
+          },
+          {
+            label: "Updated",
+            value: (
+              <span className="sm-tabular">
+                {formatDisplayDateDDMMYYYY(pkg.updated_at, "Asia/Dhaka")}
+              </span>
+            ),
+          },
         ]}
       >
 

@@ -23,6 +23,14 @@ import { sanitizeFilename } from "./r2.ts";
 /** Library per-file cap (ADR-0011): 100 MB. The 5 MB evidence cap is a different flow and is untouched. */
 export const MAX_MEDIA_BYTES = 100 * 1024 * 1024;
 
+/**
+ * Per-thumbnail cap (audit L-11): a 320px / 64px WebP is tens of KB
+ * at most — 1 MB is generous. A "thumbnail" bigger than this is not
+ * a thumbnail; it is dropped on upload (logged by the service) and
+ * rejected on regenerate, where the thumbnail IS the request.
+ */
+export const MAX_THUMBNAIL_BYTES = 1 * 1024 * 1024;
+
 export type MediaKind = "image" | "video" | "audio" | "document" | "archive" | "other";
 
 /** mime → kind. Anything not in this map is rejected with 415. */
@@ -206,27 +214,376 @@ export function parseImageDimensions(
 }
 
 /**
- * Strip everything from SVG markup that can carry active content.
- * The stored bytes are the RETURNED text re-encoded — never the raw
- * upload. Removes: DOCTYPE (ENTITY declarations), <script>, event
- * handler attributes (on*), javascript:/data:text hrefs,
- * <foreignObject> (embedded HTML). Leaves presentation markup alone.
+ * Parser-based SVG sanitizer (audit L-8). The old implementation was a
+ * set of regexes over raw markup — regexes cannot parse XML, so a
+ * crafted payload could slip past them in principle (nested tags,
+ * entity-encoded schemes, `<style>`/`<animate>` event attributes,
+ * nested `data:image/svg+xml`).
+ *
+ * This is a strict XML tokenizer + tree builder:
+ * - The document must be WELL-FORMED XML (matching tags, quoted
+ *   attribute values, no stray `<` in text, no DOCTYPE with an
+ *   internal subset — ENTITY declarations / XXE live there; a bare
+ *   DOCTYPE is stripped). Anything malformed is REJECTED (415),
+ *   exactly as a browser parsing the file as `image/svg+xml` would
+ *   reject it. What this accepts, a browser parses the same way —
+ *   there is no gap between the sanitizer's view and the renderer's
+ *   view.
+ * - Only allowlisted ELEMENTS survive (presentation + structure);
+ *   everything else — <script>, <style>, <foreignObject>, <iframe>,
+ *   <animate>/<set> (SMIL can carry event attributes), <link>,
+ *   <object>, <embed>, … — is dropped WITH its children.
+ * - Only allowlisted ATTRIBUTES survive; `style` and every `on*`
+ *   handler are gone by construction (they are not in the list).
+ * - `href`/`xlink:href` values are checked AFTER entity-decoding:
+ *   only `#fragment` references, `data:image/png|jpeg|gif|webp`
+ *   (raster only — never `data:image/svg+xml`, which could nest a
+ *   second SVG with its own script), and `http(s):` on `<a>` only.
+ * - The output is RE-SERIALIZED from the tree (attributes and text
+ *   re-escaped), so the stored bytes are exactly the parsed tree —
+ *   nothing from the raw upload survives unexamined.
  */
-export function sanitizeSvgText(text: string): string {
-  let out = text;
-  out = out.replace(/<!DOCTYPE[^>]*(\[[^\]]*\])?>/gi, "");
-  out = out.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "");
-  out = out.replace(/<script\b[^>]*\/>/gi, "");
-  out = out.replace(/<foreignObject\b[^>]*>[\s\S]*?<\/foreignObject\s*>/gi, "");
-  out = out.replace(/<foreignObject\b[^>]*\/>/gi, "");
-  // Event handlers: on<name>="..." / on<name>='...' / on<name>=bare.
-  out = out.replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, "");
-  // javascript: / data:text hrefs (both href and xlink:href). data:image/* stays.
-  out = out.replace(
-    /(\s(?:xlink:)?href\s*=\s*["'])\s*(?:javascript:|data:text)[^"']*(["'])/gi,
-    "$1#$2",
-  );
+const SVG_MAX_DEPTH = 100;
+const SVG_MAX_NODES = 200_000;
+const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
+const XLINK_NAMESPACE = "http://www.w3.org/1999/xlink";
+
+const SVG_ALLOWED_ELEMENTS: ReadonlySet<string> = new Set([
+  "svg", "g", "defs", "title", "desc", "metadata",
+  "path", "rect", "circle", "ellipse", "line", "polyline", "polygon",
+  "text", "tspan", "textpath",
+  "use", "symbol", "clippath", "mask",
+  "lineargradient", "radialgradient", "stop", "pattern", "marker",
+  "switch", "a", "image",
+]);
+
+const SVG_ALLOWED_ATTRIBUTES: ReadonlySet<string> = new Set([
+  "id", "class", "role", "aria-label", "aria-hidden", "lang", "xml:space",
+  "xmlns", "xmlns:xlink", "version", "baseprofile",
+  "viewbox", "preserveaspectratio", "width", "height", "x", "y",
+  "x1", "y1", "x2", "y2", "cx", "cy", "r", "rx", "ry", "d", "points",
+  "fill", "fill-opacity", "fill-rule", "stroke", "stroke-width",
+  "stroke-linecap", "stroke-linejoin", "stroke-dasharray", "stroke-dashoffset",
+  "stroke-opacity", "opacity", "color", "stop-color", "stop-opacity",
+  "transform", "clip-path", "clip-rule", "mask",
+  "gradientunits", "gradienttransform", "spreadmethod",
+  "patternunits", "patterncontentunits", "patterntransform",
+  "markerwidth", "markerheight", "refx", "refy", "orient", "markerunits",
+  "offset",
+  "font-family", "font-size", "font-weight", "font-style",
+  "text-anchor", "dominant-baseline", "alignment-baseline",
+  "letter-spacing", "word-spacing", "textlength", "lengthadjust",
+  "startoffset",
+  "display", "visibility", "overflow",
+  "href", "xlink:href",
+]);
+
+/** Elements whose href/xlink:href is meaningful (and therefore allowed, value-checked). */
+const SVG_HREF_ELEMENTS: ReadonlySet<string> = new Set(["a", "use", "image", "textpath"]);
+
+type SvgNode =
+  | { kind: "text"; value: string }
+  | {
+      kind: "element";
+      name: string;
+      attrs: Array<{ name: string; value: string }>;
+      children: SvgNode[];
+    };
+
+function svgError(message: string): AppError {
+  return new AppError("UNSUPPORTED_MEDIA_TYPE", message, 415);
+}
+
+/** Strict XML entity decoding — an unknown or malformed reference is rejected, never passed through. */
+function decodeXmlEntities(raw: string): string {
+  let out = "";
+  let i = 0;
+  while (i < raw.length) {
+    const amp = raw.indexOf("&", i);
+    if (amp === -1) {
+      out += raw.slice(i);
+      break;
+    }
+    out += raw.slice(i, amp);
+    const semi = raw.indexOf(";", amp + 1);
+    if (semi === -1 || semi - amp > 12) {
+      throw svgError("Invalid SVG: malformed entity reference.");
+    }
+    const body = raw.slice(amp + 1, semi);
+    if (body === "amp") out += "&";
+    else if (body === "lt") out += "<";
+    else if (body === "gt") out += ">";
+    else if (body === "quot") out += '"';
+    else if (body === "apos") out += "'";
+    else if (/^#\d+$/.test(body) || /^#x[0-9a-fA-F]+$/.test(body)) {
+      const code = body.startsWith("#x")
+        ? Number.parseInt(body.slice(2), 16)
+        : Number.parseInt(body.slice(1), 10);
+      if (
+        !Number.isFinite(code) ||
+        code <= 0 ||
+        code > 0x10ffff ||
+        (code >= 0xd800 && code <= 0xdfff)
+      ) {
+        throw svgError("Invalid SVG: invalid numeric character reference.");
+      }
+      out += String.fromCodePoint(code);
+    } else {
+      throw svgError(`Invalid SVG: unknown entity '&${body};'.`);
+    }
+    i = semi + 1;
+  }
   return out;
+}
+
+function escapeSvgText(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function escapeSvgAttr(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;");
+}
+
+/** Reference-value gate, applied AFTER entity decoding (catches `java&#115;cript:` etc.). */
+function isSafeSvgReference(elementLower: string, rawValue: string): boolean {
+  // Browsers strip ASCII control characters from a URL before
+  // reading its scheme — do the same before judging it.
+  const value = rawValue.replace(/[\x00-\x20]/g, "");
+  if (value.startsWith("#")) return true;
+  const lower = value.toLowerCase();
+  if (elementLower === "a" && (lower.startsWith("http://") || lower.startsWith("https://"))) {
+    return true;
+  }
+  if (
+    elementLower === "image" &&
+    /^data:image\/(png|jpeg|gif|webp);base64,/i.test(value)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** Strict XML tokenizer + tree builder. Throws 415 on anything malformed. */
+function parseSvgDocument(text: string): SvgNode {
+  const len = text.length;
+  let pos = 0;
+  let nodeCount = 0;
+
+  function fail(msg: string): never {
+    throw svgError(`Invalid SVG: ${msg}`);
+  }
+
+  function skipWhitespace(): void {
+    while (pos < len && /\s/.test(text[pos]!)) pos += 1;
+  }
+
+  /**
+   * A bare DOCTYPE (`<!DOCTYPE svg PUBLIC "…" "…">`) is legal XML and
+   * carries no entities — it is STRIPPED (the existing contract:
+   * the media-validation suite expects it gone, not rejected).
+   * A DOCTYPE WITH an internal subset (`<!DOCTYPE … [ <!ENTITY …> ]>`)
+   * is where ENTITY declarations / XXE live — that is REJECTED.
+   */
+  function skipDoctype(): void {
+    const end = text.indexOf(">", pos + 9);
+    if (end === -1) fail("unterminated DOCTYPE");
+    if (text.slice(pos, end).includes("[")) {
+      fail("DOCTYPE with an internal subset (ENTITY declarations) is not allowed");
+    }
+    pos = end + 1;
+  }
+
+  function readName(): string {
+    const start = pos;
+    if (pos < len && /[A-Za-z_:]/.test(text[pos]!)) pos += 1;
+    while (pos < len && /[A-Za-z0-9_.:-]/.test(text[pos]!)) pos += 1;
+    if (pos === start) fail("expected a name");
+    return text.slice(start, pos);
+  }
+
+  function parseText(): SvgNode {
+    const start = pos;
+    while (pos < len && text[pos] !== "<") pos += 1;
+    const raw = text.slice(start, pos);
+    nodeCount += 1;
+    if (nodeCount > SVG_MAX_NODES) fail("too many nodes");
+    return { kind: "text", value: decodeXmlEntities(raw) };
+  }
+
+  function parseElement(depth: number): SvgNode {
+    if (depth > SVG_MAX_DEPTH) fail("nesting too deep");
+    // text[pos] === "<", next char starts a name.
+    pos += 1;
+    const name = readName();
+    const attrs: Array<{ name: string; value: string }> = [];
+    const seenAttrs = new Set<string>();
+    for (;;) {
+      skipWhitespace();
+      if (pos >= len) fail(`unclosed tag <${name}>`);
+      if (text.startsWith("/>", pos)) {
+        pos += 2;
+        nodeCount += 1;
+        if (nodeCount > SVG_MAX_NODES) fail("too many nodes");
+        return { kind: "element", name, attrs, children: [] };
+      }
+      if (text[pos] === ">") {
+        pos += 1;
+        break;
+      }
+      if (text[pos] === "/" || text[pos] === "<" || text[pos] === "=") {
+        fail(`malformed tag <${name}>`);
+      }
+      const attrName = readName();
+      const attrLower = attrName.toLowerCase();
+      if (seenAttrs.has(attrLower)) fail(`duplicate attribute '${attrName}'`);
+      seenAttrs.add(attrLower);
+      skipWhitespace();
+      if (text[pos] !== "=") fail(`attribute '${attrName}' has no value`);
+      pos += 1;
+      skipWhitespace();
+      const quote = text[pos];
+      if (quote !== '"' && quote !== "'") {
+        fail(`attribute '${attrName}' value must be quoted`);
+      }
+      pos += 1;
+      const valueStart = pos;
+      while (pos < len && text[pos] !== quote) pos += 1;
+      if (pos >= len) fail(`unterminated attribute '${attrName}'`);
+      const rawValue = text.slice(valueStart, pos);
+      pos += 1;
+      attrs.push({ name: attrName, value: decodeXmlEntities(rawValue) });
+    }
+    const children: SvgNode[] = [];
+    for (;;) {
+      if (pos >= len) fail(`unclosed element <${name}>`);
+      if (text.startsWith(`</`, pos)) {
+        pos += 2;
+        const closeName = readName();
+        skipWhitespace();
+        if (text[pos] !== ">") fail(`malformed closing tag </${closeName}>`);
+        pos += 1;
+        if (closeName.toLowerCase() !== name.toLowerCase()) {
+          fail(`mismatched closing tag </${closeName}> for <${name}>`);
+        }
+        nodeCount += 1;
+        if (nodeCount > SVG_MAX_NODES) fail("too many nodes");
+        return { kind: "element", name, attrs, children };
+      }
+      if (text.startsWith("<!--", pos)) {
+        const end = text.indexOf("-->", pos + 4);
+        if (end === -1) fail("unterminated comment");
+        pos = end + 3;
+        continue;
+      }
+      if (text.startsWith("<![CDATA[", pos)) {
+        const end = text.indexOf("]]>", pos + 9);
+        if (end === -1) fail("unterminated CDATA section");
+        // CDATA content is literal text (no entity decoding) — correct
+        // XML semantics; it is escaped on serialization.
+        nodeCount += 1;
+        if (nodeCount > SVG_MAX_NODES) fail("too many nodes");
+        children.push({ kind: "text", value: text.slice(pos + 9, end) });
+        pos = end + 3;
+        continue;
+      }
+      if (text.startsWith("<!", pos)) fail("DOCTYPE and other declarations are not allowed");
+      if (text.startsWith("<?", pos)) fail("processing instructions are not allowed");
+      if (text[pos] === "<") {
+        children.push(parseElement(depth + 1));
+        continue;
+      }
+      children.push(parseText());
+    }
+  }
+
+  // Document prologue: optional BOM, XML declaration, comments,
+  // and a bare DOCTYPE (stripped — see skipDoctype).
+  if (text.charCodeAt(0) === 0xfeff) pos = 1;
+  for (;;) {
+    skipWhitespace();
+    if (text.startsWith("<?xml", pos)) {
+      // The declaration is `<?xml` + whitespace (`<?xml version=…?>`).
+      // `<?xml-stylesheet …?>` is a PROCESSING INSTRUCTION, not the
+      // declaration — it must be rejected, not skipped.
+      const after = text[pos + 5];
+      if (after !== undefined && after !== "?" && !/\s/.test(after)) break;
+      const end = text.indexOf("?>", pos + 5);
+      if (end === -1) fail("unterminated XML declaration");
+      // The declaration must be well-formed-ish: no '<' inside it.
+      if (text.slice(pos + 5, end).includes("<")) fail("malformed XML declaration");
+      pos = end + 2;
+      continue;
+    }
+    if (text.startsWith("<!--", pos)) {
+      const end = text.indexOf("-->", pos + 4);
+      if (end === -1) fail("unterminated comment");
+      pos = end + 3;
+      continue;
+    }
+    if (text.startsWith("<!DOCTYPE", pos)) {
+      skipDoctype();
+      continue;
+    }
+    break;
+  }
+  if (text.startsWith("<!", pos)) fail("DOCTYPE is not allowed in SVG uploads");
+  if (text.startsWith("<?", pos)) fail("processing instructions are not allowed");
+  if (pos >= len || text[pos] !== "<") fail("document has no root element");
+  const root = parseElement(0);
+  skipWhitespace();
+  // Nothing but whitespace/comments may follow the root element.
+  while (pos < len) {
+    if (text.startsWith("<!--", pos)) {
+      const end = text.indexOf("-->", pos + 4);
+      if (end === -1) fail("unterminated comment");
+      pos = end + 3;
+      skipWhitespace();
+      continue;
+    }
+    fail("content after the root element");
+  }
+  return root;
+}
+
+/** Serialize the parsed tree, dropping disallowed elements/attributes. Returns "" for a dropped subtree. */
+function serializeSvgNode(node: SvgNode, isRoot: boolean): string {
+  if (node.kind === "text") return escapeSvgText(node.value);
+  const lower = node.name.toLowerCase();
+  if (!SVG_ALLOWED_ELEMENTS.has(lower)) return "";
+  const attrs: string[] = [];
+  for (const attr of node.attrs) {
+    const attrLower = attr.name.toLowerCase();
+    if (!SVG_ALLOWED_ATTRIBUTES.has(attrLower)) continue;
+    if (attrLower === "href" || attrLower === "xlink:href") {
+      if (!SVG_HREF_ELEMENTS.has(lower)) continue;
+      if (!isSafeSvgReference(lower, attr.value)) continue;
+    }
+    if (attrLower === "xmlns" || attrLower === "xmlns:xlink") {
+      // Namespace declarations live on the root only, and must name
+      // the SVG / XLink namespaces — anything else makes the document
+      // non-SVG (or a namespace-confusion vector).
+      if (!isRoot) continue;
+      const expected = attrLower === "xmlns" ? SVG_NAMESPACE : XLINK_NAMESPACE;
+      if (attr.value !== expected) {
+        throw svgError(`Invalid SVG: unexpected namespace '${attr.value}'.`);
+      }
+    }
+    attrs.push(`${attr.name}="${escapeSvgAttr(attr.value)}"`);
+  }
+  const children = node.children.map((c) => serializeSvgNode(c, false)).join("");
+  const open = attrs.length > 0 ? `<${node.name} ${attrs.join(" ")}` : `<${node.name}`;
+  return children === "" ? `${open}/>` : `${open}>${children}</${node.name}>`;
+}
+
+export function sanitizeSvgText(text: string): string {
+  const root = parseSvgDocument(text);
+  if (root.kind !== "element" || root.name.toLowerCase() !== "svg") {
+    throw svgError("File does not look like SVG markup.");
+  }
+  return serializeSvgNode(root, true);
 }
 
 function verifySvg(bytes: Uint8Array): { sanitizedBytes: Uint8Array; dimensions: { width: number; height: number } | null } {
@@ -267,6 +624,22 @@ export interface VerifiedMedia {
   bytes: Uint8Array;
   width: number | null;
   height: number | null;
+}
+
+/**
+ * Validate a browser-generated thumbnail (L-11): it must be a WebP
+ * within the thumbnail cap. Throws on oversize (the caller decides
+ * whether that fails the request or drops the thumbnail).
+ */
+export function verifyThumbnailBytes(bytes: Uint8Array): VerifiedMedia {
+  if (bytes.byteLength > MAX_THUMBNAIL_BYTES) {
+    throw new AppError(
+      "PAYLOAD_TOO_LARGE",
+      `Thumbnail exceeds the maximum of ${MAX_THUMBNAIL_BYTES} bytes.`,
+      413
+    );
+  }
+  return verifyMediaBytes(bytes, "image/webp");
 }
 
 /**

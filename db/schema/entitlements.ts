@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   pgTable,
   uuid,
@@ -10,6 +11,7 @@ import {
   timestamp,
   unique,
   index,
+  check,
   foreignKey,
 } from "drizzle-orm/pg-core";
 import { users } from "./auth.ts";
@@ -47,6 +49,7 @@ export const productPackages = pgTable(
   (table) => [
     unique("uq_product_packages_key").on(table.productId, table.packageKey),
     unique("uq_product_packages_product_id_id").on(table.productId, table.id),
+    check("product_packages_status_check", sql`"status" IN ('draft', 'active', 'archived')`),
   ]
 );
 
@@ -77,6 +80,8 @@ export const packageVersions = pgTable(
       foreignColumns: [productPackages.productId, productPackages.id],
       name: "fk_package_versions_same_product",
     }).onDelete("restrict"),
+    check("package_versions_version_number_check", sql`"version_number" >= 1`),
+    check("package_versions_status_check", sql`"status" IN ('draft', 'published', 'retired')`),
   ]
 );
 
@@ -147,5 +152,14 @@ export const packagePrices = pgTable(
   (table) => [
     unique("uq_package_prices_ver_key").on(table.packageVersionId, table.priceKey),
     index("idx_package_prices_ver_status").on(table.packageVersionId, table.status),
+    // CHECKs declared in Drizzle (migration 0014 / audit F-11) so
+    // drizzle-kit generate reproduces them; previously SQL-only.
+    check("package_prices_price_kind_check", sql`"price_kind" IN ('free', 'one_time', 'recurring', 'lifetime')`),
+    check("package_prices_amount_minor_check", sql`"amount_minor" >= 0`),
+    check("package_prices_interval_unit_check", sql`"interval_unit" IS NULL OR "interval_unit" IN ('day', 'week', 'month', 'year')`),
+    check("package_prices_interval_count_check", sql`"interval_count" IS NULL OR "interval_count" >= 1`),
+    check("package_prices_trial_days_check", sql`"trial_days" >= 0`),
+    check("package_prices_setup_fee_minor_check", sql`"setup_fee_minor" >= 0`),
+    check("package_prices_status_check", sql`"status" IN ('active', 'inactive', 'retired')`),
   ]
 );

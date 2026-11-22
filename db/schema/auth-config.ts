@@ -1,5 +1,8 @@
+import { sql } from "drizzle-orm";
 import {
   boolean,
+  check,
+  index,
   integer,
   pgTable,
   text,
@@ -60,7 +63,10 @@ export const authTwoFactorPolicy = pgTable(
     mode: text("mode").notNull().default("off"),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [unique("uq_auth_two_factor_policy_scope").on(table.scope)]
+  (table) => [
+    unique("uq_auth_two_factor_policy_scope").on(table.scope),
+    check("auth_two_factor_policy_mode_check", sql`"mode" IN ('off', 'optional', 'required')`),
+  ]
 );
 
 export const smtpSettings = pgTable("smtp_settings", {
@@ -79,7 +85,10 @@ export const smtpSettings = pgTable("smtp_settings", {
   fromName: text("from_name").notNull().default("StackMate"),
   enabled: boolean("enabled").notNull().default(false),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  check("smtp_settings_tls_mode_check", sql`"tls_mode" IN ('starttls', 'ssl', 'none')`),
+]);
 
 export const passwordResetTokens = pgTable("password_reset_tokens", {
   id: uuid("id").primaryKey(),
@@ -94,4 +103,11 @@ export const passwordResetTokens = pgTable("password_reset_tokens", {
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   usedAt: timestamp("used_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  // Index exists in SQL (migration 0007) — declared here so
+  // drizzle-kit generate reproduces it (found during the 0014
+  // generate verification; previously the only index generate missed).
+  index("idx_password_reset_tokens_hash").on(table.tokenHash),
+  check("password_reset_tokens_purpose_check", sql`"purpose" IN ('password_reset', 'two_factor_recovery')`),
+]);

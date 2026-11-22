@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   pgTable,
   uuid,
@@ -9,6 +10,7 @@ import {
   timestamp,
   unique,
   index,
+  check,
 } from "drizzle-orm/pg-core";
 import { users } from "./auth.ts";
 import { uploadedAssets } from "./assets.ts";
@@ -20,7 +22,10 @@ export const currencies = pgTable("currencies", {
   exponent: integer("exponent").notNull().default(2),
   isActive: boolean("is_active").notNull().default(true),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  check("currencies_exponent_check", sql`"exponent" >= 0 AND "exponent" <= 4`),
+]);
 
 export const products = pgTable(
   "products",
@@ -51,7 +56,17 @@ export const products = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
     archivedAt: timestamp("archived_at", { withTimezone: true }),
   },
-  (table) => [index("idx_products_status_created_at").on(table.status, table.createdAt.desc())]
+  (table) => [
+    index("idx_products_status_created_at").on(table.status, table.createdAt.desc()),
+    // CHECKs declared in Drizzle (migration 0014 / audit F-11) so
+    // drizzle-kit generate reproduces them; previously SQL-only.
+    // default_activation_limit / offline_grace_hours are migration 0002.
+    check("products_product_type_check", sql`"product_type" IN ('wordpress_plugin', 'wordpress_theme', 'licensed_software', 'saas_application', 'dedicated_deployment', 'digital_service', 'other')`),
+    check("products_fulfillment_type_check", sql`"fulfillment_type" IN ('software_license', 'saas_provision', 'digital_service', 'custom')`),
+    check("products_status_check", sql`"status" IN ('draft', 'active', 'archived')`),
+    check("products_default_activation_limit_check", sql`"default_activation_limit" >= 1`),
+    check("products_offline_grace_hours_check", sql`"offline_grace_hours" >= 0`),
+  ]
 );
 
 export const productDistributionChannels = pgTable(
@@ -67,7 +82,11 @@ export const productDistributionChannels = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [unique("uq_product_distribution_channel").on(table.productId, table.channelKey)]
+  (table) => [
+    unique("uq_product_distribution_channel").on(table.productId, table.channelKey),
+    check("product_distribution_channels_channel_key_check", sql`"channel_key" IN ('wordpress', 'hosted_saas', 'dedicated_deployment', 'api', 'direct_download', 'service_delivery')`),
+    check("product_distribution_channels_status_check", sql`"status" IN ('active', 'inactive')`),
+  ]
 );
 
 export const productIntegrationProfiles = pgTable(
@@ -88,7 +107,10 @@ export const productIntegrationProfiles = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [unique("uq_product_integration_profile").on(table.productId, table.profileKey)]
+  (table) => [
+    unique("uq_product_integration_profile").on(table.productId, table.profileKey),
+    check("product_integration_profiles_status_check", sql`"status" IN ('active', 'inactive')`),
+  ]
 );
 
 export const productReleases = pgTable(
@@ -129,5 +151,7 @@ export const productFeatures = pgTable(
     unique("uq_product_features_key").on(table.productId, table.featureKey),
     unique("uq_product_features_product_id_id").on(table.productId, table.id),
     index("idx_product_features_product_status").on(table.productId, table.status, table.name),
+    check("product_features_value_type_check", sql`"value_type" IN ('boolean', 'limit', 'quota', 'metered')`),
+    check("product_features_status_check", sql`"status" IN ('active', 'archived')`),
   ]
 );

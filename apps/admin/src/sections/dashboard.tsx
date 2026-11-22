@@ -63,7 +63,7 @@ interface AnalyticsOverviewDto {
   active_subscriptions: number;
   active_licenses: number;
   expired_or_revoked_licenses: number;
-  verified_revenue_minor: number;
+  verified_revenue_minor: number | null;
   pending_outbox_events: number;
   range: { from: string; to: string } | null;
 }
@@ -194,7 +194,7 @@ function KpiCard({
 
 function PanelSkeleton() {
   return (
-    <div style={{ padding: "4px 0" }}>
+    <div style={{ padding: "var(--sm-space-1) 0" }}>{/* L-11: literal padding → spacing token */}
       {Array.from({ length: 3 }).map((_, i) => (
         <div key={i} style={{ marginTop: i === 0 ? 0 : 10 }}>
           <Skeleton height={14} width="70%" />
@@ -237,10 +237,13 @@ export function DashboardSection() {
   });
 
   // Report panels — existing list endpoints only, no new API.
+  // ?limit=100 (the API max): the panels sort/filter client-side
+  // over the loaded set, so the 25-row default would silently drop
+  // recent rows once the collection grows past it.
   const ordersQuery = useQuery({
     queryKey: ["admin", "dashboard", "recent-orders"],
     queryFn: async () => {
-      const res = await apiRequest<{ items: DashboardOrderRow[] }>("/api/v1/admin/orders");
+      const res = await apiRequest<{ items: DashboardOrderRow[] }>("/api/v1/admin/orders?limit=100");
       return res.items;
     },
   });
@@ -248,7 +251,7 @@ export function DashboardSection() {
     queryKey: ["admin", "dashboard", "pending-submissions"],
     queryFn: async () => {
       const res = await apiRequest<{ items: DashboardSubmissionRow[] }>(
-        "/api/v1/admin/payment-submissions",
+        "/api/v1/admin/payment-submissions?limit=100",
       );
       return res.items;
     },
@@ -257,7 +260,7 @@ export function DashboardSection() {
     queryKey: ["admin", "dashboard", "expiring-licenses"],
     queryFn: async () => {
       const res = await apiRequest<{ items: DashboardLicenseRow[] }>(
-        "/api/v1/admin/licenses",
+        "/api/v1/admin/licenses?limit=100",
       );
       return res.items;
     },
@@ -360,7 +363,9 @@ export function DashboardSection() {
           {formatRangeLabel(bounds)}
         </span>
       </div>
-      {query.isPending ? (
+      {/* LIVE L8: isFetching covers a range-change refetch, when the
+          previous range's numbers would otherwise stay visible. */}
+      {query.isPending || query.isFetching ? (
         <div className="sm-kpi-grid">
           {Array.from({ length: 8 }).map((_, i) => (
             <div key={i} className="sm-kpi-card">
@@ -383,12 +388,18 @@ export function DashboardSection() {
       ) : query.data ? (
         <>
           <div className="sm-kpi-grid">
-            <KpiCard label="Verified revenue" icon={Banknote} tone="hero">
-              <MoneyCell
-                currency={query.data.currency_code}
-                minor={query.data.verified_revenue_minor}
-              />
-            </KpiCard>
+            {/* M-8: the API returns null (not 0) when the caller lacks
+                payments.read — hide the card instead of showing
+                ৳0.00, so a missing value is never mistaken for "no
+                revenue". */}
+            {query.data.verified_revenue_minor !== null ? (
+              <KpiCard label="Verified revenue" icon={Banknote} tone="hero">
+                <MoneyCell
+                  currency={query.data.currency_code}
+                  minor={query.data.verified_revenue_minor}
+                />
+              </KpiCard>
+            ) : null}
             <KpiCard label="Pending payment review" icon={Clock} tone="strong">
               {query.data.pending_payment_submissions}
             </KpiCard>
@@ -413,7 +424,7 @@ export function DashboardSection() {
           </div>
           {bounds !== null &&
             query.data.total_orders === 0 &&
-            query.data.verified_revenue_minor === 0 && (
+            (query.data.verified_revenue_minor ?? 0) === 0 && (
               <p className="sm-hint">No activity in this period.</p>
             )}
         </>
@@ -427,7 +438,7 @@ export function DashboardSection() {
               View all orders
             </Button>
           </div>
-          {ordersQuery.isPending ? (
+          {ordersQuery.isPending || ordersQuery.isFetching ? (
             <PanelSkeleton />
           ) : ordersQuery.isError ? (
             <p className="sm-hint">
@@ -474,7 +485,10 @@ export function DashboardSection() {
               Payment review
             </Button>
           </div>
-          {submissionsQuery.isPending || licensesQuery.isPending ? (
+          {submissionsQuery.isPending ||
+          licensesQuery.isPending ||
+          submissionsQuery.isFetching ||
+          licensesQuery.isFetching ? (
             <PanelSkeleton />
           ) : submissionsQuery.isError || licensesQuery.isError ? (
             <p className="sm-hint">
@@ -574,8 +588,10 @@ export function DashboardSection() {
           }
         >
           <form id="custom-range-form" onSubmit={submitCustom}>
-            <Field label="From" required hint="DD/MM/YYYY." error={customError ?? ""}>
+            <Field label="From" required htmlFor="dash-custom-from" hint="DD/MM/YYYY." error={customError ?? ""}>
               <input
+                id="dash-custom-from"
+                name="from"
                 className="sm-input"
                 value={customFrom}
                 onChange={(e) => setCustomFrom(normalizeDateInput(e.target.value))}
@@ -588,8 +604,10 @@ export function DashboardSection() {
                 autoComplete="off"
               />
             </Field>
-            <Field label="To" required hint="DD/MM/YYYY." error="">
+            <Field label="To" required htmlFor="dash-custom-to" hint="DD/MM/YYYY." error="">
               <input
+                id="dash-custom-to"
+                name="to"
                 className="sm-input"
                 value={customTo}
                 onChange={(e) => setCustomTo(normalizeDateInput(e.target.value))}

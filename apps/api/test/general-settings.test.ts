@@ -129,8 +129,11 @@ describe.skipIf(!DATABASE_URL)("General Settings (Postgres)", () => {
     assert.equal(res.body.data.app_description, "");
     assert.equal(res.body.data.support_email, "");
     assert.equal(res.body.data.favicon_url, null);
+    // M-20: with no favicon configured the endpoint serves the embedded
+    // default SVG instead of 404ing.
     const fav = await api("/api/v1/favicon");
-    assert.equal(fav.status, 404);
+    assert.equal(fav.status, 200);
+    assert.equal(fav.headers.get("Content-Type"), "image/svg+xml");
   });
 
   it("PUT validates: empty name/title, bad email, long description", async () => {
@@ -230,7 +233,8 @@ describe.skipIf(!DATABASE_URL)("General Settings (Postgres)", () => {
     });
     assert.equal(big.status, 413, JSON.stringify(big.body));
 
-    // Clear the favicon: public URL goes back to null, endpoint 404s.
+    // Clear the favicon: public URL goes back to null, endpoint serves
+    // the embedded default again (M-20).
     const cleared = await api("/api/v1/admin/general-settings", {
       method: "PUT",
       body: { clear_favicon: true },
@@ -241,7 +245,8 @@ describe.skipIf(!DATABASE_URL)("General Settings (Postgres)", () => {
     const pub2 = await api("/api/v1/general-config");
     assert.equal(pub2.body.data.favicon_url, null);
     const fav2 = await api("/api/v1/favicon");
-    assert.equal(fav2.status, 404);
+    assert.equal(fav2.status, 200);
+    assert.equal(fav2.headers.get("Content-Type"), "image/svg+xml");
   });
 
   it("favicon bytes stream back exactly", async () => {

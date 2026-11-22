@@ -4,7 +4,8 @@
  * The SPA reads GET /api/v1/general-config once at boot (public — no
  * auth, no secrets) and applies it:
  *  - document.title = app_title
- *  - <link rel="icon"> = favicon_url (removed when no favicon)
+ *  - <link rel="icon"> = favicon_url (static /favicon.svg default when
+ *    no favicon is configured — audit M-20, never no icon at all)
  *  - <meta name="description"> = app_description
  *  - sidebar/topbar brand = app_name
  *  - login page = app_description + support_email
@@ -83,7 +84,11 @@ export function applyGeneralConfig(config: GeneralConfig): void {
       icon.href = config.favicon_url;
     }
   } else if (icon) {
-    icon.remove();
+    // Audit M-20: no configured favicon → the static default, not no
+    // icon at all (removing the link made the browser request
+    // /favicon.ico and 404 on every load).
+    const fallback = new URL("/favicon.svg", window.location.origin).href;
+    if (icon.href !== fallback) icon.href = fallback;
   }
   if (config.app_description) {
     let meta = head.querySelector<HTMLMetaElement>('meta[name="description"]');

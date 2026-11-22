@@ -236,10 +236,20 @@ describe.skipIf(!DATABASE_URL)(
       assert.equal(items[0].name, "SearchProbe Customer 55");
     });
 
-    it("customers without q returns all 61 rows (no hidden cap)", async () => {
-      const res = await authed("/api/v1/admin/customers");
-      assert.equal(res.status, 200, JSON.stringify(res.body));
-      assert.equal(itemsOf(res).length, 61);
+    it("customers without q: page 1 holds 25 of 61 (total), pages walk to all 61", async () => {
+      // M-1: lists are server-paged (default limit 25) — no hidden cap,
+      // but no single page returns everything either. The total is
+      // pre-limit; walking pages 1-3 collects all 61 rows.
+      const seen = new Set<string>();
+      for (const page of [1, 2, 3]) {
+        const res = await authed(`/api/v1/admin/customers?page=${page}`);
+        assert.equal(res.status, 200, JSON.stringify(res.body));
+        assert.equal(res.body.data.total, 61, JSON.stringify(res.body.data));
+        for (const item of itemsOf(res)) seen.add(item.id as string);
+      }
+      assert.equal(seen.size, 61);
+      const first = await authed("/api/v1/admin/customers");
+      assert.equal(itemsOf(first).length, 25);
     });
 
     it("customers q + limit caps AFTER filtering, not before", async () => {

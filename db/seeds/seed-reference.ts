@@ -41,6 +41,10 @@ export const SEED_PERMISSIONS = [
   { id: "00000000-0000-4000-8000-000000000127", key: "tickets.manage", description: "Create, assign, and resolve support tickets" },
   { id: "00000000-0000-4000-8000-000000000128", key: "leads.view", description: "View leads and their history" },
   { id: "00000000-0000-4000-8000-000000000129", key: "leads.manage", description: "Create, assign, convert, and manage leads" },
+  { id: "00000000-0000-4000-8000-000000000130", key: "media.view", description: "View the media library and download files" },
+  { id: "00000000-0000-4000-8000-000000000131", key: "media.manage", description: "Upload, rename, move, and delete media files" },
+  { id: "00000000-0000-4000-8000-000000000132", key: "integrations.read", description: "View external website integrations, webhooks, and delivery records" },
+  { id: "00000000-0000-4000-8000-000000000133", key: "tracking.read", description: "View Meta Pixel and Conversions API tracking events" },
 ] as const;
 
 export const SEED_ROLES: ReadonlyArray<{
@@ -65,7 +69,11 @@ export const SEED_ROLES: ReadonlyArray<{
     name: "Admin",
     description: "Administrative access across operational domains",
     is_system: true,
-    permissions: SEED_PERMISSIONS.filter((p) => p.key !== "users.manage").map((p) => p.key),
+    // Audit D-1 (owner decision 2026-11-19): admin holds every
+    // permission, including users.manage — so admin can see and use
+    // Staff & Roles. Migration 0014 grants users.manage to the admin
+    // role on existing databases; this keeps fresh installs in sync.
+    permissions: SEED_PERMISSIONS.map((p) => p.key),
   },
   {
     id: "00000000-0000-4000-8000-000000000203",
@@ -138,6 +146,8 @@ export const SEED_ROLES: ReadonlyArray<{
       "tickets.manage",
       "leads.view",
       "leads.manage",
+      "media.view",
+      "media.manage",
     ],
   },
   {
@@ -151,6 +161,9 @@ export const SEED_ROLES: ReadonlyArray<{
       "integrations.manage",
       "integrations.rotate_credentials",
       "tracking.manage",
+      // L-6 (audit fix, migration 0016): read-only view of tracking
+      // events for the role that configures tracking.
+      "tracking.read",
     ],
   },
   {
@@ -169,6 +182,11 @@ export const SEED_ROLES: ReadonlyArray<{
       "audit_logs.read",
       "tickets.view",
       "leads.view",
+      "media.view",
+      // L-6 (audit fix, migration 0016): read-only view of integrations
+      // (webhooks/deliveries/outbox) and tracking events.
+      "integrations.read",
+      "tracking.read",
     ],
   },
 ];

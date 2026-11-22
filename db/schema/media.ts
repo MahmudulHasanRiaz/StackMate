@@ -1,4 +1,5 @@
-import { pgTable, uuid, text, varchar, bigint, integer, timestamp, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { pgTable, uuid, text, varchar, bigint, integer, timestamp, index, check } from "drizzle-orm/pg-core";
 import { users } from "./auth.ts";
 
 /**
@@ -49,6 +50,12 @@ export const mediaAssets = pgTable(
     index("idx_media_assets_folder_created").on(table.folder, table.createdAt.desc()),
     index("idx_media_assets_mime_created").on(table.mimeType, table.createdAt.desc()),
     index("idx_media_assets_created").on(table.createdAt.desc()),
+    check("media_assets_driver_check", sql`"driver" IN ('r2', 'local')`),
+    check("media_assets_byte_size_check", sql`"byte_size" > 0`),
+    check("media_assets_width_check", sql`"width" IS NULL OR "width" > 0`),
+    check("media_assets_height_check", sql`"height" IS NULL OR "height" > 0`),
+    check("media_assets_thumb_byte_size_check", sql`"thumb_byte_size" IS NULL OR "thumb_byte_size" > 0`),
+    check("media_assets_thumb_small_byte_size_check", sql`"thumb_small_byte_size" IS NULL OR "thumb_small_byte_size" > 0`),
   ]
 );
 
@@ -57,4 +64,7 @@ export const storageSettings = pgTable("storage_settings", {
   driver: text("driver").notNull().default("r2"), // r2 | local
   localPath: text("local_path"),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  check("storage_settings_driver_check", sql`"driver" IN ('r2', 'local')`),
+]);

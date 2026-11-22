@@ -4,10 +4,12 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>StackMate Admin</title>
-    <!-- Default favicon endpoint (General Settings): serves the uploaded
-         favicon when one exists, 404s otherwise — the runtime
-         GeneralConfigApplier replaces this link when a favicon is set. -->
-    <link rel="icon" href="/api/v1/favicon" />
+    <!-- Static default favicon (audit M-20): the old /api/v1/favicon
+         link 404d on every load when no favicon was configured. The
+         runtime GeneralConfigApplier replaces this link when a favicon
+         is set in General Settings, and restores it when one is
+         removed. -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <script>
       // Theme bootstrap: apply the persisted theme choice (localStorage
       // `sm-theme`: "system" | "dark" | "light", default dark — Neon)

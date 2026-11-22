@@ -165,6 +165,7 @@ export function WebhooksSection() {
   const query = useAdminList<WebhookEndpoint>(
     "webhooks",
     "/api/v1/admin/webhooks",
+    { q: search.q, page: search.page, pageSize: search.pageSize },
   );
   const sitesQuery = useAdminList<IntegratedSite>(
     "integrated-sites",
@@ -366,6 +367,10 @@ export function WebhooksSection() {
       <ListTable<WebhookEndpoint>
         columns={columns}
         data={query.data}
+        serverSearch
+        serverPagination
+        refreshSection="webhooks"
+        total={query.total}
         search={search.q ?? ""}
         onSearchChange={(q) => setSearch({ q: q || undefined, page: 1 })}
         page={search.page ?? 1}

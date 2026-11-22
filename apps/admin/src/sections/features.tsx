@@ -22,14 +22,14 @@
  * Archive is refused with 409 while a published package version
  * references the feature (service message is surfaced verbatim).
  */
-import { useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
 import { ListChecks, Plus } from "lucide-react";
 import { FEATURE_VALUE_TYPES } from "../../../../packages/contracts/src/index.ts";
 import { ApiClientError, apiRequest } from "../lib/api-client";
-import { detailKey, queryClient } from "../lib/query";
+import { detailKey, listKey, queryClient } from "../lib/query";
 import {
   apiErrorMessage,
   DetailLayout,
@@ -350,6 +350,7 @@ function CreateFeatureDialog({
     invalidateKeys: [
       ["admin", "features", "list", productId],
       detailKey("products", productId),
+      listKey("products"),
     ],
     successTitle: "Feature created",
     onSuccess: () => onClose(),
@@ -415,6 +416,7 @@ function CreateFeatureDialog({
         queryKey: ["admin", "features", "list", productId],
       });
       void queryClient.invalidateQueries({ queryKey: detailKey("products", productId) });
+      void queryClient.invalidateQueries({ queryKey: listKey("products") });
       if (result.errors.length === 0) {
         toast({
           title: `${result.created.length} feature${result.created.length === 1 ? "" : "s"} created`,
@@ -814,6 +816,22 @@ export function FeaturesSection() {
   );
   const products = productsQuery.data ?? [];
 
+  // M-06: picker search runs server-side (?q= over products, by name
+  // or code) so a product beyond any loaded page is still found.
+  const [productSearch, setProductSearch] = useState("");
+  const productSearchQuery = useQuery({
+    queryKey: ["admin", "products", "picker-search", productSearch],
+    queryFn: async () => {
+      const res = await apiRequest<{ items: ProductListItem[] }>(
+        `/api/v1/admin/products?q=${encodeURIComponent(productSearch.trim())}`,
+      );
+      return res.items;
+    },
+    enabled: productSearch.trim().length > 0,
+  });
+  const pickerProducts =
+    productSearch.trim().length > 0 ? (productSearchQuery.data ?? []) : products;
+
   const productParam =
     typeof raw.product === "string" && raw.product.length > 0
       ? raw.product
@@ -825,13 +843,39 @@ export function FeaturesSection() {
   const productId = productParam;
   const selectedProduct = products.find((p) => p.id === productId);
 
+  const search = list.q ?? "";
+  // Server search + pagination: the product-scoped sub-endpoint
+  // reads ?q=, ?page= and ?limit= and reports data.total — the same
+  // contract as useAdminList. The query stays a custom useQuery
+  // (not useAdminList) because the product-scoped key
+  // ["admin","features","list",productId] is the invalidation key
+  // the create/archive mutations use; adding the search to the key
+  // keeps those prefix invalidations matching.
+  const [debouncedFeatureSearch, setDebouncedFeatureSearch] = useState(search);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedFeatureSearch(search), 250);
+    return () => window.clearTimeout(timer);
+  }, [search]);
   const featuresQuery = useQuery({
-    queryKey: ["admin", "features", "list", productId ?? "none"],
+    queryKey: [
+      "admin",
+      "features",
+      "list",
+      productId ?? "none",
+      debouncedFeatureSearch,
+      list.page ?? 1,
+      list.pageSize ?? 25,
+    ],
     queryFn: async () => {
-      const res = await apiRequest<{ items: FeatureDto[] }>(
-        `/api/v1/admin/products/${productId}/features`,
+      const params = new URLSearchParams({
+        limit: String(list.pageSize ?? 25),
+        page: String(list.page ?? 1),
+      });
+      if (debouncedFeatureSearch.trim()) params.set("q", debouncedFeatureSearch.trim());
+      const res = await apiRequest<{ items: FeatureDto[]; total?: number }>(
+        `/api/v1/admin/products/${productId}/features?${params}`,
       );
-      return res.items;
+      return res;
     },
     enabled: Boolean(productId),
   });
@@ -845,6 +889,7 @@ export function FeaturesSection() {
     invalidateKeys: [
       ["admin", "features", "list", productId ?? "none"],
       detailKey("products", productId ?? ""),
+      listKey("products"),
     ],
     successTitle: "Feature archived",
   });
@@ -854,8 +899,7 @@ export function FeaturesSection() {
     (STATUS_FILTERS as readonly string[]).includes(raw.status)
       ? raw.status
       : "all";
-  const search = list.q ?? "";
-  const rows = (featuresQuery.data ?? []).filter((f) =>
+  const rows = (featuresQuery.data?.items ?? []).filter((f) =>
     statusFilter === "all" ? true : f.status === statusFilter,
   );
 
@@ -1019,6 +1063,23 @@ export function FeaturesSection() {
           {/* F7 (2026-11-16): no description paragraph here — it repeated
               the header help text ("Features live under a product — pick
               one"). The (i) button beside the title already carries it. */}
+          <div style={{ marginBottom: 12 }}>
+            <Input
+              id="features-product-search"
+              name="q"
+              type="search"
+              value={productSearch}
+              onChange={(e) => setProductSearch(e.target.value)}
+              placeholder="Search products by name or code…"
+              aria-label="Search products"
+              autoComplete="off"
+            />
+            {productSearch.trim().length > 0 && productSearchQuery.isPending ? (
+              <p className="sm-hint">Searching…</p>
+            ) : productSearch.trim().length > 0 && pickerProducts.length === 0 ? (
+              <p className="sm-hint">No products match “{productSearch.trim()}”.</p>
+            ) : null}
+          </div>
           <div className="sm-table-flat">
             <table className="sm-table">
               <thead>
@@ -1031,7 +1092,7 @@ export function FeaturesSection() {
                 </tr>
               </thead>
               <tbody>
-                {products.map((p) => (
+                {pickerProducts.map((p) => (
                   <tr key={p.id}>
                     <td>{p.name}</td>
                     <td>
@@ -1062,6 +1123,11 @@ export function FeaturesSection() {
         <ListTable
           columns={columns}
           data={rows}
+          serverSearch
+          serverPagination
+          refreshSection="features"
+          filtersActive={statusFilter !== "all"}
+          total={featuresQuery.data?.total ?? 0}
           search={search}
           onSearchChange={(q) => updateSearch({ q: q || undefined, page: 1 })}
           page={list.page ?? 1}
@@ -1081,10 +1147,10 @@ export function FeaturesSection() {
           toolbar={
             <>
               {/* Searchable (PLAN §29): products are unbounded — the
-                 query runs server-side. The product picker table below
-                 still lists every product (it is a table, not a
-                 dropdown), so the full list stays loaded for it. */}
+                 query runs server-side. The picker table below is
+                 searchable server-side too (audit M-06). */}
               <SearchableSelect
+                id="features-product-picker"
                 value={productId ?? ""}
                 loadOptions={(q, signal) =>
                   loadListOptions<ProductListItem>(
@@ -1312,6 +1378,7 @@ export function FeatureDetailSection({ id }: { id: string }) {
     invalidateKeys: [
       detailKey("features", id),
       ["admin", "features", "list", productId ?? ""],
+      listKey("products"),
     ],
     successTitle: "Feature archived",
     onSuccess: () => {

@@ -59,60 +59,82 @@ describe.skipIf(!DATABASE_URL)("leads", () => {
     // Schema-level rejections (ValiError, not AppError — the 422
     // mapping happens at the route layer).
     await assert.rejects(() =>
-      ingestLead(store, site, { name: "No Contact" }),
+      ingestLead(store, site, { name: "No Contact" }, "test:leads-validation-1"),
     );
     await assert.rejects(() =>
-      ingestLead(store, site, { name: "Bad Email", email: "not-an-email" }),
+      ingestLead(store, site, { name: "Bad Email", email: "not-an-email" }, "test:leads-validation-2"),
     );
   });
 
-  it("dedupe window: same site repeats update; other sites create separately; tracking once", async () => {
+  it("dedupe window: same site repeats update; other sites create separately; every capture emits", async () => {
     const { ingestLead } = await import("../src/modules/leads/service.ts");
     const siteA = store.state.integrated_sites.find((s) => s.id === siteAId)!;
     const siteB = store.state.integrated_sites.find((s) => s.id === siteBId)!;
 
-    const first = await ingestLead(store, siteA, {
-      name: "Lead One",
-      email: "lead-one@example.com",
-      phone: "01788888888",
-      interest: "WordPress plugin",
-      utm_source: "facebook",
-      utm_campaign: "launch",
-      message: "First message.",
-    });
+    const first = await ingestLead(
+      store,
+      siteA,
+      {
+        name: "Lead One",
+        email: "lead-one@example.com",
+        phone: "01788888888",
+        interest: "WordPress plugin",
+        utm_source: "facebook",
+        utm_campaign: "launch",
+        message: "First message.",
+      },
+      "test:leads-dedupe-1",
+    );
     assert.equal(first.created, true);
     assert.match(first.lead.lead_number, /^LEAD-/);
 
     // Repeat from the SAME site within the window → update, not duplicate.
-    const repeat = await ingestLead(store, siteA, {
-      name: "Lead One",
-      email: "lead-one@example.com",
-      message: "Second message — updated.",
-    });
+    const repeat = await ingestLead(
+      store,
+      siteA,
+      {
+        name: "Lead One",
+        email: "lead-one@example.com",
+        message: "Second message — updated.",
+      },
+      "test:leads-dedupe-2",
+    );
     assert.equal(repeat.created, false);
     assert.equal(repeat.lead.id, first.lead.id);
     assert.equal(repeat.lead.message, "Second message — updated.");
 
     // Same contact from a DIFFERENT site → a separate lead.
-    const otherSite = await ingestLead(store, siteB, {
-      name: "Lead One",
-      email: "lead-one@example.com",
-      message: "From the other site.",
-    });
+    const otherSite = await ingestLead(
+      store,
+      siteB,
+      {
+        name: "Lead One",
+        email: "lead-one@example.com",
+        message: "From the other site.",
+      },
+      "test:leads-dedupe-3",
+    );
     assert.equal(otherSite.created, true);
     assert.notEqual(otherSite.lead.id, first.lead.id);
 
-    // Tracking: exactly one Lead event per created lead, queued (not
-    // claimed delivered — CAPI delivery is a known stub).
+    // Tracking (F-08): EVERY capture emits a Lead event, queued (not
+    // claimed delivered — CAPI delivery is a known stub). The first
+    // lead has two captures (create + repeat) → `lead_<id>` and
+    // `lead_<id>_c2`; the other-site lead has one.
     const leadEvents = store.state.tracking_events.filter((e) => e.event_name === "Lead");
-    assert.equal(leadEvents.length, 2);
+    assert.equal(leadEvents.length, 3);
     assert.ok(leadEvents.every((e) => e.status === "queued"));
     assert.ok(
       leadEvents.some((e) => e.event_id === `lead_${first.lead.id}` && e.integrated_site_id === siteAId),
     );
+    assert.ok(
+      leadEvents.some(
+        (e) => e.event_id === `lead_${first.lead.id}_c2` && e.integrated_site_id === siteAId,
+      ),
+    );
     assert.equal(
       store.state.outbox_events.filter((e) => e.event_type === "tracking.meta_capi.dispatch").length,
-      2,
+      3,
     );
   });
 

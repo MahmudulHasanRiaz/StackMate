@@ -143,7 +143,7 @@
  *   node-postgres as Date and are converted with toISOString() (UTC).
  *   payment_date is a date-only YYYY-MM-DD string, never a timestamp.
  */
-import { createPrivateKey, createPublicKey, randomUUID } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, randomUUID } from "node:crypto";
 import { Client } from "pg";
 import { drizzle } from "drizzle-orm/node-postgres";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
@@ -185,6 +185,7 @@ import {
   type PaymentMethodRecord,
   type PaymentProviderRecord,
   type PaymentSubmissionRecord,
+  type PaymentRefundRecord,
   type PaymentTransactionRecord,
   type PaymentVerificationLogRecord,
   type ProductFeatureRecord,
@@ -516,6 +517,7 @@ interface StoreCapabilities {
   sequenceCounters: boolean;
   usersPasswordHash: boolean;
   usersTwoFactorEnabled: boolean;
+  usersAvatarUrl: boolean;
   authEmailTables: boolean;
   productsDefaults: boolean;
   packagesCurrentVersion: boolean;
@@ -533,6 +535,7 @@ const NO_MIGRATION_0002: StoreCapabilities = {
   sequenceCounters: false,
   usersPasswordHash: false,
   usersTwoFactorEnabled: false,
+  usersAvatarUrl: false,
   authEmailTables: false,
   productsDefaults: false,
   packagesCurrentVersion: false,
@@ -588,6 +591,7 @@ const REQUIRED_TABLES: readonly string[] = [
   "payment_providers",
   "payment_methods",
   "payment_method_transfer_rails",
+  "payment_refunds",
   "payment_submissions",
   "payment_transactions",
   "payment_verification_logs",
@@ -637,6 +641,79 @@ const REQUIRED_TABLES: readonly string[] = [
 const capabilitiesByConnectionString = new Map<string, StoreCapabilities>();
 const requiredTablesVerified = new Set<string>();
 
+/**
+ * M-16: per-isolate signing-key cache. resolveSigningKey's
+ * advisory-locked transaction costs 5 round-trips (BEGIN + lock +
+ * 2 SELECTs + COMMIT) on EVERY store creation — i.e. every request.
+ * The keys are durable rows, so the decrypted material is cached per
+ * (connection string, encryption secret, signing key id, env-JWK
+ * hash) for 60s. FIXED 2026-11-20: a bare TTL cache masked table
+ * mutations — a boot after a TRUNCATE returned stale keys, and a
+ * corrupt row never failed closed (it broke signing-keys (e)/(f)
+ * and poisoned the shared test DB when (f) minted a key under the
+ * wrong secret into the empty table). The cache is therefore
+ * validated on every hit against a one-query fingerprint (key ids +
+ * statuses + ciphertext hashes); any change falls through to the
+ * full reload, which decrypts and fails closed. Rotation/revocation
+ * clear the whole cache; a rotation by ANOTHER isolate/process is
+ * caught by the fingerprint on the next create (worst case the old
+ * key signs until the next create — retired keys still verify, so
+ * tokens stay valid). Bootstrap (no active row) never populates the
+ * cache. The key is a hash, so no secret material lands in the
+ * cache key itself.
+ */
+const SIGNING_KEY_CACHE_TTL_MS = 60_000;
+type CachedSigningKeys = {
+  keys: Map<string, Ed25519KeyMaterial>;
+  activeKeyId: string;
+  cachedAtMs: number;
+  fingerprint: string;
+};
+const signingKeyCache = new Map<string, CachedSigningKeys>();
+
+function signingKeyCacheKey(
+  connectionString: string,
+  secret: string,
+  signingKeyId = "",
+  signingPrivateJwkHash = "",
+): string {
+  return createHash("sha256")
+    .update(connectionString)
+    .update("\0")
+    .update(secret)
+    .update("\0")
+    .update(signingKeyId)
+    .update("\0")
+    .update(signingPrivateJwkHash)
+    .digest("hex");
+}
+
+/**
+ * Fingerprint of the non-revoked signing_keys rows (key id + status +
+ * md5 of the ciphertext), in key-id order. The cache-hit path
+ * recomputes the same string in SQL (md5() over the same bytes), so
+ * the two must stay in sync: any row added/removed/changed — or any
+ * ciphertext byte changed — produces a different fingerprint.
+ */
+function fingerprintSigningKeyRows(rows: Array<Record<string, unknown>>): string {
+  const sorted = [...rows].sort((a, b) =>
+    String(a.key_id ?? "").localeCompare(String(b.key_id ?? "")),
+  );
+  return sorted
+    .map(
+      (r) =>
+        `${String(r.key_id ?? "")}:${String(r.status ?? "")}:${createHash("md5").update(String(r.encrypted_private_jwk ?? ""), "utf8").digest("hex")}`,
+    )
+    .join("|");
+}
+
+/**
+ * C-1: warned once when the DB-backed rate-limit table is missing,
+ * so the in-memory fallback (and the migration still owed) is visible
+ * in the logs instead of silent.
+ */
+let rateLimitTableMissingWarned = false;
+
 async function detectCapabilitiesCached(
   connectionString: string,
   client: Client
@@ -666,6 +743,7 @@ async function detectCapabilities(client: Client): Promise<StoreCapabilities> {
         AND ((table_name = 'sequence_counters')
           OR (table_name = 'users' AND column_name = 'password_hash')
           OR (table_name = 'users' AND column_name = 'two_factor_enabled')
+          OR (table_name = 'users' AND column_name = 'avatar_url')
           OR (table_name IN ('two_factor', 'auth_oauth_providers', 'auth_two_factor_policy', 'smtp_settings', 'password_reset_tokens'))
           OR (table_name = 'products' AND column_name IN ('default_activation_limit', 'offline_grace_hours'))
           OR (table_name = 'product_packages' AND column_name = 'current_version_id')
@@ -688,6 +766,9 @@ async function detectCapabilities(client: Client): Promise<StoreCapabilities> {
     sequenceCounters: present.has("sequence_counters.counter_key"),
     usersPasswordHash: present.has("users.password_hash"),
     usersTwoFactorEnabled: present.has("users.two_factor_enabled"),
+    // M-23: custom avatar (migration 0014). Until the column exists
+    // the store behaves as if no user has a custom avatar (null).
+    usersAvatarUrl: present.has("users.avatar_url"),
     // The auth-email tables are detected as a group: the combined load
     // only selects auth_two_factor_policy when ALL of them exist
     // (migration 0007 creates them together).
@@ -917,6 +998,24 @@ export class DrizzleStore extends StackMateDataStore {
   }
 
   /**
+   * One-query fingerprint of the non-revoked signing_keys rows — the
+   * same string fingerprintSigningKeyRows computes in TS from loaded
+   * rows. Used to validate a warm-cache hit: only an exact match may
+   * trust the cached material.
+   */
+  private async signingKeysFingerprint(client: Client): Promise<string> {
+    const rows = await queryRows(
+      client,
+      `SELECT key_id, status, md5(COALESCE(encrypted_private_jwk, '')) AS ct_hash
+         FROM signing_keys WHERE status <> 'revoked'
+        ORDER BY key_id ASC`,
+    );
+    return rows
+      .map((r) => `${str(r, "key_id")}:${str(r, "status")}:${str(r, "ct_hash")}`)
+      .join("|");
+  }
+
+  /**
    * Durably resolve the signing keys (header note 4).
    *
    * Source of truth is the signing_keys table, never process memory:
@@ -947,6 +1046,36 @@ export class DrizzleStore extends StackMateDataStore {
       );
     }
     const client = this.pgClient;
+    // M-16: warm-cache fast path — skip the 5-round-trip transaction.
+    // The cache key binds the signing opts (key id + env-JWK hash), so
+    // a boot with different import opts never gets a stale hit.
+    const cacheKey = signingKeyCacheKey(
+      opts.connectionString,
+      secret,
+      opts.signingKeyId?.trim() ?? "",
+      opts.signingPrivateJwk
+        ? createHash("sha256").update(opts.signingPrivateJwk).digest("hex")
+        : "",
+    );
+    const cached = signingKeyCache.get(cacheKey);
+    if (cached && Date.now() - cached.cachedAtMs < SIGNING_KEY_CACHE_TTL_MS) {
+      // FIXED 2026-11-20: a bare TTL cache masked table mutations —
+      // a boot after a TRUNCATE returned the old keys (signing-keys
+      // (e) could never win the empty table), and a corrupt row never
+      // failed closed (signing-keys (f) part 2). Validate the entry
+      // against a one-query fingerprint (key ids + statuses +
+      // ciphertext hashes) before trusting it; any change falls
+      // through to the full reload below, which decrypts and fails
+      // closed on a corrupt/undecryptable row.
+      const fingerprint = await this.signingKeysFingerprint(client);
+      if (fingerprint === cached.fingerprint) {
+        this.signingKeys.clear();
+        for (const [keyId, material] of cached.keys) this.signingKeys.set(keyId, material);
+        this.activeSigningKeyId = cached.activeKeyId;
+        this.signingKeysDurable = true;
+        return;
+      }
+    }
     await client.query("BEGIN");
     try {
       await client.query("SELECT pg_advisory_xact_lock($1)", [WRITER_ADVISORY_LOCK_KEY]);
@@ -989,6 +1118,16 @@ export class DrizzleStore extends StackMateDataStore {
       for (const [keyId, material] of loaded) this.signingKeys.set(keyId, material);
       this.activeSigningKeyId = activeKeyId;
       this.signingKeysDurable = true;
+      // M-16: populate the warm cache for the next create() on this
+      // isolate (same connection string + secret). The fingerprint is
+      // computed from the rows just loaded, so the next hit can prove
+      // the table has not changed since (see fingerprintSigningKeyRows).
+      signingKeyCache.set(cacheKey, {
+        keys: new Map(loaded),
+        activeKeyId,
+        cachedAtMs: Date.now(),
+        fingerprint: fingerprintSigningKeyRows(rows),
+      });
     } catch (error) {
       await client.query("ROLLBACK").catch(() => {});
       throw error;
@@ -1308,6 +1447,8 @@ export class DrizzleStore extends StackMateDataStore {
       }
       this.signingKeys.set(nextKeyId, material);
       this.activeSigningKeyId = nextKeyId;
+      // M-16: the cached key set is stale after a rotation.
+      signingKeyCache.clear();
       return material;
     } finally {
       release();
@@ -1371,8 +1512,93 @@ export class DrizzleStore extends StackMateDataStore {
         throw error;
       }
       this.signingKeys.delete(keyId);
+      // M-16: the cached key set is stale after a revocation.
+      signingKeyCache.clear();
     } finally {
       release();
+    }
+  }
+
+  /**
+   * C-1: DB-backed rate limiting (table `rate_limit_buckets`,
+   * migration 0016 — the DB agent's part). One atomic upsert: the
+   * count increments and the window resets iff expired, so concurrent
+   * requests cannot both slip under the limit. Until migration 0016
+   * lands the table is missing (42P01) — fall back to the in-memory
+   * Map (best-effort, same as the pre-fix behaviour) so auth never
+   * 500s on a missing table; warn once so the gap is visible.
+   */
+  public override async checkRateLimit(
+    bucketKey: string,
+    maxRequests: number,
+    windowMs = 60_000
+  ): Promise<void> {
+    this.assertOpen();
+    try {
+      const res = await this.pgClient.query(
+        `INSERT INTO rate_limit_buckets ("key", "count", "reset_at")
+           VALUES ($1, 1, NOW() + ($2 * INTERVAL '1 millisecond'))
+           ON CONFLICT ("key") DO UPDATE SET
+             "count" = CASE WHEN rate_limit_buckets."reset_at" <= NOW() THEN 1 ELSE rate_limit_buckets."count" + 1 END,
+             "reset_at" = CASE WHEN rate_limit_buckets."reset_at" <= NOW() THEN NOW() + ($2 * INTERVAL '1 millisecond') ELSE rate_limit_buckets."reset_at" END
+           RETURNING "count"`,
+        [bucketKey, windowMs]
+      );
+      const count = (res.rows[0] as { count: number } | undefined)?.count ?? 1;
+      if (count > maxRequests) {
+        throw new AppError(
+          "RATE_LIMIT_EXCEEDED",
+          "Too many requests. Please retry after the rate-limit window resets.",
+          429
+        );
+      }
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      if ((error as { code?: string })?.code === "42P01") {
+        if (!rateLimitTableMissingWarned) {
+          rateLimitTableMissingWarned = true;
+          console.warn(
+            "[stackmate] rate_limit_buckets table is missing (migration 0016 not applied) — rate limiting falls back to the per-isolate in-memory map until it lands."
+          );
+        }
+        return super.checkRateLimit(bucketKey, maxRequests, windowMs);
+      }
+      throw error;
+    }
+  }
+
+  public override async resetRateLimit(bucketKey: string): Promise<void> {
+    this.assertOpen();
+    try {
+      await this.pgClient.query(`DELETE FROM rate_limit_buckets WHERE "key" = $1`, [bucketKey]);
+    } catch (error) {
+      if ((error as { code?: string })?.code === "42P01") {
+        return super.resetRateLimit(bucketKey);
+      }
+      throw error;
+    }
+  }
+
+  public override async isRateLimited(
+    bucketKey: string,
+    maxRequests: number,
+    windowMs = 60_000
+  ): Promise<boolean> {
+    this.assertOpen();
+    try {
+      const res = await this.pgClient.query(
+        `SELECT "count", "reset_at" FROM rate_limit_buckets WHERE "key" = $1`,
+        [bucketKey]
+      );
+      const row = res.rows[0] as { count: number; reset_at: Date } | undefined;
+      if (!row) return false;
+      if (new Date(row.reset_at).getTime() <= Date.now()) return false;
+      return Number(row.count) >= maxRequests;
+    } catch (error) {
+      if ((error as { code?: string })?.code === "42P01") {
+        return super.isRateLimited(bucketKey, maxRequests, windowMs);
+      }
+      throw error;
     }
   }
 
@@ -1583,6 +1809,7 @@ function buildLoadStateQuery(caps: StoreCapabilities): string {
             sp.status AS staff_status
             ${caps.usersPasswordHash ? ", u.password_hash" : ""}
             ${caps.usersTwoFactorEnabled ? ", u.two_factor_enabled" : ""}
+            ${caps.usersAvatarUrl ? ", u.avatar_url" : ""}
        FROM users u
        LEFT JOIN staff_profiles sp ON sp.user_id = u.id` },
     { key: "sessions", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, token, user_id, ip_address, user_agent, expires_at, created_at
@@ -1728,6 +1955,10 @@ function buildLoadStateQuery(caps: StoreCapabilities): string {
     { key: "verificationLogs", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, payment_submission_id, actor_user_id, decision, reason_code,
             customer_message, notes, created_at
        FROM payment_verification_logs` },
+    { key: "refunds", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, payment_transaction_id, amount_minor, currency_code, status,
+            reason, provider_refund_id, requested_by_user_id, processed_by_user_id,
+            created_at, updated_at
+       FROM payment_refunds` },
     { key: "licenseSnapshotItems", orderBy: "t.snapshot_id, t.feature_key_snapshot", sql: `SELECT id, snapshot_id, feature_key_snapshot, value_type_snapshot,
             entitlement_value, unit_snapshot
        FROM license_entitlement_snapshot_items` },
@@ -1852,6 +2083,9 @@ async function loadStateInternalImpl(
     // use staff password sign-in; verifyPasswordScrypt fails closed on "".
     password_hash: caps.usersPasswordHash ? (str(row, "password_hash") ?? "") : "",
     two_factor_enabled: bool(row, "two_factor_enabled"),
+    // M-23: custom avatar R2 object key (migration 0014); null =
+    // Gravatar/initials. Missing column (pre-0014 DB) reads as null.
+    avatar_url: caps.usersAvatarUrl ? (str(row, "avatar_url") ?? null) : null,
     status: asEnum(str(row, "staff_status"), ["active", "suspended"] as const, "active"),
     created_at: reqIso(row, "created_at", "users"),
     updated_at: reqIso(row, "updated_at", "users"),
@@ -2709,6 +2943,26 @@ async function loadStateInternalImpl(
       created_at: reqIso(row, "created_at", "payment_verification_logs"),
     }));
 
+  // -- Manual refunds (F-03) --------------------------------------------------
+  const refundRows = loadRows(combined, "refunds");
+  const payment_refunds: PaymentRefundRecord[] = refundRows.map((row) => ({
+    id: reqStr(row, "id", "payment_refunds"),
+    payment_transaction_id: reqStr(row, "payment_transaction_id", "payment_refunds"),
+    amount_minor: reqNum(row, "amount_minor", "payment_refunds"),
+    currency_code: reqStr(row, "currency_code", "payment_refunds"),
+    status: asEnum(
+      str(row, "status"),
+      ["requested", "pending", "succeeded", "failed", "cancelled"] as const,
+      "requested"
+    ),
+    reason: reqStr(row, "reason", "payment_refunds"),
+    provider_refund_id: str(row, "provider_refund_id"),
+    requested_by_user_id: str(row, "requested_by_user_id"),
+    processed_by_user_id: str(row, "processed_by_user_id"),
+    created_at: reqIso(row, "created_at", "payment_refunds"),
+    updated_at: reqIso(row, "updated_at", "payment_refunds"),
+  }));
+
   // -- Licenses (snapshots + items + activations) -----------------------------
   const licenseSnapshotItemRows = loadRows(combined, "licenseSnapshotItems");
   const licenseSnapshotItemsBySnapshot = groupBy(licenseSnapshotItemRows, (r) =>
@@ -2848,7 +3102,9 @@ async function loadStateInternalImpl(
     sanitized_payload: asJsonObject(row, "sanitized_payload"),
     status: asEnum(
       str(row, "status"),
-      ["received", "queued", "processed", "rejected"] as const,
+      // C-2/D-6: "simulated" must survive the load — without it a
+      // simulated event would silently reload as "received".
+      ["received", "queued", "processed", "rejected", "simulated"] as const,
       "received"
     ),
     delivery_attempts: caps.trackingEventsDelivery
@@ -2903,7 +3159,8 @@ async function loadStateInternalImpl(
     delivery_id: reqStr(row, "delivery_id", "webhook_deliveries"),
     status: asEnum(
       str(row, "status"),
-      ["pending", "delivered", "retrying", "failed"] as const,
+      // C-2/D-6: "simulated" must survive the load.
+      ["pending", "delivered", "retrying", "failed", "simulated"] as const,
       "pending"
     ),
     attempt_count: reqNum(row, "attempt_count", "webhook_deliveries"),
@@ -2921,7 +3178,10 @@ async function loadStateInternalImpl(
     payload: asJsonObject(row, "payload"),
     status: asEnum(
       str(row, "status"),
-      ["pending", "processing", "delivered", "dead_letter"] as const,
+      // C-2/D-6: "simulated" must survive the load — without it a
+      // simulated outbox row would silently reload as "pending"
+      // and the next cron would try to deliver it for real.
+      ["pending", "processing", "delivered", "dead_letter", "simulated"] as const,
       "pending"
     ),
     attempt_count: reqNum(row, "attempt_count", "outbox_events"),
@@ -3161,6 +3421,7 @@ async function loadStateInternalImpl(
     payment_submissions,
     payment_transactions,
     payment_verification_logs,
+    payment_refunds,
     subscriptions,
     licenses,
     license_events,
@@ -3413,6 +3674,10 @@ async function persistStateDiff(
         cols.push("password_hash");
         vals.push(r.password_hash);
       }
+      if (caps.usersAvatarUrl) {
+        cols.push("avatar_url");
+        vals.push(r.avatar_url ?? null);
+      }
       await ins("users", cols, vals);
     },
     update: async (c, _b, r) => {
@@ -3421,6 +3686,10 @@ async function persistStateDiff(
       if (caps.usersPasswordHash) {
         cols.push("password_hash");
         vals.push(r.password_hash);
+      }
+      if (caps.usersAvatarUrl) {
+        cols.push("avatar_url");
+        vals.push(r.avatar_url ?? null);
       }
       await upd("users", cols, [...vals, r.id], idWhere(cols.length + 1), false);
     },
@@ -5827,6 +6096,80 @@ async function persistStateDiff(
     remove: immutableStub(),
   };
 
+  // F-03: refunds are MUTABLE (status requested -> pending ->
+  // succeeded/failed/cancelled, processed_by_user_id set on
+  // processing), so a full insert/update/remove spec — unlike the
+  // immutable verification logs above.
+  const refundSpec: SyncSpec<PaymentRefundRecord> = {
+    keyOf: (r) => r.id,
+    scalarOf: (r) => r,
+    insert: async (c, r) => {
+      await ins(
+        "payment_refunds",
+        [
+          "id",
+          "payment_transaction_id",
+          "amount_minor",
+          "currency_code",
+          "status",
+          "reason",
+          "provider_refund_id",
+          "requested_by_user_id",
+          "processed_by_user_id",
+          "created_at",
+          "updated_at",
+        ],
+        [
+          r.id,
+          r.payment_transaction_id,
+          r.amount_minor,
+          r.currency_code,
+          r.status,
+          r.reason,
+          r.provider_refund_id,
+          r.requested_by_user_id,
+          r.processed_by_user_id,
+          r.created_at,
+          r.updated_at,
+        ]
+      );
+    },
+    update: async (c, _b, r) => {
+      const cols = [
+        "payment_transaction_id",
+        "amount_minor",
+        "currency_code",
+        "status",
+        "reason",
+        "provider_refund_id",
+        "requested_by_user_id",
+        "processed_by_user_id",
+        "updated_at",
+      ];
+      await upd(
+        "payment_refunds",
+        cols,
+        [
+          r.payment_transaction_id,
+          r.amount_minor,
+          r.currency_code,
+          r.status,
+          r.reason,
+          r.provider_refund_id,
+          r.requested_by_user_id,
+          r.processed_by_user_id,
+          r.updated_at,
+          r.id,
+        ],
+        idWhere(cols.length + 1),
+        true
+      );
+    },
+    remove: async (c, r) => {
+      await del("payment_refunds", idWhere(1), [r.id]);
+    },
+  };
+
   const licenseSpec: SyncSpec<LicenseRecord> = {
     keyOf: (r) => r.id,
     scalarOf: (r) => ({ ...r, snapshots: [], activations: [] }),
@@ -6615,6 +6958,7 @@ async function persistStateDiff(
   await syncDeletes(client, before.audit_logs, after.audit_logs, auditLogSpec, "audit_logs");
   await syncDeletes(client, before.sent_reminders, after.sent_reminders, sentReminderSpec, "sent_reminders");
   await syncDeletes(client, before.payment_verification_logs, after.payment_verification_logs, verificationLogSpec, "payment_verification_logs");
+  await syncDeletes(client, before.payment_refunds, after.payment_refunds, refundSpec, "payment_refunds");
   await syncDeletes(client, fb.licenseSnapshotItems, fa.licenseSnapshotItems, licenseSnapshotItemSpec, "license_entitlement_snapshot_items");
   await syncDeletes(client, fb.licenseSnapshots, fa.licenseSnapshots, licenseSnapshotSpec, "license_entitlement_snapshots");
   await syncDeletes(client, fb.licenseActivations, fa.licenseActivations, licenseActivationSpec, "license_activations");
@@ -6702,6 +7046,7 @@ async function persistStateDiff(
   await syncUpserts(client, before.payment_submissions, after.payment_submissions, submissionSpec, "payment_submissions");
   await syncUpserts(client, before.payment_transactions, after.payment_transactions, transactionSpec, "payment_transactions");
   await syncUpserts(client, before.payment_verification_logs, after.payment_verification_logs, verificationLogSpec, "payment_verification_logs");
+  await syncUpserts(client, before.payment_refunds, after.payment_refunds, refundSpec, "payment_refunds");
   await syncUpserts(client, before.licenses, after.licenses, licenseSpec, "licenses");
   await syncUpserts(client, fb.licenseSnapshots, fa.licenseSnapshots, licenseSnapshotSpec, "license_entitlement_snapshots");
   await syncUpserts(client, fb.licenseSnapshotItems, fa.licenseSnapshotItems, licenseSnapshotItemSpec, "license_entitlement_snapshot_items");

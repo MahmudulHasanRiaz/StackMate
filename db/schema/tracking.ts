@@ -9,6 +9,7 @@ import {
   timestamp,
   unique,
   index,
+  check,
 } from "drizzle-orm/pg-core";
 import { integratedSites } from "./integrations.ts";
 import { orders } from "./orders.ts";
@@ -44,6 +45,7 @@ export const trackingConfigurations = pgTable(
       table.provider,
       table.pixelId
     ),
+    check("tracking_configurations_status_check", sql`"status" IN ('enabled', 'disabled')`),
   ]
 );
 
@@ -62,7 +64,7 @@ export const trackingEvents = pgTable(
     consentState: text("consent_state").notNull(),
     consentPolicyVersion: varchar("consent_policy_version", { length: 40 }).notNull(),
     sanitizedPayload: jsonb("sanitized_payload").notNull().default({}),
-    status: text("status").notNull().default("received"), // received | queued | processed | rejected
+    status: text("status").notNull().default("received"), // received | queued | processed | rejected | simulated (migration 0015, audit C-2/D-6)
     // Added by migration 0002: the store's TrackingEventRecord carries a
     // delivery counter + timestamp (updated by the outbox dispatcher);
     // previously no columns (tracking_deliveries holds per-attempt rows).
@@ -73,6 +75,8 @@ export const trackingEvents = pgTable(
   (table) => [
     unique("uq_tracking_events_dedup").on(table.integratedSiteId, table.eventName, table.eventId),
     index("idx_tracking_events_order_id").on(table.orderId).where(sql`"order_id" IS NOT NULL`),
+    check("tracking_events_status_check", sql`"status" IN ('received', 'queued', 'processed', 'rejected', 'simulated')`),
+    check("tracking_events_delivery_attempts_check", sql`"delivery_attempts" >= 0`),
   ]
 );
 
@@ -90,7 +94,10 @@ export const trackingDeliveries = pgTable("tracking_deliveries", {
   deliveredAt: timestamp("delivered_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  check("tracking_deliveries_status_check", sql`"status" IN ('pending', 'delivered', 'retrying', 'failed', 'skipped')`),
+]);
 
 export const orderAttributions = pgTable("order_attributions", {
   id: uuid("id").primaryKey(),

@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { pgTable, uuid, varchar, text, timestamp, index } from "drizzle-orm/pg-core";
+import { pgTable, uuid, varchar, text, timestamp, index, check } from "drizzle-orm/pg-core";
 import { customers } from "./customers.ts";
 import { integratedSites } from "./integrations.ts";
 import { products } from "./catalog.ts";
@@ -59,5 +59,8 @@ export const leads = pgTable(
     index("idx_leads_normalized_phone").on(table.normalizedPhone).where(sql`"normalized_phone" IS NOT NULL`),
     index("idx_leads_status_created").on(table.status, table.createdAt.desc()),
     index("idx_leads_source_site_created").on(table.sourceSiteId, table.createdAt.desc()),
+    // CHECK declared in Drizzle (migration 0014 / audit F-11) so
+    // drizzle-kit generate reproduces it; previously SQL-only.
+    check("leads_status_check", sql`"status" IN ('new', 'contacted', 'qualified', 'converted', 'lost')`),
   ]
 );

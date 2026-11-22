@@ -33,7 +33,7 @@
  *   LICENSE_EXPIRED throw, so the transaction rolls it back. The test
  *   asserts the 403 AND documents the surviving DB status.
  */
-import { describe, it, beforeAll, afterAll } from "vitest";
+import { describe, it, beforeAll, afterAll, vi } from "vitest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -1403,11 +1403,36 @@ describe.skipIf(!DATABASE_URL)("Business workflows (Postgres)", () => {
     assert.equal(epRow.url, "https://hooks.example.com/stackmate");
     assert.equal(epRow.status, "active");
 
-    // Dispatch the outbox batch (simulated transport returns 200 in test env).
-    const dispatch = await apiRequest("/api/v1/admin/outbox/dispatch", {
-      method: "POST",
-      cookie: superCookie,
-    });
+    // Dispatch the outbox batch with the REAL transport (C-2): the
+    // endpoint is a fake hostname, so stub the outbound fetch (DoH +
+    // target) to a public IP / 200 — the same pattern as
+    // audit-fix-api-domain-webhooks.test.ts. Without the stub the
+    // sandbox DNS sinkhole makes the delivery fail and the row stays
+    // pending; the stub proves a 2xx delivery records "delivered".
+    // Restored right after the dispatch: test 26 needs the REAL
+    // (failing) fetch for its unreachable endpoint.
+    vi.stubGlobal(
+      "fetch",
+      async (url: string | URL, _init?: RequestInit): Promise<Response> => {
+        const href = url instanceof Request ? url.url : String(url);
+        if (href.startsWith("https://cloudflare-dns.com/dns-query")) {
+          return new Response(
+            JSON.stringify({ Answer: [{ data: "93.184.216.34", type: 1 }] }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response("ok", { status: 200 });
+      },
+    );
+    let dispatch: Awaited<ReturnType<typeof apiRequest>>;
+    try {
+      dispatch = await apiRequest("/api/v1/admin/outbox/dispatch", {
+        method: "POST",
+        cookie: superCookie,
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
     assert.equal(dispatch.status, 200, JSON.stringify(dispatch.body));
     assert.ok(dispatch.body.data.claimed > 0, "dispatch must claim pending events");
     assert.ok(dispatch.body.data.delivered > 0, "dispatch must deliver events");
@@ -1441,14 +1466,16 @@ describe.skipIf(!DATABASE_URL)("Business workflows (Postgres)", () => {
     assert.equal(purchase.consent_policy_version, "server-verified-v1");
     assert.equal(purchase.sanitized_payload.currency, "BDT");
     assert.equal(purchase.sanitized_payload.value_minor, 499900);
-    // The outbox dispatch (test 18) marked the Meta event processed.
-    assert.equal(purchase.status, "processed");
-    assert.ok(purchase.delivered_at !== null);
+    // The outbox dispatch (test 18) marked the Meta event simulated
+    // (C-2/D-6: CAPI is a known stub — no delivery attempt, no
+    // delivered_at; real CAPI is a future batch).
+    assert.equal(purchase.status, "simulated");
+    assert.equal(purchase.delivered_at, null);
     const metaOutbox = await one(
       "SELECT * FROM outbox_events WHERE event_type = $1 AND payload->>'order_reference' = $2",
       ["tracking.meta_capi.dispatch", publicReference]
     );
-    assert.equal(metaOutbox.status, "delivered");
+    assert.equal(metaOutbox.status, "simulated");
     // The renewal order was admin-sourced (no site), so it produced no second Purchase.
     assert.equal(
       await countWhere("tracking_events", "event_name = $1", ["Purchase"]),
@@ -1915,12 +1942,19 @@ describe.skipIf(!DATABASE_URL)("Business workflows (Postgres)", () => {
     assert.ok(
       newDomain.verification_challenge.startsWith("stackmate-site-verification=")
     );
-    // Automated verification is not implemented yet -> 409.
+    // Automated dns_txt verification is REAL now (H-6, via DoH): a
+    // domain with no TXT record fails with 422 — it is never
+    // auto-verified. (The old 409 "not implemented" is gone.)
     const autoVerify = await apiRequest(
       `/api/v1/admin/integrated-sites/${siteId}/domains/${newDomain.id}/verify`,
       { method: "POST", cookie: superCookie, body: { method: "dns_txt" } }
     );
-    assert.equal(autoVerify.status, 409, JSON.stringify(autoVerify.body));
+    assert.equal(autoVerify.status, 422, JSON.stringify(autoVerify.body));
+    assert.equal(autoVerify.body.error.code, "VALIDATION_ERROR");
+    assert.ok(
+      String(autoVerify.body.error.message).includes("DNS TXT verification failed"),
+      JSON.stringify(autoVerify.body),
+    );
     // Manual review with a note verifies it.
     const manual = await apiRequest(
       `/api/v1/admin/integrated-sites/${siteId}/domains/${newDomain.id}/verify`,

@@ -1,4 +1,5 @@
-import { pgTable, uuid, varchar, text, jsonb, timestamp, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { pgTable, uuid, varchar, text, jsonb, timestamp, index, check } from "drizzle-orm/pg-core";
 import { users } from "./auth.ts";
 import { integratedSites } from "./integrations.ts";
 
@@ -24,5 +25,7 @@ export const auditLogs = pgTable(
     index("idx_audit_logs_resource").on(table.resourceType, table.resourceId, table.createdAt.desc()),
     index("idx_audit_logs_actor").on(table.actorUserId, table.createdAt.desc()),
     index("idx_audit_logs_action").on(table.action, table.createdAt.desc()),
+    check("audit_logs_actor_type_check", sql`"actor_type" IN ('staff', 'system', 'integration')`),
+    check("audit_logs_outcome_check", sql`"outcome" IN ('success', 'denied', 'failed')`),
   ]
 );

@@ -9,6 +9,7 @@ import {
   timestamp,
   unique,
   index,
+  check,
 } from "drizzle-orm/pg-core";
 import { users } from "./auth.ts";
 import { customers } from "./customers.ts";
@@ -25,7 +26,10 @@ export const signingKeyMetadata = pgTable("signing_key_metadata", {
   activatedAt: timestamp("activated_at", { withTimezone: true }).notNull().defaultNow(),
   retiredAt: timestamp("retired_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  check("signing_key_metadata_status_check", sql`"status" IN ('active', 'retiring', 'retired', 'revoked')`),
+]);
 
 export const licenses = pgTable(
   "licenses",
@@ -60,6 +64,16 @@ export const licenses = pgTable(
     validFrom: timestamp("valid_from", { withTimezone: true }).notNull(),
     expiresAt: timestamp("expires_at", { withTimezone: true }),
     graceUntil: timestamp("grace_until", { withTimezone: true }),
+    // NOTE (migration 0014, audit F-14): the FK to
+    // license_entitlement_snapshots lives ONLY in migration 0014 SQL
+    // (licenses_current_entitlement_snapshot_id_fkey, ON DELETE SET
+    // NULL). It is NOT declared here with .references():
+    // licenses and licenseEntitlementSnapshots reference each other,
+    // and a column-level .references() closure makes TypeScript's
+    // inference circular (TS7022/TS7024) — same SQL-only precedent as
+    // productPackages.current_version_id (entitlements.ts),
+    // signingKeys.supersedes_key_id, and leads.converted_order_id.
+    // See also the SQL-only CHECKs/triggers note in db/schema/README.md.
     currentEntitlementSnapshotId: uuid("current_entitlement_snapshot_id"),
     issuedAt: timestamp("issued_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -69,6 +83,8 @@ export const licenses = pgTable(
     index("idx_licenses_customer_created").on(table.customerId, table.createdAt.desc()),
     index("idx_licenses_product_status_expires").on(table.productId, table.status, table.expiresAt),
     index("idx_licenses_subscription_id").on(table.subscriptionId).where(sql`"subscription_id" IS NOT NULL`),
+    check("licenses_status_check", sql`"status" IN ('pending', 'active', 'expired', 'suspended', 'revoked')`),
+    check("licenses_activation_limit_check", sql`"activation_limit" >= 1`),
   ]
 );
 
@@ -98,6 +114,8 @@ export const licenseEntitlementSnapshots = pgTable(
   },
   (table) => [
     unique("uq_license_entitlement_snapshot_ver").on(table.licenseId, table.versionNumber),
+    check("license_entitlement_snapshots_source_type_check", sql`"source_type" IN ('order_item', 'subscription_period', 'manual_grant', 'admin_adjustment')`),
+    check("license_entitlement_snapshots_version_number_check", sql`"version_number" >= 1`),
   ]
 );
 
@@ -140,6 +158,8 @@ export const licenseActivations = pgTable(
   (table) => [
     unique("uq_license_activations_installation").on(table.licenseId, table.installationIdHash),
     index("idx_license_activations_license_status").on(table.licenseId, table.status),
+    check("license_activations_environment_check", sql`"environment" IN ('production', 'staging', 'development', 'other')`),
+    check("license_activations_status_check", sql`"status" IN ('active', 'deactivated', 'blocked')`),
   ]
 );
 
@@ -156,7 +176,10 @@ export const licenseEvents = pgTable("license_events", {
   }),
   metadata: jsonb("metadata").notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  check("license_events_actor_type_check", sql`"actor_type" IN ('system', 'staff', 'client')`),
+]);
 
 export const licenseValidationLogs = pgTable("license_validation_logs", {
   id: uuid("id").primaryKey(),
@@ -172,4 +195,7 @@ export const licenseValidationLogs = pgTable("license_validation_logs", {
   errorCode: varchar("error_code", { length: 80 }),
   requestId: varchar("request_id", { length: 100 }).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  check("license_validation_logs_outcome_check", sql`"outcome" IN ('valid', 'rejected')`),
+]);

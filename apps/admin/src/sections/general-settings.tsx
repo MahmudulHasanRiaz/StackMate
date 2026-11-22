@@ -203,8 +203,10 @@ function GeneralSettingsForm({ initial }: { initial: GeneralSettingsView }) {
       />
       {formError ? <Alert variant="danger">{formError}</Alert> : null}
       <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 640 }}>
-        <Field label="App name" hint="Sidebar and topbar brand. Shown when no tab title is set.">
+        <Field label="App name" htmlFor="general-app-name" hint="Sidebar and topbar brand. Shown when no tab title is set.">
           <Input
+            id="general-app-name"
+            name="app_name"
             value={appName}
             onChange={(e) => setAppName(e.target.value)}
             maxLength={120}
@@ -212,8 +214,10 @@ function GeneralSettingsForm({ initial }: { initial: GeneralSettingsView }) {
             autoComplete="off"
           />
         </Field>
-        <Field label="App title" hint="The browser tab title.">
+        <Field label="App title" htmlFor="general-app-title" hint="The browser tab title.">
           <Input
+            id="general-app-title"
+            name="app_title"
             value={appTitle}
             onChange={(e) => setAppTitle(e.target.value)}
             maxLength={120}
@@ -221,16 +225,20 @@ function GeneralSettingsForm({ initial }: { initial: GeneralSettingsView }) {
             autoComplete="off"
           />
         </Field>
-        <Field label="App description" hint="Short tagline — shown on the sign-in page and used as the meta description.">
+        <Field label="App description" htmlFor="general-app-description" hint="Short tagline — shown on the sign-in page and used as the meta description.">
           <Textarea
+            id="general-app-description"
+            name="app_description"
             value={appDescription}
             onChange={(e) => setAppDescription(e.target.value)}
             maxLength={500}
             rows={3}
           />
         </Field>
-        <Field label="Support email" hint="Shown on the sign-in page for staff who cannot sign in. Leave empty to hide it.">
+        <Field label="Support email" htmlFor="general-support-email" hint="Shown on the sign-in page for staff who cannot sign in. Leave empty to hide it.">
           <Input
+            id="general-support-email"
+            name="support_email"
             type="email"
             value={supportEmail}
             onChange={(e) => setSupportEmail(e.target.value)}

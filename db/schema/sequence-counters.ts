@@ -1,4 +1,5 @@
-import { pgTable, varchar, bigint, timestamp } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { pgTable, varchar, bigint, timestamp, check } from "drizzle-orm/pg-core";
 
 /**
  * Durable sequence counters (migration 0002).
@@ -20,4 +21,7 @@ export const sequenceCounters = pgTable("sequence_counters", {
   counterKey: varchar("counter_key", { length: 40 }).primaryKey(),
   counterValue: bigint("counter_value", { mode: "number" }).notNull(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  check("sequence_counters_counter_value_check", sql`"counter_value" >= 0`),
+]);

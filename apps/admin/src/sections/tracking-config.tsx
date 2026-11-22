@@ -129,6 +129,7 @@ export function TrackingConfigSection() {
             {/* Searchable (PLAN §29): integrated sites are unbounded —
                the query runs server-side over the full site set. */}
             <SearchableSelect
+              id="tracking-site-filter"
               value={siteId}
               onChange={(v) => setSiteId(v)}
               loadOptions={(q, signal) =>
@@ -463,11 +464,13 @@ function TrackingGroupDialog({
     >
       <form onSubmit={submit}>
         <div className="sm-form-grid">
-          <Field label="Site">
-            <Input value={site.name} disabled />
+          <Field label="Site" htmlFor="pixel-site">
+            <Input id="pixel-site" name="site" value={site.name} disabled />
           </Field>
-          <Field label="Provider" required>
+          <Field label="Provider" required htmlFor="pixel-provider">
             <Select
+              id="pixel-provider"
+              name="provider"
               value={provider}
               onChange={(e) =>
                 setProvider(e.target.value as TrackingConfig["provider"])
@@ -477,16 +480,20 @@ function TrackingGroupDialog({
               <option value="tiktok">TikTok</option>
             </Select>
           </Field>
-          <Field label="Group label" hint="Shown in the list; falls back to the pixel ID.">
+          <Field label="Group label" htmlFor="pixel-label" hint="Shown in the list; falls back to the pixel ID.">
             <Input
+              id="pixel-label"
+              name="label"
               value={label}
               onChange={(e) => setLabel(e.target.value)}
               placeholder="e.g. Main store pixel"
               maxLength={120}
             />
           </Field>
-          <Field label="Pixel ID" required error={errors.pixel_id}>
+          <Field label="Pixel ID" required htmlFor="pixel-id" error={errors.pixel_id}>
             <Input
+              id="pixel-id"
+              name="pixel_id"
               value={pixelId}
               onChange={(e) => setPixelId(e.target.value)}
               placeholder="e.g. 123456789012345"
@@ -495,6 +502,7 @@ function TrackingGroupDialog({
           <Field
             label="CAPI access token"
             required={mode === "create"}
+            htmlFor="pixel-access-token"
             error={errors.access_token}
             hint={
               mode === "edit"
@@ -503,6 +511,8 @@ function TrackingGroupDialog({
             }
           >
             <Input
+              id="pixel-access-token"
+              name="access_token"
               type="password"
               value={token}
               onChange={(e) => setToken(e.target.value)}
@@ -512,8 +522,10 @@ function TrackingGroupDialog({
               }
             />
           </Field>
-          <Field label="Test event code" hint="Meta test-events code; leave empty when not testing.">
+          <Field label="Test event code" htmlFor="pixel-test-code" hint="Meta test-events code; leave empty when not testing.">
             <Input
+              id="pixel-test-code"
+              name="test_event_code"
               value={testCode}
               onChange={(e) => setTestCode(e.target.value)}
               placeholder="e.g. TEST12345"

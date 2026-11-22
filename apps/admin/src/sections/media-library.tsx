@@ -19,6 +19,7 @@
  * (never invented).
  */
 import { useEffect, useRef, useState } from "react";
+import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Check,
@@ -106,9 +107,39 @@ export function MediaLibrarySection() {
   const [debouncedQ, setDebouncedQ] = useState("");
   const [kind, setKind] = useState<MediaLibraryKind | "">("");
   const [folder, setFolder] = useState<string | undefined>(undefined);
+  const [folderSearch, setFolderSearch] = useState("");
   const [view, setView] = useState<"grid" | "list">("grid");
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(50);
+  // LIVE L5: page + pageSize are URL-backed (like every ListTable
+  // page) so the URL and the control always agree. The list used local
+  // state defaulting to 50 while the URL carried a stale pageSize=25
+  // from another page — the control showed 50, the URL said 25.
+  const urlSearch = useRouterState({ select: (s) => s.location.search }) as Record<
+    string,
+    unknown
+  >;
+  const navigate = useNavigate();
+  const initialPage =
+    Number.isFinite(Number(urlSearch.page)) && Number(urlSearch.page) >= 1
+      ? Math.floor(Number(urlSearch.page))
+      : 1;
+  const initialPageSize = [25, 50, 100].includes(Number(urlSearch.pageSize))
+    ? Number(urlSearch.pageSize)
+    : 50;
+  const [page, setPage] = useState(initialPage);
+  const [pageSize, setPageSize] = useState(initialPageSize);
+  const updatePage = (next: number) => {
+    setPage(next);
+    void navigate({
+      search: (prev: Record<string, unknown>) => ({ ...prev, page: next }),
+    } as never);
+  };
+  const updatePageSize = (size: number) => {
+    setPageSize(size);
+    setPage(1);
+    void navigate({
+      search: (prev: Record<string, unknown>) => ({ ...prev, pageSize: size, page: 1 }),
+    } as never);
+  };
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [detail, setDetail] = useState<MediaAssetView | null>(null);
   const [uploadOpen, setUploadOpen] = useState(false);
@@ -125,9 +156,19 @@ export function MediaLibrarySection() {
     return () => window.clearTimeout(timer);
   }, [q]);
 
-  // Any filter change restarts at page 1.
+  // Any filter change restarts at page 1 (not on mount — a deep-linked
+  // ?page= must survive the first render).
+  const firstFilterRun = useRef(true);
   useEffect(() => {
+    if (firstFilterRun.current) {
+      firstFilterRun.current = false;
+      return;
+    }
     setPage(1);
+    void navigate({
+      search: (prev: Record<string, unknown>) => ({ ...prev, page: 1 }),
+    } as never);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [debouncedQ, kind, folder]);
 
   const listQuery = useQuery({
@@ -291,6 +332,18 @@ export function MediaLibrarySection() {
       <div className="sm-media-layout">
         <aside className="sm-media-folders" aria-label="Folders">
           <div className="sm-media-folders-title">Folders</div>
+          <div style={{ marginBottom: 8 }}>
+            <Input
+              id="media-folder-search"
+              name="folder_search"
+              type="search"
+              value={folderSearch}
+              onChange={(e) => setFolderSearch(e.target.value)}
+              placeholder="Search folders…"
+              aria-label="Search folders"
+              autoComplete="off"
+            />
+          </div>
           <button
             type="button"
             className={`sm-media-folder${folder === undefined ? " sm-media-folder-active" : ""}`}
@@ -306,7 +359,12 @@ export function MediaLibrarySection() {
             <Folder size={14} /> (root)
           </button>
           {folders
-            .filter((f) => f !== "")
+            .filter(
+              (f) =>
+                f !== "" &&
+                (folderSearch.trim() === "" ||
+                  f.toLowerCase().includes(folderSearch.trim().toLowerCase())),
+            )
             .map((f) => (
               <button
                 key={f}
@@ -318,11 +376,21 @@ export function MediaLibrarySection() {
                 <Folder size={14} /> {f}
               </button>
             ))}
+          {folderSearch.trim() !== "" &&
+          folders.filter(
+            (f) =>
+              f !== "" &&
+              f.toLowerCase().includes(folderSearch.trim().toLowerCase()),
+          ).length === 0 ? (
+            <p className="sm-hint">No folders match “{folderSearch.trim()}”.</p>
+          ) : null}
         </aside>
 
         <div className="sm-media-main">
           <div className="sm-media-toolbar">
             <Input
+              id="media-search"
+              name="q"
               value={q}
               onChange={(e) => setQ(e.target.value)}
               placeholder="Search files by name or tag…"
@@ -578,11 +646,8 @@ export function MediaLibrarySection() {
               page={page}
               pageSize={pageSize}
               total={total}
-              onPageChange={setPage}
-              onPageSizeChange={(size) => {
-                setPageSize(size);
-                setPage(1);
-              }}
+              onPageChange={updatePage}
+              onPageSizeChange={updatePageSize}
             />
           ) : null}
         </div>
@@ -684,18 +749,19 @@ function UploadDialog({
   function addFiles(list: FileList | File[]) {
     const incoming = Array.from(list);
     if (incoming.length === 0) return;
-    setFiles((prev) => {
-      const seen = new Set(prev.map((f) => `${f.name}\0${f.size}\0${f.lastModified}`));
-      const fresh = incoming.filter(
-        (f) => !seen.has(`${f.name}\0${f.size}\0${f.lastModified}`),
-      );
-      if (fresh.length === 0) return prev;
-      setStates((prevStates) => [
-        ...prevStates,
-        ...fresh.map(() => ({ status: "queued" as const })),
-      ]);
-      return [...prev, ...fresh];
-    });
+    // L-13: setStates used to run inside the setFiles updater — a side
+    // effect inside an updater, which StrictMode double-invokes in dev.
+    // Both setters run outside any updater now, like removeFile below.
+    const seen = new Set(files.map((f) => `${f.name}\0${f.size}\0${f.lastModified}`));
+    const fresh = incoming.filter(
+      (f) => !seen.has(`${f.name}\0${f.size}\0${f.lastModified}`),
+    );
+    if (fresh.length === 0) return;
+    setFiles([...files, ...fresh]);
+    setStates((prevStates) => [
+      ...prevStates,
+      ...fresh.map(() => ({ status: "queued" as const })),
+    ]);
   }
 
   function removeFile(index: number) {
@@ -859,8 +925,9 @@ function UploadDialog({
             })}
           </ul>
         ) : null}
-        <Field label="Folder">
+        <Field label="Folder" htmlFor="upload-folder">
           <SearchableSelect
+            id="upload-folder"
             value={creatingFolder ? "__new__" : targetFolder}
             onChange={(value) => {
               if (value === "__new__") {
@@ -882,6 +949,8 @@ function UploadDialog({
           />
           {creatingFolder ? (
             <Input
+              id="upload-new-folder"
+              name="new_folder"
               value={newFolder}
               onChange={(e) => setNewFolder(e.target.value)}
               placeholder="e.g. brand/logos"
@@ -908,6 +977,8 @@ function UploadDialog({
             </span>
           ) : null}
           <Input
+            id="upload-tag-input"
+            name="tag"
             value={tagInput}
             onChange={(e) => setTagInput(e.target.value)}
             onKeyDown={(e) => {
@@ -934,7 +1005,7 @@ function UploadDialog({
           </Button>
           <Button
             type="button"
-            variant="primary"
+            variant="accent"
             disabled={files.length === 0 || uploading || doneCount === files.length}
             onClick={() => void handleUpload()}
           >
@@ -968,8 +1039,8 @@ function RenameDialog({
   return (
     <Dialog open={asset !== null} onClose={onClose} title="Rename file">
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        <Field label="Filename">
-          <Input value={name} onChange={(e) => setName(e.target.value)} autoComplete="off" />
+        <Field label="Filename" htmlFor="rename-filename">
+          <Input id="rename-filename" name="filename" value={name} onChange={(e) => setName(e.target.value)} autoComplete="off" />
         </Field>
         <div className="sm-dialog-footer" style={{ padding: 0, border: 0 }}>
           <Button type="button" variant="secondary" onClick={onClose} disabled={pending}>
@@ -977,7 +1048,7 @@ function RenameDialog({
           </Button>
           <Button
             type="button"
-            variant="primary"
+            variant="accent"
             disabled={pending || name.trim() === "" || name === asset?.original_filename}
             onClick={() => onSave(name)}
           >
@@ -1009,8 +1080,10 @@ function MoveDialog({
   return (
     <Dialog open={asset !== null} onClose={onClose} title="Move to folder">
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        <Field label="Folder" hint="Leave empty for the root folder. Type a new name to create a folder.">
+        <Field label="Folder" htmlFor="move-folder" hint="Leave empty for the root folder. Type a new name to create a folder.">
           <Input
+            id="move-folder"
+            name="folder"
             value={nextFolder}
             onChange={(e) => setNextFolder(e.target.value)}
             placeholder="(root)"
@@ -1029,7 +1102,7 @@ function MoveDialog({
           </Button>
           <Button
             type="button"
-            variant="primary"
+            variant="accent"
             disabled={pending || nextFolder === asset?.folder}
             onClick={() => onSave(nextFolder)}
           >
@@ -1059,8 +1132,10 @@ function TagsDialog({
   return (
     <Dialog open={asset !== null} onClose={onClose} title="Edit tags">
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        <Field label="Tags" hint="Comma-separated — up to 10 tags, letters, digits, '-' or '_'. Tags are searchable.">
+        <Field label="Tags" htmlFor="edit-tags" hint="Comma-separated — up to 10 tags, letters, digits, '-' or '_'. Tags are searchable.">
           <Input
+            id="edit-tags"
+            name="tags"
             value={tagsText}
             onChange={(e) => setTagsText(e.target.value)}
             placeholder="logo, brand"
@@ -1071,7 +1146,7 @@ function TagsDialog({
           <Button type="button" variant="secondary" onClick={onClose} disabled={pending}>
             Cancel
           </Button>
-          <Button type="button" variant="primary" disabled={pending} onClick={() => onSave(tagsText.split(",").map((t) => t.trim()).filter(Boolean))}>
+          <Button type="button" variant="accent" disabled={pending} onClick={() => onSave(tagsText.split(",").map((t) => t.trim()).filter(Boolean))}>
             {pending ? "Saving…" : "Save tags"}
           </Button>
         </div>

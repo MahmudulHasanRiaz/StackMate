@@ -90,8 +90,8 @@ function StorageSettingsForm({ initial }: { initial: StorageSettingsView }) {
       />
       {formError ? <Alert variant="danger">{formError}</Alert> : null}
       <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: 16, maxWidth: 640 }}>
-        <Field label="Storage driver" hint="Applies to new uploads immediately. Existing files are unaffected — see the warning below.">
-          <Select value={driver} onChange={(e) => setDriver(e.target.value as "r2" | "local")}>
+        <Field label="Storage driver" htmlFor="storage-driver" hint="Applies to new uploads immediately. Existing files are unaffected — see the warning below.">
+          <Select id="storage-driver" name="driver" value={driver} onChange={(e) => setDriver(e.target.value as "r2" | "local")}>
             <option value="r2">Cloudflare R2 (recommended)</option>
             <option value="local">Local filesystem (Docker / VPS)</option>
           </Select>
@@ -107,9 +107,12 @@ function StorageSettingsForm({ initial }: { initial: StorageSettingsView }) {
         {driver === "local" ? (
           <Field
             label="Local directory"
+            htmlFor="storage-local-path"
             hint="Directory on the server where files are stored, e.g. ./data/media (relative to the app working directory) or /var/lib/stackmate/media. Leave empty to use the default (./data/media). Unavailable on Cloudflare Workers — the API refuses Local there instead of storing nowhere."
           >
             <Input
+              id="storage-local-path"
+              name="local_path"
               value={localPath}
               onChange={(e) => setLocalPath(e.target.value)}
               placeholder="./data/media"

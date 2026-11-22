@@ -102,6 +102,7 @@ export function TrackingSection() {
   const query = useAdminList<TrackingEvent>(
     "tracking-events",
     "/api/v1/admin/tracking/events",
+    { q: search.q, page: search.page, pageSize: search.pageSize },
   );
   const sitesQuery = useAdminList<IntegratedSite>(
     "integrated-sites",
@@ -226,6 +227,11 @@ export function TrackingSection() {
       <ListTable<TrackingEvent>
         columns={columns}
         data={filtered}
+        serverSearch
+        serverPagination
+        refreshSection="tracking-events"
+        filtersActive={statusFilter !== "all"}
+        total={query.total}
         search={search.q ?? ""}
         onSearchChange={(q) => setSearch({ q: q || undefined, page: 1 })}
         page={search.page ?? 1}

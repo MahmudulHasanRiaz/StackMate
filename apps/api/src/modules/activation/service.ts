@@ -18,6 +18,10 @@
  * already-suspended, or already-reactivated order is a no-op.
  */
 import { randomUUID } from "node:crypto";
+import {
+  formatDisplayDateDDMMYYYY,
+  parseStrictDDMMYYYYToIsoDate,
+} from "../../../../../packages/contracts/src/index.ts";
 import type {
   DatabaseState,
   LicenseRecord,
@@ -26,7 +30,10 @@ import type {
 } from "../../platform/db/store.ts";
 import { appendAuditLog } from "../audit/service.ts";
 import { computeOrderPaid } from "../customers/service.ts";
-import { issueLicenseForOrderItemInTx } from "../licensing/service.ts";
+import {
+  issueLicenseForOrderItemInTx,
+  recordLicenseEventInTx,
+} from "../licensing/service.ts";
 import { createOrExtendSubscriptionInTx } from "../subscriptions/service.ts";
 
 export interface ActivationOutcome {
@@ -44,13 +51,32 @@ export interface ActivationConfig {
   paymentTransactionId?: string | null;
   actorUserId?: string | null;
   requestId: string;
+  /**
+   * Business timezone for date-only boundaries (F-12). The business
+   * runs on Asia/Dhaka; callers should pass `env.DEFAULT_TIMEZONE`.
+   * Defaults to Asia/Dhaka (the env default) when omitted.
+   */
+  timeZone?: string | undefined;
+}
+
+/**
+ * Today as an ISO date-only string in the BUSINESS timezone (F-12).
+ * Date-only values (activation_date, installment due_date) are business
+ * dates: at 01:00 Dhaka the UTC date is still yesterday, so
+ * `now.toISOString().slice(0, 10)` would activate/suspend a day late.
+ * Composed from the shared strict parsers (AGENTS.md §7) — no native
+ * Date.parse on ambiguous strings.
+ */
+export function businessTodayIso(now: Date, timeZone = "Asia/Dhaka"): string {
+  return parseStrictDDMMYYYYToIsoDate(formatDisplayDateDDMMYYYY(now, timeZone));
 }
 
 /** Pure policy evaluation: is this order due for activation right now? */
 export function activationDueNow(
   order: OrderRecord,
   paidMinor: number,
-  now: Date
+  now: Date,
+  timeZone = "Asia/Dhaka"
 ): { due: boolean; reason: string } {
   if (order.activation_mode === "on_full_payment") {
     return {
@@ -77,7 +103,8 @@ export function activationDueNow(
   if (!date) {
     return { due: false, reason: "on_date: no activation date set" };
   }
-  const today = now.toISOString().slice(0, 10);
+  // F-12: compare against TODAY IN THE BUSINESS TIMEZONE, not UTC.
+  const today = businessTodayIso(now, timeZone);
   return {
     due: today >= date,
     reason: today >= date ? `on_date: ${date} reached` : `on_date: ${date} not yet reached`,
@@ -183,12 +210,20 @@ function pushLicenseOutboxEvent(
   license: LicenseRecord,
   eventType: "license.activated" | "license.suspended" | "license.reactivated" | "license.expired",
   reason: string,
-  nowIso: string
+  nowIso: string,
+  /**
+   * F-06: the outbox key is deterministic — the license_events row id
+   * this outbox event describes. The same license event never queues
+   * twice (a re-run finds the existing event row and skips), so the
+   * unique `event_key` can never collide or defeat dedup the way
+   * `Date.now()` did.
+   */
+  licenseEventId: string
 ): void {
   const product = state.products.find((p) => p.id === license.product_id);
   state.outbox_events.push({
     id: randomUUID(),
-    event_key: `${eventType}:${license.id}:${Date.now()}`,
+    event_key: `${eventType}:${license.id}:${licenseEventId}`,
     aggregate_type: "license",
     aggregate_id: license.id,
     event_type: eventType,
@@ -208,27 +243,6 @@ function pushLicenseOutboxEvent(
     last_error_code: null,
     created_at: nowIso,
     processed_at: null,
-  });
-}
-
-function recordLicenseEvent(
-  state: DatabaseState,
-  license: LicenseRecord,
-  eventType: "activated" | "suspended" | "reactivated" | "expired",
-  actorType: "system" | "staff",
-  actorUserId: string | null,
-  metadata: Record<string, unknown>,
-  nowIso: string
-): void {
-  state.license_events.push({
-    id: randomUUID(),
-    license_id: license.id,
-    event_type: eventType,
-    actor_type: actorType,
-    actor_user_id: actorUserId,
-    activation_id: null,
-    metadata,
-    created_at: nowIso,
   });
 }
 
@@ -267,7 +281,12 @@ export function evaluateActivationForOrderInTx(
   config: ActivationConfig
 ): ActivationOutcome {
   const paid = computeOrderPaid(state, order.id);
-  const { due, reason } = activationDueNow(order, paid, new Date(nowIso));
+  const { due, reason } = activationDueNow(
+    order,
+    paid,
+    new Date(nowIso),
+    config.timeZone ?? "Asia/Dhaka"
+  );
   if (!due) {
     return { activated: false, reason, newly_issued: 0, subscriptions: [], issued_licenses: [] };
   }
@@ -292,12 +311,12 @@ export function evaluateActivationForOrderInTx(
   if (pendingItems.length > 0) {
     for (const license of newly_issued_licenses) {
       if (license.status === "active") {
-        recordLicenseEvent(state, license, "activated", "system", config.actorUserId ?? null, {
+        const eventRow = recordLicenseEventInTx(state, license, "activated", "system", config.actorUserId ?? null, {
           reason,
           order_id: order.id,
           activation_mode: order.activation_mode,
         }, nowIso);
-        pushLicenseOutboxEvent(state, license, "license.activated", reason, nowIso);
+        pushLicenseOutboxEvent(state, license, "license.activated", reason, nowIso, eventRow.id);
         auditLicenseTransition(
           state,
           license,
@@ -357,11 +376,11 @@ export function suspendLicenseInTx(
   if (license.status !== "active") return false;
   license.status = "suspended";
   license.updated_at = nowIso;
-  recordLicenseEvent(state, license, "suspended", "system", config.actorUserId ?? null, {
+  const eventRow = recordLicenseEventInTx(state, license, "suspended", "system", config.actorUserId ?? null, {
     reason,
     ...extraMetadata,
   }, nowIso);
-  pushLicenseOutboxEvent(state, license, "license.suspended", reason, nowIso);
+  pushLicenseOutboxEvent(state, license, "license.suspended", reason, nowIso, eventRow.id);
   auditLicenseTransition(
     state,
     license,
@@ -420,11 +439,11 @@ export function reactivateLicensesForOrderInTx(
   for (const license of missedScheduleSuspendedLicenses(state, order.id)) {
     license.status = "active";
     license.updated_at = nowIso;
-    recordLicenseEvent(state, license, "reactivated", "system", config.actorUserId ?? null, {
+    const eventRow = recordLicenseEventInTx(state, license, "reactivated", "system", config.actorUserId ?? null, {
       reason,
       order_id: order.id,
     }, nowIso);
-    pushLicenseOutboxEvent(state, license, "license.reactivated", reason, nowIso);
+    pushLicenseOutboxEvent(state, license, "license.reactivated", reason, nowIso, eventRow.id);
     auditLicenseTransition(
       state,
       license,
@@ -449,13 +468,16 @@ export function evaluateSuspensionForOrderInTx(
   state: DatabaseState,
   order: OrderRecord,
   now: Date,
-  config: { actorUserId?: string | null; requestId: string }
+  config: { actorUserId?: string | null; requestId: string; timeZone?: string | undefined }
 ): { suspended: LicenseRecord[]; reactivated: LicenseRecord[] } {
   const nowIso = now.toISOString();
   if (!order.suspend_on_missed_schedule) {
     return { suspended: [], reactivated: [] };
   }
-  const today = nowIso.slice(0, 10);
+  // F-12: the missed-schedule boundary is a BUSINESS date (Asia/Dhaka),
+  // not the UTC date — an installment due "today Dhaka" is not missed
+  // at 01:00 Dhaka (when UTC still says yesterday).
+  const today = businessTodayIso(now, config.timeZone ?? "Asia/Dhaka");
   const missed = state.order_installments.some(
     (i) =>
       i.order_id === order.id &&
@@ -493,8 +515,8 @@ export function expireLicenseInTx(
   if (license.status === "expired" || license.status === "revoked") return;
   license.status = "expired";
   license.updated_at = nowIso;
-  recordLicenseEvent(state, license, "expired", "system", null, { reason }, nowIso);
-  pushLicenseOutboxEvent(state, license, "license.expired", reason, nowIso);
+  const eventRow = recordLicenseEventInTx(state, license, "expired", "system", null, { reason }, nowIso);
+  pushLicenseOutboxEvent(state, license, "license.expired", reason, nowIso, eventRow.id);
   auditLicenseTransition(state, license, "licenses.license.expired", "system", null, requestId, {
     reason,
   });

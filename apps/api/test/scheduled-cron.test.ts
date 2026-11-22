@@ -184,7 +184,7 @@ describe.skipIf(!DATABASE_URL)("scheduled (cron) handler — live-path repro", (
 
   it("empty outbox: scheduled resolves (no throw) and claims nothing", async () => {
     const result = await app.scheduled({}, envStaging, { waitUntil: () => {} });
-    assert.deepEqual(result, { claimed: 0, delivered: 0, retrying: 0, dead_lettered: 0 });
+    assert.deepEqual(result, { claimed: 0, delivered: 0, simulated: 0, retrying: 0, dead_lettered: 0 });
   }, 60_000);
 
   it("webhook event with no subscribed endpoints: delivered, no throw", async () => {
@@ -198,15 +198,16 @@ describe.skipIf(!DATABASE_URL)("scheduled (cron) handler — live-path repro", (
     assert.equal((await readOutboxStatus(id)).status, "delivered");
   }, 60_000);
 
-  it("Meta CAPI dispatch event: processed, no throw", async () => {
+  it("Meta CAPI dispatch event: simulated, no throw", async () => {
     const id = await seedOutboxEvent({
       event_type: "tracking.meta_capi.dispatch",
       payload: { tracking_event_id: randomUUID() },
     });
     const result = await app.scheduled({}, envStaging, { waitUntil: () => {} });
     assert.equal(result.claimed, 1, JSON.stringify(result));
-    assert.equal(result.delivered, 1, JSON.stringify(result));
-    assert.equal((await readOutboxStatus(id)).status, "delivered");
+    assert.equal(result.delivered, 0, JSON.stringify(result));
+    assert.equal(result.simulated, 1, JSON.stringify(result));
+    assert.equal((await readOutboxStatus(id)).status, "simulated");
   }, 60_000);
 
   it("poison event (endpoint URL fails SSRF validation): retried, NOT thrown", async () => {

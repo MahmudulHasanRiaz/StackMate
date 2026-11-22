@@ -21,6 +21,7 @@ import {
   createSuccessEnvelope,
   formatDisplayDateDDMMYYYY,
   formatDisplayDateTimeDDMMYYYY,
+  RecordManualRefundSchema,
   SchemaValidationError,
 } from "../../../packages/contracts/src/index.ts";
 import {
@@ -85,8 +86,10 @@ import {
 import {
   acceptStaffInvitation,
   assertStaffPermission,
+  assertStaffPermissionAudited,
   bootstrapInitialSuperAdmin,
   changeStaffPassword,
+  checkBetterAuthFallbackAccess,
   createPasswordResetToken,
   createRoleByAdmin,
   createStaffInvitationByAdmin,
@@ -94,6 +97,7 @@ import {
   ensureBetterAuthIdentity,
   isSuperAdminProvisioned,
   recoverTwoFactorByToken,
+  recordTwoFactorStateChange,
   resetStaffPasswordByToken,
   resolveStaffPrincipal,
   revokeStaffInvitationByAdmin,
@@ -101,7 +105,9 @@ import {
   signOutStaffSession,
   storePasswordResetToken,
   storeSupportsBetterAuth,
+  suspendStaffUser,
   type StaffPrincipal,
+  unsuspendStaffUser,
   updateRoleByAdmin,
   updateStaffUserRoles,
   updateOwnProfile,
@@ -153,6 +159,7 @@ import {
   createPaymentMethodByAdmin,
   createPaymentProviderByAdmin,
   recordManualPaymentClaimByAdmin,
+  recordManualRefundByAdmin,
   rejectPaymentSubmissionByStaff,
   setPaymentMethodEnabledByAdmin,
   submitManualPaymentClaim,
@@ -199,6 +206,7 @@ import {
   updateTrackingConfigByAdmin,
 } from "./modules/tracking/service.ts";
 import {
+  createRealWebhookTransport,
   deleteWebhookEndpointByAdmin,
   processTransactionalOutboxBatch,
   registerWebhookEndpointByAdmin,
@@ -291,6 +299,43 @@ function setupTokenMatches(provided: string, expected: string): boolean {
 }
 
 /**
+ * H-7: fail closed when staging/production still points at localhost
+ * URLs. The URL vars default to http://localhost:5173/8787 in env.ts,
+ * so a deployed API that never set them would silently run against
+ * loopback. This runs AFTER store resolution (at the top of
+ * handleRequest / handleScheduled) — never inside
+ * resolveRuntimeConfig, where a throw would escape as a bare Worker
+ * exception instead of the JSON error envelope. Test/local envs are
+ * exempt: localhost is correct there.
+ */
+function assertProductionUrlVars(env: StackMateBindings): void {
+  if (env.APP_ENV !== "staging" && env.APP_ENV !== "production") return;
+  const localhostHosts = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+  const check = (name: string, value: string | undefined): void => {
+    if (!value) return;
+    let host = "";
+    try {
+      host = new URL(value).hostname.toLowerCase();
+    } catch {
+      return;
+    }
+    if (localhostHosts.has(host)) {
+      throw new AppError(
+        "INTERNAL_ERROR",
+        `Server misconfiguration: ${name} points at localhost in ${env.APP_ENV}.`,
+        500
+      );
+    }
+  };
+  check("APP_URL", env.APP_URL);
+  check("API_URL", env.API_URL);
+  check("BETTER_AUTH_URL", env.BETTER_AUTH_URL);
+  for (const origin of env.TRUSTED_ORIGINS.split(",")) {
+    check("TRUSTED_ORIGINS", origin.trim());
+  }
+}
+
+/**
  * Per-request store factory: builds (or returns) the store for one request
  * from the already-resolved env. Used by the Worker entrypoint so every
  * request gets a fresh DrizzleStore instead of a module-level shared store.
@@ -316,8 +361,25 @@ export interface StackMateAppInstance {
     event: { cron?: string; scheduledTime?: number },
     rawEnv?: Partial<StackMateBindings>,
     ctx?: WorkerExecutionContext
-  ): Promise<{ claimed: number; delivered: number; retrying: number; dead_lettered: number }>;
+  ): Promise<{
+    claimed: number;
+    delivered: number;
+    // C-2/D-6: the dispatcher also counts simulated deliveries.
+    simulated: number;
+    retrying: number;
+    dead_lettered: number;
+  }>;
 }
+
+// M-20: the static default favicon (byte-identical to
+// apps/admin/public/favicon.svg, which the API Worker cannot read at
+// runtime — no fs on Workers). Keep the two in sync when the brand
+// mark changes.
+const DEFAULT_FAVICON_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">' +
+  '<rect width="64" height="64" rx="12" fill="#141414"/>' +
+  '<text x="32" y="44" font-family="Arial, Helvetica, sans-serif" font-size="38" font-weight="700" fill="#00E599" text-anchor="middle">S</text>' +
+  "</svg>";
 
 export function createStackMateApp(
   existingStore?: StackMateDataStore
@@ -336,25 +398,12 @@ export function createStackMateApp(
     ? undefined
     : ((existingStoreOrOptions as StackMateDataStore | undefined) ??
       new StackMateDataStore());
-  const rateLimitBuckets = new Map<string, { count: number; resetAtMs: number }>();
-
-  function checkRateLimit(bucketKey: string, maxRequests: number, windowMs = 60_000): void {
-    const now = Date.now();
-    const entry = rateLimitBuckets.get(bucketKey);
-    if (!entry || now >= entry.resetAtMs) {
-      rateLimitBuckets.set(bucketKey, { count: 1, resetAtMs: now + windowMs });
-      return;
-    }
-    entry.count += 1;
-    if (entry.count > maxRequests) {
-      throw new AppError(
-        "RATE_LIMIT_EXCEEDED",
-        "Too many requests. Please retry after the rate-limit window resets.",
-        429
-      );
-    }
-  }
-
+  // C-1: rate limiting is STORE-backed (store.checkRateLimit) — the
+  // old in-app Map lived inside createStackMateApp() and was recreated
+  // on every fetch(), so the limit never tripped in production. The
+  // DB-backed buckets (table rate_limit_buckets) survive across
+  // requests on Workers; the in-memory store keeps a per-instance Map
+  // as the test/fallback implementation.
   function buildStandardHeaders(
     requestId: string,
     origin: string | null,
@@ -529,14 +578,65 @@ export function createStackMateApp(
     const pathname = url.pathname.replace(/\/+$/, "") || "/";
     const method = request.method.toUpperCase();
 
+    // L-1: CSRF gate for cookie-authenticated state-changing requests.
+    // An absent Origin no longer skips the gate — a cross-site Referer
+    // or Sec-Fetch-Site: cross-site also blocks. Absent Origin AND
+    // absent Referer stays allowed: non-browser clients (and the test
+    // suite) send neither, and a blanket fail-closed there would break
+    // legitimate API clients that carry the session cookie. Residual
+    // risk, documented honestly: a forgery from a page that suppresses
+    // both headers (e.g. <meta name="referrer" content="no-referrer">)
+    // cannot be distinguished from a non-browser client here.
+    // Bearer-token requests are unaffected (no ambient credential to
+    // forge with), and GET/HEAD never mutate.
+    const assertSameSiteCookieMutation = (req: Request) => {
+      const sessionCookie = parseSessionCookie(req.headers.get("Cookie"));
+      if (!sessionCookie) return;
+      const methodUpper = req.method.toUpperCase();
+      if (methodUpper === "GET" || methodUpper === "HEAD") return;
+      const origin = req.headers.get("Origin");
+      const referer = req.headers.get("Referer");
+      const fetchSite = req.headers.get("Sec-Fetch-Site");
+      const refererOrigin = (() => {
+        if (!referer) return null;
+        try {
+          return new URL(referer).origin;
+        } catch {
+          return "invalid";
+        }
+      })();
+      const crossSite =
+        (origin !== null && !trustedOrigins.includes(origin)) ||
+        (origin === null &&
+          refererOrigin !== null &&
+          !trustedOrigins.includes(refererOrigin)) ||
+        (origin === null && refererOrigin === null && fetchSite === "cross-site");
+      if (crossSite) {
+        throw new AppError(
+          "FORBIDDEN",
+          `Cross-origin state-changing request from untrusted origin '${origin ?? refererOrigin ?? "cross-site"}' blocked by CSRF policy.`,
+          403
+        );
+      }
+    };
+
     if (method === "OPTIONS") {
+      // L-20: the method/header allow-list is only advertised to a
+      // trusted origin. Any other origin (or none) gets a bare 204 —
+      // it grants nothing and reveals nothing about the API surface.
+      const isTrustedOrigin =
+        originHeader !== null && trustedOrigins.includes(originHeader);
       return new Response(null, {
         status: 204,
         headers: {
           ...buildStandardHeaders(requestId, originHeader, trustedOrigins),
-          "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-          "Access-Control-Allow-Headers":
-            "Content-Type, Authorization, Idempotency-Key, X-Request-ID, X-StackMate-Site-Key, X-StackMate-Key-Id, X-StackMate-Timestamp, X-StackMate-Nonce, X-StackMate-Content-SHA256, X-StackMate-Signature",
+          ...(isTrustedOrigin
+            ? {
+                "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers":
+                  "Content-Type, Authorization, Idempotency-Key, X-Request-ID, X-StackMate-Site-Key, X-StackMate-Key-Id, X-StackMate-Timestamp, X-StackMate-Nonce, X-StackMate-Content-SHA256, X-StackMate-Signature",
+              }
+            : {}),
         },
       });
     }
@@ -571,15 +671,27 @@ export function createStackMateApp(
       });
     };
 
+    // M-1: `total` is the pre-limit count (the full filtered set), so
+    // clients can paginate. It is additive inside `data` — the
+    // contracts envelope type gains no field here (contracts is outside
+    // this batch's files); the runtime JSON carries it and the SPA
+    // reads it. Callers that do not pass a total get no `total` key.
     const collectionResponse = <T>(
       items: T[],
       nextCursor: string | null = null,
-      status = 200
-    ) =>
-      new Response(JSON.stringify(createCollectionEnvelope(items, nextCursor, requestId)), {
+      status = 200,
+      total?: number
+    ) => {
+      const envelope = createCollectionEnvelope(items, nextCursor, requestId) as {
+        data: { items: T[]; next_cursor: string | null; total?: number };
+        meta: { request_id: string; api_version: string };
+      };
+      if (total !== undefined) envelope.data.total = total;
+      return new Response(JSON.stringify(envelope), {
         status,
         headers: buildStandardHeaders(requestId, originHeader, trustedOrigins),
       });
+    };
 
     // Server-side list search (PLAN §29 / ADR-0010): `?q=` filters a list
     // over the FULL dataset on the server — never over a loaded page —
@@ -589,17 +701,40 @@ export function createStackMateApp(
     // the DB layer, these filters must move into SQL.
     // `q` is trimmed + lowercased once here; every caller matches with
     // `includes` on already-lowercased haystacks.
-    const parseListQuery = (params: URLSearchParams): { q: string; limit: number | null } => {
+    // M-1: lists default to 25 rows (the PaginationQuerySchema
+    // default — `limit` absent/invalid used to mean "the FULL table").
+    // An explicit ?limit= (1..100) overrides; anything else is 25.
+    // Every list handler in this dispatcher goes through here, so no
+    // list can silently return an unbounded collection anymore.
+    const parseListQuery = (params: URLSearchParams): { q: string; limit: number; page: number } => {
       const q = params.get("q")?.trim().toLowerCase() ?? "";
       const rawLimit = Number(params.get("limit"));
       const limit =
         Number.isFinite(rawLimit) && rawLimit >= 1
           ? Math.min(Math.floor(rawLimit), 100)
-          : null;
-      return { q, limit };
+          : 25;
+      // Offset pagination: ?page= (default 1; non-integer or <= 0 is 1).
+      // pagedCollectionResponse slices the (page-1)*limit window, so
+      // rows past the first page are reachable — no list is capped.
+      const rawPage = Number(params.get("page"));
+      const page =
+        Number.isFinite(rawPage) && rawPage >= 1 ? Math.floor(rawPage) : 1;
+      return { q, limit, page };
     };
-    const applyListLimit = <T>(items: T[], limit: number | null): T[] =>
-      limit === null ? items : items.slice(0, limit);
+    const applyListPage = <T>(items: T[], limit: number, page: number): T[] =>
+      items.slice((page - 1) * limit, page * limit);
+    // Paged list response: slices the (page-1)*limit window AFTER
+    // filtering and reports the pre-limit total, so the client can
+    // paginate (M-1). `page` is 3rd so every call site reads
+    // (items, limit, page); nextCursor/status stay optional after
+    // it (no caller passes them today).
+    const pagedCollectionResponse = <T>(
+      filtered: T[],
+      limit: number,
+      page = 1,
+      nextCursor: string | null = null,
+      status = 200
+    ) => collectionResponse(applyListPage(filtered, limit, page), nextCursor, status, filtered.length);
     const includesQuery = (haystack: string | null | undefined, q: string): boolean =>
       !q ? true : (haystack ?? "").toLowerCase().includes(q);
     // Digits-only queries (e.g. a phone fragment) also match the digit
@@ -616,7 +751,80 @@ export function createStackMateApp(
       return (normalizedPhone ?? "").replace(/\D/g, "").includes(digits);
     };
 
+    // M-2: the 6 MB body cap (enforced above on Content-Length) is
+    // bypassed by chunked / length-less requests, because
+    // request.json() and request.text() buffer the whole stream
+    // unchecked. These helpers read through the stream with a running
+    // byte count and 413 past the cap, so every body read in this
+    // dispatcher is capped the same way. Multipart uploads (media /
+    // evidence) keep their own size validation and do not use these.
+    const MAX_REQUEST_BODY_BYTES = 6 * 1024 * 1024;
+    const readCappedText = async (req: Request): Promise<string> => {
+      const body = req.body;
+      if (!body) return "";
+      const reader = body.getReader();
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > MAX_REQUEST_BODY_BYTES) {
+          await reader.cancel().catch(() => {});
+          throw new AppError("PAYLOAD_TOO_LARGE", "Request payload exceeds limit.", 413);
+        }
+        chunks.push(value);
+      }
+      const merged = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        merged.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return new TextDecoder().decode(merged);
+    };
+    // M-6: malformed JSON is a client error (400), never a 500. The
+    // old request.json() threw a bare SyntaxError that the outer catch
+    // mapped to a generic 500.
+    const parseJsonText = (text: string): unknown => {
+      try {
+        return JSON.parse(text);
+      } catch {
+        throw new AppError("VALIDATION_ERROR", "Request body is not valid JSON.", 400);
+      }
+    };
+    // Typed `any` (like request.json() itself) so the ~80 existing
+    // handlers compile unchanged — the fix here is behavioural (cap +
+    // 400), and each handler still validates/casts its own shape.
+    const readJsonBody = async (req: Request): Promise<any> => {
+      const text = await readCappedText(req);
+      if (text.trim() === "") {
+        throw new AppError(
+          "VALIDATION_ERROR",
+          "Request body is required and must be valid JSON.",
+          400
+        );
+      }
+      return parseJsonText(text);
+    };
+    // Lenient variant for handlers that treat a missing/malformed body
+    // as "no body" (public token endpoints). A 413 is never swallowed:
+    // an oversize body must fail loudly.
+    const readJsonBodyLenient = async (req: Request): Promise<any> => {
+      try {
+        return await readJsonBody(req);
+      } catch (error) {
+        if (error instanceof AppError && error.code === "PAYLOAD_TOO_LARGE") throw error;
+        return {};
+      }
+    };
+
     try {
+      // H-7: fail closed on localhost URL vars in staging/production
+      // (runs after store resolution, so a misconfiguration answers
+      // with the JSON error envelope, never a bare Worker exception).
+      assertProductionUrlVars(env);
+
       // Reject oversized JSON bodies (> 6 MB)
       const contentLength = Number(request.headers.get("Content-Length") ?? "0");
       if (contentLength > 6 * 1024 * 1024) {
@@ -654,8 +862,11 @@ export function createStackMateApp(
       // OAuth providers the login page may show, and whether email
       // (forgot password / invitations / 2FA recovery) is configured.
       // No secrets, no user data — a provider is listed only when it is
-      // enabled AND has a stored client id; the secret never leaves the
-      // server. Same source of truth as the Better Auth instance.
+      // enabled AND has a stored client id AND a decryptable client
+      // secret (L-4): the same predicate as provider registration in
+      // better-auth.ts, so the login page never offers a button whose
+      // sign-in fails. The secret itself never leaves the server. Same
+      // source of truth as the Better Auth instance.
       if (method === "GET" && pathname === "/api/v1/auth-config") {
         const maybeDrizzle = store as unknown as { drizzleDb?: unknown };
         if (!maybeDrizzle.drizzleDb) {
@@ -668,7 +879,7 @@ export function createStackMateApp(
         ).catch(() => undefined);
         return jsonResponse({
           oauth_providers: (config?.oauth ?? [])
-            .filter((p) => p.enabled && p.clientId)
+            .filter((p) => p.enabled && p.clientId && p.clientSecret)
             .map((p) => p.provider),
           email_configured: config?.smtp.enabled ?? false,
         });
@@ -690,23 +901,34 @@ export function createStackMateApp(
       }
 
       // Public favicon: streams the R2 object the General Settings
-      // favicon points at. 404 when no favicon is uploaded (the SPA then
-      // keeps its built-in default). Cacheable — the object key contains
-      // the content hash, so a re-upload changes the key.
+      // favicon points at. M-20: when no favicon is configured (or the
+      // stored object is gone) the handler returns the static default
+      // instead of 404 — the SPA keeps its built-in default, and the
+      // browser stops logging a failed favicon fetch on every load.
+      // Cacheable — the object key contains the content hash, so a
+      // re-upload changes the key.
       if (method === "GET" && pathname === "/api/v1/favicon") {
+        const defaultFavicon = () =>
+          new Response(DEFAULT_FAVICON_SVG, {
+            status: 200,
+            headers: {
+              "Content-Type": "image/svg+xml",
+              "Cache-Control": "public, max-age=86400",
+            },
+          });
         const maybeDrizzle = store as unknown as { drizzleDb?: unknown };
-        if (!maybeDrizzle.drizzleDb) throw new AppError("NOT_FOUND", "No favicon is configured.", 404);
+        if (!maybeDrizzle.drizzleDb) return defaultFavicon();
         const row = await loadGeneralSettings(
           maybeDrizzle.drizzleDb as Parameters<typeof loadGeneralSettings>[0]
         ).catch(() => null);
         if (!row?.faviconObjectKey) {
-          throw new AppError("NOT_FOUND", "No favicon is configured.", 404);
+          return defaultFavicon();
         }
         const bucket = (store as unknown as { r2Bucket?: unknown }).r2Bucket as
           | { get: (key: string) => Promise<{ arrayBuffer: () => Promise<ArrayBuffer>; httpMetadata?: { contentType?: string } } | null> }
           | undefined;
         const obj = await bucket?.get(row.faviconObjectKey);
-        if (!obj) throw new AppError("NOT_FOUND", "Favicon not found.", 404);
+        if (!obj) return defaultFavicon();
         const bytes = await obj.arrayBuffer();
         return new Response(bytes, {
           status: 200,
@@ -719,7 +941,7 @@ export function createStackMateApp(
 
       // 2. Authentication Routes (/api/auth/*)
       if (pathname.startsWith("/api/auth")) {
-        checkRateLimit(`auth:${clientIp}`, 60);
+        await store.checkRateLimit(`auth:${clientIp}`, 60);
 
         if (method === "POST" && pathname === "/api/auth/bootstrap-super-admin") {
           // TOKEN-GATED first-admin bootstrap (Security, 2026-11-15 — the
@@ -744,13 +966,19 @@ export function createStackMateApp(
               404
             );
           }
-          const body = (await request.json()) as {
+          const body = (await readJsonBody(request)) as {
             name?: string;
             email?: string;
             password?: string;
             setupToken?: string;
           };
-          if (!body.setupToken || !setupTokenMatches(body.setupToken, configuredSetupToken)) {
+          // L-13(b): a non-string setupToken used to reach
+          // setupTokenMatches and throw a bare TypeError (500). A
+          // wrong-typed token is simply an invalid token — 403, no hint.
+          if (
+            typeof body.setupToken !== "string" ||
+            !setupTokenMatches(body.setupToken, configuredSetupToken)
+          ) {
             throw new AppError(
               "FORBIDDEN",
               "Setup token is missing or invalid.",
@@ -764,9 +992,32 @@ export function createStackMateApp(
               422
             );
           }
+          // L-13(b): validate the shape here so a malformed bootstrap
+          // fails 422 at the route instead of a downstream 500/DB
+          // error. Name is capped (users.name is unbounded text);
+          // email is format-checked and capped at the varchar(320).
+          const bootstrapName = body.name.trim();
+          const bootstrapEmail = body.email.trim().toLowerCase();
+          if (bootstrapName.length === 0 || bootstrapName.length > 200) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              "name must be 1–200 characters.",
+              422
+            );
+          }
+          if (
+            bootstrapEmail.length > 320 ||
+            !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(bootstrapEmail)
+          ) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              "email must be a valid email address.",
+              422
+            );
+          }
           const created = await bootstrapInitialSuperAdmin(store, {
-            name: body.name,
-            email: body.email,
+            name: bootstrapName,
+            email: bootstrapEmail,
             password: body.password,
             requestId,
           });
@@ -777,7 +1028,7 @@ export function createStackMateApp(
           if (storeSupportsBetterAuth(store)) {
             await ensureBetterAuthIdentity(store, {
               userId: created.user.id,
-              email: body.email,
+              email: bootstrapEmail,
               password: body.password,
             }).catch(() => {});
           }
@@ -785,24 +1036,52 @@ export function createStackMateApp(
         }
 
         if (method === "POST" && pathname === "/api/auth/sign-in") {
-          const body = (await request.json()) as { email?: string; password?: string };
+          const body = (await readJsonBody(request)) as { email?: string; password?: string };
           if (!body.email || !body.password) {
             throw new AppError("VALIDATION_ERROR", "email and password are required.", 422);
+          }
+          // C-1: per-account lockout — 10 failed sign-ins in 15 minutes
+          // lock the account's sign-in (429). The probe runs BEFORE the
+          // password check so a locked account never burns a bcrypt
+          // hash; failures increment afterwards, a success clears the
+          // bucket. Keyed by email hash (never the raw email) so the
+          // bucket key leaks nothing. Unknown emails accumulate too,
+          // so a 429 reveals nothing about whether the account exists.
+          const normalizedSignInEmail = body.email.trim().toLowerCase();
+          const signInLockoutKey = `signin-fail:${createHash("sha256").update(normalizedSignInEmail, "utf8").digest("hex")}`;
+          if (await store.isRateLimited(signInLockoutKey, 10, 15 * 60_000)) {
+            throw new AppError(
+              "RATE_LIMIT_EXCEEDED",
+              "Too many failed sign-in attempts for this account. Try again later.",
+              429
+            );
           }
           const auth = storeSupportsBetterAuth(store)
             ? await getBetterAuth(env, store)
             : null;
-          const signedIn = await signInStaffSession(
-            store,
-            {
-              email: body.email,
-              password: body.password,
-              ipAddress: clientIp,
-              userAgent: request.headers.get("User-Agent"),
-              requestId,
-            },
-            auth
-          );
+          let signedIn: Awaited<ReturnType<typeof signInStaffSession>>;
+          try {
+            signedIn = await signInStaffSession(
+              store,
+              {
+                email: body.email,
+                password: body.password,
+                ipAddress: clientIp,
+                userAgent: request.headers.get("User-Agent"),
+                requestId,
+              },
+              auth
+            );
+          } catch (error) {
+            // Count the failure; the 10th failure answers 429 instead
+            // of the underlying 401 (the account just locked).
+            await store.checkRateLimit(signInLockoutKey, 10, 15 * 60_000);
+            throw error;
+          }
+          // Success clears the failure bucket, so typos never lock a
+          // legitimate user out. Best-effort: a reset failure must
+          // never break a successful sign-in.
+          await store.resetRateLimit(signInLockoutKey).catch(() => {});
           const payload = {
             session_token: signedIn.session_token,
             expires_at: signedIn.expires_at,
@@ -833,6 +1112,9 @@ export function createStackMateApp(
         }
 
         if (method === "POST" && pathname === "/api/auth/sign-out") {
+          // L-1: signing out is a cookie-authenticated mutation — a
+          // cross-site page must not be able to log the admin out.
+          assertSameSiteCookieMutation(request);
           const cookieHeader = request.headers.get("Cookie");
           const bearerToken = extractBearerToken(request.headers.get("Authorization"));
           const auth = storeSupportsBetterAuth(store)
@@ -865,7 +1147,10 @@ export function createStackMateApp(
         }
 
         if (method === "POST" && pathname === "/api/auth/change-password") {
-          const body = (await request.json()) as {
+          // L-1: cookie-authenticated mutation — cross-site requests
+          // are blocked before any password work happens.
+          assertSameSiteCookieMutation(request);
+          const body = (await readJsonBody(request)) as {
             current_password?: string;
             new_password?: string;
           };
@@ -904,7 +1189,7 @@ export function createStackMateApp(
           // No email is sent anywhere in this flow: invitations are
           // created by an admin who delivers the one-time link to the
           // invitee out of band (there is no email system yet — Batch 5).
-          const body = (await request.json()) as {
+          const body = (await readJsonBody(request)) as {
             token?: string;
             name?: string;
             password?: string;
@@ -943,13 +1228,26 @@ export function createStackMateApp(
         // SMTP config) so the endpoint cannot enumerate staff. A token is
         // created and an email sent ONLY when the account exists, is
         // active, and SMTP is configured; the response never says which
-        // of those failed. Per-email 60s cooldown via the same in-memory
-        // rate-limit map (best-effort — an attacker learns nothing either
-        // way). On a store without a database (in-memory test adapter)
+        // of those failed. H-5: a real per-email 60s cooldown, enforced
+        // via the store-backed rate limit (the old comment claimed one
+        // but no code enforced it). A throttled resend is silently
+        // skipped — the generic 200 below is the only answer either
+        // way. On a store without a database (in-memory test adapter)
         // there is no SMTP config and no token table — the generic 200
         // is returned with nothing sent.
+        // L-21 (accepted trade-off, recorded): the reset / invitation /
+        // recovery token travels in the email link's query string
+        // (?token=...), so it can land in the recipient's browser
+        // history, a proxy log, or a Referer header if the landing page
+        // links out before the token is consumed. That is the standard
+        // email-link pattern (no password is ever in the URL, the token
+        // is single-use, short-lived, and hashed at rest, and the
+        // landing page consumes it immediately on load), and replacing
+        // it with a code the user types would break the one-click flow
+        // the admin UX depends on. The token value is never logged.
+        // The link itself is built in modules/email/service.ts.
         if (method === "POST" && pathname === "/api/auth/forgot-password") {
-          const body = (await request.json().catch(() => ({}))) as { email?: string };
+          const body = (await readJsonBodyLenient(request)) as { email?: string };
           const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
           if (email) {
             const maybeDrizzle = store as unknown as { drizzleDb?: unknown };
@@ -971,14 +1269,33 @@ export function createStackMateApp(
                   }
                 ).catch(() => false);
                 if (emailReady) {
-                  const token = createPasswordResetToken(store, user.id, "password_reset");
-                  await storePasswordResetToken(
-                    store, user.id, "password_reset", token.tokenHash, token.expiresAt
-                  );
-                  await sendEmailViaSmtp(store, env, {
-                    to: user.email,
-                    ...buildPasswordResetEmail(env.APP_URL, token.rawToken),
-                  }).catch(() => {});
+                  // H-5: per-email 60s cooldown, keyed by email hash.
+                  // A throttled resend is skipped, not an error — the
+                  // generic 200 below is the only answer either way.
+                  let cooledDown = false;
+                  try {
+                    await store.checkRateLimit(
+                      `forgot-password:${createHash("sha256").update(email, "utf8").digest("hex")}`,
+                      1,
+                      60_000
+                    );
+                  } catch (error) {
+                    if (error instanceof AppError && error.code === "RATE_LIMIT_EXCEEDED") {
+                      cooledDown = true;
+                    } else {
+                      throw error;
+                    }
+                  }
+                  if (!cooledDown) {
+                    const token = createPasswordResetToken(store, user.id, "password_reset");
+                    await storePasswordResetToken(
+                      store, user.id, "password_reset", token.tokenHash, token.expiresAt
+                    );
+                    await sendEmailViaSmtp(store, env, {
+                      to: user.email,
+                      ...buildPasswordResetEmail(env.APP_URL, token.rawToken),
+                    }).catch(() => {});
+                  }
                 }
               } catch {
                 // Fail closed + silent: the generic 200 below is the only
@@ -997,7 +1314,7 @@ export function createStackMateApp(
         // the credential here, so a generic message would hide nothing.
         // Does NOT disable 2FA: a compromised mailbox must not defeat it.
         if (method === "POST" && pathname === "/api/auth/reset-password") {
-          const body = (await request.json().catch(() => ({}))) as {
+          const body = (await readJsonBodyLenient(request)) as {
             token?: string;
             new_password?: string;
           };
@@ -1019,7 +1336,7 @@ export function createStackMateApp(
         // steps are generic: step 1 always returns 200, step 2 returns
         // 422 for a bad/expired token and 401 for a wrong password.
         if (method === "POST" && pathname === "/api/auth/two-factor/recover") {
-          const body = (await request.json().catch(() => ({}))) as { email?: string };
+          const body = (await readJsonBodyLenient(request)) as { email?: string };
           const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
           if (email) {
             const maybeDrizzle = store as unknown as { drizzleDb?: unknown };
@@ -1039,14 +1356,34 @@ export function createStackMateApp(
                   }
                 ).catch(() => false);
                 if (emailReady) {
-                  const token = createPasswordResetToken(store, user.id, "two_factor_recovery");
-                  await storePasswordResetToken(
-                    store, user.id, "two_factor_recovery", token.tokenHash, token.expiresAt
-                  );
-                  await sendEmailViaSmtp(store, env, {
-                    to: user.email,
-                    ...buildTwoFactorRecoveryEmail(env.APP_URL, token.rawToken),
-                  }).catch(() => {});
+                  // H-5 (same class as forgot-password): per-email 60s
+                  // cooldown on recovery mail. Throttled resends are
+                  // skipped, not errors — the generic 200 below is the
+                  // only answer either way.
+                  let cooledDown = false;
+                  try {
+                    await store.checkRateLimit(
+                      `two-factor-recovery:${createHash("sha256").update(email, "utf8").digest("hex")}`,
+                      1,
+                      60_000
+                    );
+                  } catch (error) {
+                    if (error instanceof AppError && error.code === "RATE_LIMIT_EXCEEDED") {
+                      cooledDown = true;
+                    } else {
+                      throw error;
+                    }
+                  }
+                  if (!cooledDown) {
+                    const token = createPasswordResetToken(store, user.id, "two_factor_recovery");
+                    await storePasswordResetToken(
+                      store, user.id, "two_factor_recovery", token.tokenHash, token.expiresAt
+                    );
+                    await sendEmailViaSmtp(store, env, {
+                      to: user.email,
+                      ...buildTwoFactorRecoveryEmail(env.APP_URL, token.rawToken),
+                    }).catch(() => {});
+                  }
                 }
               } catch {
                 // Generic 200 below, whatever happened inside.
@@ -1059,7 +1396,7 @@ export function createStackMateApp(
           });
         }
         if (method === "POST" && pathname === "/api/auth/two-factor/recover/confirm") {
-          const body = (await request.json().catch(() => ({}))) as {
+          const body = (await readJsonBodyLenient(request)) as {
             token?: string;
             password?: string;
           };
@@ -1128,12 +1465,46 @@ export function createStackMateApp(
         // seam is the in-memory test adapter (no Postgres, no Better
         // Auth) — see modules/identity/service.ts header.
         const auth = await getBetterAuth(env, store);
-        return auth.handler(request);
+        // M-10 (audit fix batch): gate the Better Auth fallback the
+        // same way as the custom /api/auth/* routes — unknown paths
+        // 404, session paths require a live staff principal (401), and
+        // 2FA-setup-required roles are held at 403 except on the setup
+        // paths. The check throws and the outer catch turns it into
+        // the standard JSON error envelope; it never consumes the
+        // request body, so auth.handler below still reads it.
+        const { principal: fallbackPrincipal } =
+          await checkBetterAuthFallbackAccess(store, {
+            auth,
+            cookieHeader: request.headers.get("Cookie"),
+            bearerToken: extractBearerToken(
+              request.headers.get("Authorization")
+            ),
+            pathname,
+          });
+        const fallbackResponse = await auth.handler(request);
+        // M-10: audit 2FA state changes that happen through the
+        // fallback — Better Auth itself writes no StackMate audit row.
+        // Only on a successful response: a failed enable/disable
+        // changes nothing. recordTwoFactorStateChange never throws
+        // (a failed audit write must not break the 2FA response).
+        if (
+          fallbackResponse.ok &&
+          fallbackPrincipal &&
+          (pathname === "/api/auth/two-factor/enable" ||
+            pathname === "/api/auth/two-factor/disable")
+        ) {
+          await recordTwoFactorStateChange(store, {
+            userId: fallbackPrincipal.user.id,
+            enabled: pathname === "/api/auth/two-factor/enable",
+            requestId,
+          });
+        }
+        return fallbackResponse;
       }
 
       // 3. License Client API (/api/v1/licenses/*)
       if (pathname.startsWith("/api/v1/licenses")) {
-        checkRateLimit(`licenses:${clientIp}`, 120);
+        await store.checkRateLimit(`licenses:${clientIp}`, 120);
 
         // Security rule (API Spec §6.5 & §25.2): Reject license_key in URL query string
         if (url.searchParams.has("license_key") || url.searchParams.has("key")) {
@@ -1150,16 +1521,17 @@ export function createStackMateApp(
         }
 
         if (method === "POST" && pathname === "/api/v1/licenses/activate") {
-          const body = await request.json();
+          const body = await readJsonBody(request);
           const result = await activateLicenseInstallation(store, body, {
             verifierSecret: env.LICENSE_VERIFIER_SECRET,
             issuerUrl: env.API_URL,
+            requestId,
           });
           return jsonResponse(result, 200);
         }
 
         if (method === "POST" && pathname === "/api/v1/licenses/validate") {
-          const body = await request.json();
+          const body = await readJsonBody(request);
           const result = await validateLicenseInstallation(store, body, {
             verifierSecret: env.LICENSE_VERIFIER_SECRET,
             issuerUrl: env.API_URL,
@@ -1168,9 +1540,10 @@ export function createStackMateApp(
         }
 
         if (method === "POST" && pathname === "/api/v1/licenses/deactivate") {
-          const body = await request.json();
+          const body = await readJsonBody(request);
           const result = await deactivateLicenseInstallation(store, body, {
             verifierSecret: env.LICENSE_VERIFIER_SECRET,
+            requestId,
           });
           return jsonResponse(result, 200);
         }
@@ -1178,7 +1551,7 @@ export function createStackMateApp(
 
       // 4. Public Website & Checkout API (/api/v1/public/*)
       if (pathname.startsWith("/api/v1/public/")) {
-        checkRateLimit(`public:${clientIp}`, 120);
+        await store.checkRateLimit(`public:${clientIp}`, 120);
         const siteKeyHeader = request.headers.get("X-StackMate-Site-Key")?.trim();
 
         const mProducts = matchPath("/api/v1/public/sites/:siteKey/products", pathname);
@@ -1205,7 +1578,8 @@ export function createStackMateApp(
               website_url: p.website_url,
               documentation_url: p.documentation_url,
             }));
-          return collectionResponse(allowedProducts);
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(allowedProducts, limit, page);
         }
 
         const mPackages = matchPath(
@@ -1268,7 +1642,8 @@ export function createStackMateApp(
             })
             .filter((item): item is NonNullable<typeof item> => item !== null);
 
-          return collectionResponse(packages);
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(packages, limit, page);
         }
 
         // Batch 1: single-product detail for a site's public catalogue —
@@ -1442,7 +1817,7 @@ export function createStackMateApp(
               400
             );
           }
-          const rawBody = await request.json();
+          const rawBody = await readJsonBody(request);
           const result = await createPublicCheckoutOrder(store, {
             siteKey,
             idempotencyKey,
@@ -1529,7 +1904,8 @@ export function createStackMateApp(
             .filter((m) => m.is_enabled)
             .sort((a, b) => a.sort_order - b.sort_order)
             .map((m) => toPublicPaymentMethodDto(store, m));
-          return collectionResponse(activeMethods);
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(activeMethods, limit, page);
         }
 
         const mEvidenceUpload = matchPath(
@@ -1554,7 +1930,7 @@ export function createStackMateApp(
           const order = store.state.orders.find((o) => o.id === tokenClaims.oid);
           if (!order) throw new AppError("NOT_FOUND", "Order not found.", 404);
 
-          const body = (await request.json()) as {
+          const body = (await readJsonBody(request)) as {
             filename?: string;
             content_type?: string;
             content_base64?: string;
@@ -1579,6 +1955,11 @@ export function createStackMateApp(
             bytes,
             bucketName: evidenceDriver.name === "r2" ? env.R2_BUCKET_NAME : "local",
             driver: evidenceDriver,
+            // Public checkout route: actor null — its authorization is
+            // the site key + checkout token + order reference, verified
+            // by this route before the call.
+            actor: null,
+            requestId,
           });
           return jsonResponse(
             {
@@ -1620,11 +2001,12 @@ export function createStackMateApp(
               400
             );
           }
-          const rawBody = await request.json();
+          const rawBody = await readJsonBody(request);
           const submitted = await submitManualPaymentClaim(store, {
             orderPublicReference: publicReference,
             idempotencyKey,
             rawBody,
+            requestId,
           });
           const { replayed: _, ...payload } = submitted;
           return jsonResponse(payload, submitted.replayed ? 200 : 201);
@@ -1636,7 +2018,7 @@ export function createStackMateApp(
         );
         if (method === "POST" && mPublicTrack) {
           const siteKey = mPublicTrack.params.siteKey!;
-          const rawBody = await request.json();
+          const rawBody = await readJsonBody(request);
           const result = await ingestExternalTrackingEvent(store, siteKey, rawBody);
           return jsonResponse(result, 202);
         }
@@ -1646,7 +2028,7 @@ export function createStackMateApp(
 
       // 5. Server-to-Server Signed Integration API (/api/v1/integrations/*)
       if (pathname.startsWith("/api/v1/integrations/")) {
-        checkRateLimit(`integrations:${clientIp}`, 120);
+        await store.checkRateLimit(`integrations:${clientIp}`, 120);
 
         const mServerProducts = matchPath(
           "/api/v1/integrations/sites/:siteKey/products",
@@ -1671,7 +2053,8 @@ export function createStackMateApp(
           const items = store.state.products.filter(
             (p) => p.status === "active" && site.product_ids.includes(p.id)
           );
-          return collectionResponse(items);
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(items, limit, page);
         }
 
         const mServerOrders = matchPath(
@@ -1680,7 +2063,7 @@ export function createStackMateApp(
         );
         if (method === "POST" && mServerOrders) {
           const siteKey = mServerOrders.params.siteKey!;
-          const rawBodyText = await request.text();
+          const rawBodyText = await readCappedText(request);
           await authenticateSignedServerRequest(store, {
             siteKey,
             requiredScope: "checkout.create",
@@ -1699,7 +2082,7 @@ export function createStackMateApp(
           if (!idempotencyKey) {
             throw new AppError("VALIDATION_ERROR", "Idempotency-Key header is required.", 400);
           }
-          const parsedJson = JSON.parse(rawBodyText);
+          const parsedJson = parseJsonText(rawBodyText);
           const result = await createPublicCheckoutOrder(store, {
             siteKey,
             idempotencyKey,
@@ -1821,7 +2204,8 @@ export function createStackMateApp(
               };
             })
             .filter((item): item is NonNullable<typeof item> => item !== null);
-          return collectionResponse(packages);
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(packages, limit, page);
         }
 
         // Batch 1: signed server-side order cancel (scope orders.cancel:own).
@@ -1837,7 +2221,7 @@ export function createStackMateApp(
             siteKey: string;
             publicReference: string;
           };
-          const rawBodyText = await request.text();
+          const rawBodyText = await readCappedText(request);
           const { site } = await authenticateSignedServerRequest(store, {
             siteKey,
             requiredScope: "orders.cancel:own",
@@ -1852,7 +2236,7 @@ export function createStackMateApp(
             rawBody: rawBodyText,
             encryptionKey: env.ENCRYPTION_KEY_V1,
           });
-          const body = (JSON.parse(rawBodyText || "{}")) as { reason?: string };
+          const body = (parseJsonText(rawBodyText || "{}")) as { reason?: string };
           const cancelled = await store.withTransaction((state) => {
             const order = state.orders.find(
               (o) => o.public_reference === publicReference && o.integrated_site_id === site.id
@@ -1881,7 +2265,7 @@ export function createStackMateApp(
         );
         if (method === "POST" && mServerTracking) {
           const siteKey = mServerTracking.params.siteKey!;
-          const rawBodyText = await request.text();
+          const rawBodyText = await readCappedText(request);
           await authenticateSignedServerRequest(store, {
             siteKey,
             requiredScope: "tracking.events.write",
@@ -1899,7 +2283,7 @@ export function createStackMateApp(
           const res = await ingestExternalTrackingEvent(
             store,
             siteKey,
-            JSON.parse(rawBodyText)
+            parseJsonText(rawBodyText)
           );
           return jsonResponse(res, 202);
         }
@@ -1917,7 +2301,7 @@ export function createStackMateApp(
         );
         if (method === "POST" && mServerLeads) {
           const siteKey = mServerLeads.params.siteKey!;
-          const rawBodyText = await request.text();
+          const rawBodyText = await readCappedText(request);
           const { site } = await authenticateSignedServerRequest(store, {
             siteKey,
             requiredScope: "leads.create",
@@ -1932,7 +2316,7 @@ export function createStackMateApp(
             rawBody: rawBodyText,
             encryptionKey: env.ENCRYPTION_KEY_V1,
           });
-          const result = await ingestLead(store, site, JSON.parse(rawBodyText));
+          const result = await ingestLead(store, site, parseJsonText(rawBodyText), requestId);
           return jsonResponse(result, result.created ? 201 : 200);
         }
       }
@@ -1955,20 +2339,10 @@ export function createStackMateApp(
         const sessionCookie = parseSessionCookie(request.headers.get("Cookie"));
         const bearerToken = extractBearerToken(request.headers.get("Authorization"));
 
-        // CSRF protection for cookie-authenticated state-changing requests
-        if (
-          sessionCookie &&
-          method !== "GET" &&
-          method !== "HEAD" &&
-          originHeader &&
-          !trustedOrigins.includes(originHeader)
-        ) {
-          throw new AppError(
-            "FORBIDDEN",
-            `Cross-origin state-changing request from untrusted origin '${originHeader}' blocked by CSRF policy.`,
-            403
-          );
-        }
+        // L-1: CSRF gate for cookie-authenticated state-changing
+        // requests (shared helper — Origin, Referer and
+        // Sec-Fetch-Site rules; see its definition above).
+        assertSameSiteCookieMutation(request);
 
         const auth = storeSupportsBetterAuth(store)
           ? await getBetterAuth(env, store)
@@ -2009,12 +2383,129 @@ export function createStackMateApp(
           // Self-service profile: name ONLY. Email is the login identity
           // (administrator change only) and roles are never self-editable
           // — extra fields in the body are ignored, never applied.
-          const body = (await request.json()) as { name?: unknown };
-          const updated = await updateOwnProfile(store, principal, {
-            name: body.name,
-            requestId,
+          const body = (await readJsonBody(request)) as {
+            name?: unknown;
+            avatar_url?: unknown;
+          };
+          // updateOwnProfile requires a valid name (1–120 chars), so it
+          // runs only when a name is actually being changed — an
+          // avatar-only PATCH must not 422 on the missing name.
+          let updated: StaffPrincipal = principal;
+          if (body.name !== undefined) {
+            updated = await updateOwnProfile(store, principal, {
+              name: body.name,
+              requestId,
+            });
+          }
+          // M-23: avatar_url is set at the route (updateOwnProfile owns
+          // name only); null clears the avatar. Two forms are accepted
+          // and both are stored as the object KEY (never a URL):
+          //  - an `avatars/` key returned by POST /me/avatar;
+          //  - a media-library content URL
+          //    (/api/v1/admin/media/<id>/content), resolved here to
+          //    the asset's object key — the asset must exist and be an
+          //    image. Anything else (external URLs included) is 422.
+          // The UI renders the stored key through GET /me/avatar.
+          let avatarUrl: string | null | undefined = (
+            updated.user as { avatar_url?: string | null }
+          ).avatar_url;
+          if (body.avatar_url !== undefined) {
+            let key: string | null = null;
+            if (body.avatar_url !== null) {
+              if (typeof body.avatar_url !== "string") {
+                throw new AppError(
+                  "VALIDATION_ERROR",
+                  "avatar_url must be a string or null.",
+                  422,
+                );
+              }
+              if (body.avatar_url.startsWith("avatars/")) {
+                key = body.avatar_url;
+              } else {
+                const mediaMatch = body.avatar_url.match(
+                  /^\/api\/v1\/admin\/media\/([^/?#]+)\/content(?:\?.*)?$/,
+                );
+                if (!mediaMatch) {
+                  throw new AppError(
+                    "VALIDATION_ERROR",
+                    "avatar_url must be an avatar object key returned by POST /api/v1/admin/me/avatar, a media-library content URL, or null to clear.",
+                    422,
+                  );
+                }
+                const asset = store.state.media_assets.find((a) => a.id === mediaMatch[1]);
+                if (!asset) {
+                  throw new AppError("NOT_FOUND", "Media asset not found.", 404);
+                }
+                if (!asset.mime_type.startsWith("image/")) {
+                  throw new AppError("VALIDATION_ERROR", "Avatar must be an image.", 422);
+                }
+                key = asset.object_key;
+              }
+            }
+            const saved = await store.setStaffAvatarUrl(principal.user.id, key);
+            avatarUrl = saved.avatar_url;
+          }
+          return jsonResponse({ ...updated, avatar_url: avatarUrl ?? null }, 200);
+        }
+
+        // M-23: custom avatar upload (D-5). Multipart 'file' (image
+        // only, <= 2 MB); stored via the selected storage driver under
+        // avatars/<userId>/<uuid>.<ext>; the key is saved as
+        // users.avatar_url and served by GET /api/v1/admin/me/avatar.
+        // No media-library row — the avatar is a profile asset, not a
+        // library asset. The previous object is deleted best-effort.
+        if (method === "POST" && pathname === "/api/v1/admin/me/avatar") {
+          const form = await request.formData();
+          const file = form.get("file");
+          if (!(file instanceof File)) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              "A file upload is required (multipart field 'file').",
+              422
+            );
+          }
+          const allowedTypes: Record<string, string> = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/webp": "webp",
+            "image/gif": "gif",
+          };
+          const ext = allowedTypes[file.type];
+          if (!ext) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              "Avatar must be a PNG, JPEG, WebP, or GIF image.",
+              422
+            );
+          }
+          const bytes = new Uint8Array(await file.arrayBuffer());
+          if (bytes.length > 2 * 1024 * 1024) {
+            throw new AppError("VALIDATION_ERROR", "Avatar must be 2 MB or smaller.", 413);
+          }
+          const driver = await resolveStorageDriver(driverDepsForRequest(store, env));
+          const key = `avatars/${principal.user.id}/${randomUUID()}.${ext}`;
+          await driver.put(key, bytes, file.type);
+          const previous = store.state.users.find((u) => u.id === principal.user.id)?.avatar_url;
+          const saved = await store.setStaffAvatarUrl(principal.user.id, key);
+          if (previous && previous.startsWith("avatars/") && previous !== key) {
+            await driver.delete(previous).catch(() => {});
+          }
+          return jsonResponse({ avatar_url: saved.avatar_url }, 201);
+        }
+
+        if (method === "GET" && pathname === "/api/v1/admin/me/avatar") {
+          const key = store.state.users.find((u) => u.id === principal.user.id)?.avatar_url;
+          if (!key) throw new AppError("NOT_FOUND", "No avatar is set.", 404);
+          const driver = await resolveStorageDriver(driverDepsForRequest(store, env));
+          const obj = await driver.get(key);
+          if (!obj) throw new AppError("NOT_FOUND", "Avatar not found.", 404);
+          return new Response(obj.bytes, {
+            status: 200,
+            headers: {
+              "Content-Type": obj.contentType,
+              "Cache-Control": "private, max-age=3600",
+            },
           });
-          return jsonResponse(updated, 200);
         }
 
         // Authentication configuration (Auth + Email batch, ADR-0008):
@@ -2075,7 +2566,7 @@ export function createStackMateApp(
         }
         if (method === "PUT" && pathname === "/api/v1/admin/auth-config/oauth") {
           assertStaffPermission(principal, "users.manage");
-          const body = (await request.json().catch(() => ({}))) as {
+          const body = (await readJsonBodyLenient(request)) as {
             provider?: string;
             enabled?: boolean;
             client_id?: string;
@@ -2105,7 +2596,7 @@ export function createStackMateApp(
           pathname === "/api/v1/admin/auth-config/two-factor-policy"
         ) {
           assertStaffPermission(principal, "users.manage");
-          const body = (await request.json().catch(() => ({}))) as {
+          const body = (await readJsonBodyLenient(request)) as {
             scope?: string;
             mode?: string;
           };
@@ -2122,7 +2613,7 @@ export function createStackMateApp(
         }
         if (method === "PUT" && pathname === "/api/v1/admin/auth-config/smtp") {
           assertStaffPermission(principal, "users.manage");
-          const body = (await request.json().catch(() => ({}))) as {
+          const body = (await readJsonBodyLenient(request)) as {
             host?: string;
             port?: number;
             username?: string;
@@ -2159,7 +2650,7 @@ export function createStackMateApp(
         }
         if (method === "POST" && pathname === "/api/v1/admin/auth-config/smtp/test") {
           assertStaffPermission(principal, "users.manage");
-          const body = (await request.json().catch(() => ({}))) as { to?: string };
+          const body = (await readJsonBodyLenient(request)) as { to?: string };
           // Test mail goes ONLY to the admin's own address — the
           // endpoint must never become an open mail relay.
           const to = (body.to ?? principal.user.email).trim().toLowerCase();
@@ -2218,7 +2709,7 @@ export function createStackMateApp(
         }
         if (method === "PUT" && pathname === "/api/v1/admin/general-settings") {
           assertStaffPermission(principal, "users.manage");
-          const body = (await request.json().catch(() => ({}))) as {
+          const body = (await readJsonBodyLenient(request)) as {
             app_name?: string;
             app_title?: string;
             app_description?: string;
@@ -2237,7 +2728,7 @@ export function createStackMateApp(
         }
         if (method === "POST" && pathname === "/api/v1/admin/general-settings/favicon") {
           assertStaffPermission(principal, "users.manage");
-          const body = (await request.json()) as {
+          const body = (await readJsonBody(request)) as {
             filename?: string;
             content_type?: string;
             content_base64?: string;
@@ -2397,7 +2888,7 @@ export function createStackMateApp(
           }
           if (method === "PATCH") {
             assertStaffPermission(principal, "media.manage");
-            const body = (await request.json().catch(() => ({}))) as {
+            const body = (await readJsonBodyLenient(request)) as {
               original_filename?: string;
               folder?: string;
               tags?: string[];
@@ -2524,9 +3015,14 @@ export function createStackMateApp(
             throw err;
           }
           const safeFilename = content.row.originalFilename.replace(/["\\\r\n]/g, "");
+          // M-19: ?download=1 forces a save-as download instead of the
+          // default inline preview (ADR-0011 open item).
+          const download = url.searchParams.get("download") === "1";
           const headers: Record<string, string> = {
             "Content-Type": content.mimeType,
-            "Content-Disposition": `inline; filename="${safeFilename}"`,
+            "Content-Disposition": download
+              ? `attachment; filename="${safeFilename}"`
+              : `inline; filename="${safeFilename}"`,
             "Cache-Control": "private, max-age=3600, immutable",
             "X-Content-Type-Options": "nosniff",
             "Accept-Ranges": "bytes",
@@ -2573,7 +3069,7 @@ export function createStackMateApp(
         }
         if (method === "PUT" && pathname === "/api/v1/admin/storage-settings") {
           assertStaffPermission(principal, "users.manage");
-          const body = (await request.json().catch(() => ({}))) as {
+          const body = (await readJsonBodyLenient(request)) as {
             driver?: "r2" | "local";
             local_path?: string | null;
           };
@@ -2597,9 +3093,13 @@ export function createStackMateApp(
 
         if (method === "GET" && pathname === "/api/v1/admin/users") {
           assertStaffPermission(principal, "users.manage");
-          const { q, limit } = parseListQuery(url.searchParams);
-          const users = applyListLimit(
-            store.state.users
+          const { q, limit, page } = parseListQuery(url.searchParams);
+          // H-03: ?status=active narrows the combobox/server list to
+          // active staff (unknown values match nothing, unknown params
+          // are ignored).
+          const statusFilter = url.searchParams.get("status");
+          const users = store.state.users
+              .filter((u) => (!statusFilter ? true : u.status === statusFilter))
               .filter((u) => includesQuery(u.name, q) || includesQuery(u.email, q))
               .map((u) => {
                 const roleIds = new Set(
@@ -2617,14 +3117,15 @@ export function createStackMateApp(
                   created_at: u.created_at,
                   created_date_display: formatDisplayDateDDMMYYYY(u.created_at, env.DEFAULT_TIMEZONE),
                 };
-              }),
-            limit,
-          );
-          return collectionResponse(users);
+              });
+          return pagedCollectionResponse(users, limit, page);
         }
 
         if (method === "POST" && pathname === "/api/v1/admin/users") {
-          const body = (await request.json()) as {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
+          const body = (await readJsonBody(request)) as {
             name: string;
             email: string;
             password: string;
@@ -2648,7 +3149,19 @@ export function createStackMateApp(
 
         const mUserRoles = matchPath("/api/v1/admin/users/:userId/roles", pathname);
         if (method === "PUT" && mUserRoles) {
-          const body = (await request.json()) as { role_keys: string[] };
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
+          const body = (await readJsonBody(request)) as { role_keys: string[] };
+          // L-13: role_keys must be an array — a string used to reach
+          // updateStaffUserRoles and throw a bare TypeError (500).
+          if (!body || typeof body !== "object" || !Array.isArray(body.role_keys)) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              "role_keys must be an array of role keys.",
+              422
+            );
+          }
           const updated = await updateStaffUserRoles(
             store,
             principal,
@@ -2661,10 +3174,17 @@ export function createStackMateApp(
 
         if (method === "GET" && pathname === "/api/v1/admin/roles") {
           assertStaffPermission(principal, "users.manage");
-          return collectionResponse(store.state.roles);
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(store.state.roles, limit, page);
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/permissions") {
+          // L-5: the permission catalogue is readable only to staff who
+          // can manage users/roles (same gate as /roles) — it leaks the
+          // RBAC surface otherwise. Deliberately NOT paged (M-1): it is
+          // a fixed catalogue, not a table, so it cannot grow
+          // unboundedly; the role editor needs the whole list at once.
+          assertStaffPermission(principal, "users.manage");
           return collectionResponse([...store.allPermissions]);
         }
 
@@ -2674,18 +3194,26 @@ export function createStackMateApp(
         // NOT exist in the seeded permission catalogue — the existing
         // users.manage key ("Manage staff users, roles, and permissions")
         // is the equivalent gate and is used for all role + invitation
-        // writes. No email is sent for invitations (there is no email
-        // system yet — Batch 5); the one-time token is returned once so
-        // an admin can deliver the accept link out of band.
+        // writes. Invitations ARE emailed when SMTP is configured
+        // (Auth + Email batch; the POST /users/invitations handler
+        // reports email_sent / email_error honestly) — the one-time
+        // token is still returned once, as the delivery path when
+        // email is not configured.
         if (method === "POST" && pathname === "/api/v1/admin/roles") {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
+          const body = await readJsonBody(request);
           const created = await createRoleByAdmin(store, principal, body, requestId);
           return jsonResponse(created, 201);
         }
 
         const mRoleDetail = matchPath("/api/v1/admin/roles/:roleId", pathname);
         if (method === "PATCH" && mRoleDetail) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
+          const body = await readJsonBody(request);
           const updated = await updateRoleByAdmin(
             store,
             principal,
@@ -2698,15 +3226,19 @@ export function createStackMateApp(
 
         if (method === "GET" && pathname === "/api/v1/admin/users/invitations") {
           assertStaffPermission(principal, "users.manage");
+          const { limit, page } = parseListQuery(url.searchParams);
           const items = (store.state.staff_invitations ?? []).map((inv) => {
             const { token_hash: _h, ...safe } = inv;
             return safe;
           });
-          return collectionResponse(items);
+          return pagedCollectionResponse(items, limit, page);
         }
 
         if (method === "POST" && pathname === "/api/v1/admin/users/invitations") {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
+          const body = await readJsonBody(request);
           const created = await createStaffInvitationByAdmin(store, principal, body, requestId);
           // Invitation email (Auth + Email batch): best-effort — the
           // token_once return is unchanged and stays the delivery path
@@ -2735,6 +3267,9 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mInvitationRevoke) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           const revoked = await revokeStaffInvitationByAdmin(
             store,
             principal,
@@ -2766,35 +3301,68 @@ export function createStackMateApp(
           });
         }
 
+        // Staff suspension (audit H-3): PATCH …/suspend + …/unsuspend.
+        // No dispatcher assert here on purpose — the service functions
+        // assert users.manage via assertStaffPermissionAudited, so a
+        // denial is written to the audit log; a plain dispatcher assert
+        // would throw first and the denial would never be recorded.
+        // Suspend revokes every session of the target (the service
+        // also refuses self-suspension with 409); unsuspend restores
+        // the account without re-issuing sessions.
+        const mUserSuspend = matchPath("/api/v1/admin/users/:userId/suspend", pathname);
+        if (method === "PATCH" && mUserSuspend) {
+          const result = await suspendStaffUser(
+            store,
+            principal,
+            mUserSuspend.params.userId!,
+            requestId
+          );
+          return jsonResponse(result);
+        }
+
+        const mUserUnsuspend = matchPath(
+          "/api/v1/admin/users/:userId/unsuspend",
+          pathname
+        );
+        if (method === "PATCH" && mUserUnsuspend) {
+          const result = await unsuspendStaffUser(
+            store,
+            principal,
+            mUserUnsuspend.params.userId!,
+            requestId
+          );
+          return jsonResponse(result);
+        }
+
         // Products, Features, Packages & Prices
         if (method === "GET" && pathname === "/api/v1/admin/products") {
           assertStaffPermission(principal, "products.read");
-          const { q, limit } = parseListQuery(url.searchParams);
-          const items = applyListLimit(
-            store.state.products
-              .filter(
-                (p) => includesQuery(p.name, q) || includesQuery(p.code, q),
-              )
-              .map((p) => ({
-                ...p,
-                features_count: store.state.product_features.filter(
-                  (f) => f.product_id === p.id,
-                ).length,
-                packages_count: store.state.product_packages.filter(
-                  (pkg) => pkg.product_id === p.id,
-                ).length,
-                created_date_display: formatDisplayDateDDMMYYYY(
-                  p.created_at,
-                  env.DEFAULT_TIMEZONE,
-                ),
-              })),
-            limit,
-          );
-          return collectionResponse(items);
+          const { q, limit, page } = parseListQuery(url.searchParams);
+          const items = store.state.products
+            .filter(
+              (p) => includesQuery(p.name, q) || includesQuery(p.code, q),
+            )
+            .map((p) => ({
+              ...p,
+              features_count: store.state.product_features.filter(
+                (f) => f.product_id === p.id,
+              ).length,
+              packages_count: store.state.product_packages.filter(
+                (pkg) => pkg.product_id === p.id,
+              ).length,
+              created_date_display: formatDisplayDateDDMMYYYY(
+                p.created_at,
+                env.DEFAULT_TIMEZONE,
+              ),
+            }));
+          return pagedCollectionResponse(items, limit, page);
         }
 
         if (method === "POST" && pathname === "/api/v1/admin/products") {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "products.create", requestId);
+          const body = await readJsonBody(request);
           const created = await createProduct(store, principal, body, requestId);
           return jsonResponse(created, 201);
         }
@@ -2814,7 +3382,10 @@ export function createStackMateApp(
         }
 
         if (method === "PATCH" && mProductDetail) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "products.update", requestId);
+          const body = await readJsonBody(request);
           const updated = await updateProductMetadata(
             store,
             principal,
@@ -2827,6 +3398,9 @@ export function createStackMateApp(
 
         const mProductPublish = matchPath("/api/v1/admin/products/:productId/publish", pathname);
         if (method === "POST" && mProductPublish) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "products.update", requestId);
           const updated = await updateProductStatus(
             store,
             principal,
@@ -2839,6 +3413,9 @@ export function createStackMateApp(
 
         const mProductArchive = matchPath("/api/v1/admin/products/:productId/archive", pathname);
         if (method === "POST" && mProductArchive) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "products.update", requestId);
           const updated = await updateProductStatus(
             store,
             principal,
@@ -2852,19 +3429,19 @@ export function createStackMateApp(
         const mProductFeatures = matchPath("/api/v1/admin/products/:productId/features", pathname);
         if (method === "GET" && mProductFeatures) {
           assertStaffPermission(principal, "products.read");
-          const { q, limit } = parseListQuery(url.searchParams);
-          const items = applyListLimit(
-            store.state.product_features
-              .filter((f) => f.product_id === mProductFeatures.params.productId)
-              .filter((f) => includesQuery(f.name, q) || includesQuery(f.feature_key, q))
-              .map((f) => withFeatureUsage(store.state, f)),
-            limit,
-          );
-          return collectionResponse(items);
+          const { q, limit, page } = parseListQuery(url.searchParams);
+          const items = store.state.product_features
+            .filter((f) => f.product_id === mProductFeatures.params.productId)
+            .filter((f) => includesQuery(f.name, q) || includesQuery(f.feature_key, q))
+            .map((f) => withFeatureUsage(store.state, f));
+          return pagedCollectionResponse(items, limit, page);
         }
 
         if (method === "POST" && mProductFeatures) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "features.manage", requestId);
+          const body = await readJsonBody(request);
           const created = await createProductFeature(
             store,
             principal,
@@ -2884,7 +3461,10 @@ export function createStackMateApp(
           pathname,
         );
         if (method === "POST" && mProductFeaturesBulk) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "features.manage", requestId);
+          const body = await readJsonBody(request);
           const result = await createProductFeaturesBulk(
             store,
             principal,
@@ -2898,29 +3478,29 @@ export function createStackMateApp(
         const mProductPackages = matchPath("/api/v1/admin/products/:productId/packages", pathname);
         if (method === "GET" && mProductPackages) {
           assertStaffPermission(principal, "products.read");
-          const { q, limit } = parseListQuery(url.searchParams);
-          const pkgs = applyListLimit(
-            store.state.product_packages
-              .filter((p) => p.product_id === mProductPackages.params.productId)
-              .filter((p) => includesQuery(p.name, q))
-              .map((p) => ({
-                ...p,
-                versions: store.state.package_versions
-                  .filter((v) => v.package_id === p.id)
-                  .map((v) => ({
-                    ...v,
-                    prices: store.state.package_prices.filter(
-                      (pr) => pr.package_version_id === v.id,
-                    ),
-                  })),
-              })),
-            limit,
-          );
-          return collectionResponse(pkgs);
+          const { q, limit, page } = parseListQuery(url.searchParams);
+          const pkgs = store.state.product_packages
+            .filter((p) => p.product_id === mProductPackages.params.productId)
+            .filter((p) => includesQuery(p.name, q))
+            .map((p) => ({
+              ...p,
+              versions: store.state.package_versions
+                .filter((v) => v.package_id === p.id)
+                .map((v) => ({
+                  ...v,
+                  prices: store.state.package_prices.filter(
+                    (pr) => pr.package_version_id === v.id,
+                  ),
+                })),
+            }));
+          return pagedCollectionResponse(pkgs, limit, page);
         }
 
         if (method === "POST" && mProductPackages) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "packages.manage", requestId);
+          const body = await readJsonBody(request);
           const created = await createProductPackageWithDraftVersion(
             store,
             principal,
@@ -2933,7 +3513,10 @@ export function createStackMateApp(
 
         const mPkgVersions = matchPath("/api/v1/admin/packages/:packageId/versions", pathname);
         if (method === "POST" && mPkgVersions) {
-          const body = (await request.json()) as {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "packages.manage", requestId);
+          const body = (await readJsonBody(request)) as {
             features: Array<{ product_feature_id: string; entitlement_value: unknown }>;
             change_summary?: string;
           };
@@ -2965,6 +3548,9 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mVerPublish) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "packages.publish", requestId);
           const published = await publishPackageVersion(
             store,
             principal,
@@ -2983,11 +3569,15 @@ export function createStackMateApp(
           const prices = store.state.package_prices.filter(
             (pr) => pr.package_version_id === mVerPrices.params.versionId
           );
-          return collectionResponse(prices);
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(prices, limit, page);
         }
 
         if (method === "POST" && mVerPrices) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "packages.manage", requestId);
+          const body = await readJsonBody(request);
           const created = await createPackagePrice(
             store,
             principal,
@@ -3015,7 +3605,10 @@ export function createStackMateApp(
         }
 
         if (method === "PATCH" && mFeatureDetail) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "features.manage", requestId);
+          const body = await readJsonBody(request);
           const updated = await updateProductFeatureByAdmin(
             store,
             principal,
@@ -3032,6 +3625,9 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mFeatureArchive) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "features.manage", requestId);
           const archived = await archiveProductFeatureByAdmin(
             store,
             principal,
@@ -3063,7 +3659,10 @@ export function createStackMateApp(
         }
 
         if (method === "PATCH" && mPackageDetail) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "packages.manage", requestId);
+          const body = await readJsonBody(request);
           const updated = await updateProductPackageByAdmin(
             store,
             principal,
@@ -3079,6 +3678,9 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mVerRetire) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "packages.publish", requestId);
           const retired = await retirePackageVersionByAdmin(
             store,
             principal,
@@ -3099,7 +3701,10 @@ export function createStackMateApp(
         }
 
         if (method === "PATCH" && mPriceDetail) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "packages.manage", requestId);
+          const body = await readJsonBody(request);
           const updated = await updatePackagePriceByAdmin(
             store,
             principal,
@@ -3112,6 +3717,9 @@ export function createStackMateApp(
 
         const mPriceDisable = matchPath("/api/v1/admin/prices/:priceId/disable", pathname);
         if (method === "POST" && mPriceDisable) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "packages.manage", requestId);
           const disabled = await disablePackagePriceByAdmin(
             store,
             principal,
@@ -3140,39 +3748,39 @@ export function createStackMateApp(
         // Customers, Orders & Invoices
         if (method === "GET" && pathname === "/api/v1/admin/customers") {
           assertStaffPermission(principal, "customers.read");
-          const { q, limit } = parseListQuery(url.searchParams);
-          const items = applyListLimit(
-            store.state.customers
-              .filter(
-                (c) =>
-                  includesQuery(c.name, q) ||
-                  includesQuery(c.email, q) ||
-                  includesQuery(c.customer_number, q) ||
-                  includesQuery(c.company_name, q) ||
-                  matchesPhoneQuery(c.phone, c.normalized_phone, q),
-              )
-              .map((c) => ({
-                ...c,
-                // Staff-report flag (ADR-0009): a warning badge when a concern
-                // report exists; the count lets the list row show it plainly.
-                report_count: store.state.customer_reports.filter(
-                  (r) => r.customer_id === c.id,
-                ).length,
-                has_concern_report: store.state.customer_reports.some(
-                  (r) => r.customer_id === c.id && r.type === "concern",
-                ),
-                created_date_display: formatDisplayDateDDMMYYYY(
-                  c.created_at,
-                  env.DEFAULT_TIMEZONE,
-                ),
-              })),
-            limit,
-          );
-          return collectionResponse(items);
+          const { q, limit, page } = parseListQuery(url.searchParams);
+          const items = store.state.customers
+            .filter(
+              (c) =>
+                includesQuery(c.name, q) ||
+                includesQuery(c.email, q) ||
+                includesQuery(c.customer_number, q) ||
+                includesQuery(c.company_name, q) ||
+                matchesPhoneQuery(c.phone, c.normalized_phone, q),
+            )
+            .map((c) => ({
+              ...c,
+              // Staff-report flag (ADR-0009): a warning badge when a concern
+              // report exists; the count lets the list row show it plainly.
+              report_count: store.state.customer_reports.filter(
+                (r) => r.customer_id === c.id,
+              ).length,
+              has_concern_report: store.state.customer_reports.some(
+                (r) => r.customer_id === c.id && r.type === "concern",
+              ),
+              created_date_display: formatDisplayDateDDMMYYYY(
+                c.created_at,
+                env.DEFAULT_TIMEZONE,
+              ),
+            }));
+          return pagedCollectionResponse(items, limit, page);
         }
 
         if (method === "POST" && pathname === "/api/v1/admin/customers") {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "customers.manage", requestId);
+          const body = await readJsonBody(request);
           const customer = await createCustomerByAdmin(store, principal, body, requestId);
           return jsonResponse(customer, 201);
         }
@@ -3277,39 +3885,49 @@ export function createStackMateApp(
         if (method === "GET" && pathname === "/api/v1/admin/orders") {
           assertStaffPermission(principal, "orders.read");
           const statusFilter = url.searchParams.get("payment_status");
-          const { q, limit } = parseListQuery(url.searchParams);
-          const items = applyListLimit(
-            store.state.orders
-              .filter((o) => (!statusFilter ? true : o.payment_status === statusFilter))
-              .filter(
-                (o) =>
-                  includesQuery(o.order_number, q) ||
-                  includesQuery(o.public_reference, q) ||
-                  includesQuery(
-                    store.state.customers.find((c) => c.id === o.customer_id)?.name,
-                    q,
-                  ),
-              )
-              .map((o) => ({
-                ...o,
-                customer: store.state.customers.find((c) => c.id === o.customer_id) ?? null,
-                // Paid/remaining are computed from verified payments
-                // (ADR-0009) — never denormalized, so they cannot drift.
-                paid_amount_minor: computeOrderPaid(store.state, o.id),
-                remaining_minor: computeOrderRemaining(store.state, o),
-                created_date_display: formatDisplayDateDDMMYYYY(
-                  o.created_at,
-                  env.DEFAULT_TIMEZONE,
+          // H-03: ?open_only=true narrows to orders with a balance due
+          // (remaining > 0 from verified payments) — the payment-review
+          // order picker. Unknown params are ignored.
+          const openOnly = url.searchParams.get("open_only") === "true";
+          const { q, limit, page } = parseListQuery(url.searchParams);
+          const items = store.state.orders
+            .filter((o) => (!statusFilter ? true : o.payment_status === statusFilter))
+            .filter((o) => (!openOnly ? true : computeOrderRemaining(store.state, o) > 0))
+            .filter(
+              (o) =>
+                includesQuery(o.order_number, q) ||
+                includesQuery(o.public_reference, q) ||
+                includesQuery(
+                  store.state.customers.find((c) => c.id === o.customer_id)?.name,
+                  q,
                 ),
-              })),
-            limit,
-          );
-          return collectionResponse(items);
+            )
+            .map((o) => ({
+              ...o,
+              customer: store.state.customers.find((c) => c.id === o.customer_id) ?? null,
+              // Paid/remaining are computed from verified payments
+              // (ADR-0009) — never denormalized, so they cannot drift.
+              paid_amount_minor: computeOrderPaid(store.state, o.id),
+              remaining_minor: computeOrderRemaining(store.state, o),
+              created_date_display: formatDisplayDateDDMMYYYY(
+                o.created_at,
+                env.DEFAULT_TIMEZONE,
+              ),
+            }));
+          return pagedCollectionResponse(items, limit, page);
         }
 
         if (method === "POST" && pathname === "/api/v1/admin/orders") {
-          const body = await request.json();
-          const created = await createOrderByAdmin(store, principal, body, requestId);
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "orders.create", requestId);
+          const body = await readJsonBody(request);
+          // F-12: the order's on_date boundary is a business date in the
+          // configured timezone (defaults to Asia/Dhaka inside the
+          // service when omitted).
+          const created = await createOrderByAdmin(store, principal, body, requestId, {
+            timeZone: env.DEFAULT_TIMEZONE,
+          });
           return jsonResponse(created, 201);
         }
 
@@ -3342,14 +3960,18 @@ export function createStackMateApp(
 
         if (method === "GET" && pathname === "/api/v1/admin/invoices") {
           assertStaffPermission(principal, "orders.read");
-          return collectionResponse(store.state.invoices);
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(store.state.invoices, limit, page);
         }
 
         // Batch 1: customer update + per-customer collections.
         // (Customer detail already embeds orders/subscriptions/licenses;
         // these filtered collections are the list views the SPA needs.)
         if (method === "PATCH" && mCustDetail) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "customers.manage", requestId);
+          const body = await readJsonBody(request);
           const updated = await updateCustomerByAdmin(
             store,
             principal,
@@ -3367,14 +3989,16 @@ export function createStackMateApp(
             (c) => c.id === mCustOrders.params.customerId
           );
           if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
-          return collectionResponse(
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(
             store.state.orders
               .filter((o) => o.customer_id === customer.id)
               .map((o) => ({
                 ...o,
                 paid_amount_minor: computeOrderPaid(store.state, o.id),
                 remaining_minor: computeOrderRemaining(store.state, o),
-              }))
+              })),
+            limit, page
           );
         }
 
@@ -3388,8 +4012,10 @@ export function createStackMateApp(
             (c) => c.id === mCustSubs.params.customerId
           );
           if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
-          return collectionResponse(
-            store.state.subscriptions.filter((s) => s.customer_id === customer.id)
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(
+            store.state.subscriptions.filter((s) => s.customer_id === customer.id),
+            limit, page
           );
         }
 
@@ -3403,10 +4029,12 @@ export function createStackMateApp(
             (c) => c.id === mCustLicenses.params.customerId
           );
           if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
-          return collectionResponse(
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(
             store.state.licenses
               .filter((l) => l.customer_id === customer.id)
-              .map(({ license_key_hash: _h, issued_raw_key_once: _r, ...safe }) => safe)
+              .map(({ license_key_hash: _h, issued_raw_key_once: _r, ...safe }) => safe),
+            limit, page
           );
         }
 
@@ -3419,12 +4047,17 @@ export function createStackMateApp(
         );
         if (method === "GET" && mCustAddresses) {
           assertStaffPermission(principal, "customers.read");
-          return collectionResponse(
-            await listCustomerAddresses(store, principal, mCustAddresses.params.customerId!)
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(
+            await listCustomerAddresses(store, principal, mCustAddresses.params.customerId!),
+            limit, page
           );
         }
         if (method === "POST" && mCustAddresses) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "customers.manage", requestId);
+          const body = await readJsonBody(request);
           const address = await createCustomerAddressByAdmin(
             store,
             principal,
@@ -3439,7 +4072,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "PATCH" && mCustAddressDetail) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "customers.manage", requestId);
+          const body = await readJsonBody(request);
           const address = await updateCustomerAddressByAdmin(
             store,
             principal,
@@ -3451,6 +4087,9 @@ export function createStackMateApp(
           return jsonResponse(address);
         }
         if (method === "DELETE" && mCustAddressDetail) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "customers.manage", requestId);
           await deleteCustomerAddressByAdmin(
             store,
             principal,
@@ -3467,12 +4106,17 @@ export function createStackMateApp(
         );
         if (method === "GET" && mCustReports) {
           assertStaffPermission(principal, "customers.read");
-          return collectionResponse(
-            await listCustomerReports(store, principal, mCustReports.params.customerId!)
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(
+            await listCustomerReports(store, principal, mCustReports.params.customerId!),
+            limit, page
           );
         }
         if (method === "POST" && mCustReports) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "customers.manage", requestId);
+          const body = await readJsonBody(request);
           const report = await createCustomerReportByAdmin(
             store,
             principal,
@@ -3488,7 +4132,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mCustSplit) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "customers.manage", requestId);
+          const body = await readJsonBody(request);
           const result = await splitCustomerContactByAdmin(
             store,
             principal,
@@ -3533,7 +4180,8 @@ export function createStackMateApp(
         );
         if (method === "GET" && mCustInstallations) {
           assertStaffPermission(principal, "customers.read");
-          return collectionResponse(
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(
             store.state.licenses
               .filter((l) => l.customer_id === mCustInstallations.params.customerId)
               .flatMap((l) =>
@@ -3542,7 +4190,8 @@ export function createStackMateApp(
                   license_number: l.license_number,
                   product_id: l.product_id,
                 }))
-              )
+              ),
+            limit, page
           );
         }
 
@@ -3571,7 +4220,8 @@ export function createStackMateApp(
               .filter((l) => l.customer_id === customer.id)
               .map((l) => l.id)
           );
-          return collectionResponse(
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(
             store.state.audit_logs
               .filter(
                 (a) =>
@@ -3581,7 +4231,8 @@ export function createStackMateApp(
                   (a.resource_type === "license" && licenseIds.has(a.resource_id))
               )
               .slice(-100)
-              .reverse()
+              .reverse(),
+            limit, page
           );
         }
 
@@ -3591,17 +4242,22 @@ export function createStackMateApp(
         );
         if (method === "GET" && mCustTickets) {
           assertStaffPermission(principal, "tickets.view");
-          return collectionResponse(
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(
             store.state.support_tickets.filter(
               (t) => t.customer_id === mCustTickets.params.customerId
-            )
+            ),
+            limit, page
           );
         }
 
         // Batch 1: order lifecycle + invoice writes.
         const mOrderCancel = matchPath("/api/v1/admin/orders/:orderId/cancel", pathname);
         if (method === "POST" && mOrderCancel) {
-          const body = (await request.json().catch(() => ({}))) as { reason?: string };
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "orders.manage", requestId);
+          const body = (await readJsonBodyLenient(request)) as { reason?: string };
           const cancelled = await cancelOrderByAdmin(
             store,
             principal,
@@ -3614,6 +4270,9 @@ export function createStackMateApp(
 
         const mOrderComplete = matchPath("/api/v1/admin/orders/:orderId/complete", pathname);
         if (method === "POST" && mOrderComplete) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "orders.manage", requestId);
           const completed = await completeOrderByAdmin(
             store,
             principal,
@@ -3630,12 +4289,17 @@ export function createStackMateApp(
             (o) => o.id === mOrderInvoices.params.orderId
           );
           if (!order) throw new AppError("NOT_FOUND", "Order not found.", 404);
-          return collectionResponse(
-            store.state.invoices.filter((i) => i.order_id === order.id)
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(
+            store.state.invoices.filter((i) => i.order_id === order.id),
+            limit, page
           );
         }
 
         if (method === "POST" && mOrderInvoices) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "orders.manage", requestId);
           const invoice = await createInvoiceForOrderByAdmin(
             store,
             principal,
@@ -3656,7 +4320,8 @@ export function createStackMateApp(
             (o) => o.id === mOrderInstallments.params.orderId
           );
           if (!order) throw new AppError("NOT_FOUND", "Order not found.", 404);
-          return collectionResponse(
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(
             store.state.order_installments
               .filter((i) => i.order_id === order.id)
               .sort((a, b) => a.installment_number - b.installment_number)
@@ -3666,7 +4331,8 @@ export function createStackMateApp(
                   `${i.due_date}T00:00:00.000Z`,
                   env.DEFAULT_TIMEZONE
                 ),
-              }))
+              })),
+            limit, page
           );
         }
         const mOrderInstallmentDetail = matchPath(
@@ -3674,7 +4340,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "PATCH" && mOrderInstallmentDetail) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "orders.manage", requestId);
+          const body = await readJsonBody(request);
           const updated = await updateInstallmentByAdmin(
             store,
             principal,
@@ -3704,7 +4373,10 @@ export function createStackMateApp(
 
         const mInvoiceVoid = matchPath("/api/v1/admin/invoices/:invoiceId/void", pathname);
         if (method === "POST" && mInvoiceVoid) {
-          const body = (await request.json().catch(() => ({}))) as { reason?: string };
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "orders.manage", requestId);
+          const body = (await readJsonBodyLenient(request)) as { reason?: string };
           const voided = await voidInvoiceByAdmin(
             store,
             principal,
@@ -3738,37 +4410,37 @@ export function createStackMateApp(
           const customerFilter = url.searchParams.get("customer_id");
           const assigneeFilter = url.searchParams.get("assignee_user_id");
           const q = url.searchParams.get("q")?.trim().toLowerCase() ?? "";
-          const { limit } = parseListQuery(url.searchParams);
-          const items = applyListLimit(
-            store.state.support_tickets
-              .filter((t) => (!statusFilter ? true : t.status === statusFilter))
-              .filter((t) => (!priorityFilter ? true : t.priority === priorityFilter))
-              .filter((t) => (!customerFilter ? true : t.customer_id === customerFilter))
-              .filter((t) => (!assigneeFilter ? true : t.assignee_user_id === assigneeFilter))
-              .filter((t) =>
-                !q
-                  ? true
-                  : t.ticket_number.toLowerCase().includes(q) ||
-                    t.title.toLowerCase().includes(q) ||
-                    (t.description ?? "").toLowerCase().includes(q)
-              )
-              .map((t) => ({
-                ...t,
-                customer: t.customer_id
-                  ? (store.state.customers.find((c) => c.id === t.customer_id) ?? null)
-                  : null,
-                assignee_name: t.assignee_user_id
-                  ? (store.state.users.find((u) => u.id === t.assignee_user_id)?.name ?? null)
-                  : null,
-                assignee_email: staffContactFor(t.assignee_user_id).email,
-                assignee_roles: staffContactFor(t.assignee_user_id).roles,
-              })),
-            limit,
-          );
-          return collectionResponse(items);
+          const { limit, page } = parseListQuery(url.searchParams);
+          const items = store.state.support_tickets
+            .filter((t) => (!statusFilter ? true : t.status === statusFilter))
+            .filter((t) => (!priorityFilter ? true : t.priority === priorityFilter))
+            .filter((t) => (!customerFilter ? true : t.customer_id === customerFilter))
+            .filter((t) => (!assigneeFilter ? true : t.assignee_user_id === assigneeFilter))
+            .filter((t) =>
+              !q
+                ? true
+                : t.ticket_number.toLowerCase().includes(q) ||
+                  t.title.toLowerCase().includes(q) ||
+                  (t.description ?? "").toLowerCase().includes(q)
+            )
+            .map((t) => ({
+              ...t,
+              customer: t.customer_id
+                ? (store.state.customers.find((c) => c.id === t.customer_id) ?? null)
+                : null,
+              assignee_name: t.assignee_user_id
+                ? (store.state.users.find((u) => u.id === t.assignee_user_id)?.name ?? null)
+                : null,
+              assignee_email: staffContactFor(t.assignee_user_id).email,
+              assignee_roles: staffContactFor(t.assignee_user_id).roles,
+            }));
+          return pagedCollectionResponse(items, limit, page);
         }
         if (method === "POST" && pathname === "/api/v1/admin/tickets") {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "tickets.manage", requestId);
+          const body = await readJsonBody(request);
           const ticket = await createTicketByAdmin(store, principal, body, requestId);
           return jsonResponse(ticket, 201);
         }
@@ -3817,7 +4489,10 @@ export function createStackMateApp(
           });
         }
         if (method === "PATCH" && mTicketDetail) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "tickets.manage", requestId);
+          const body = await readJsonBody(request);
           const updated = await updateTicketByAdmin(
             store,
             principal,
@@ -3832,7 +4507,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mTicketTransition) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "tickets.manage", requestId);
+          const body = await readJsonBody(request);
           const updated = await transitionTicketByAdmin(
             store,
             principal,
@@ -3847,7 +4525,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mTicketAssign) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "tickets.manage", requestId);
+          const body = await readJsonBody(request);
           const updated = await assignTicketByAdmin(
             store,
             principal,
@@ -3862,7 +4543,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mTicketComments) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "tickets.manage", requestId);
+          const body = await readJsonBody(request);
           const comment = await addTicketCommentByAdmin(
             store,
             principal,
@@ -3882,37 +4566,37 @@ export function createStackMateApp(
           const fromFilter = url.searchParams.get("from");
           const toFilter = url.searchParams.get("to");
           const q = url.searchParams.get("q")?.trim().toLowerCase() ?? "";
-          const { limit } = parseListQuery(url.searchParams);
-          const items = applyListLimit(
-            store.state.leads
-              .filter((l) => (!statusFilter ? true : l.status === statusFilter))
-              .filter((l) => (!siteFilter ? true : l.source_site_id === siteFilter))
-              .filter((l) => (!campaignFilter ? true : l.utm_campaign === campaignFilter))
-              .filter((l) => (!fromFilter ? true : l.created_at.slice(0, 10) >= fromFilter))
-              .filter((l) => (!toFilter ? true : l.created_at.slice(0, 10) <= toFilter))
-              .filter((l) =>
-                !q
-                  ? true
-                  : l.name.toLowerCase().includes(q) ||
-                    (l.email ?? "").toLowerCase().includes(q) ||
-                    (l.phone ?? "").includes(q) ||
-                    (l.interest ?? "").toLowerCase().includes(q)
-              )
-              .map((l) => ({
-                ...l,
-                source_site: l.source_site_id
-                  ? (store.state.integrated_sites.find((s) => s.id === l.source_site_id) ?? null)
-                  : null,
-                assignee_name: l.assignee_user_id
-                  ? (store.state.users.find((u) => u.id === l.assignee_user_id)?.name ?? null)
-                  : null,
-              })),
-            limit,
-          );
-          return collectionResponse(items);
+          const { limit, page } = parseListQuery(url.searchParams);
+          const items = store.state.leads
+            .filter((l) => (!statusFilter ? true : l.status === statusFilter))
+            .filter((l) => (!siteFilter ? true : l.source_site_id === siteFilter))
+            .filter((l) => (!campaignFilter ? true : l.utm_campaign === campaignFilter))
+            .filter((l) => (!fromFilter ? true : l.created_at.slice(0, 10) >= fromFilter))
+            .filter((l) => (!toFilter ? true : l.created_at.slice(0, 10) <= toFilter))
+            .filter((l) =>
+              !q
+                ? true
+                : l.name.toLowerCase().includes(q) ||
+                  (l.email ?? "").toLowerCase().includes(q) ||
+                  (l.phone ?? "").includes(q) ||
+                  (l.interest ?? "").toLowerCase().includes(q)
+            )
+            .map((l) => ({
+              ...l,
+              source_site: l.source_site_id
+                ? (store.state.integrated_sites.find((s) => s.id === l.source_site_id) ?? null)
+                : null,
+              assignee_name: l.assignee_user_id
+                ? (store.state.users.find((u) => u.id === l.assignee_user_id)?.name ?? null)
+                : null,
+            }));
+          return pagedCollectionResponse(items, limit, page);
         }
         if (method === "POST" && pathname === "/api/v1/admin/leads") {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "leads.manage", requestId);
+          const body = await readJsonBody(request);
           const lead = await createLeadByAdmin(store, principal, body, requestId);
           return jsonResponse(lead, 201);
         }
@@ -3941,7 +4625,10 @@ export function createStackMateApp(
           });
         }
         if (method === "PATCH" && mLeadDetail) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "leads.manage", requestId);
+          const body = await readJsonBody(request);
           const updated = await updateLeadByAdmin(
             store,
             principal,
@@ -3956,7 +4643,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mLeadTransition) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "leads.manage", requestId);
+          const body = await readJsonBody(request);
           const updated = await transitionLeadByAdmin(
             store,
             principal,
@@ -3968,7 +4658,10 @@ export function createStackMateApp(
         }
         const mLeadAssign = matchPath("/api/v1/admin/leads/:leadId/assign", pathname);
         if (method === "POST" && mLeadAssign) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "leads.manage", requestId);
+          const body = await readJsonBody(request);
           const updated = await assignLeadByAdmin(
             store,
             principal,
@@ -3980,6 +4673,9 @@ export function createStackMateApp(
         }
         const mLeadConvert = matchPath("/api/v1/admin/leads/:leadId/convert", pathname);
         if (method === "POST" && mLeadConvert) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "leads.manage", requestId);
           const result = await convertLeadByAdmin(
             store,
             principal,
@@ -4000,7 +4696,7 @@ export function createStackMateApp(
         }
         if (method === "PUT" && pathname === "/api/v1/admin/reminder-settings") {
           assertStaffPermission(principal, "users.manage");
-          const body = await request.json();
+          const body = await readJsonBody(request);
           const db = (store as unknown as { drizzleDb?: unknown }).drizzleDb as
             | Parameters<typeof saveReminderSettings>[0]
             | undefined;
@@ -4040,7 +4736,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mOrderPaySub) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "payments.approve", requestId);
+          const body = await readJsonBody(request);
           const created = await recordManualPaymentClaimByAdmin(
             store,
             principal,
@@ -4056,7 +4755,11 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mOrderPayEvidence) {
-          const body = (await request.json()) as {
+          // H-1: the admin evidence upload is a privileged write —
+          // require payments.approve at the route (the service asserts
+          // it again when the principal is passed as actor below).
+          assertStaffPermission(principal, "payments.approve");
+          const body = (await readJsonBody(request)) as {
             filename: string;
             content_type: string;
             file_base64: string;
@@ -4089,6 +4792,10 @@ export function createStackMateApp(
             bytes,
             bucketName: adminEvidenceDriver.name === "r2" ? env.R2_BUCKET_NAME : "local",
             driver: adminEvidenceDriver,
+            // H-1: pass the staff principal so the service-level
+            // payments.approve check and the staff audit row fire.
+            actor: principal,
+            requestId,
           });
           return jsonResponse(asset, 201);
         }
@@ -4096,35 +4803,44 @@ export function createStackMateApp(
         // Payment Providers, Methods, Submissions & Verification
         if (method === "GET" && pathname === "/api/v1/admin/payment-providers") {
           assertStaffPermission(principal, "payments.read");
-          const { q, limit } = parseListQuery(url.searchParams);
-          return collectionResponse(
-            applyListLimit(
-              store.state.payment_providers.filter((p) => includesQuery(p.display_name, q)),
-              limit,
-            ),
+          const { q, limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(
+            store.state.payment_providers.filter((p) => includesQuery(p.display_name, q)),
+            limit, page
           );
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/payment-methods") {
           assertStaffPermission(principal, "payments.read");
-          const { q, limit } = parseListQuery(url.searchParams);
-          return collectionResponse(
-            applyListLimit(
-              store.state.payment_methods.filter((m) => includesQuery(m.display_name, q)),
-              limit,
-            ),
+          // H-03: ?is_enabled=true/false narrows the combobox/server
+          // list to enabled/disabled methods. Unknown params ignored.
+          const isEnabledParam = url.searchParams.get("is_enabled");
+          const enabledFilter =
+            isEnabledParam === "true" ? true : isEnabledParam === "false" ? false : null;
+          const { q, limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(
+            store.state.payment_methods
+              .filter((m) => (enabledFilter === null ? true : m.is_enabled === enabledFilter))
+              .filter((m) => includesQuery(m.display_name, q)),
+            limit, page
           );
         }
 
         if (method === "POST" && pathname === "/api/v1/admin/payment-methods") {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "payments.methods.manage", requestId);
+          const body = await readJsonBody(request);
           const created = await createPaymentMethodByAdmin(store, principal, body, requestId);
           return jsonResponse(created, 201);
         }
 
         // Batch 1: payment provider + method lifecycle writes.
         if (method === "POST" && pathname === "/api/v1/admin/payment-providers") {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "payments.methods.manage", requestId);
+          const body = await readJsonBody(request);
           const created = await createPaymentProviderByAdmin(store, principal, body, requestId);
           return jsonResponse(created, 201);
         }
@@ -4134,7 +4850,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "PATCH" && mProviderDetail) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "payments.methods.manage", requestId);
+          const body = await readJsonBody(request);
           const updated = await updatePaymentProviderByAdmin(
             store,
             principal,
@@ -4156,7 +4875,10 @@ export function createStackMateApp(
         }
 
         if (method === "PATCH" && mMethodDetail) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "payments.methods.manage", requestId);
+          const body = await readJsonBody(request);
           const updated = await updatePaymentMethodByAdmin(
             store,
             principal,
@@ -4172,6 +4894,9 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mMethodEnable) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "payments.methods.manage", requestId);
           const updated = await setPaymentMethodEnabledByAdmin(
             store,
             principal,
@@ -4187,6 +4912,9 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mMethodDisable) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "payments.methods.manage", requestId);
           const updated = await setPaymentMethodEnabledByAdmin(
             store,
             principal,
@@ -4244,10 +4972,12 @@ export function createStackMateApp(
             (s) => s.id === mSubmissionHistory.params.submissionId
           );
           if (!sub) throw new AppError("NOT_FOUND", "Payment submission not found.", 404);
-          return collectionResponse(
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(
             store.state.payment_verification_logs.filter(
               (l) => l.payment_submission_id === sub.id
-            )
+            ),
+            limit, page
           );
         }
 
@@ -4256,6 +4986,14 @@ export function createStackMateApp(
           const statusFilter = url.searchParams.get("status");
           const items = store.state.payment_submissions
             .filter((s) => (!statusFilter ? true : s.status === statusFilter))
+            // M-22: deterministic newest-first order (submitted_at DESC,
+            // id ASC) — the SPA's "transient inconsistency" was partly
+            // this list arriving unsorted while the client paginated.
+            .sort((a, b) => {
+              const byTime =
+                new Date(b.submitted_at).getTime() - new Date(a.submitted_at).getTime();
+              return byTime !== 0 ? byTime : a.id.localeCompare(b.id);
+            })
             .map((s) => {
               const order = store.state.orders.find((o) => o.id === s.order_id);
               const customer = store.state.customers.find((c) => c.id === s.customer_id);
@@ -4275,7 +5013,8 @@ export function createStackMateApp(
                 ),
               };
             });
-          return collectionResponse(items);
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(items, limit, page);
         }
 
         const mSubmissionApprove = matchPath(
@@ -4283,7 +5022,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mSubmissionApprove) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "payments.approve", requestId);
+          const body = await readJsonBody(request);
           const result = await approvePaymentSubmissionByStaff(
             store,
             principal,
@@ -4292,6 +5034,7 @@ export function createStackMateApp(
             {
               licenseVerifierSecret: env.LICENSE_VERIFIER_SECRET,
               requestId,
+              timeZone: env.DEFAULT_TIMEZONE,
             }
           );
           return jsonResponse(result, 200);
@@ -4302,7 +5045,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mSubmissionReject) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "payments.reject", requestId);
+          const body = await readJsonBody(request);
           const result = await rejectPaymentSubmissionByStaff(
             store,
             principal,
@@ -4313,6 +5059,63 @@ export function createStackMateApp(
           return jsonResponse(result, 200);
         }
 
+        // Refunds (D-4 / F-03): manual refunds only — no gateway.
+        // The service records the refund, reverses it out of
+        // installments newest-first, adjusts the order balance and
+        // writes the audit row; the route validates the envelope with
+        // RecordManualRefundSchema and gates on payments.approve.
+        if (method === "POST" && pathname === "/api/v1/admin/refunds") {
+          assertStaffPermission(principal, "payments.approve");
+          const body = await readJsonBody(request);
+          const parsed = RecordManualRefundSchema.safeParse(body);
+          if (!parsed.success) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              parsed.issues[0]?.message ?? "Invalid refund request.",
+              422,
+            );
+          }
+          // exactOptionalPropertyTypes: the schema's optional fields
+          // parse to `undefined` when absent; the service input takes
+          // `string | null`, so normalize absent to null (the refine
+          // above guarantees exactly one of the two ids is set).
+          const created = await recordManualRefundByAdmin(
+            store,
+            principal,
+            {
+              ...parsed.data,
+              payment_transaction_id: parsed.data.payment_transaction_id ?? null,
+              order_id: parsed.data.order_id ?? null,
+              provider_refund_id: parsed.data.provider_refund_id ?? null,
+            },
+            requestId,
+          );
+          return jsonResponse(created, 201);
+        }
+
+        if (method === "GET" && pathname === "/api/v1/admin/refunds") {
+          assertStaffPermission(principal, "payments.read");
+          const { q, limit, page } = parseListQuery(url.searchParams);
+          const items = store.state.payment_refunds.filter(
+            (r) =>
+              includesQuery(r.id, q) ||
+              includesQuery(r.payment_transaction_id, q) ||
+              includesQuery(r.reason, q) ||
+              includesQuery(r.provider_refund_id, q),
+          );
+          return pagedCollectionResponse(items, limit, page);
+        }
+
+        const mRefundDetail = matchPath("/api/v1/admin/refunds/:refundId", pathname);
+        if (method === "GET" && mRefundDetail) {
+          assertStaffPermission(principal, "payments.read");
+          const refund = store.state.payment_refunds.find(
+            (r) => r.id === mRefundDetail.params.refundId
+          );
+          if (!refund) throw new AppError("NOT_FOUND", "Refund not found.", 404);
+          return jsonResponse(refund);
+        }
+
         const mAssetContent = matchPath("/api/v1/admin/assets/:assetId/content", pathname);
         if (method === "GET" && mAssetContent) {
           assertStaffPermission(principal, "payments.read");
@@ -4320,14 +5123,18 @@ export function createStackMateApp(
             (a) => a.id === mAssetContent.params.assetId
           );
           if (!asset) throw new AppError("NOT_FOUND", "Asset not found.", 404);
-          const obj = await store.r2Bucket.get(asset.object_key);
-          if (!obj) throw new AppError("NOT_FOUND", "R2 object content not found.", 404);
-          const buf = await obj.arrayBuffer();
-          return new Response(buf, {
+          // L-10: serve through the resolved storage driver (R2 or
+          // Local) — the direct r2Bucket.get bypassed the driver
+          // selection, so a Local-configured instance 404d here even
+          // though the object existed.
+          const assetDriver = await resolveStorageDriver(driverDepsForRequest(store, env));
+          const obj = await assetDriver.get(asset.object_key);
+          if (!obj) throw new AppError("NOT_FOUND", "Object content not found.", 404);
+          return new Response(obj.bytes, {
             status: 200,
             headers: {
               "Content-Type": asset.content_type,
-              "Content-Length": String(asset.byte_size),
+              "Content-Length": String(obj.size),
               "Cache-Control": "private, no-store",
               "Content-Disposition": `inline; filename="${asset.original_filename}"`,
               "X-Request-ID": requestId,
@@ -4338,28 +5145,25 @@ export function createStackMateApp(
         // Subscriptions & Licenses
         if (method === "GET" && pathname === "/api/v1/admin/subscriptions") {
           assertStaffPermission(principal, "subscriptions.read");
-          const { q, limit } = parseListQuery(url.searchParams);
-          const items = applyListLimit(
-            store.state.subscriptions
-              .filter(
-                (s) =>
-                  includesQuery(s.subscription_number, q) ||
-                  includesQuery(
-                    store.state.customers.find((c) => c.id === s.customer_id)?.name,
-                    q,
-                  ),
-              )
-              .map((s) => ({
-                ...s,
-                customer: store.state.customers.find((c) => c.id === s.customer_id) ?? null,
-                product: store.state.products.find((p) => p.id === s.product_id) ?? null,
-                next_renewal_display: s.next_renewal_at
-                  ? formatDisplayDateDDMMYYYY(s.next_renewal_at, env.DEFAULT_TIMEZONE)
-                  : null,
-              })),
-            limit,
-          );
-          return collectionResponse(items);
+          const { q, limit, page } = parseListQuery(url.searchParams);
+          const items = store.state.subscriptions
+            .filter(
+              (s) =>
+                includesQuery(s.subscription_number, q) ||
+                includesQuery(
+                  store.state.customers.find((c) => c.id === s.customer_id)?.name,
+                  q,
+                ),
+            )
+            .map((s) => ({
+              ...s,
+              customer: store.state.customers.find((c) => c.id === s.customer_id) ?? null,
+              product: store.state.products.find((p) => p.id === s.product_id) ?? null,
+              next_renewal_display: s.next_renewal_at
+                ? formatDisplayDateDDMMYYYY(s.next_renewal_at, env.DEFAULT_TIMEZONE)
+                : null,
+            }));
+          return pagedCollectionResponse(items, limit, page);
         }
 
         // Batch 1: subscription detail.
@@ -4388,6 +5192,9 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mSubRenewal) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "subscriptions.manage", requestId);
           const idempotencyKey =
             request.headers.get("Idempotency-Key") ?? `ren_${mSubRenewal.params.subscriptionId}`;
           const res = await generateSubscriptionRenewalInvoice(
@@ -4411,6 +5218,9 @@ export function createStackMateApp(
             mSubAction.params.action === "resume" ||
             mSubAction.params.action === "cancel")
         ) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "subscriptions.manage", requestId);
           const updated = await transitionSubscriptionStatus(
             store,
             principal,
@@ -4424,43 +5234,43 @@ export function createStackMateApp(
         if (method === "GET" && pathname === "/api/v1/admin/licenses") {
           assertStaffPermission(principal, "licenses.read");
           // Never expose license_key_hash or raw keys in list responses (API Spec §12.3)
-          const { q, limit } = parseListQuery(url.searchParams);
-          const items = applyListLimit(
-            store.state.licenses
-              .filter(
-                (l) =>
-                  includesQuery(l.license_number, q) ||
-                  includesQuery(
-                    store.state.customers.find((c) => c.id === l.customer_id)?.name,
-                    q,
-                  ) ||
-                  includesQuery(
-                    store.state.products.find((p) => p.id === l.product_id)?.code,
-                    q,
-                  ),
-              )
-              .map((l) => {
-            const { license_key_hash: _h, issued_raw_key_once: _r, ...safe } = l;
-            const customer = store.state.customers.find((c) => c.id === l.customer_id);
-            const product = store.state.products.find((p) => p.id === l.product_id);
-            return {
-              ...safe,
-              customer_name: customer?.name ?? null,
-              product_code: product?.code ?? null,
-              product_name: product?.name ?? null,
-              active_activations_count: l.activations.filter((a) => a.status === "active").length,
-              expires_date_display: l.expires_at
-                ? formatDisplayDateDDMMYYYY(l.expires_at, env.DEFAULT_TIMEZONE)
-                : "Lifetime",
-              };
-            }),
-            limit,
-          );
-          return collectionResponse(items);
+          const { q, limit, page } = parseListQuery(url.searchParams);
+          const items = store.state.licenses
+            .filter(
+              (l) =>
+                includesQuery(l.license_number, q) ||
+                includesQuery(
+                  store.state.customers.find((c) => c.id === l.customer_id)?.name,
+                  q,
+                ) ||
+                includesQuery(
+                  store.state.products.find((p) => p.id === l.product_id)?.code,
+                  q,
+                ),
+            )
+            .map((l) => {
+          const { license_key_hash: _h, issued_raw_key_once: _r, ...safe } = l;
+          const customer = store.state.customers.find((c) => c.id === l.customer_id);
+          const product = store.state.products.find((p) => p.id === l.product_id);
+          return {
+            ...safe,
+            customer_name: customer?.name ?? null,
+            product_code: product?.code ?? null,
+            product_name: product?.name ?? null,
+            active_activations_count: l.activations.filter((a) => a.status === "active").length,
+            expires_date_display: l.expires_at
+              ? formatDisplayDateDDMMYYYY(l.expires_at, env.DEFAULT_TIMEZONE)
+              : "Lifetime",
+            };
+          });
+          return pagedCollectionResponse(items, limit, page);
         }
 
         if (method === "POST" && pathname === "/api/v1/admin/licenses/manual-grants") {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "licenses.manage", requestId);
+          const body = await readJsonBody(request);
           const granted = await createManualLicenseGrantByAdmin(
             store,
             principal,
@@ -4510,7 +5320,8 @@ export function createStackMateApp(
             (l) => l.id === mLicenseActivations.params.licenseId
           );
           if (!lic) throw new AppError("NOT_FOUND", "License not found.", 404);
-          return collectionResponse(lic.activations);
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(lic.activations, limit, page);
         }
 
         const mActivationDeactivate = matchPath(
@@ -4518,7 +5329,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mActivationDeactivate) {
-          const body = (await request.json().catch(() => ({}))) as { reason?: string };
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "licenses.manage", requestId);
+          const body = (await readJsonBodyLenient(request)) as { reason?: string };
           const result = await deactivateLicenseActivationByAdmin(
             store,
             principal,
@@ -4541,7 +5355,15 @@ export function createStackMateApp(
             mLicenseAction.params.action === "resume" ||
             mLicenseAction.params.action === "revoke")
         ) {
-          const body = (await request.json().catch(() => ({}))) as { reason?: string };
+          // M-9: revoke is irreversible — it needs licenses.revoke;
+          // suspend/resume need licenses.manage.
+          await assertStaffPermissionAudited(
+            store,
+            principal,
+            mLicenseAction.params.action === "revoke" ? "licenses.revoke" : "licenses.manage",
+            requestId
+          );
+          const body = (await readJsonBodyLenient(request)) as { reason?: string };
           const updated = await transitionLicenseStatusByAdmin(
             store,
             principal,
@@ -4559,7 +5381,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mLicenseSnapshots) {
-          const body = (await request.json()) as {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "licenses.manage", requestId);
+          const body = (await readJsonBody(request)) as {
             reason: string;
             entitlements: Record<string, unknown>;
           };
@@ -4579,31 +5404,31 @@ export function createStackMateApp(
         // Integrated Sites, Credentials, Tracking, Webhooks
         if (method === "GET" && pathname === "/api/v1/admin/integrated-sites") {
           assertStaffPermission(principal, "integrations.manage");
-          const { q, limit } = parseListQuery(url.searchParams);
-          const sites = applyListLimit(
-            store.state.integrated_sites
-              .filter(
-                (s) =>
-                  includesQuery(s.name, q) ||
-                  includesQuery(s.site_key, q) ||
-                  s.domains.some((d) => includesQuery(d.domain, q)),
-              )
-              .map((s) => ({
-                ...s,
-                credentials: store.state.site_credentials
-                  .filter((c) => c.integrated_site_id === s.id)
-                  .map(({ secret_ciphertext: _c, secret_hash: _h, ...safeCred }) => safeCred),
-                tracking: store.state.tracking_configurations
-                  .filter((tc) => tc.integrated_site_id === s.id)
-                  .map(({ access_token_ciphertext: _a, ...safeTc }) => safeTc),
-              })),
-            limit,
-          );
-          return collectionResponse(sites);
+          const { q, limit, page } = parseListQuery(url.searchParams);
+          const sites = store.state.integrated_sites
+            .filter(
+              (s) =>
+                includesQuery(s.name, q) ||
+                includesQuery(s.site_key, q) ||
+                s.domains.some((d) => includesQuery(d.domain, q)),
+            )
+            .map((s) => ({
+              ...s,
+              credentials: store.state.site_credentials
+                .filter((c) => c.integrated_site_id === s.id)
+                .map(({ secret_ciphertext: _c, secret_hash: _h, ...safeCred }) => safeCred),
+              tracking: store.state.tracking_configurations
+                .filter((tc) => tc.integrated_site_id === s.id)
+                .map(({ access_token_ciphertext: _a, ...safeTc }) => safeTc),
+            }));
+          return pagedCollectionResponse(sites, limit, page);
         }
 
         if (method === "POST" && pathname === "/api/v1/admin/integrated-sites") {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
+          const body = await readJsonBody(request);
           const created = await registerIntegratedSiteByAdmin(store, principal, body, {
             encryptionKey: env.ENCRYPTION_KEY_V1,
             keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION,
@@ -4632,7 +5457,10 @@ export function createStackMateApp(
         }
 
         if (method === "PATCH" && mSiteDetail) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
+          const body = await readJsonBody(request);
           const updated = await updateIntegratedSiteByAdmin(
             store,
             principal,
@@ -4648,6 +5476,9 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mSiteSuspend) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
           const suspended = await suspendIntegratedSiteByAdmin(
             store,
             principal,
@@ -4662,6 +5493,9 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mSiteRevoke) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
           const revoked = await revokeIntegratedSiteByAdmin(
             store,
             principal,
@@ -4676,7 +5510,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mSiteProducts) {
-          const body = (await request.json()) as { product_id: string };
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
+          const body = (await readJsonBody(request)) as { product_id: string };
           if (!body.product_id) {
             throw new AppError("VALIDATION_ERROR", "product_id is required.", 422);
           }
@@ -4695,6 +5532,9 @@ export function createStackMateApp(
           pathname
         );
         if (method === "DELETE" && mSiteProductRemove) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
           const updated = await removeProductFromSiteByAdmin(
             store,
             principal,
@@ -4715,15 +5555,20 @@ export function createStackMateApp(
             (s) => s.id === mSiteCredentials.params.siteId
           );
           if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
-          return collectionResponse(
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(
             store.state.site_credentials
               .filter((c) => c.integrated_site_id === site.id)
-              .map(({ secret_ciphertext: _c, secret_hash: _h, ...safeCred }) => safeCred)
+              .map(({ secret_ciphertext: _c, secret_hash: _h, ...safeCred }) => safeCred),
+            limit, page
           );
         }
 
         if (method === "POST" && mSiteCredentials) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "integrations.rotate_credentials", requestId);
+          const body = await readJsonBody(request);
           const created = await createSiteCredentialByAdmin(
             store,
             principal,
@@ -4743,6 +5588,9 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mSiteCredRevoke) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "integrations.rotate_credentials", requestId);
           const revoked = await revokeSiteCredentialByAdmin(
             store,
             principal,
@@ -4760,7 +5608,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mSiteDomains) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
+          const body = await readJsonBody(request);
           const updated = await registerSiteDomainByAdmin(
             store,
             principal,
@@ -4776,6 +5627,9 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mDomainChallenge) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
           const updated = await generateDomainVerificationChallengeByAdmin(
             store,
             principal,
@@ -4791,7 +5645,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mDomainVerify) {
-          const body = (await request.json().catch(() => ({}))) as {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
+          const body = (await readJsonBodyLenient(request)) as {
             method?: string;
             reviewer_note?: string;
           };
@@ -4811,6 +5668,9 @@ export function createStackMateApp(
           pathname
         );
         if (method === "DELETE" && mDomainDelete) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
           const updated = await deleteSiteDomainByAdmin(
             store,
             principal,
@@ -4826,6 +5686,9 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mRotateCred) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "integrations.rotate_credentials", requestId);
           const rotated = await rotateSiteServerCredentialByAdmin(
             store,
             principal,
@@ -4845,7 +5708,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "PUT" && mSiteTracking) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "tracking.manage", requestId);
+          const body = await readJsonBody(request);
           const cfg = await configureSiteTrackingByAdmin(
             store,
             principal,
@@ -4870,15 +5736,20 @@ export function createStackMateApp(
             (s) => s.id === mSiteTracking.params.siteId
           );
           if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
-          return collectionResponse(
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(
             store.state.tracking_configurations
               .filter((tc) => tc.integrated_site_id === site.id)
-              .map(({ access_token_ciphertext: _, ...safeTc }) => safeTc)
+              .map(({ access_token_ciphertext: _, ...safeTc }) => safeTc),
+            limit, page
           );
         }
 
         if (method === "POST" && mSiteTracking) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "tracking.manage", requestId);
+          const body = await readJsonBody(request);
           const created = await createTrackingConfigByAdmin(
             store,
             principal,
@@ -4898,7 +5769,10 @@ export function createStackMateApp(
           pathname
         );
         if (method === "PATCH" && mSiteTrackingConfig) {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "tracking.manage", requestId);
+          const body = await readJsonBody(request);
           const updated = await updateTrackingConfigByAdmin(
             store,
             principal,
@@ -4915,6 +5789,9 @@ export function createStackMateApp(
         }
 
         if (method === "DELETE" && mSiteTrackingConfig) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "tracking.manage", requestId);
           const deleted = await deleteTrackingConfigByAdmin(
             store,
             principal,
@@ -4926,20 +5803,27 @@ export function createStackMateApp(
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/tracking/events") {
-          assertStaffPermission(principal, "tracking.manage");
-          return collectionResponse(store.state.tracking_events);
+          // L-6: read-only roles hold tracking.read (migration 0016).
+          assertStaffPermission(principal, "tracking.read");
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(store.state.tracking_events, limit, page);
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/webhooks") {
-          assertStaffPermission(principal, "integrations.manage");
+          // L-6: read-only roles hold integrations.read (migration 0016).
+          assertStaffPermission(principal, "integrations.read");
           const endpoints = store.state.webhook_endpoints.map(
             ({ secret_ciphertext: _, ...safe }) => safe
           );
-          return collectionResponse(endpoints);
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(endpoints, limit, page);
         }
 
         if (method === "POST" && pathname === "/api/v1/admin/webhooks") {
-          const body = await request.json();
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
+          const body = await readJsonBody(request);
           const created = await registerWebhookEndpointByAdmin(store, principal, body, {
             encryptionKey: env.ENCRYPTION_KEY_V1,
             keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION,
@@ -4954,6 +5838,9 @@ export function createStackMateApp(
           pathname
         );
         if (method === "DELETE" && mWebhookDelete) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
           const deleted = await deleteWebhookEndpointByAdmin(
             store,
             principal,
@@ -4969,6 +5856,9 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mWebhookTest) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
           const result = await testWebhookEndpointByAdmin(store, principal, mWebhookTest.params.webhookId!, {
             encryptionKey: env.ENCRYPTION_KEY_V1,
             allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
@@ -4982,25 +5872,30 @@ export function createStackMateApp(
           pathname
         );
         if (method === "GET" && mWebhookDeliveries) {
-          assertStaffPermission(principal, "integrations.manage");
+          // L-6: read-only roles hold integrations.read (migration 0016).
+          assertStaffPermission(principal, "integrations.read");
           const endpoint = store.state.webhook_endpoints.find(
             (ep) => ep.id === mWebhookDeliveries.params.webhookId
           );
           if (!endpoint) throw new AppError("NOT_FOUND", "Webhook endpoint not found.", 404);
-          return collectionResponse(
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(
             store.state.webhook_deliveries.filter(
               (d) => d.webhook_endpoint_id === endpoint.id
-            )
+            ),
+            limit, page
           );
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/outbox-events") {
-          assertStaffPermission(principal, "integrations.manage");
+          // L-6: read-only roles hold integrations.read (migration 0016).
+          assertStaffPermission(principal, "integrations.read");
           const statusFilter = url.searchParams.get("status");
           const items = store.state.outbox_events.filter((e) =>
             !statusFilter ? true : e.status === statusFilter
           );
-          return collectionResponse(items);
+          const { limit, page } = parseListQuery(url.searchParams);
+          return pagedCollectionResponse(items, limit, page);
         }
 
         const mOutboxReplay = matchPath(
@@ -5008,6 +5903,9 @@ export function createStackMateApp(
           pathname
         );
         if (method === "POST" && mOutboxReplay) {
+          // M-9: the mutation maps to its write permission at the
+          // dispatcher (audited variant, so a denial is recorded).
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
           const replayed = await replayOutboxEventByAdmin(
             store,
             principal,
@@ -5019,9 +5917,14 @@ export function createStackMateApp(
 
         if (method === "POST" && pathname === "/api/v1/admin/outbox/dispatch") {
           assertStaffPermission(principal, "integrations.manage");
+          // C-2: pass the real transport — without it the dispatcher
+          // runs simulated and records "simulated" (never "delivered").
           const summary = await processTransactionalOutboxBatch(store, {
             encryptionKey: env.ENCRYPTION_KEY_V1,
             allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
+            transport: createRealWebhookTransport({
+              allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
+            }),
           });
           return jsonResponse(summary);
         }
@@ -5038,6 +5941,16 @@ export function createStackMateApp(
         // licenses / queues / all-time customer total are NOT range-scoped.
         if (method === "GET" && pathname === "/api/v1/admin/analytics/overview") {
           assertStaffPermission(principal, "products.read");
+          // M-8: revenue is finance data — only callers who can see
+          // payments see it. There is no finance.* permission in the
+          // seed catalogue (only the finance_manager ROLE, which holds
+          // payments.read), so payments.read is the gate; null (not 0)
+          // when the caller lacks it, so a missing value is never
+          // mistaken for "no revenue". The SPA hides the revenue card
+          // on null.
+          const canSeeRevenue =
+            principal.roles.includes("super_admin") ||
+            principal.permissions.includes("payments.read");
           const range = parseOverviewRange(url.searchParams);
           const timeZone = env.DEFAULT_TIMEZONE;
           const inRange = (iso: string | null | undefined) =>
@@ -5071,7 +5984,7 @@ export function createStackMateApp(
             expired_or_revoked_licenses: store.state.licenses.filter(
               (l) => l.status === "expired" || l.status === "revoked"
             ).length,
-            verified_revenue_minor: verifiedRevenueMinor,
+            verified_revenue_minor: canSeeRevenue ? verifiedRevenueMinor : null,
             pending_outbox_events: store.state.outbox_events.filter(
               (e) => e.status === "pending"
             ).length,
@@ -5081,28 +5994,50 @@ export function createStackMateApp(
 
         if (method === "GET" && pathname === "/api/v1/admin/audit-logs") {
           assertStaffPermission(principal, "audit_logs.read");
-          const items = store.state.audit_logs.map((a) => ({
-            ...a,
-            // Human display name for the resource (F3 follow-up): resolved
-            // server-side from the in-memory state; null when the resource
-            // no longer exists — the SPA falls back to its client-side
-            // maps, then a short id. Additive field, no contract break.
-            resource_display_name: resolveAuditResourceDisplayName(
-              store.state,
-              a.resource_type,
-              a.resource_id,
-              a.actor_user_id,
-              // Fix batch #2: the row's own changes carry the identity
-              // of deleted resources (webhook URL, pixel-group label,
-              // bulk feature keys) — the resolver falls back to them.
-              a.changes,
-            ),
-            created_date_display: formatDisplayDateTimeDDMMYYYY(
-              a.created_at,
-              env.DEFAULT_TIMEZONE
-            ),
-          }));
-          return collectionResponse(items);
+          // H-05: server-side filters (like the other list endpoints).
+          // ?q= matches action / resource type / resource id / actor /
+          // display name; ?action=, ?resource=, ?outcome=, ?actor=
+          // filter exact. Unknown params are ignored.
+          const { q, limit, page } = parseListQuery(url.searchParams);
+          const actionFilter = url.searchParams.get("action");
+          const resourceFilter = url.searchParams.get("resource");
+          const outcomeFilter = url.searchParams.get("outcome");
+          const actorFilter = url.searchParams.get("actor");
+          const items = store.state.audit_logs
+            .filter((a) => (!actionFilter ? true : a.action === actionFilter))
+            .filter((a) => (!resourceFilter ? true : a.resource_type === resourceFilter))
+            .filter((a) => (!outcomeFilter ? true : a.outcome === outcomeFilter))
+            .filter((a) => (!actorFilter ? true : a.actor_user_id === actorFilter))
+            .map((a) => ({
+              ...a,
+              // Human display name for the resource (F3 follow-up): resolved
+              // server-side from the in-memory state; null when the resource
+              // no longer exists — the SPA falls back to its client-side
+              // maps, then a short id. Additive field, no contract break.
+              resource_display_name: resolveAuditResourceDisplayName(
+                store.state,
+                a.resource_type,
+                a.resource_id,
+                a.actor_user_id,
+                // Fix batch #2: the row's own changes carry the identity
+                // of deleted resources (webhook URL, pixel-group label,
+                // bulk feature keys) — the resolver falls back to them.
+                a.changes,
+              ),
+              created_date_display: formatDisplayDateTimeDDMMYYYY(
+                a.created_at,
+                env.DEFAULT_TIMEZONE
+              ),
+            }))
+            .filter(
+              (a) =>
+                includesQuery(a.action, q) ||
+                includesQuery(a.resource_type, q) ||
+                includesQuery(a.resource_id, q) ||
+                includesQuery(a.actor_user_id, q) ||
+                includesQuery(a.resource_display_name, q),
+            );
+          return pagedCollectionResponse(items, limit, page);
         }
       }
 
@@ -5158,6 +6093,9 @@ export function createStackMateApp(
     const env = resolveRuntimeConfig(rawEnv);
     const store = await resolveRequestStore(env, ctx);
     try {
+      // H-7: fail closed on localhost URL vars in staging/production
+      // (after store resolution, same as the fetch path).
+      assertProductionUrlVars(env);
       // The await is LOAD-BEARING (cron bug 2026-11-16): `return
       // <pending promise>` runs this finally block BEFORE the promise
       // settles, so without it closeRequestStore ends the store's pg
@@ -5166,9 +6104,16 @@ export function createStackMateApp(
       // cron invocation errored (~1/min uncaught exceptions in the
       // Cloudflare metrics) and the outbox never drained on schedule.
       // fetchHandler already awaits for the same reason.
+      // C-2: the cron passes the real transport — without it the
+      // dispatcher runs simulated and records "simulated" (never
+      // "delivered"). Meta CAPI events stay simulated by design
+      // (Batch 4 builds the real Meta client).
       const drainResult = await processTransactionalOutboxBatch(store, {
         encryptionKey: env.ENCRYPTION_KEY_V1,
         allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
+        transport: createRealWebhookTransport({
+          allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
+        }),
       });
       // Renewal + expiry sweep (ADR-0009): runs AFTER the drain, so a
       // sweep failure can never block outbox delivery. The sweep itself
@@ -5179,6 +6124,7 @@ export function createStackMateApp(
         const sweep = await runRenewalExpirySweep(store, {
           licenseVerifierSecret: env.LICENSE_VERIFIER_SECRET,
           requestId: `cron:sweep:${new Date().toISOString()}`,
+          timeZone: env.DEFAULT_TIMEZONE,
         });
         const sent: typeof sweep.reminders_due = [];
         for (const reminder of sweep.reminders_due) {

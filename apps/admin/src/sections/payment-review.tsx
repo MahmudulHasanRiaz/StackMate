@@ -20,6 +20,8 @@
  *  - POST /api/v1/admin/orders/:id/payment-evidence       (JSON+base64; 503 fail-closed without a real bucket; PNG/JPEG/WEBP/PDF)
  *  - GET  /api/v1/admin/orders                            orders.read (order picker)
  *  - GET  /api/v1/admin/payment-methods                   payments.read (method picker)
+ *  - GET  /api/v1/admin/refunds                           payments.read (Refunds tab)
+ *  - POST /api/v1/admin/refunds                           payments.approve (manual refund record — no gateway)
  *
  * Evidence can be picked from the media library (PNG/JPEG/WEBP/PDF)
  * via the shared MediaPicker (PLAN §31) or uploaded directly — the
@@ -56,17 +58,22 @@ import {
   DateCell,
   DateTimeCell,
   Dialog,
+  Drawer,
   ErrorState,
   Field,
   Input,
   MoneyCell,
   SearchableSelect,
   Select,
+  type SearchableOption,
   Skeleton,
   StatusBadge,
+  Tabs,
   Textarea,
 } from "../components/primitives";
+import { shortId } from "../lib/resolve-names";
 import type { PaymentMethod } from "./payment-methods";
+import { normalizeDateInput, normalizePastedDate } from "../lib/dates";
 
 /* ------------------------------------------------------------------ */
 /* Types (mirror apps/api/src/platform/db/store.ts + contracts)        */
@@ -129,6 +136,21 @@ export interface OrderSummary {
   paid_amount_minor?: number;
   remaining_minor?: number;
   created_at: string;
+}
+
+/** Manual refund record (apps/api/src/platform/db/store.ts — PaymentRefundRecord). */
+export interface PaymentRefund {
+  id: string;
+  payment_transaction_id: string;
+  amount_minor: number;
+  currency_code: string;
+  status: "requested" | "pending" | "succeeded" | "failed" | "cancelled";
+  reason: string;
+  provider_refund_id: string | null;
+  requested_by_user_id: string | null;
+  processed_by_user_id: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 interface OrderInstallmentOption {
@@ -196,16 +218,28 @@ export function PaymentReviewSection() {
   const goDetail = useGoDetail("/payment-review", "submissionId");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [recordOpen, setRecordOpen] = useState(false);
+  const [tab, setTab] = useState<"submissions" | "refunds">("submissions");
+  const [refundOpen, setRefundOpen] = useState(false);
 
   const submissions = useAdminList<PaymentSubmission>(
     "payment-submissions",
     "/api/v1/admin/payment-submissions",
+    // No `extra` here on purpose: the header's pendingCount is
+    // derived from this same query, so a server-side ?status= would
+    // zero it whenever the chip filter is not "all". The status
+    // filter stays client-side over the loaded page; thread
+    // ?status= only together with a separate unfiltered count query.
+    { q: parsed.q, page: parsed.page, pageSize: parsed.pageSize },
   );
+  // SPA M-22: default newest-first by submitted_at (the server ORDER
+  // BY is the core API agent's job; this keeps the list stable until
+  // then and guards the transient inconsistency the audit saw).
   const filtered = useMemo(
     () =>
-      (submissions.data ?? []).filter((s) =>
-        statusFilter === "all" ? true : s.status === statusFilter,
-      ),
+      (submissions.data ?? [])
+        .filter((s) => (statusFilter === "all" ? true : s.status === statusFilter))
+        .slice()
+        .sort((a, b) => b.submitted_at.localeCompare(a.submitted_at)),
     [submissions.data, statusFilter],
   );
   const pendingCount = useMemo(
@@ -290,14 +324,34 @@ export function PaymentReviewSection() {
             : "No submissions awaiting verification"
         }
         action={
-          <Button variant="accent" icon={Plus} onClick={() => setRecordOpen(true)}>
-            Record payment
-          </Button>
+          tab === "submissions" ? (
+            <Button variant="primary" icon={Plus} onClick={() => setRecordOpen(true)}>
+              Record payment
+            </Button>
+          ) : (
+            <Button variant="primary" icon={Plus} onClick={() => setRefundOpen(true)}>
+              Record refund
+            </Button>
+          )
         }
       />
+      <Tabs
+        tabs={[
+          { key: "submissions", label: "Submissions" },
+          { key: "refunds", label: "Refunds" },
+        ]}
+        active={tab}
+        onChange={(key) => setTab(key as "submissions" | "refunds")}
+      />
+      {tab === "submissions" ? (
       <ListTable<PaymentSubmission>
         columns={columns}
         data={filtered}
+        serverSearch
+        serverPagination
+        refreshSection="payment-submissions"
+        filtersActive={statusFilter !== "all"}
+        total={submissions.total}
         search={parsed.q ?? ""}
         onSearchChange={(q) => setSearch({ q: q || null, page: 1 })}
         page={parsed.page ?? 1}
@@ -331,12 +385,343 @@ export function PaymentReviewSection() {
         }
         getRowId={(row) => row.id}
       />
+      ) : (
+        <RefundsList />
+      )}
       {recordOpen ? (
         <Dialog open size="md" onClose={() => setRecordOpen(false)} title="Record manual payment">
           <RecordPaymentForm onDone={() => setRecordOpen(false)} onCancel={() => setRecordOpen(false)} />
         </Dialog>
       ) : null}
+      {refundOpen ? (
+        <Dialog open size="md" onClose={() => setRefundOpen(false)} title="Record refund">
+          <RecordRefundForm onDone={() => setRefundOpen(false)} onCancel={() => setRefundOpen(false)} />
+        </Dialog>
+      ) : null}
     </section>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Refunds — minimal list + record form (D-4: manual refunds only,    */
+/* no gateway). The record draws from the order's latest refundable   */
+/* transaction server-side; the amount ceiling is enforced there.      */
+/* ------------------------------------------------------------------ */
+function RefundsList() {
+  const { parsed, setSearch } = useListSearch();
+  const [selected, setSelected] = useState<PaymentRefund | null>(null);
+  const refunds = useAdminList<PaymentRefund>("refunds", "/api/v1/admin/refunds", {
+    q: parsed.q,
+    page: parsed.page,
+    pageSize: parsed.pageSize,
+  });
+
+  const columns: ColumnDef<PaymentRefund, unknown>[] = [
+    {
+      accessorKey: "id",
+      header: "Refund",
+      cell: ({ row }) => (
+        <span>
+          <span className="sm-mono">{shortId(row.original.id)}</span>
+          <CopyButton value={row.original.id} label="Copy refund ID" />
+        </span>
+      ),
+    },
+    {
+      accessorKey: "payment_transaction_id",
+      header: "Transaction",
+      cell: ({ row }) => (
+        <span className="sm-mono">{shortId(row.original.payment_transaction_id)}</span>
+      ),
+    },
+    {
+      accessorKey: "amount_minor",
+      header: "Amount",
+      cell: ({ row }) => (
+        <MoneyCell currency={row.original.currency_code} minor={row.original.amount_minor} />
+      ),
+    },
+    {
+      accessorKey: "status",
+      header: "Status",
+      cell: ({ row }) => <StatusBadge status={row.original.status} />,
+    },
+    {
+      accessorKey: "reason",
+      header: "Reason",
+      cell: ({ row }) => <span className="sm-cell-text">{row.original.reason}</span>,
+    },
+    {
+      accessorKey: "provider_refund_id",
+      header: "Provider ref",
+      cell: ({ row }) => (
+        <span className="sm-mono">{row.original.provider_refund_id ?? "—"}</span>
+      ),
+    },
+    {
+      accessorKey: "created_at",
+      header: "Created",
+      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
+    },
+    {
+      id: "actions",
+      header: "",
+      enableSorting: false,
+      cell: ({ row }) => (
+        <Button variant="ghost" size="sm" onClick={() => setSelected(row.original)}>
+          View
+        </Button>
+      ),
+    },
+  ];
+
+  return (
+    <>
+      <ListTable<PaymentRefund>
+        columns={columns}
+        data={refunds.data}
+        serverSearch
+        serverPagination
+        refreshSection="refunds"
+        total={refunds.total}
+        search={parsed.q ?? ""}
+        onSearchChange={(q) => setSearch({ q: q || null, page: 1 })}
+        page={parsed.page ?? 1}
+        onPageChange={(page) => setSearch({ page })}
+        pageSize={parsed.pageSize ?? 25}
+        onPageSizeChange={(pageSize) => setSearch({ pageSize, page: 1 })}
+        isLoading={refunds.isPending}
+        isError={refunds.isError}
+        error={refunds.error}
+        onRetry={() => void refunds.refetch()}
+        emptyIcon={ClipboardCheck}
+        emptyTitle="No refunds yet"
+        emptyBody="Manual refunds recorded against a payment appear here."
+        getRowId={(row) => row.id}
+      />
+      <Drawer
+        open={selected !== null}
+        onClose={() => setSelected(null)}
+        title={selected ? `Refund ${shortId(selected.id)}` : "Refund"}
+      >
+        {selected ? (
+          <DetailFacts
+            facts={[
+              { label: "Refund", value: <span className="sm-mono">{shortId(selected.id)}</span> },
+              {
+                label: "Transaction",
+                value: <span className="sm-mono">{shortId(selected.payment_transaction_id)}</span>,
+              },
+              {
+                label: "Amount",
+                value: <MoneyCell currency={selected.currency_code} minor={selected.amount_minor} />,
+              },
+              { label: "Status", value: <StatusBadge status={selected.status} /> },
+              { label: "Reason", value: selected.reason },
+              { label: "Provider ref", value: selected.provider_refund_id ?? "—" },
+              {
+                label: "Requested by",
+                value: selected.requested_by_user_id ? (
+                  <span className="sm-mono">{shortId(selected.requested_by_user_id)}</span>
+                ) : (
+                  "—"
+                ),
+              },
+              {
+                label: "Processed by",
+                value: selected.processed_by_user_id ? (
+                  <span className="sm-mono">{shortId(selected.processed_by_user_id)}</span>
+                ) : (
+                  "—"
+                ),
+              },
+              { label: "Created", value: <DateTimeCell value={selected.created_at} /> },
+              { label: "Updated", value: <DateTimeCell value={selected.updated_at} /> },
+            ]}
+          />
+        ) : null}
+      </Drawer>
+    </>
+  );
+}
+
+function RecordRefundForm({ onDone, onCancel }: { onDone: () => void; onCancel: () => void }) {
+  const [orderId, setOrderId] = useState("");
+  const [selectedOrder, setSelectedOrder] = useState<OrderSummary | null>(null);
+  const [amountMinor, setAmountMinor] = useState("");
+  const [currency, setCurrency] = useState("BDT");
+  const [reason, setReason] = useState("");
+  const [providerRefundId, setProviderRefundId] = useState("");
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [formError, setFormError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const mutation = useAdminMutation<{ refund: PaymentRefund }, Record<string, unknown>>({
+    mutationFn: (body) =>
+      apiRequest<{ refund: PaymentRefund }>("/api/v1/admin/refunds", {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
+    invalidateKeys: [listKey("refunds"), listKey("orders")],
+    successTitle: "Refund recorded",
+    successMessage: "The refund was recorded and the order balance adjusted.",
+  });
+
+  const amountNum = Number(amountMinor);
+  const amountPreview =
+    amountMinor.trim() !== "" && Number.isInteger(amountNum) && amountNum > 0
+      ? formatMinorMoney(amountNum, currency.trim().toUpperCase() || "BDT")
+      : null;
+  const paidMinor = selectedOrder
+    ? selectedOrder.total_minor - (selectedOrder.remaining_minor ?? 0)
+    : null;
+
+  const onOrderChange = (nextId: string, option?: { data?: unknown }) => {
+    setOrderId(nextId);
+    const order = (option?.data as OrderSummary | undefined) ?? null;
+    setSelectedOrder(order);
+    if (order) {
+      // Default to the order's paid amount — the server enforces the
+      // refundable ceiling (transaction amount minus refunds already
+      // recorded) and 422s above it.
+      setAmountMinor(String(order.total_minor - (order.remaining_minor ?? 0)));
+      setCurrency(order.currency_code);
+    }
+  };
+
+  const submit = async () => {
+    const next: Record<string, string> = {};
+    if (!orderId) next.order_id = "Choose an order.";
+    if (amountMinor.trim() === "" || !Number.isInteger(amountNum) || amountNum <= 0) {
+      next.amount_minor = "Enter a positive whole amount in minor units.";
+    }
+    if (!/^[A-Z]{3}$/.test(currency.trim().toUpperCase())) {
+      next.currency_code = "Currency must be a 3-letter code.";
+    }
+    if (reason.trim() === "") next.reason = "A reason is required.";
+    else if (reason.trim().length > 1000) next.reason = "Reason must be at most 1000 characters.";
+    if (providerRefundId.trim().length > 180) {
+      next.provider_refund_id = "At most 180 characters.";
+    }
+    setErrors(next);
+    if (Object.keys(next).length > 0) return;
+    setFormError(null);
+    setSubmitting(true);
+    try {
+      await mutation.mutateAsync({
+        order_id: orderId,
+        amount_minor: amountNum,
+        currency_code: currency.trim().toUpperCase(),
+        reason: reason.trim(),
+        ...(providerRefundId.trim() ? { provider_refund_id: providerRefundId.trim() } : {}),
+      });
+      onDone();
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : "Could not record the refund.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        void submit();
+      }}
+      aria-label="Record refund"
+    >
+      <Field label="Order" required htmlFor="refund-order" error={errors.order_id ?? ""}>
+        {/* All orders, not open-only: a fully-paid order is exactly the
+           refundable case (open_only would hide it). The server picks
+           the order's latest refundable transaction and 422s when the
+           order has none. */}
+        <SearchableSelect
+          id="refund-order"
+          value={orderId}
+          onChange={(v, option) => onOrderChange(v, option)}
+          loadOptions={(q, signal) =>
+            loadListOptions<OrderSummary>(
+              "/api/v1/admin/orders",
+              q,
+              (o) => ({
+                value: o.id,
+                label: `${o.order_number} — ${formatMinorMoney(o.total_minor, o.currency_code)} (${o.payment_status})`,
+                data: o,
+              }),
+              signal,
+            )
+          }
+          placeholder="Type an order number or customer…"
+          ariaLabel="Order"
+        />
+      </Field>
+      <Field
+        label="Amount (minor units)"
+        required
+        htmlFor="refund-amount"
+        hint={
+          amountPreview
+            ? `= ${amountPreview}${paidMinor !== null ? ` · Paid ${formatMinorMoney(paidMinor, currency.trim().toUpperCase() || "BDT")}` : ""}`
+            : "Minor units, e.g. 50000 = ৳500.00."
+        }
+        error={errors.amount_minor ?? ""}
+      >
+        <Input
+          id="refund-amount"
+          name="amount_minor"
+          inputMode="numeric"
+          value={amountMinor}
+          onChange={(e) => setAmountMinor(e.target.value)}
+          aria-invalid={Boolean(errors.amount_minor) || undefined}
+        />
+      </Field>
+      <Field label="Currency" required htmlFor="refund-currency" error={errors.currency_code ?? ""}>
+        <Input
+          id="refund-currency"
+          name="currency_code"
+          value={currency}
+          onChange={(e) => setCurrency(e.target.value)}
+          aria-invalid={Boolean(errors.currency_code) || undefined}
+        />
+      </Field>
+      <Field label="Reason" required htmlFor="refund-reason" error={errors.reason ?? ""}>
+        <Textarea
+          id="refund-reason"
+          name="reason"
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          maxLength={1000}
+        />
+      </Field>
+      <Field
+        label="Provider refund ID"
+        htmlFor="refund-provider-ref"
+        hint="Reference from the bank / MFS provider, if any."
+        error={errors.provider_refund_id ?? ""}
+      >
+        <Input
+          id="refund-provider-ref"
+          name="provider_refund_id"
+          value={providerRefundId}
+          onChange={(e) => setProviderRefundId(e.target.value)}
+          maxLength={180}
+        />
+      </Field>
+      {formError ? (
+        <div style={{ marginTop: 16 }}>
+          <Alert variant="danger">{formError}</Alert>
+        </div>
+      ) : null}
+      <div className="sm-dialog-footer" style={{ padding: 0, marginTop: 20 }}>
+        <Button variant="secondary" onClick={onCancel}>
+          Cancel
+        </Button>
+        <Button variant="accent" loading={submitting || mutation.isPending} onClick={() => void submit()}>
+          Record refund
+        </Button>
+      </div>
+    </form>
   );
 }
 
@@ -468,6 +853,18 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
     }
     if (senderPhone.trim() && senderPhone.trim().length < 6)
       next.sender_phone = "Phone needs at least 6 characters.";
+    if (senderPhone.trim().length > 40)
+      next.sender_phone = "Phone must be at most 40 characters.";
+    if (senderName.trim().length > 160)
+      next.sender_name = "Sender name must be at most 160 characters.";
+    if (senderBank.trim().length > 160)
+      next.sender_bank_name = "Sender bank name must be at most 160 characters.";
+    if (senderRef.trim().length > 160)
+      next.sender_account_reference = "Sender account reference must be at most 160 characters.";
+    if (transactionId.trim().length > 160)
+      next.transaction_id = "Transaction ID must be at most 160 characters.";
+    if (customerNote.trim().length > 1000)
+      next.customer_note = "Customer note must be at most 1000 characters.";
     if (paymentDate.trim() && !/^\d{2}\/\d{2}\/\d{4}$/.test(paymentDate.trim()))
       next.payment_date_display = "Use DD/MM/YYYY.";
     setErrors(next);
@@ -557,17 +954,18 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
         paid — the order stays pending verification until staff approve it.
       </Alert>
       <div className="sm-form-grid" style={{ marginTop: 16 }}>
-        <Field label="Order" required hint="Unpaid orders only." error={errors.order_id ?? ""}>
+        <Field label="Order" required htmlFor="claim-order" hint="Unpaid orders only." error={errors.order_id ?? ""}>
           {/* Searchable (PLAN §29): the query runs server-side over
              the full order set (by number, reference or customer
-             name). Unpaid-only filtering happens in the loader over
-             the first 100 matches — the typed query narrows first, so
-             the open order is among them (see ADR-0010). */}
+             name). Unpaid-only is a server param now (audit H-04) —
+             the typed query narrows among unpaid orders, so an open
+             order beyond the first 100 loaded matches is still found. */}
           <SearchableSelect
+            id="claim-order"
             value={orderId}
             onChange={(v, option) => onOrderChange(v, option)}
-            loadOptions={async (q, signal) => {
-              const all = await loadListOptions<OrderSummary>(
+            loadOptions={(q, signal) =>
+              loadListOptions<OrderSummary>(
                 "/api/v1/admin/orders",
                 q,
                 (o) => ({
@@ -576,34 +974,30 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
                   data: o,
                 }),
                 signal,
-                { limit: 100 },
-              );
-              return all.filter((o) => {
-                const d = o.data as OrderSummary | undefined;
-                return d !== undefined && d.payment_status !== "paid" && d.status !== "cancelled";
-              });
-            }}
+                { extra: { open_only: "true" }, limit: 100 },
+              )
+            }
             placeholder="Type an order number or customer…"
             ariaLabel="Order"
           />
         </Field>
-        <Field label="Payment method" required error={errors.payment_method_id ?? ""}>
-          {/* Searchable (PLAN §29): only enabled methods are offered
-             (the loader filters). */}
+        <Field label="Payment method" required htmlFor="claim-method" error={errors.payment_method_id ?? ""}>
+          {/* Searchable (PLAN §29): only enabled methods are offered —
+             is_enabled is a server param now (audit H-03), not a
+             client-side filter over the first 25 matches. */}
           <SearchableSelect
+            id="claim-method"
             value={methodId}
             onChange={(v, option) => onMethodChange(v, option)}
-            loadOptions={async (q, signal) => {
-              const all = await loadListOptions<PaymentMethod>(
+            loadOptions={(q, signal) =>
+              loadListOptions<PaymentMethod>(
                 "/api/v1/admin/payment-methods",
                 q,
                 (m) => ({ value: m.id, label: m.display_name, data: m }),
                 signal,
-              );
-              return all.filter(
-                (o) => (o.data as PaymentMethod | undefined)?.is_enabled,
-              );
-            }}
+                { extra: { is_enabled: "true" } },
+              )
+            }
             placeholder="Type a method name…"
             ariaLabel="Payment method"
           />
@@ -611,6 +1005,7 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
         <Field
           label="Amount (minor units)"
           required
+          htmlFor="claim-amount"
           hint={
             amountPreview
               ? `= ${amountPreview}${selectedOrder ? ` · Remaining ${formatMinorMoney(selectedOrder.remaining_minor ?? selectedOrder.total_minor, selectedOrder.currency_code)}` : ""}${selectedOrder && amountNum > (selectedOrder.remaining_minor ?? selectedOrder.total_minor) ? ` · Exceeds the remaining amount by ${formatMinorMoney(amountNum - (selectedOrder.remaining_minor ?? selectedOrder.total_minor), selectedOrder.currency_code)} — the excess becomes the customer's credit balance at approval.` : ""}`
@@ -619,6 +1014,8 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
           error={errors.amount_minor ?? ""}
         >
           <Input
+            id="claim-amount"
+            name="amount_minor"
             inputMode="numeric"
             value={amountMinor}
             onChange={(e) => setAmountMinor(e.target.value)}
@@ -626,9 +1023,10 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
           />
         </Field>
         {orderId !== "" ? (
-          <Field label="Apply to installment" hint="Optional — oldest unpaid first when left blank.">
+          <Field label="Apply to installment" htmlFor="claim-installment" hint="Optional — oldest unpaid first when left blank.">
             {/* Local mode: installments are this order's complete set. */}
             <SearchableSelect
+              id="claim-installment"
               value={installmentId}
               onChange={(v) => setInstallmentId(v)}
               options={(installmentsQuery.data ?? [])
@@ -644,28 +1042,32 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
             />
           </Field>
         ) : null}
-        <Field label="Currency" required error={errors.currency_code ?? ""}>
+        <Field label="Currency" required htmlFor="claim-currency" error={errors.currency_code ?? ""}>
           <Input
+            id="claim-currency"
+            name="currency_code"
             value={currency}
             onChange={(e) => setCurrency(e.target.value)}
             aria-invalid={Boolean(errors.currency_code) || undefined}
           />
         </Field>
-        <Field label="Sender name">
-          <Input value={senderName} onChange={(e) => setSenderName(e.target.value)} />
+        <Field label="Sender name" htmlFor="claim-sender-name" error={errors.sender_name ?? ""}>
+          <Input id="claim-sender-name" name="sender_name" autoComplete="name" value={senderName} onChange={(e) => setSenderName(e.target.value)} maxLength={160} />
         </Field>
-        <Field label="Sender phone">
-          <Input value={senderPhone} onChange={(e) => setSenderPhone(e.target.value)} placeholder="01XXXXXXXXX" />
+        <Field label="Sender phone" htmlFor="claim-sender-phone" error={errors.sender_phone ?? ""}>
+          <Input id="claim-sender-phone" name="sender_phone" autoComplete="tel" value={senderPhone} onChange={(e) => setSenderPhone(e.target.value)} placeholder="01XXXXXXXXX" maxLength={40} />
         </Field>
-        <Field label="Sender bank name">
-          <Input value={senderBank} onChange={(e) => setSenderBank(e.target.value)} />
+        <Field label="Sender bank name" htmlFor="claim-sender-bank" error={errors.sender_bank_name ?? ""}>
+          <Input id="claim-sender-bank" name="sender_bank_name" value={senderBank} onChange={(e) => setSenderBank(e.target.value)} maxLength={160} />
         </Field>
-        <Field label="Sender account reference">
-          <Input value={senderRef} onChange={(e) => setSenderRef(e.target.value)} />
+        <Field label="Sender account reference" htmlFor="claim-sender-ref" error={errors.sender_account_reference ?? ""}>
+          <Input id="claim-sender-ref" name="sender_account_reference" value={senderRef} onChange={(e) => setSenderRef(e.target.value)} maxLength={160} />
         </Field>
         {selectedMethod?.method_kind === "bank_account" ? (
-          <Field label="Transfer rail" required error={errors.transfer_rail ?? ""}>
+          <Field label="Transfer rail" required htmlFor="claim-transfer-rail" error={errors.transfer_rail ?? ""}>
             <Select
+              id="claim-transfer-rail"
+              name="transfer_rail"
               value={transferRail}
               onChange={(e) => setTransferRail(e.target.value as "npsb" | "beftn" | "rtgs")}
               aria-invalid={Boolean(errors.transfer_rail) || undefined}
@@ -682,16 +1084,30 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
         <Field
           label="Transaction ID"
           required={selectedMethod?.configuration.transaction_id_requirement === "required"}
+          htmlFor="claim-transaction-id"
           error={errors.transaction_id ?? ""}
         >
-          <Input value={transactionId} onChange={(e) => setTransactionId(e.target.value)} />
+          <Input id="claim-transaction-id" name="transaction_id" value={transactionId} onChange={(e) => setTransactionId(e.target.value)} maxLength={160} />
         </Field>
-        <Field label="Payment date" hint="DD/MM/YYYY, if known." error={errors.payment_date_display ?? ""}>
-          <Input value={paymentDate} onChange={(e) => setPaymentDate(e.target.value)} placeholder="15/11/2026" />
+        <Field label="Payment date" htmlFor="claim-payment-date" hint="DD/MM/YYYY, if known." error={errors.payment_date_display ?? ""}>
+          <Input
+            id="claim-payment-date"
+            name="payment_date_display"
+            value={paymentDate}
+            onChange={(e) => setPaymentDate(normalizeDateInput(e.target.value))}
+            onPaste={(e) => {
+              e.preventDefault();
+              setPaymentDate(normalizePastedDate(e.clipboardData.getData("text")));
+            }}
+            placeholder="15/11/2026"
+            maxLength={10}
+          />
         </Field>
-        <Field label="Evidence file" hint="Screenshot or receipt. Uploaded to private storage.">
+        <Field label="Evidence file" htmlFor="claim-evidence" hint="Screenshot or receipt. Uploaded to private storage.">
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             <Input
+              id="claim-evidence"
+              name="evidence_file"
               type="file"
               accept="image/*,.pdf"
               onChange={(e) => setEvidenceFile(e.target.files?.[0] ?? null)}
@@ -705,8 +1121,8 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
         </Field>
       </div>
       <div style={{ marginTop: 16 }}>
-        <Field label="Customer note">
-          <Textarea value={customerNote} onChange={(e) => setCustomerNote(e.target.value)} />
+        <Field label="Customer note" htmlFor="claim-customer-note" error={errors.customer_note ?? ""}>
+          <Textarea id="claim-customer-note" name="customer_note" value={customerNote} onChange={(e) => setCustomerNote(e.target.value)} maxLength={1000} />
         </Field>
       </div>
       {formError ? (
@@ -810,7 +1226,7 @@ export function PaymentSubmissionDetailSection({ id }: { id: string }) {
           { label: sub.order_number ?? sub.id.slice(0, 8) },
         ]}
         title={`Payment for ${sub.order_number ?? "order"}`}
-        subtitle="Verify actual receipt before approving — approval marks the order paid"
+        help="Verify actual receipt before approving — approval marks the order paid"
         action={
           isReviewable ? (
             <span style={{ display: "inline-flex", gap: 8 }}>
@@ -1000,6 +1416,10 @@ function ApproveForm({
       next.apply_credit_minor = `At most ${formatMinorMoney(maxCredit, submission.currency_code)} can be applied (credit ${formatMinorMoney(creditBalance, submission.currency_code)}, remaining ${formatMinorMoney(orderRemaining, submission.currency_code)}).`;
     if (!/^[A-Za-z]{3}$/.test(currency.trim())) next.currency_code = "Currency must be a 3-letter code.";
     if (reference.trim().length < 2) next.verification_reference = "Verification reference is required.";
+    else if (reference.trim().length > 160)
+      next.verification_reference = "Verification reference must be at most 160 characters.";
+    if (internalNote.trim().length > 2000)
+      next.internal_note = "Internal note must be at most 2000 characters.";
     setErrors(next);
     if (Object.keys(next).length > 0) return;
     setFormError(null);
@@ -1031,19 +1451,28 @@ function ApproveForm({
         the order's activation policy.
       </Alert>
       <div className="sm-form-grid" style={{ marginTop: 16 }}>
-        <Field label="Verified amount (minor units)" required error={errors.verified_amount_minor ?? ""}>
+        <Field
+          label="Verified amount (minor units)"
+          required
+          htmlFor="approve-verified-amount"
+          hint={`Claimed ${formatMinorMoney(submission.amount_minor, submission.currency_code)} · Remaining ${formatMinorMoney(orderRemaining, submission.currency_code)}`}
+          error={errors.verified_amount_minor ?? ""}
+        >
           <Input
+            id="approve-verified-amount"
+            name="verified_amount_minor"
             inputMode="numeric"
             value={verifiedAmount}
             onChange={(e) => setVerifiedAmount(e.target.value)}
             aria-invalid={Boolean(errors.verified_amount_minor) || undefined}
           />
         </Field>
-        <Field label="Currency" required error={errors.currency_code ?? ""}>
-          <Input value={currency} onChange={(e) => setCurrency(e.target.value)} />
+        <Field label="Currency" required htmlFor="approve-currency" error={errors.currency_code ?? ""}>
+          <Input id="approve-currency" name="currency_code" value={currency} onChange={(e) => setCurrency(e.target.value)} />
         </Field>
         <Field
           label="Apply customer credit (minor units)"
+          htmlFor="approve-credit"
           hint={
             creditBalance > 0
               ? `Customer credit balance ${formatMinorMoney(creditBalance, submission.currency_code)} · order remaining ${formatMinorMoney(orderRemaining, submission.currency_code)} · at most ${formatMinorMoney(maxCredit, submission.currency_code)} can be applied.`
@@ -1052,6 +1481,8 @@ function ApproveForm({
           error={errors.apply_credit_minor ?? ""}
         >
           <Input
+            id="approve-credit"
+            name="apply_credit_minor"
             inputMode="numeric"
             value={applyCredit}
             onChange={(e) => setApplyCredit(e.target.value)}
@@ -1059,18 +1490,21 @@ function ApproveForm({
             disabled={maxCredit <= 0}
           />
         </Field>
-        <Field label="Verification reference" required hint="Bank statement or receipt reference." error={errors.verification_reference ?? ""}>
+        <Field label="Verification reference" required htmlFor="approve-reference" hint="Bank statement or receipt reference." error={errors.verification_reference ?? ""}>
           <Input
+            id="approve-reference"
+            name="verification_reference"
             value={reference}
             onChange={(e) => setReference(e.target.value)}
             aria-invalid={Boolean(errors.verification_reference) || undefined}
             placeholder="e.g. bKash TrxID confirmed on statement"
+            maxLength={160}
           />
         </Field>
       </div>
       <div style={{ marginTop: 16 }}>
-        <Field label="Internal note">
-          <Textarea value={internalNote} onChange={(e) => setInternalNote(e.target.value)} />
+        <Field label="Internal note" htmlFor="approve-internal-note" error={errors.internal_note ?? ""}>
+          <Textarea id="approve-internal-note" name="internal_note" value={internalNote} onChange={(e) => setInternalNote(e.target.value)} maxLength={2000} />
         </Field>
       </div>
       {formError ? (
@@ -1128,6 +1562,10 @@ function RejectForm({
     if (!/^[A-Z0-9_]{2,80}$/.test(reasonCode)) next.reason_code = "Choose a reason code.";
     if (customerMessage.trim().length < 5)
       next.customer_message = "Explain the rejection to the customer (at least 5 characters).";
+    else if (customerMessage.trim().length > 1000)
+      next.customer_message = "Message to the customer must be at most 1000 characters.";
+    if (internalNote.trim().length > 2000)
+      next.internal_note = "Internal note must be at most 2000 characters.";
     setErrors(next);
     if (Object.keys(next).length > 0) return;
     setFormError(null);
@@ -1155,8 +1593,8 @@ function RejectForm({
         customer can submit a new payment.
       </Alert>
       <div className="sm-form-grid" style={{ marginTop: 16 }}>
-        <Field label="Reason code" required error={errors.reason_code ?? ""}>
-          <Select value={reasonCode} onChange={(e) => setReasonCode(e.target.value)}>
+        <Field label="Reason code" required htmlFor="reject-reason" error={errors.reason_code ?? ""}>
+          <Select id="reject-reason" name="reason_code" value={reasonCode} onChange={(e) => setReasonCode(e.target.value)}>
             {REJECT_REASONS.map((r) => (
               <option key={r.code} value={r.code}>
                 {r.label}
@@ -1166,18 +1604,21 @@ function RejectForm({
         </Field>
       </div>
       <div style={{ marginTop: 16 }}>
-        <Field label="Message to customer" required error={errors.customer_message ?? ""}>
+        <Field label="Message to customer" required htmlFor="reject-message" error={errors.customer_message ?? ""}>
           <Textarea
+            id="reject-message"
+            name="customer_message"
             value={customerMessage}
             onChange={(e) => setCustomerMessage(e.target.value)}
             aria-invalid={Boolean(errors.customer_message) || undefined}
             placeholder="We could not verify this payment because…"
+            maxLength={1000}
           />
         </Field>
       </div>
       <div style={{ marginTop: 16 }}>
-        <Field label="Internal note">
-          <Textarea value={internalNote} onChange={(e) => setInternalNote(e.target.value)} />
+        <Field label="Internal note" htmlFor="reject-internal-note" error={errors.internal_note ?? ""}>
+          <Textarea id="reject-internal-note" name="internal_note" value={internalNote} onChange={(e) => setInternalNote(e.target.value)} maxLength={2000} />
         </Field>
       </div>
       {formError ? (

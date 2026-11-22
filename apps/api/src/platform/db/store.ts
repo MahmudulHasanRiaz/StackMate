@@ -41,6 +41,14 @@ export interface UserRecord {
   // always loads the column.
   two_factor_enabled: boolean;
   status: "active" | "suspended";
+  // Custom avatar (audit M-23): R2 object key of the uploaded avatar
+  // image, or null for Gravatar/initials. Optional (not required) so
+  // existing user constructors keep compiling — readers treat a
+  // missing value as null. The column lives in migration 0014
+  // (DB agent) + the users SyncSpec; until then the DrizzleStore
+  // load/persist ignore it and the in-memory store is the only place
+  // it round-trips.
+  avatar_url?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -474,6 +482,26 @@ export interface PaymentVerificationLogRecord {
   created_at: string;
 }
 
+// F-03: manual refunds (DB spec §13.8, table `payment_refunds` since
+// migration 0000). The payments service previously defined this record
+// locally and failed closed without the collection; it lives here now
+// so the store can load/persist it. (The service's local definition
+// should be replaced by an import + re-export from here — domain
+// agent's file, not this one.)
+export interface PaymentRefundRecord {
+  id: string;
+  payment_transaction_id: string;
+  amount_minor: number;
+  currency_code: string;
+  status: "requested" | "pending" | "succeeded" | "failed" | "cancelled";
+  reason: string;
+  provider_refund_id: string | null;
+  requested_by_user_id: string | null;
+  processed_by_user_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface SubscriptionPeriodRecord {
   id: string;
   subscription_id: string;
@@ -634,7 +662,10 @@ export interface TrackingEventRecord {
   consent_state: "granted" | "denied";
   consent_policy_version: string;
   sanitized_payload: Record<string, unknown>;
-  status: "received" | "queued" | "processed" | "rejected";
+  // C-2/D-6: "simulated" — the event was recorded but never sent to
+  // any receiver (no transport configured / Meta CAPI stub). It must
+  // never be mistaken for "processed"/"delivered".
+  status: "received" | "queued" | "processed" | "rejected" | "simulated";
   delivery_attempts: number;
   delivered_at: string | null;
   created_at: string;
@@ -660,7 +691,10 @@ export interface OutboxEventRecord {
   aggregate_id: string;
   event_type: string;
   payload: Record<string, unknown>;
-  status: "pending" | "processing" | "delivered" | "dead_letter";
+  // C-2/D-6: "simulated" — the outbox row was recorded but never
+  // delivered to any receiver (no transport configured). It must
+  // never be mistaken for "delivered".
+  status: "pending" | "processing" | "delivered" | "dead_letter" | "simulated";
   attempt_count: number;
   available_at: string;
   locked_until: string | null;
@@ -816,6 +850,7 @@ export interface DatabaseState {
   payment_submissions: PaymentSubmissionRecord[];
   payment_transactions: PaymentTransactionRecord[];
   payment_verification_logs: PaymentVerificationLogRecord[];
+  payment_refunds: PaymentRefundRecord[];
   subscriptions: SubscriptionRecord[];
   licenses: LicenseRecord[];
   license_events: LicenseEventRecord[];
@@ -835,7 +870,9 @@ export interface DatabaseState {
     webhook_endpoint_id: string;
     event_id: string;
     delivery_id: string;
-    status: "pending" | "delivered" | "retrying" | "failed";
+    // C-2/D-6: "simulated" — the delivery was recorded but never sent
+    // to any receiver (no transport configured). Never "delivered".
+    status: "pending" | "delivered" | "retrying" | "failed" | "simulated";
     attempt_count: number;
     last_http_status: number | null;
     delivered_at: string | null;
@@ -872,6 +909,13 @@ export class StackMateDataStore {
   public readonly signingKeys: Map<string, Ed25519KeyMaterial>;
   public activeSigningKeyId: string;
   private txMutex: Promise<void> = Promise.resolve();
+  /**
+   * C-1 rate-limit buckets (in-memory implementation). The base store
+   * keeps them per instance; DrizzleStore overrides checkRateLimit /
+   * resetRateLimit with DB-backed buckets (table rate_limit_buckets)
+   * and falls back to this map only when the table is missing.
+   */
+  private rateLimitBuckets = new Map<string, { count: number; resetAtMs: number }>();
   public queryMetrics = {
     uncachedQueries: 0,
     cachedQueries: 0,
@@ -919,6 +963,7 @@ export class StackMateDataStore {
       payment_submissions: [],
       payment_transactions: [],
       payment_verification_logs: [],
+      payment_refunds: [],
       subscriptions: [],
       licenses: [],
       license_events: [],
@@ -1069,6 +1114,88 @@ export class StackMateDataStore {
     } finally {
       releaseLock();
     }
+  }
+
+  /**
+   * C-1: rate limiting. Atomically increments the bucket for
+   * `bucketKey` and throws 429 RATE_LIMIT_EXCEEDED once the count
+   * passes `maxRequests` inside the `windowMs` window. A bucket with
+   * an expired window restarts at 1. Callers count only the events
+   * that should trip the limit (e.g. failed sign-ins for the lockout
+   * bucket) and call resetRateLimit on the success path.
+   *
+   * The base (in-memory) implementation is per store instance — it is
+   * the test adapter and the fallback when the DB table is missing.
+   * DrizzleStore overrides this with a single-statement Postgres
+   * upsert on `rate_limit_buckets`, which is what makes the limit
+   * survive across requests on Workers (the pre-fix in-app Map was
+   * recreated on every fetch() and never tripped).
+   */
+  public async checkRateLimit(
+    bucketKey: string,
+    maxRequests: number,
+    windowMs = 60_000
+  ): Promise<void> {
+    const now = Date.now();
+    const entry = this.rateLimitBuckets.get(bucketKey);
+    if (!entry || now >= entry.resetAtMs) {
+      this.rateLimitBuckets.set(bucketKey, { count: 1, resetAtMs: now + windowMs });
+      return;
+    }
+    entry.count += 1;
+    if (entry.count > maxRequests) {
+      throw new AppError(
+        "RATE_LIMIT_EXCEEDED",
+        "Too many requests. Please retry after the rate-limit window resets.",
+        429
+      );
+    }
+  }
+
+  /**
+   * C-1: clears one rate-limit bucket (e.g. a successful sign-in
+   * clears the per-account failure bucket, so typos never lock a
+   * legitimate user out).
+   */
+  public async resetRateLimit(bucketKey: string): Promise<void> {
+    this.rateLimitBuckets.delete(bucketKey);
+  }
+
+  /**
+   * C-1: non-incrementing lockout probe — true when the bucket is
+   * already at/over `maxRequests` inside its window. Lets a caller
+   * refuse a locked account BEFORE doing expensive work (e.g. a
+   * bcrypt check on sign-in) without counting the refused attempt.
+   */
+  public async isRateLimited(
+    bucketKey: string,
+    maxRequests: number,
+    windowMs = 60_000
+  ): Promise<boolean> {
+    const entry = this.rateLimitBuckets.get(bucketKey);
+    if (!entry) return false;
+    if (Date.now() >= entry.resetAtMs) return false;
+    return entry.count >= maxRequests;
+  }
+
+  /**
+   * M-23: sets (or clears, with null) a staff user's custom avatar.
+   * The value is the storage object key; serving is the
+   * GET /api/v1/admin/me/avatar route. Runs inside a transaction so a
+   * DrizzleStore persists it with the next diff once the DB agent
+   * adds avatar_url to the users SyncSpec.
+   */
+  public async setStaffAvatarUrl(
+    userId: string,
+    avatarUrl: string | null
+  ): Promise<{ user_id: string; avatar_url: string | null }> {
+    return this.withTransaction((state) => {
+      const user = state.users.find((u) => u.id === userId);
+      if (!user) throw new AppError("NOT_FOUND", "Staff user not found.", 404);
+      user.avatar_url = avatarUrl;
+      user.updated_at = new Date().toISOString();
+      return { user_id: user.id, avatar_url: user.avatar_url ?? null };
+    });
   }
 
   /**

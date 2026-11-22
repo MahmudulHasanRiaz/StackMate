@@ -311,6 +311,7 @@ export function AuthScreen({
                 type="password"
                 required
                 minLength={10}
+                autoComplete="new-password"
                 value={setupPassword}
                 onChange={(e) => setSetupPassword(e.target.value)}
               />
@@ -441,6 +442,7 @@ export function AuthScreen({
                 id="sm-email"
                 type="email"
                 required
+                autoComplete="username"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
               />
@@ -450,6 +452,7 @@ export function AuthScreen({
                 id="sm-password"
                 type="password"
                 required
+                autoComplete="current-password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
               />

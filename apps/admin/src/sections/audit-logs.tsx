@@ -1,12 +1,13 @@
 /**
  * Audit Log — read-only record of staff, system, and integration actions.
  *
- * GET /api/v1/admin/audit-logs (audit_logs.read). The API returns the full
- * collection with NO server-side filters, so action / resource / outcome /
- * actor filters are applied client-side over the loaded collection.
- * Search, page, and pageSize are URL-backed via the route search params;
- * filters are URL-backed the same way. There are no mutation endpoints
- * for audit logs (read-only by design) — this section creates nothing.
+ * GET /api/v1/admin/audit-logs (audit_logs.read). Server-side search
+ * (?q=) and filters (?action=, ?resource=, ?outcome=) over the full
+ * history; the actor-type filter stays client-side (the API's ?actor=
+ * filters by actor user id, not by type). Search, page, and pageSize
+ * are URL-backed via the route search params; filters are URL-backed
+ * the same way. There are no mutation endpoints for audit logs
+ * (read-only by design) — this section creates nothing.
  *
  * Changes are sanitized server-side (passwords/secrets redacted) and are
  * rendered exactly as returned; nothing here ever tries to un-redact.
@@ -122,6 +123,30 @@ export function AuditLogsSection() {
   const query = useAdminList<AuditLogRecord>(
     "audit-logs",
     "/api/v1/admin/audit-logs",
+    {
+      q: search.q,
+      page: search.page,
+      pageSize: search.pageSize,
+      // Server-side: ?action=, ?resource=, ?outcome= filter the full
+      // history. ?actor= is NOT threaded — it filters by actor user
+      // id, while this page's actor filter is the actor TYPE, so it
+      // stays client-side in the `filtered` memo below.
+      extra: {
+        ...(search.action ? { action: search.action } : {}),
+        ...(search.resource_type ? { resource: search.resource_type } : {}),
+        ...(search.outcome ? { outcome: search.outcome } : {}),
+      },
+    },
+  );
+
+  // Filter-dropdown options come from a separate UNFILTERED load:
+  // deriving them from the filtered rows would narrow the dropdowns
+  // to the current filter (pick action=X and the action list would
+  // show only X). When no filter/search is active this shares the
+  // main query's key, so TanStack dedupes it into one fetch.
+  const optionsQuery = useAdminList<AuditLogRecord>(
+    "audit-logs",
+    "/api/v1/admin/audit-logs",
   );
 
   /* F3 (2026-11-16, follow-up): the API returns a server-resolved
@@ -135,16 +160,16 @@ export function AuditLogsSection() {
   const resourceMaps = useResourceMaps();
 
   const actions = useMemo(
-    () => distinctSorted((query.data ?? []).map((e) => e.action)),
-    [query.data],
+    () => distinctSorted((optionsQuery.data ?? []).map((e) => e.action)),
+    [optionsQuery.data],
   );
   const resourceTypes = useMemo(
-    () => distinctSorted((query.data ?? []).map((e) => e.resource_type)),
-    [query.data],
+    () => distinctSorted((optionsQuery.data ?? []).map((e) => e.resource_type)),
+    [optionsQuery.data],
   );
   const actorTypes = useMemo(
-    () => distinctSorted((query.data ?? []).map((e) => e.actor_type)),
-    [query.data],
+    () => distinctSorted((optionsQuery.data ?? []).map((e) => e.actor_type)),
+    [optionsQuery.data],
   );
 
   const filtersActive = Boolean(
@@ -298,6 +323,11 @@ export function AuditLogsSection() {
       <ListTable<AuditLogRecord>
         columns={columns}
         data={filtered}
+        serverSearch
+        serverPagination
+        refreshSection="audit-logs"
+        filtersActive={filtersActive}
+        total={query.total}
         search={search.q ?? ""}
         onSearchChange={(q) => updateSearch({ q: q === "" ? undefined : q }, true)}
         page={search.page ?? 1}
@@ -327,11 +357,13 @@ export function AuditLogsSection() {
           <>
             {/* Searchable, local mode (PLAN §29): the action vocabulary
                grows with the product (100+ event names), so a plain
-               dropdown is unusable. The options are the COMPLETE
-               distinct set from the loaded collection — client-side
-               filtering cannot miss one. A URL-restored value shows
-               itself (selectedLabel) even before its rows load. */}
+               dropdown is unusable. The options are the distinct set
+               from the UNFILTERED collection (optionsQuery) — deriving
+               them from the filtered rows would narrow the dropdown to
+               the current filter. A URL-restored value shows itself
+               (selectedLabel) even before its rows load. */}
             <SearchableSelect
+              id="audit-action-filter"
               value={search.action ?? ""}
               onChange={(v) =>
                 updateSearch(
@@ -347,6 +379,7 @@ export function AuditLogsSection() {
             />
             {/* Same: resource types are a fixed but >8 vocabulary. */}
             <SearchableSelect
+              id="audit-resource-filter"
               value={search.resource_type ?? ""}
               onChange={(v) =>
                 updateSearch(
@@ -361,6 +394,8 @@ export function AuditLogsSection() {
               ariaLabel="Filter by resource type"
             />
             <Select
+              id="audit-outcome-filter"
+              name="outcome"
               aria-label="Filter by outcome"
               value={search.outcome ?? ""}
               onChange={(e) =>
@@ -378,6 +413,7 @@ export function AuditLogsSection() {
             {/* Same: actor types are few, but the same searchable
                treatment keeps the toolbar consistent. */}
             <SearchableSelect
+              id="audit-actor-filter"
               value={search.actor_type ?? ""}
               onChange={(v) =>
                 updateSearch(

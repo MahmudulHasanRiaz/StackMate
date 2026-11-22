@@ -1,4 +1,5 @@
-import { pgTable, uuid, text, varchar, bigint, timestamp, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { pgTable, uuid, text, varchar, bigint, timestamp, index, check } from "drizzle-orm/pg-core";
 import { users } from "./auth.ts";
 import { customers } from "./customers.ts";
 
@@ -25,5 +26,7 @@ export const uploadedAssets = pgTable(
   (table) => [
     index("idx_uploaded_assets_owner_created").on(table.ownerCustomerId, table.createdAt.desc()),
     index("idx_uploaded_assets_visibility_created").on(table.visibility, table.createdAt.desc()),
+    check("uploaded_assets_byte_size_check", sql`"byte_size" >= 0`),
+    check("uploaded_assets_visibility_check", sql`"visibility" IN ('private', 'public')`),
   ]
 );

@@ -190,6 +190,9 @@ const WebhooksSection = lazy(() =>
 const WebhookDetailSection = lazy(() =>
   import("./sections/webhooks").then((m) => ({ default: m.WebhookDetailSection })),
 );
+const GettingStartedPage = lazy(() =>
+  import("./components/getting-started").then((m) => ({ default: m.GettingStartedPage })),
+);
 
 function RootComponent() {
   const [principal, setPrincipal] = useState<StaffPrincipalDto | null>(null);
@@ -384,6 +387,8 @@ const leadsRoute = makeListRoute("/leads", LeadsSection);
 const leadDetailRoute = makeDetailRoute("/leads/$leadId", "leadId", LeadDetailSection);
 // Media library (PLAN §31): main-menu section under Product.
 const mediaRoute = makeListRoute("/media", MediaLibrarySection);
+// Help menu (audit D-7): small Getting Started page, real content only.
+const gettingStartedRoute = makeListRoute("/getting-started", GettingStartedPage);
 
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -500,6 +505,7 @@ const routeTree = rootRoute.addChildren([
     leadsRoute,
     leadDetailRoute,
     mediaRoute,
+    gettingStartedRoute,
   ]),
   settingsRoute.addChildren([
     settingsIndexRoute,

@@ -211,14 +211,38 @@ export function resolveOrCreateCustomerInTx(
   return { customer, created: true };
 }
 
+/**
+ * SPA H-02 — one-request customer create. The request body may carry
+ * an optional `address` object (the CreateCustomerAddressSchema shape,
+ * same as POST .../addresses) alongside the customer fields. It is
+ * validated BEFORE the transaction opens and created in the SAME
+ * transaction as the customer, so an address validation failure never
+ * leaves a created customer behind — and a dedupe conflict (409)
+ * rolls both back together. When the customer resolves to an EXISTING
+ * customer (dedupe match), the address is attached to that customer,
+ * exactly as the old two-step UI did with its second call.
+ *
+ * The route (app.ts POST /api/v1/admin/customers) passes the whole
+ * request body through, so no route change is needed: sending
+ * `address` in the create body is enough. The response is the customer
+ * record with an added `address` key (the created address DTO, or
+ * null when no address was sent) — all existing fields stay at the
+ * top level, so the current UI keeps working unchanged.
+ */
 export async function createCustomerByAdmin(
   store: StackMateDataStore,
   actor: StaffPrincipal,
   rawInput: unknown,
   requestId: string
-): Promise<CustomerRecord> {
+): Promise<CustomerRecord & { address: CustomerAddressDto | null }> {
   assertStaffPermission(actor, "customers.manage");
+  // CreateCustomerSchema carries `address` natively (H-02 contracts
+  // fix), so the whole body parses in one step — no key stripping.
+  // A bad address 422s before any write (parse is before
+  // withTransaction), so a validation failure never leaves a created
+  // customer behind.
   const input = CreateCustomerSchema.parse(rawInput);
+  const addressInput = input.address ?? null;
 
   return store.withTransaction((state) => {
     // Dedupe (ADR-0009): an email/phone match resolves to the existing
@@ -236,6 +260,13 @@ export async function createCustomerByAdmin(
       notes: input.notes ?? null,
     });
 
+    let address: CustomerAddressDto | null = null;
+    let addressRow: CustomerAddressRecord | null = null;
+    if (addressInput) {
+      addressRow = createCustomerAddressInTx(state, customer.id, addressInput);
+      address = toCustomerAddressDto(addressRow);
+    }
+
     appendAuditLog(state, {
       actor_type: "staff",
       actor_user_id: actor.user.id,
@@ -247,7 +278,20 @@ export async function createCustomerByAdmin(
       changes: { customer_number: customer.customer_number, country_code: customer.country_code },
     });
 
-    return customer;
+    if (address && addressRow) {
+      appendAuditLog(state, {
+        actor_type: "staff",
+        actor_user_id: actor.user.id,
+        action: "customers.address.created",
+        resource_type: "customer",
+        resource_id: customer.id,
+        outcome: "success",
+        request_id: requestId,
+        changes: { address_id: addressRow.id, address_type: addressRow.address_type },
+      });
+    }
+
+    return { ...customer, address };
   });
 }
 
@@ -402,6 +446,55 @@ export async function listCustomerAddresses(
     .map(toCustomerAddressDto);
 }
 
+/**
+ * Create one address row inside the caller's transaction (no audit
+ * here — the caller logs its own action). Shared by the standalone
+ * address endpoint and the atomic customer+address create (SPA H-02).
+ * The `| undefined` on the optionals is deliberate: this file must
+ * accept valibot's parsed output under `exactOptionalPropertyTypes`.
+ */
+export function createCustomerAddressInTx(
+  state: DatabaseState,
+  customerId: string,
+  input: {
+    address_type: "billing" | "shipping" | "other";
+    contact_name?: string | null | undefined;
+    phone?: string | null | undefined;
+    address_line_1?: string | null | undefined;
+    address_line_2?: string | null | undefined;
+    city?: string | null | undefined;
+    state_or_region?: string | null | undefined;
+    postal_code?: string | null | undefined;
+    country_code: string;
+    is_default: boolean;
+  }
+): CustomerAddressRecord {
+  const now = new Date().toISOString();
+  if (input.is_default) {
+    for (const a of state.customer_addresses) {
+      if (a.customer_id === customerId && a.is_default) a.is_default = false;
+    }
+  }
+  const address: CustomerAddressRecord = {
+    id: randomUUID(),
+    customer_id: customerId,
+    address_type: input.address_type,
+    contact_name: input.contact_name ?? null,
+    phone: input.phone ?? null,
+    address_line_1: input.address_line_1 ?? null,
+    address_line_2: input.address_line_2 ?? null,
+    city: input.city ?? null,
+    state_or_region: input.state_or_region ?? null,
+    postal_code: input.postal_code ?? null,
+    country_code: input.country_code.toUpperCase(),
+    is_default: input.is_default,
+    created_at: now,
+    updated_at: now,
+  };
+  state.customer_addresses.push(address);
+  return address;
+}
+
 export async function createCustomerAddressByAdmin(
   store: StackMateDataStore,
   actor: StaffPrincipal,
@@ -414,29 +507,7 @@ export async function createCustomerAddressByAdmin(
   return store.withTransaction((state) => {
     const customer = state.customers.find((c) => c.id === customerId);
     if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
-    const now = new Date().toISOString();
-    if (input.is_default) {
-      for (const a of state.customer_addresses) {
-        if (a.customer_id === customerId && a.is_default) a.is_default = false;
-      }
-    }
-    const address: CustomerAddressRecord = {
-      id: randomUUID(),
-      customer_id: customerId,
-      address_type: input.address_type,
-      contact_name: input.contact_name ?? null,
-      phone: input.phone ?? null,
-      address_line_1: input.address_line_1 ?? null,
-      address_line_2: input.address_line_2 ?? null,
-      city: input.city ?? null,
-      state_or_region: input.state_or_region ?? null,
-      postal_code: input.postal_code ?? null,
-      country_code: input.country_code.toUpperCase(),
-      is_default: input.is_default,
-      created_at: now,
-      updated_at: now,
-    };
-    state.customer_addresses.push(address);
+    const address = createCustomerAddressInTx(state, customerId, input);
     appendAuditLog(state, {
       actor_type: "staff",
       actor_user_id: actor.user.id,

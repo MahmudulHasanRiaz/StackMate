@@ -1,4 +1,5 @@
 import {
+  check,
   index,
   jsonb,
   pgTable,
@@ -52,5 +53,6 @@ export const staffInvitations = pgTable(
       .where(sql`"staff_invitations"."status" = 'pending'`),
     index("idx_staff_invitations_token_hash").on(table.tokenHash),
     index("idx_staff_invitations_status").on(table.status),
+    check("staff_invitations_status_check", sql`"status" IN ('pending', 'accepted', 'revoked', 'expired')`),
   ]
 );

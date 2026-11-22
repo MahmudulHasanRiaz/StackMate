@@ -29,6 +29,7 @@ import type {
 import { AppError } from "../../shared/errors.ts";
 import { appendAuditLog } from "../audit/service.ts";
 import { assertStaffPermission, type StaffPrincipal } from "../identity/service.ts";
+import { queryDnsOverHttps } from "../webhooks/service.ts";
 
 export async function registerIntegratedSiteByAdmin(
   store: StackMateDataStore,
@@ -83,8 +84,14 @@ export async function registerIntegratedSiteByAdmin(
           domain: normalizedDomain,
           verification_method: "dns_txt",
           verification_challenge: domainChallenge,
-          verification_status: "verified",
-          verified_at: nowIso,
+          // H-6: NEVER auto-verify. A domain is "pending" until its
+          // owner proves control — by publishing the challenge in DNS
+          // (verifySiteDomainByAdmin, method dns_txt) or by an explicit
+          // staff manual review. The old code marked the primary
+          // domain "verified" with zero DNS proof, which let any staff
+          // registration claim any domain.
+          verification_status: "pending",
+          verified_at: null,
           is_primary: true,
         },
       ],
@@ -707,21 +714,59 @@ export async function verifySiteDomainByAdmin(
 ): Promise<IntegratedSiteRecord> {
   assertStaffPermission(actor, "integrations.manage");
   const input = VerifySiteDomainSchema.parse(rawInput);
-  // Automated DNS/HTTP verification is Batch 2 — it does not exist yet,
-  // and a fake "verified" would repeat the original defect. Only an
-  // explicit manual review (with a recorded note) can verify a domain now.
-  if (input.method !== "manual_review") {
+  // H-6: real DNS verification (Batch 2 is DONE for dns_txt). The
+  // challenge is a TXT value (`stackmate-site-verification=<token>`);
+  // verification queries the domain's TXT records over DNS-over-HTTPS
+  // (Cloudflare dns-json) and requires the challenge string to appear
+  // in one of them. A DNS failure never verifies — it 503s, and the
+  // domain stays pending. `http_file` is still unimplemented: there
+  // is no agreed well-known file convention for it yet, and a fake
+  // "verified" would repeat the original defect.
+  let verifiedMethod: "dns_txt" | "manual_review";
+  if (input.method === "dns_txt") {
+    const site = store.state.integrated_sites.find((s) => s.id === siteId);
+    if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
+    const domain = site.domains.find((d) => d.id === domainId);
+    if (!domain) throw new AppError("NOT_FOUND", "Domain not found.", 404);
+    if (domain.verification_status === "verified") {
+      throw new AppError("CONFLICT", "Domain is already verified.", 409);
+    }
+    if (!domain.verification_challenge) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        "Domain has no verification challenge — generate one first.",
+        422
+      );
+    }
+    // TXT answers come back as quoted character-strings, possibly
+    // split across segments ("part1" "part2") — strip the quotes and
+    // look for the challenge anywhere in the joined value.
+    const answers = await queryDnsOverHttps(domain.domain, "TXT");
+    const found = answers.some((a) =>
+      a.data.replace(/"/g, "").includes(domain.verification_challenge!)
+    );
+    if (!found) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        `DNS TXT verification failed: no TXT record for '${domain.domain}' contains the verification challenge. Publish the challenge as a TXT record and try again (DNS can take a few minutes to propagate).`,
+        422
+      );
+    }
+    verifiedMethod = "dns_txt";
+  } else if (input.method === "manual_review") {
+    if (!input.reviewer_note) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        "Manual domain verification requires a reviewer_note.",
+        422
+      );
+    }
+    verifiedMethod = "manual_review";
+  } else {
     throw new AppError(
       "CONFLICT",
-      `Automated ${input.method} verification is not implemented yet (Batch 2). Use method "manual_review" with a reviewer_note to record a manual review.`,
+      `Automated ${input.method} verification is not implemented yet. Use method "dns_txt" (publish the challenge as a TXT record) or "manual_review" with a reviewer_note to record a manual review.`,
       409
-    );
-  }
-  if (!input.reviewer_note) {
-    throw new AppError(
-      "VALIDATION_ERROR",
-      "Manual domain verification requires a reviewer_note.",
-      422
     );
   }
   return store.withTransaction((state) => {
@@ -739,12 +784,21 @@ export async function verifySiteDomainByAdmin(
     appendAuditLog(state, {
       actor_type: "staff",
       actor_user_id: actor.user.id,
-      action: "integrations.domain.verified_manually",
+      action:
+        verifiedMethod === "dns_txt"
+          ? "integrations.domain.verified_dns"
+          : "integrations.domain.verified_manually",
       resource_type: "integrated_site",
       resource_id: site.id,
       outcome: "success",
       request_id: requestId,
-      changes: { domain: domain.domain, reviewer_note: input.reviewer_note },
+      changes: {
+        domain: domain.domain,
+        verification_method: verifiedMethod,
+        ...(verifiedMethod === "manual_review"
+          ? { reviewer_note: input.reviewer_note }
+          : {}),
+      },
     });
     return site;
   });

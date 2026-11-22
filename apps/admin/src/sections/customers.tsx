@@ -372,6 +372,31 @@ export function validateCustomerForm(
 ): Record<string, string> {
   const next: Record<string, string> = {};
   if (v.name.trim().length < 2) next.name = "Name must be at least 2 characters.";
+  if (v.name.trim().length > 200) next.name = "Name must be at most 200 characters.";
+  if (v.company_name.trim().length > 200) {
+    next.company_name = "Company must be at most 200 characters.";
+  }
+  if (v.website.trim().length > 200) {
+    next.website = "Website must be at most 200 characters.";
+  }
+  if (v.notes.trim().length > 2000) {
+    next.notes = "Notes must be at most 2000 characters.";
+  }
+  if (v.address_line1.trim().length > 250) {
+    next.address_line1 = "Address line 1 must be at most 250 characters.";
+  }
+  if (v.address_line2.trim().length > 250) {
+    next.address_line2 = "Address line 2 must be at most 250 characters.";
+  }
+  if (v.address_city.trim().length > 120) {
+    next.address_city = "City must be at most 120 characters.";
+  }
+  if (v.address_state.trim().length > 120) {
+    next.address_state = "State must be at most 120 characters.";
+  }
+  if (v.address_postal_code.trim().length > 40) {
+    next.address_postal_code = "Postal code must be at most 40 characters.";
+  }
   if (v.email.trim() === "" && v.phone.trim() === "") {
     next.email = "At least one of email or phone is required.";
     next.phone = "At least one of email or phone is required.";
@@ -442,6 +467,8 @@ export function CustomerFormFields({
       <Field label="Name" required htmlFor={`${idPrefix}-name`} error={errors.name ?? ""}>
         <Input
           id={`${idPrefix}-name`}
+          name="name"
+          autoComplete="name"
           value={values.name}
           onChange={(e) => onChange({ name: e.target.value })}
           aria-invalid={Boolean(errors.name) || undefined}
@@ -451,6 +478,7 @@ export function CustomerFormFields({
       <Field label="Type" htmlFor={`${idPrefix}-type`}>
         <Select
           id={`${idPrefix}-type`}
+          name="customer_type"
           value={values.customer_type}
           onChange={(e) =>
             onChange({ customer_type: e.target.value as "person" | "business" })
@@ -463,7 +491,9 @@ export function CustomerFormFields({
       <Field label="Email" htmlFor={`${idPrefix}-email`} error={errors.email ?? ""}>
         <Input
           id={`${idPrefix}-email`}
+          name="email"
           type="email"
+          autoComplete="email"
           value={values.email}
           onChange={(e) => onChange({ email: e.target.value })}
           aria-invalid={Boolean(errors.email) || undefined}
@@ -473,7 +503,9 @@ export function CustomerFormFields({
       <Field label="Phone" htmlFor={`${idPrefix}-phone`} error={errors.phone ?? ""}>
         <Input
           id={`${idPrefix}-phone`}
+          name="phone"
           type="tel"
+          autoComplete="tel"
           value={values.phone}
           onChange={(e) => onChange({ phone: e.target.value })}
           aria-invalid={Boolean(errors.phone) || undefined}
@@ -483,7 +515,9 @@ export function CustomerFormFields({
       <Field label="WhatsApp" htmlFor={`${idPrefix}-whatsapp`} error={errors.whatsapp ?? ""}>
         <Input
           id={`${idPrefix}-whatsapp`}
+          name="whatsapp"
           type="tel"
+          autoComplete="tel"
           value={values.whatsappSameAsPhone ? values.phone : values.whatsapp}
           onChange={(e) => onChange({ whatsapp: e.target.value })}
           disabled={values.whatsappSameAsPhone}
@@ -496,11 +530,14 @@ export function CustomerFormFields({
         checked={values.whatsappSameAsPhone}
         onChange={(e) => onChange({ whatsappSameAsPhone: e.target.checked })}
       />
-      <Field label="Company" htmlFor={`${idPrefix}-company`}>
+      <Field label="Company" htmlFor={`${idPrefix}-company`} error={errors.company_name ?? ""}>
         <Input
           id={`${idPrefix}-company`}
+          name="company_name"
+          autoComplete="organization"
           value={values.company_name}
           onChange={(e) => onChange({ company_name: e.target.value })}
+          aria-invalid={Boolean(errors.company_name) || undefined}
           maxLength={200}
         />
       </Field>
@@ -512,73 +549,97 @@ export function CustomerFormFields({
       >
         <Input
           id={`${idPrefix}-country`}
+          name="country_code"
+          autoComplete="country"
           value={values.country_code}
           onChange={(e) => onChange({ country_code: e.target.value.toUpperCase() })}
           aria-invalid={Boolean(errors.country_code) || undefined}
           maxLength={2}
         />
       </Field>
-      <Field label="Website" htmlFor={`${idPrefix}-website`}>
+      <Field label="Website" htmlFor={`${idPrefix}-website`} error={errors.website ?? ""}>
         <Input
           id={`${idPrefix}-website`}
+          name="website"
+          autoComplete="url"
           value={values.website}
           onChange={(e) => onChange({ website: e.target.value })}
-          maxLength={500}
+          aria-invalid={Boolean(errors.website) || undefined}
+          maxLength={200}
           placeholder="https://example.com"
         />
       </Field>
-      <Field label="Notes" htmlFor={`${idPrefix}-notes`}>
+      <Field label="Notes" htmlFor={`${idPrefix}-notes`} error={errors.notes ?? ""}>
         <Textarea
           id={`${idPrefix}-notes`}
+          name="notes"
           value={values.notes}
           onChange={(e) => onChange({ notes: e.target.value })}
+          aria-invalid={Boolean(errors.notes) || undefined}
           maxLength={2000}
         />
       </Field>
       <CollapsibleSection title="Billing address (optional)">
-        <Field label="Address line 1" htmlFor={`${idPrefix}-addr1`}>
+        <Field label="Address line 1" htmlFor={`${idPrefix}-addr1`} error={errors.address_line1 ?? ""}>
           <Input
             id={`${idPrefix}-addr1`}
+            name="address_line_1"
+            autoComplete="address-line1"
             value={values.address_line1}
             onChange={(e) => onChange({ address_line1: e.target.value })}
-            maxLength={300}
+            aria-invalid={Boolean(errors.address_line1) || undefined}
+            maxLength={250}
           />
         </Field>
-        <Field label="Address line 2" htmlFor={`${idPrefix}-addr2`}>
+        <Field label="Address line 2" htmlFor={`${idPrefix}-addr2`} error={errors.address_line2 ?? ""}>
           <Input
             id={`${idPrefix}-addr2`}
+            name="address_line_2"
+            autoComplete="address-line2"
             value={values.address_line2}
             onChange={(e) => onChange({ address_line2: e.target.value })}
-            maxLength={300}
+            aria-invalid={Boolean(errors.address_line2) || undefined}
+            maxLength={250}
           />
         </Field>
-        <Field label="City" htmlFor={`${idPrefix}-city`}>
+        <Field label="City" htmlFor={`${idPrefix}-city`} error={errors.address_city ?? ""}>
           <Input
             id={`${idPrefix}-city`}
+            name="city"
+            autoComplete="address-level2"
             value={values.address_city}
             onChange={(e) => onChange({ address_city: e.target.value })}
-            maxLength={150}
+            aria-invalid={Boolean(errors.address_city) || undefined}
+            maxLength={120}
           />
         </Field>
-        <Field label="State" htmlFor={`${idPrefix}-state`}>
+        <Field label="State" htmlFor={`${idPrefix}-state`} error={errors.address_state ?? ""}>
           <Input
             id={`${idPrefix}-state`}
+            name="state_or_region"
+            autoComplete="address-level1"
             value={values.address_state}
             onChange={(e) => onChange({ address_state: e.target.value })}
-            maxLength={150}
+            aria-invalid={Boolean(errors.address_state) || undefined}
+            maxLength={120}
           />
         </Field>
-        <Field label="Postal code" htmlFor={`${idPrefix}-postal`}>
+        <Field label="Postal code" htmlFor={`${idPrefix}-postal`} error={errors.address_postal_code ?? ""}>
           <Input
             id={`${idPrefix}-postal`}
+            name="postal_code"
+            autoComplete="postal-code"
             value={values.address_postal_code}
             onChange={(e) => onChange({ address_postal_code: e.target.value })}
-            maxLength={20}
+            aria-invalid={Boolean(errors.address_postal_code) || undefined}
+            maxLength={40}
           />
         </Field>
         <Field label="Address country" htmlFor={`${idPrefix}-addr-country`}>
           <Input
             id={`${idPrefix}-addr-country`}
+            name="address_country_code"
+            autoComplete="country"
             value={values.address_country}
             onChange={(e) => onChange({ address_country: e.target.value.toUpperCase() })}
             maxLength={2}
@@ -662,7 +723,11 @@ export function CustomersSection() {
   const updateSearch = useListSearchControls(parsed);
   const goTo = useGoTo();
   const [createOpen, setCreateOpen] = useState(false);
-  const query = useAdminList<CustomerDto>("customers", "/api/v1/admin/customers");
+  const query = useAdminList<CustomerDto>("customers", "/api/v1/admin/customers", {
+    q: parsed.q,
+    page: parsed.page,
+    pageSize: parsed.pageSize,
+  });
 
   // The name cell renders the customer name as text; the row action opens
   // the detail page. (ListTable columns are module-level so they cannot
@@ -700,6 +765,10 @@ export function CustomersSection() {
       <ListTable<CustomerDto>
         columns={columns}
         data={query.data}
+        serverSearch
+        serverPagination
+        refreshSection="customers"
+        total={query.total}
         search={parsed.q ?? ""}
         onSearchChange={(q) => updateSearch({ q: q === "" ? undefined : q, page: 1 })}
         page={parsed.page ?? 1}
@@ -762,16 +831,15 @@ function AddCustomerDialog({
     setFormError(null);
     setSaving(true);
     try {
-      const created = await mutation.mutateAsync(customerFormToCreateBody(values));
-      // Billing address (if any fields were filled) is a second call —
-      // the customer must exist first.
+      // H-02: one atomic call — the API accepts `address` in the
+      // create body, so an invalid address can never leave a created
+      // customer behind (the old two-step flow 422d on the address
+      // after the customer existed, then 409d on retry).
       const addressBody = customerFormToAddressBody(values);
-      if (addressBody) {
-        await apiRequest(`/api/v1/admin/customers/${created.id}/addresses`, {
-          method: "POST",
-          body: JSON.stringify(addressBody),
-        });
-      }
+      const created = await mutation.mutateAsync({
+        ...customerFormToCreateBody(values),
+        ...(addressBody ? { address: addressBody } : {}),
+      });
       onCreated(created.id);
     } catch (err) {
       // A 409 here is the dedupe conflict — the server message names
@@ -794,7 +862,7 @@ function AddCustomerDialog({
             Cancel
           </Button>
           <Button
-            variant="primary"
+            variant="accent"
             type="submit"
             form="add-customer-form"
             loading={saving || mutation.isPending}
@@ -820,11 +888,18 @@ function AddCustomerDialog({
 /* ------------------------------------------------------------------ */
 /* Customer detail — tabs (PRD §9 + Issues + Reports)                  */
 /* ------------------------------------------------------------------ */
+// Detail-tab related lists have no server search (?q= is not threaded
+// here), so server paging would shrink the client-side search to one
+// page. They keep the ?limit=100 window instead: the whole window is
+// searchable and pageable client-side, and the old API-default cap of
+// 25 rows (which silently truncated a customer's orders at 25) is gone.
 function useCustomerCollection<T>(customerId: string, key: string, path: string) {
   return useQuery({
     queryKey: ["admin", "customers", "detail", customerId, key],
     queryFn: async () => {
-      const res = await apiRequest<{ items: T[] }>(path);
+      const res = await apiRequest<{ items: T[] }>(
+        `${path}${path.includes("?") ? "&" : "?"}limit=100`,
+      );
       return res.items;
     },
   });
@@ -1709,6 +1784,7 @@ function EditCustomerDialog({
     e.preventDefault();
     const next: typeof errors = {};
     if (name.trim().length < 2) next.name = "Name must be at least 2 characters.";
+    if (name.trim().length > 200) next.name = "Name must be at most 200 characters.";
     if (email.trim() !== "" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
       next.email = "Enter a valid email address.";
     }
@@ -1782,6 +1858,8 @@ function EditCustomerDialog({
         >
           <Input
             id="edit-name"
+            name="name"
+            autoComplete="name"
             value={name}
             onChange={(e) => setName(e.target.value)}
             aria-invalid={errors.name ? true : undefined}
@@ -1795,7 +1873,9 @@ function EditCustomerDialog({
         >
           <Input
             id="edit-email"
+            name="email"
             type="email"
+            autoComplete="email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
             aria-invalid={errors.email ? true : undefined}
@@ -1809,7 +1889,9 @@ function EditCustomerDialog({
         >
           <Input
             id="edit-phone"
+            name="phone"
             type="tel"
+            autoComplete="tel"
             value={phone}
             onChange={(e) => setPhone(e.target.value)}
             aria-invalid={errors.phone ? true : undefined}
@@ -1823,7 +1905,9 @@ function EditCustomerDialog({
         >
           <Input
             id="edit-whatsapp"
+            name="whatsapp"
             type="tel"
+            autoComplete="tel"
             value={whatsappSameAsPhone ? phone : whatsapp}
             onChange={(e) => setWhatsapp(e.target.value)}
             disabled={whatsappSameAsPhone}
@@ -1839,6 +1923,8 @@ function EditCustomerDialog({
         <Field label="Company" htmlFor="edit-company">
           <Input
             id="edit-company"
+            name="company_name"
+            autoComplete="organization"
             value={companyName}
             onChange={(e) => setCompanyName(e.target.value)}
             maxLength={200}
@@ -1847,9 +1933,11 @@ function EditCustomerDialog({
         <Field label="Website" htmlFor="edit-website">
           <Input
             id="edit-website"
+            name="website"
+            autoComplete="url"
             value={website}
             onChange={(e) => setWebsite(e.target.value)}
-            maxLength={500}
+            maxLength={200}
           />
         </Field>
         <Field
@@ -1860,6 +1948,8 @@ function EditCustomerDialog({
         >
           <Input
             id="edit-country"
+            name="country_code"
+            autoComplete="country"
             value={countryCode}
             onChange={(e) => setCountryCode(e.target.value.toUpperCase())}
             aria-invalid={errors.countryCode ? true : undefined}
@@ -1869,6 +1959,7 @@ function EditCustomerDialog({
         <Field label="Status" htmlFor="edit-status">
           <Select
             id="edit-status"
+            name="status"
             value={status}
             onChange={(e) =>
               setStatus(e.target.value as CustomerDto["status"])
@@ -1882,6 +1973,7 @@ function EditCustomerDialog({
         <Field label="Notes" htmlFor="edit-notes">
           <Textarea
             id="edit-notes"
+            name="notes"
             value={notes}
             onChange={(e) => setNotes(e.target.value)}
             maxLength={2000}
@@ -1933,7 +2025,14 @@ function AddressDialog({
     e.preventDefault();
     const next: Record<string, string> = {};
     if (line1.trim() === "") next.line1 = "Address line 1 is required.";
+    if (line1.trim().length > 250) next.line1 = "Address line 1 must be at most 250 characters.";
+    if (line2.trim().length > 250) next.line2 = "Address line 2 must be at most 250 characters.";
     if (city.trim() === "") next.city = "City is required.";
+    if (city.trim().length > 120) next.city = "City must be at most 120 characters.";
+    if (state.trim().length > 120) next.state = "State must be at most 120 characters.";
+    if (postalCode.trim().length > 40) {
+      next.postal_code = "Postal code must be at most 40 characters.";
+    }
     if (countryCode.trim().length !== 2) next.country_code = "Country code is 2 letters.";
     setErrors(next);
     if (Object.keys(next).length > 0) return;
@@ -1979,25 +2078,69 @@ function AddressDialog({
               : "Could not save the address."}
           </Alert>
         ) : null}
-        <Field label="Address line 1" required error={errors.line1 ?? ""}>
-          <Input value={line1} onChange={(e) => setLine1(e.target.value)} maxLength={300} />
-        </Field>
-        <Field label="Address line 2">
-          <Input value={line2} onChange={(e) => setLine2(e.target.value)} maxLength={300} />
-        </Field>
-        <Field label="City" required error={errors.city ?? ""}>
-          <Input value={city} onChange={(e) => setCity(e.target.value)} maxLength={150} />
-        </Field>
-        <Field label="State">
-          <Input value={state} onChange={(e) => setState(e.target.value)} maxLength={150} />
-        </Field>
-        <Field label="Postal code">
-          <Input value={postalCode} onChange={(e) => setPostalCode(e.target.value)} maxLength={20} />
-        </Field>
-        <Field label="Country code" required error={errors.country_code ?? ""}>
+        <Field label="Address line 1" required htmlFor="addr-line1" error={errors.line1 ?? ""}>
           <Input
+            id="addr-line1"
+            name="address_line_1"
+            autoComplete="address-line1"
+            value={line1}
+            onChange={(e) => setLine1(e.target.value)}
+            aria-invalid={Boolean(errors.line1) || undefined}
+            maxLength={250}
+          />
+        </Field>
+        <Field label="Address line 2" htmlFor="addr-line2" error={errors.line2 ?? ""}>
+          <Input
+            id="addr-line2"
+            name="address_line_2"
+            autoComplete="address-line2"
+            value={line2}
+            onChange={(e) => setLine2(e.target.value)}
+            aria-invalid={Boolean(errors.line2) || undefined}
+            maxLength={250}
+          />
+        </Field>
+        <Field label="City" required htmlFor="addr-city" error={errors.city ?? ""}>
+          <Input
+            id="addr-city"
+            name="city"
+            autoComplete="address-level2"
+            value={city}
+            onChange={(e) => setCity(e.target.value)}
+            aria-invalid={Boolean(errors.city) || undefined}
+            maxLength={120}
+          />
+        </Field>
+        <Field label="State" htmlFor="addr-state" error={errors.state ?? ""}>
+          <Input
+            id="addr-state"
+            name="state_or_region"
+            autoComplete="address-level1"
+            value={state}
+            onChange={(e) => setState(e.target.value)}
+            aria-invalid={Boolean(errors.state) || undefined}
+            maxLength={120}
+          />
+        </Field>
+        <Field label="Postal code" htmlFor="addr-postal" error={errors.postal_code ?? ""}>
+          <Input
+            id="addr-postal"
+            name="postal_code"
+            autoComplete="postal-code"
+            value={postalCode}
+            onChange={(e) => setPostalCode(e.target.value)}
+            aria-invalid={Boolean(errors.postal_code) || undefined}
+            maxLength={40}
+          />
+        </Field>
+        <Field label="Country code" required htmlFor="addr-country" error={errors.country_code ?? ""}>
+          <Input
+            id="addr-country"
+            name="country_code"
+            autoComplete="country"
             value={countryCode}
             onChange={(e) => setCountryCode(e.target.value.toUpperCase())}
+            aria-invalid={Boolean(errors.country_code) || undefined}
             maxLength={2}
           />
         </Field>
@@ -2078,16 +2221,24 @@ function ReportDialog({
               : "Could not file the report."}
           </Alert>
         ) : null}
-        <Field label="Type">
-          <Select value={type} onChange={(e) => setType(e.target.value as "note" | "concern")}>
+        <Field label="Type" htmlFor="report-type">
+          <Select
+            id="report-type"
+            name="type"
+            value={type}
+            onChange={(e) => setType(e.target.value as "note" | "concern")}
+          >
             <option value="note">Note — something worth recording</option>
             <option value="concern">Concern — a problem with this customer</option>
           </Select>
         </Field>
-        <Field label="Detail" required error={error ?? ""}>
+        <Field label="Detail" required htmlFor="report-detail" error={error ?? ""}>
           <Textarea
+            id="report-detail"
+            name="detail"
             value={detail}
             onChange={(e) => setDetail(e.target.value)}
+            aria-invalid={Boolean(error) || undefined}
             maxLength={5000}
             placeholder="What happened, when, and what should other staff know?"
           />
@@ -2198,10 +2349,11 @@ function SplitContactDialog({
           Detaches a secondary email or phone from this profile into a new
           customer profile. Orders stay with this customer.
         </p>
-        <Field label="Contact to split off" required>
+        <Field label="Contact to split off" required htmlFor="split-contact">
           {/* Local mode: secondary contacts are this customer's own
              complete set — client-side filtering cannot miss one. */}
           <SearchableSelect
+            id="split-contact"
             value={contactId}
             onChange={(v) => setContactId(v)}
             options={secondary.map((c) => ({
@@ -2212,8 +2364,11 @@ function SplitContactDialog({
             ariaLabel="Contact to split off"
           />
         </Field>
-        <Field label="New customer name" required>
+        <Field label="New customer name" required htmlFor="split-name">
           <Input
+            id="split-name"
+            name="new_customer_name"
+            autoComplete="name"
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
             maxLength={200}
@@ -2222,11 +2377,13 @@ function SplitContactDialog({
         </Field>
         <Field
           label="Phone for the new profile"
+          htmlFor="split-phone"
           hint="Defaults to the most recently added secondary phone, else the primary phone. Pick a different one if needed."
         >
           {/* Local mode: the phone options are this customer's own
              complete set — client-side filtering cannot miss one. */}
           <SearchableSelect
+            id="split-phone"
             value={phone}
             onChange={(v) => setPhone(v)}
             options={[

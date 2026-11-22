@@ -32,6 +32,7 @@ import {
 } from "../../platform/storage/driver.ts";
 import {
   MAX_MEDIA_BYTES,
+  MAX_THUMBNAIL_BYTES,
   MEDIA_ALLOWED_MIME,
   mediaKindOfMime,
   mediaObjectKey,
@@ -40,6 +41,7 @@ import {
   normalizeFolder,
   normalizeTags,
   verifyMediaBytes,
+  verifyThumbnailBytes,
   type MediaKind,
 } from "../../platform/storage/media-validation.ts";
 import type {
@@ -245,6 +247,11 @@ const THUMBNAILABLE_MIMES: ReadonlySet<string> = new Set([
  * size, or null when there is nothing to store (no input, wrong
  * original kind, or validation failed — the caller never fails the
  * upload over a thumbnail).
+ *
+ * L-11: a bad thumbnail is DROPPED, but the drop is now LOGGED (the
+ * old code swallowed it silently, so nobody could tell a broken
+ * browser thumbnail generator from a healthy upload). The log line
+ * carries the variant, the reason, and the size — never file bytes.
  */
 async function storeThumbnail(
   driver: { put(key: string, bytes: Uint8Array, contentType: string): Promise<unknown>; name: string },
@@ -256,14 +263,22 @@ async function storeThumbnail(
   if (!input || !THUMBNAILABLE_MIMES.has(originalMime)) return null;
   let verified;
   try {
-    verified = verifyMediaBytes(input.bytes, "image/webp");
-  } catch {
+    verified = verifyThumbnailBytes(input.bytes);
+  } catch (err) {
+    console.warn(
+      `[media] thumbnail dropped (variant=${variant}, original=${objectKey}, ` +
+        `reason=${(err as Error).message}, bytes=${input.bytes.byteLength}, cap=${MAX_THUMBNAIL_BYTES})`
+    );
     return null;
   }
   const key = mediaThumbnailKey(objectKey, variant);
   try {
     await driver.put(key, verified.bytes, "image/webp");
-  } catch {
+  } catch (err) {
+    console.warn(
+      `[media] thumbnail dropped (variant=${variant}, original=${objectKey}, ` +
+        `reason=storage put failed: ${(err as Error).message})`
+    );
     return null;
   }
   return { objectKey: key, byteSize: verified.bytes.byteLength };
@@ -362,6 +377,46 @@ export async function regenerateMediaThumbnail(
     );
   }
   const driver = await resolveStorageDriver(driverDeps, driverNameOf(row));
+  // F-13: thumbnail keys are DERIVED from the original key, so a
+  // regenerate overwrites the same objects. Snapshot the CURRENT
+  // thumbnail bytes BEFORE overwriting: if the row update below fails,
+  // the old bytes are restored, so the row's thumbByteSize still
+  // matches the stored object. (The old code put first and updated
+  // second with no recovery — a failed update left a stale size
+  // pointing at different-sized bytes, i.e. corrupt Content-Length /
+  // Range responses.) If the restore itself fails, the new keys are
+  // deleted instead, leaving a clean 404 the UI falls back from.
+  const previous: { thumb?: Uint8Array | undefined; small?: Uint8Array | undefined } = {};
+  if (thumbnails.thumb && row.thumbObjectKey) {
+    const old = await driver.get(row.thumbObjectKey).catch(() => null);
+    if (old) previous.thumb = old.bytes;
+  }
+  if (thumbnails.small && row.thumbSmallObjectKey) {
+    const old = await driver.get(row.thumbSmallObjectKey).catch(() => null);
+    if (old) previous.small = old.bytes;
+  }
+  const restorePrevious = async (): Promise<void> => {
+    if (thumbnails.thumb) {
+      const key = mediaThumbnailKey(row.objectKey, "thumb");
+      if (previous.thumb) {
+        await driver.put(key, previous.thumb, "image/webp").catch(() =>
+          driver.delete(key).catch(() => undefined)
+        );
+      } else {
+        await driver.delete(key).catch(() => undefined);
+      }
+    }
+    if (thumbnails.small) {
+      const key = mediaThumbnailKey(row.objectKey, "small");
+      if (previous.small) {
+        await driver.put(key, previous.small, "image/webp").catch(() =>
+          driver.delete(key).catch(() => undefined)
+        );
+      } else {
+        await driver.delete(key).catch(() => undefined);
+      }
+    }
+  };
   const stored: {
     thumbObjectKey?: string | null;
     thumbSmallObjectKey?: string | null;
@@ -369,26 +424,37 @@ export async function regenerateMediaThumbnail(
     thumbSmallByteSize?: number | null;
   } = {};
   if (thumbnails.thumb) {
-    const verified = verifyMediaBytes(thumbnails.thumb.bytes, "image/webp");
+    // L-11: on regenerate the thumbnail IS the request, so an oversize
+    // or invalid thumbnail is a 413/415 — not a silent drop.
+    const verified = verifyThumbnailBytes(thumbnails.thumb.bytes);
     const key = mediaThumbnailKey(row.objectKey, "thumb");
     await driver.put(key, verified.bytes, "image/webp");
     stored.thumbObjectKey = key;
     stored.thumbByteSize = verified.bytes.byteLength;
   }
   if (thumbnails.small) {
-    const verified = verifyMediaBytes(thumbnails.small.bytes, "image/webp");
+    const verified = verifyThumbnailBytes(thumbnails.small.bytes);
     const key = mediaThumbnailKey(row.objectKey, "small");
     await driver.put(key, verified.bytes, "image/webp");
     stored.thumbSmallObjectKey = key;
     stored.thumbSmallByteSize = verified.bytes.byteLength;
   }
-  const updated = await db
-    .update(mediaAssets)
-    .set({ ...stored, updatedAt: new Date() })
-    .where(eq(mediaAssets.id, row.id))
-    .returning();
+  let updated;
+  try {
+    updated = await db
+      .update(mediaAssets)
+      .set({ ...stored, updatedAt: new Date() })
+      .where(eq(mediaAssets.id, row.id))
+      .returning();
+  } catch (err) {
+    await restorePrevious();
+    throw err;
+  }
   const saved = updated[0];
-  if (!saved) throw new AppError("INTERNAL_ERROR", "Media thumbnail update failed to persist.", 500);
+  if (!saved) {
+    await restorePrevious();
+    throw new AppError("INTERNAL_ERROR", "Media thumbnail update failed to persist.", 500);
+  }
   return mediaViewOf(saved);
 }
 

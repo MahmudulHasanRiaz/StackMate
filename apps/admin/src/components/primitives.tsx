@@ -6,7 +6,9 @@
  * icon set (Lucide only, 16px default, stroke-width 2, currentColor).
  */
 import {
+  cloneElement,
   createContext,
+  isValidElement,
   useCallback,
   useContext,
   useEffect,
@@ -17,6 +19,7 @@ import {
   useState,
   type ButtonHTMLAttributes,
   type InputHTMLAttributes,
+  type ReactElement,
   type ReactNode,
   type SelectHTMLAttributes,
   type TextareaHTMLAttributes,
@@ -50,14 +53,18 @@ export function Spinner() {
 
 /* ------------------------------------------------------------------ */
 /* Button — six variants (Neon button system, images 80/81/82,      */
-/* corrected 2026-11-16 ~03:07 +06 from Neon's live CSS). PRIMARY     */
-/* (white/black) is reserved for the SINGLE most-important action on  */
-/* a page — "Create product" on the Products list (mirrors Neon's     */
-/* "Create branch"); white everywhere else looked bad. Every other    */
+/* corrected 2026-11-16 ~03:07 +06 from Neon's live CSS; system       */
+/* decided 2026-11-19, audit D-2 — the old "exactly three" rule is    */
+/* retired). Three MAIN variants — PRIMARY (white/black), SECONDARY   */
+/* (grey outline), ACCENT (green outline for brand CTAs) — plus       */
+/* DANGER (solid red confirm action, owner-approved Defect B) and     */
+/* GHOST forms (ghost + danger-ghost, the text-button pattern for     */
+/* icon actions, menus and low-emphasis actions). PRIMARY is          */
+/* reserved for the SINGLE most-important action on a page —          */
+/* "Create product" on the Products list (mirrors Neon's "Create      */
+/* branch"); one white primary per page (audit D-3). Every other      */
 /* main action is ACCENT: green outline, filling with the green       */
-/* gradient on hover/focus (Neon image-85). SECONDARY is a grey       */
-/* outline. DANGER renders as secondary (Neon shows no danger        */
-/* button).                                                           */
+/* gradient on hover/focus (Neon image-85).                           */
 /* ------------------------------------------------------------------ */
 type ButtonVariant =
   | "primary"
@@ -524,11 +531,19 @@ export function SearchableSelect({
   disabled,
   ariaLabel,
   id,
+  name,
+  "aria-describedby": ariaDescribedBy,
 }: {
   value: string;
   onChange: (value: string, option?: SearchableOption) => void;
   options?: SearchableOption[];
-  loadOptions?: (query: string, signal: AbortSignal) => Promise<SearchableOption[]>;
+  /** Server search. May return a bare list, or `{ options, capped }`
+   *  when the server capped the page (audit L-01) — the capped hint
+   *  below renders only from the object form. */
+  loadOptions?: (
+    query: string,
+    signal: AbortSignal,
+  ) => Promise<SearchableOption[] | { options: SearchableOption[]; capped: boolean }>;
   selectedLabel?: string | undefined;
   resolveLabel?: (
     value: string,
@@ -539,11 +554,23 @@ export function SearchableSelect({
   disabled?: boolean;
   ariaLabel: string;
   id?: string;
+  /** Forwarded to the combobox input (audit L-06) so the control is
+   *  form-identifiable like every other input. */
+  name?: string;
+  /** Wired by Field (audit M-10) — the hint/error ids reach the
+   *  input through this prop because Field clones the component. */
+  "aria-describedby"?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
   const [results, setResults] = useState<SearchableOption[]>([]);
   const [loading, setLoading] = useState(false);
+  /** Audit M-04: a failed server search must not masquerade as "No
+   *  results" — the flag renders "Search failed — try again." */
+  const [searchError, setSearchError] = useState(false);
+  /** Audit L-01: true when the server capped the page; renders the
+   *  "Showing first N — refine your search" hint. */
+  const [capped, setCapped] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
   const [pos, setPos] = useState<{ top: number; left: number; width: number } | null>(null);
   const [chosenLabel, setChosenLabel] = useState<{ value: string; label: string } | null>(null);
@@ -605,10 +632,20 @@ export function SearchableSelect({
       const controller = new AbortController();
       abortRef.current = controller;
       setLoading(true);
+      setSearchError(false);
+      setCapped(false);
       try {
         let loaded: SearchableOption[];
         if (loadOptions) {
-          loaded = await loadOptions(query, controller.signal);
+          const res = await loadOptions(query, controller.signal);
+          // Object form carries the server cap (audit L-01); the bare
+          // array form is the legacy shape and stays supported.
+          if (Array.isArray(res)) {
+            loaded = res;
+          } else {
+            loaded = res.options;
+            setCapped(res.capped);
+          }
         } else {
           const q = query.trim().toLowerCase();
           loaded = (options ?? []).filter(
@@ -630,7 +667,13 @@ export function SearchableSelect({
         }
       } catch (err) {
         if (err instanceof DOMException && err.name === "AbortError") return;
-        if (!controller.signal.aborted) setResults([]);
+        if (!controller.signal.aborted) {
+          setResults([]);
+          setCapped(false);
+          // Audit M-04: the empty list below is NOT "no matches" —
+          // the search itself failed.
+          setSearchError(true);
+        }
       } finally {
         if (!controller.signal.aborted) setLoading(false);
       }
@@ -764,6 +807,7 @@ export function SearchableSelect({
       <input
         ref={inputRef}
         id={id}
+        name={name}
         type="text"
         role="combobox"
         aria-expanded={open}
@@ -772,6 +816,7 @@ export function SearchableSelect({
           open && activeIndex >= 0 ? `${listId}-${activeIndex}` : undefined
         }
         aria-label={ariaLabel}
+        aria-describedby={ariaDescribedBy}
         aria-autocomplete="list"
         autoComplete="off"
         className="sm-select sm-searchable-select"
@@ -805,7 +850,9 @@ export function SearchableSelect({
             >
               {shown.length === 0 && !loading ? (
                 <div className="sm-menu-item" aria-disabled="true">
-                  No results — try a different search.
+                  {searchError
+                    ? "Search failed — try again."
+                    : "No results — try a different search."}
                 </div>
               ) : (
                 shown.map((o, i) => (
@@ -832,6 +879,20 @@ export function SearchableSelect({
                   </button>
                 ))
               )}
+              {/* Audit M-04: with static leading options present a
+                  failed search still shows them — the failure gets
+                  its own row instead of silence. Audit L-01: the cap
+                  hint names the count actually returned. */}
+              {searchError && shown.length > 0 && !loading ? (
+                <div className="sm-menu-item" aria-disabled="true">
+                  Search failed — try again.
+                </div>
+              ) : null}
+              {capped && shown.length > 0 && !loading ? (
+                <div className="sm-menu-item" aria-disabled="true">
+                  Showing first {results.length} — refine your search.
+                </div>
+              ) : null}
               {loading ? (
                 <div className="sm-menu-item" aria-disabled="true">
                   Searching…
@@ -866,18 +927,54 @@ export function Field({
   required?: boolean;
   hint?: string | undefined;
   error?: string | undefined;
+  /** The id of the control this label belongs to. Optional in the
+   *  type — the section call sites pass plain controls without it —
+   *  but EFFECTIVELY required: when it is missing, Field generates
+   *  one and injects it into a single valid-element child, so the
+   *  label is always associated (audit M-08). The sections agent is
+   *  adding explicit htmlFor at the call sites; until then the
+   *  generated id closes the gap. */
   htmlFor?: string;
   children: ReactNode;
 }) {
   const hintId = useId();
   const errorId = useId();
+  const generatedId = useId();
+  // Audit M-10: the hint/error ids existed but were never wired to
+  // the control — aria-describedby was used 0 times in the app. The
+  // described-by value is the error id when an error is present,
+  // else the hint id.
+  const describedBy = [error ? errorId : null, !error && hint ? hintId : null]
+    .filter(Boolean)
+    .join(" ");
+  const controlId = htmlFor ?? generatedId;
+  // Inject id + aria-describedby into a single valid-element child
+  // (input/select/textarea, or a component that forwards id, e.g.
+  // SearchableSelect). Wrappers, fragments and multi-child content
+  // render untouched — the label still points at controlId, which
+  // the sections agent's explicit htmlFor will resolve.
+  let child = children;
+  if (isValidElement(children)) {
+    const el = children as ReactElement<Record<string, unknown>>;
+    const existingDescribedBy =
+      typeof el.props["aria-describedby"] === "string"
+        ? (el.props["aria-describedby"] as string)
+        : "";
+    const mergedDescribedBy = [existingDescribedBy, describedBy]
+      .filter(Boolean)
+      .join(" ");
+    child = cloneElement(el, {
+      id: (el.props.id as string | undefined) ?? controlId,
+      ...(mergedDescribedBy ? { "aria-describedby": mergedDescribedBy } : {}),
+    });
+  }
   return (
     <div className="sm-field">
-      <label className="sm-label" htmlFor={htmlFor}>
+      <label className="sm-label" htmlFor={controlId}>
         {label}
         {required ? <span className="sm-required"> *</span> : null}
       </label>
-      {children}
+      {child}
       {hint && !error ? (
         <span className="sm-hint" id={hintId}>
           {hint}
@@ -895,11 +992,19 @@ export function Field({
 
 export function Checkbox({
   label,
+  id,
+  name,
   ...props
-}: InputHTMLAttributes<HTMLInputElement> & { label: string }) {
+}: InputHTMLAttributes<HTMLInputElement> & {
+  label: string;
+  /** Audit L-09: explicit id/name — the spread forwarded them in
+   *  practice, but the signature never said so. */
+  id?: string;
+  name?: string;
+}) {
   return (
     <label className="sm-check-label">
-      <input type="checkbox" className="sm-checkbox" {...props} />
+      <input type="checkbox" className="sm-checkbox" id={id} name={name} {...props} />
       {label}
     </label>
   );
@@ -907,11 +1012,18 @@ export function Checkbox({
 
 export function Switch({
   label,
+  id,
+  name,
   ...props
-}: InputHTMLAttributes<HTMLInputElement> & { label: string }) {
+}: InputHTMLAttributes<HTMLInputElement> & {
+  label: string;
+  /** Audit L-09: explicit id/name — see Checkbox. */
+  id?: string;
+  name?: string;
+}) {
   return (
     <label className="sm-check-label">
-      <input type="checkbox" role="switch" className="sm-switch" {...props} />
+      <input type="checkbox" role="switch" className="sm-switch" id={id} name={name} {...props} />
       {label}
     </label>
   );
@@ -1115,8 +1227,17 @@ export function Pagination({
   onPageSizeChange?: (size: number) => void;
 }) {
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
-  const from = total === 0 ? 0 : (page - 1) * pageSize + 1;
-  const to = Math.min(total, page * pageSize);
+  // Audit M-01: the page was never clamped — after a delete or a
+  // filter narrowed the list, page 2 of 1 rendered an empty tbody
+  // with "Showing 26–25 of 25". Step back to the last page (which
+  // also corrects the URL param at the ListTable level) and display
+  // the clamped page so no render ever shows an impossible range.
+  const clampedPage = Math.min(Math.max(1, page), totalPages);
+  useEffect(() => {
+    if (page > totalPages) onPageChange(totalPages);
+  }, [page, totalPages, onPageChange]);
+  const from = total === 0 ? 0 : (clampedPage - 1) * pageSize + 1;
+  const to = Math.min(total, clampedPage * pageSize);
   return (
     <div className="sm-pagination">
       <span>
@@ -1140,19 +1261,19 @@ export function Pagination({
         <Button
           variant="secondary"
           size="sm"
-          disabled={page <= 1}
-          onClick={() => onPageChange(page - 1)}
+          disabled={clampedPage <= 1}
+          onClick={() => onPageChange(clampedPage - 1)}
         >
           Prev
         </Button>
         <span aria-live="polite">
-          Page {page} of {totalPages}
+          Page {clampedPage} of {totalPages}
         </span>
         <Button
           variant="secondary"
           size="sm"
-          disabled={page >= totalPages}
-          onClick={() => onPageChange(page + 1)}
+          disabled={clampedPage >= totalPages}
+          onClick={() => onPageChange(clampedPage + 1)}
         >
           Next
         </Button>
@@ -1227,30 +1348,51 @@ function getInitials(name: string): string {
   return (first + second).toUpperCase();
 }
 
-/* Avatar — Gravatar photo when the email has one (d=404 → the <img>
-   errors and the initials tile shows instead), initials otherwise.
-   The photo is square (4px radius, never circular — radius rules). */
+/* Avatar — custom uploaded photo first (audit M-23), Gravatar
+   second (d=404 → the <img> errors and the next fallback shows),
+   initials otherwise. The photo is square (4px radius, never
+   circular — radius rules). */
 export function Avatar({
   name,
   email,
+  avatarUrl,
   size = "md",
 }: {
   name: string;
-  email?: string | null;
+  email?: string | null | undefined;
+  /** Custom avatar URL (users.avatar_url, set from Profile → media
+   *  picker). null/undefined means "no custom photo". */
+  avatarUrl?: string | null | undefined;
   size?: "md" | "lg";
 }) {
-  const [failed, setFailed] = useState(false);
-  // A new email retries the photo (e.g. switching accounts).
+  const [customFailed, setCustomFailed] = useState(false);
+  const [gravatarFailed, setGravatarFailed] = useState(false);
+  // A new photo/email retries the photo (e.g. switching accounts or
+  // after uploading a new avatar).
   useEffect(() => {
-    setFailed(false);
-  }, [email]);
-  const url = failed ? null : gravatarUrl(email, size === "lg" ? 72 : 56);
+    setCustomFailed(false);
+    setGravatarFailed(false);
+  }, [avatarUrl, email]);
+  const customUrl = avatarUrl && !customFailed ? avatarUrl : null;
+  const gravatar = !customUrl && !gravatarFailed ? gravatarUrl(email, size === "lg" ? 72 : 56) : null;
+  const url = customUrl ?? gravatar;
   return (
     <span
       className={`sm-avatar${size === "lg" ? " sm-avatar-lg" : ""}`}
       aria-hidden="true"
     >
-      {url ? <img src={url} alt="" onError={() => setFailed(true)} /> : getInitials(name)}
+      {url ? (
+        <img
+          src={url}
+          alt=""
+          onError={() => {
+            if (customUrl) setCustomFailed(true);
+            else setGravatarFailed(true);
+          }}
+        />
+      ) : (
+        getInitials(name)
+      )}
     </span>
   );
 }
@@ -1691,8 +1833,15 @@ function useFocusTrap(active: boolean, onClose: () => void) {
           "button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])",
         ),
       );
-    const first = focusables()[0];
-    first?.focus();
+    // Audit L-08: initial focus landed on the header Close button
+    // (the first focusable in DOM order) — the user had to Tab past
+    // it to reach the form. Focus the first FORM control instead;
+    // dialogs with no form control (e.g. ConfirmDialog) keep the
+    // old behaviour and focus the first focusable item.
+    const firstControl = focusables().find((item) =>
+      ["INPUT", "SELECT", "TEXTAREA"].includes(item.tagName),
+    );
+    (firstControl ?? focusables()[0])?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         // An open combobox owns Escape: it closes its own listbox, and

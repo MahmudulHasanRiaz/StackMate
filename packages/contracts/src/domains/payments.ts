@@ -94,6 +94,33 @@ export const RejectPaymentSubmissionSchema = v.object({
   internal_note: v.string().trim().max(2000).nullable().optional(),
 });
 
+/**
+ * Manual refund (audit F-03, owner decision D-4): record money handed
+ * back by hand against a payment transaction (preferred) or the latest
+ * refundable transaction of an order. Mirrors
+ * `RecordManualRefundInput` in modules/payments/service.ts — the service
+ * re-validates the plain shape, so the rules hold whichever way it is
+ * called. The route (app.ts) parses the body with this schema.
+ * The two ids are plain non-empty strings, NOT uuid(): transaction and
+ * order ids are store-assigned identifiers (the in-memory store uses
+ * synthetic ids such as "txn-refund"); the service resolves them by
+ * exact match and 404s on an unknown id, so a uuid() constraint here
+ * would reject valid requests.
+ */
+export const RecordManualRefundSchema = v
+  .object({
+    payment_transaction_id: v.string().trim().min(1).nullable().optional(),
+    order_id: v.string().trim().min(1).nullable().optional(),
+    amount_minor: v.number().int().positive(),
+    currency_code: v.string().trim().regex(/^[A-Za-z]{3}$/, "currency_code must be a 3-letter code."),
+    reason: v.string().trim().min(1).max(1000),
+    provider_refund_id: v.string().trim().max(180).nullable().optional(),
+  })
+  .refine(
+    (val) => Boolean(val.payment_transaction_id) !== Boolean(val.order_id),
+    "Provide exactly one of payment_transaction_id or order_id."
+  );
+
 export const CreatePaymentProviderSchema = v.object({
   provider_key: v
     .string()

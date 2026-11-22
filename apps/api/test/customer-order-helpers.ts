@@ -384,8 +384,14 @@ export function seedLicense(
 ): LicenseRecord {
   const now = testNow();
   const { product_id, customer_id, ...rest } = overrides;
+  const licenseId = randomUUID();
+  // F-14: the license points at a REAL snapshot row. The FK is
+  // DEFERRABLE INITIALLY DEFERRED (migration 0014) because the store
+  // persists the license row before its snapshot in one transaction;
+  // a random UUID with no row fails the check at COMMIT.
+  const snapshotId = randomUUID();
   const license: LicenseRecord = {
-    id: randomUUID(),
+    id: licenseId,
     license_number: `LIC-T-${randomUUID().slice(0, 8).toUpperCase()}`,
     product_id,
     customer_id,
@@ -398,8 +404,21 @@ export function seedLicense(
     valid_from: now,
     expires_at: null,
     grace_until: null,
-    current_entitlement_snapshot_id: randomUUID(),
-    snapshots: [],
+    current_entitlement_snapshot_id: snapshotId,
+    snapshots: [
+      {
+        id: snapshotId,
+        license_id: licenseId,
+        version_number: 1,
+        source_type: "manual_grant",
+        effective_at: now,
+        reason: null,
+        snapshot_hash: `test-${randomUUID().replace(/-/g, "")}`,
+        items: [],
+        created_by_user_id: null,
+        created_at: now,
+      },
+    ],
     activations: [],
     issued_at: now,
     created_at: now,

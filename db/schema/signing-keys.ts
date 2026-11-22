@@ -1,4 +1,5 @@
-import { pgTable, uuid, text, jsonb, timestamp, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { pgTable, uuid, text, jsonb, timestamp, index, check } from "drizzle-orm/pg-core";
 
 /**
  * Durable license signing keys (migration 0004).
@@ -25,7 +26,11 @@ export const signingKeys = pgTable(
   {
     id: uuid("id").primaryKey(),
     keyId: text("key_id").notNull().unique(),
-    publicKeyJwk: jsonb("public_key_jwk").notNull(),
+    // NOTE: the column is "public_jwk" in SQL (migration 0004) and in
+    // the API's raw SQL (drizzle-store.ts) — the TS property keeps the
+    // longer name, but the COLUMN string must stay "public_jwk" or
+    // drizzle-kit generate emits a rename of the live column.
+    publicKeyJwk: jsonb("public_jwk").notNull(),
     encryptedPrivateJwk: text("encrypted_private_jwk").notNull(),
     status: text("status").notNull(), // active | retired | revoked
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -46,5 +51,6 @@ export const signingKeys = pgTable(
     // uq_signing_keys_single_active), like other SQL-only constraints
     // in this repo — Drizzle's index builder cannot express it.
     index("idx_signing_keys_status").on(table.status),
+    check("signing_keys_status_check", sql`"status" IN ('active', 'retired', 'revoked')`),
   ]
 );

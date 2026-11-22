@@ -104,6 +104,23 @@ export function resolveRuntimeConfig(rawEnv: Partial<StackMateBindings> = {}): S
   const appEnv = (rawEnv.APP_ENV ?? process.env.APP_ENV ?? "local") as StackMateBindings["APP_ENV"];
   const isProd = appEnv === "production" || appEnv === "staging";
 
+  // H-7: APP_ENV defaults to "local" — which silently enables the
+  // hardcoded dev secrets below. That default is only legitimate for
+  // a bare local run. A deployment that carries a Hyperdrive binding
+  // (or runs with NODE_ENV=production) but no APP_ENV is
+  // misconfigured: fail boot loudly instead of serving with known dev
+  // secrets. All known callers pass APP_ENV explicitly.
+  const appEnvExplicitlySet =
+    rawEnv.APP_ENV !== undefined || process.env.APP_ENV !== undefined;
+  if (
+    !appEnvExplicitlySet &&
+    (rawEnv.HYPERDRIVE_NO_CACHE !== undefined || process.env.NODE_ENV === "production")
+  ) {
+    throw new Error(
+      "APP_ENV must be set (local, test, staging, or production). It defaults to 'local' only for a bare local run; a deployment without APP_ENV would silently use development secrets."
+    );
+  }
+
   const betterAuthSecret =
     rawEnv.BETTER_AUTH_SECRET ??
     process.env.BETTER_AUTH_SECRET ??
@@ -161,7 +178,7 @@ export function resolveRuntimeConfig(rawEnv: Partial<StackMateBindings> = {}): S
     BETTER_AUTH_URL: rawEnv.BETTER_AUTH_URL ?? process.env.BETTER_AUTH_URL ?? "http://localhost:8787",
     ENCRYPTION_KEY_V1: encryptionKeyV1,
     ACTIVE_ENCRYPTION_KEY_VERSION:
-      rawEnv.ACTIVE_ENCRYPTION_KEY_VERSION ?? process.env.ACTIVE_ENCRYPTION_KEY_VERSION ?? "v1",
+      rawEnv.ACTIVE_ENCRYPTION_KEY_VERSION ?? process.env.ACTIVE_ENCRYPTION_KEY_VERSION ?? "v2",
     LICENSE_VERIFIER_SECRET: licenseVerifierSecret,
     CHECKOUT_TOKEN_SECRET: checkoutTokenSecret,
     SETUP_TOKEN: setupToken || undefined,

@@ -162,13 +162,17 @@ export const CreateRoleSchema = v.object({
     .regex(/^[a-z][a-z0-9_]*$/, "Role key must start with a lowercase letter and use snake_case."),
   name: v.string().trim().min(2).max(160),
   description: v.string().trim().max(500).optional(),
-  permissions: v.array(v.string().trim().min(2).max(80)).default([]),
+  // L-13: capped at 64 — the permission catalogue has 31 keys; 64
+  // leaves room for growth and an unbounded array cannot be submitted.
+  permissions: v.array(v.string().trim().min(2).max(80), { max: 64 }).default([]),
 });
 
 export const UpdateRoleSchema = v.object({
   name: v.string().trim().min(2).max(160).optional(),
   description: v.string().trim().max(500).nullable().optional(),
-  permissions: v.array(v.string().trim().min(2).max(80)).optional(),
+  // L-13: capped like the create schema — the catalogue has 31 keys;
+  // 64 leaves room for growth and an unbounded array cannot be submitted.
+  permissions: v.array(v.string().trim().min(2).max(80), { max: 64 }).optional(),
 });
 
 export const CreateStaffInvitationSchema = v.object({

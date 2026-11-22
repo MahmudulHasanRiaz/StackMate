@@ -60,10 +60,12 @@ export function isValidIsoDateOnly(isoDate: string): boolean {
 /**
  * Converts an ISO 8601 date-only string (YYYY-MM-DD) or ISO timestamp into user-facing DD/MM/YYYY.
  * When a timezone is provided for an instant timestamp, formats in that IANA timezone.
+ * Defaults to Asia/Dhaka, the product's display timezone (LIVE L3: the
+ * UTC default showed the wrong date for evening timestamps).
  */
 export function formatDisplayDateDDMMYYYY(
   isoDateOrTimestamp: string | Date,
-  timeZone = "UTC"
+  timeZone = "Asia/Dhaka"
 ): string {
   if (typeof isoDateOrTimestamp === "string" && ISO_DATE_ONLY_REGEX.test(isoDateOrTimestamp.trim())) {
     const trimmed = isoDateOrTimestamp.trim();

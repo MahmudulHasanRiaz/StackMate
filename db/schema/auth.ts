@@ -1,4 +1,5 @@
-import { pgTable, text, timestamp, boolean, varchar, integer } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { pgTable, text, timestamp, boolean, varchar, integer, check } from "drizzle-orm/pg-core";
 
 export const users = pgTable("users", {
   id: text("id").primaryKey(),
@@ -18,6 +19,10 @@ export const users = pgTable("users", {
   // password sign-in until a password is set through the identity service.
   passwordHash: text("password_hash"),
   image: text("image"),
+  // Migration 0014 (audit D-5, full avatar batch): the R2 object key of
+  // the staff member's custom avatar (NULL = Gravatar default). Written
+  // by the API avatar-upload endpoint; read by the SPA Avatar component.
+  avatarUrl: text("avatar_url"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 });
@@ -70,7 +75,10 @@ export const staffProfiles = pgTable("staff_profiles", {
   status: text("status").notNull().default("active"), // active | suspended
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  check("staff_profiles_status_check", sql`"status" IN ('active', 'suspended')`),
+]);
 
 /**
  * Better Auth two-factor plugin table (Auth + Email batch, 2026-11-16).

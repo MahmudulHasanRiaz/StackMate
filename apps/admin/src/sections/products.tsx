@@ -441,14 +441,18 @@ export function ProductsSection() {
   const { raw, list } = useRouteSearch();
   const updateSearch = useSearchUpdater();
   const [createOpen, setCreateOpen] = useState(false);
-  const query = useAdminList<ProductListItem>("products", "/api/v1/admin/products");
+  const search = list.q ?? "";
+  const query = useAdminList<ProductListItem>("products", "/api/v1/admin/products", {
+    q: search,
+    page: list.page,
+    pageSize: list.pageSize,
+  });
 
   const statusFilter =
     typeof raw.status === "string" &&
     (STATUS_FILTERS as readonly string[]).includes(raw.status)
       ? raw.status
       : "all";
-  const search = list.q ?? "";
   const rows = (query.data ?? []).filter((p) =>
     statusFilter === "all" ? true : p.status === statusFilter,
   );
@@ -519,6 +523,11 @@ export function ProductsSection() {
       <ListTable
         columns={columns}
         data={rows}
+        serverSearch
+        serverPagination
+        refreshSection="products"
+        filtersActive={statusFilter !== "all"}
+        total={query.total}
         search={search}
         onSearchChange={(q) => updateSearch({ q: q || undefined, page: 1 })}
         page={list.page ?? 1}

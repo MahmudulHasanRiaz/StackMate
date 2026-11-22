@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   pgTable,
   uuid,
@@ -8,6 +9,7 @@ import {
   jsonb,
   timestamp,
   index,
+  check,
 } from "drizzle-orm/pg-core";
 import { customers } from "./customers.ts";
 import { currencies } from "./catalog.ts";
@@ -48,6 +50,14 @@ export const invoices = pgTable(
     index("idx_invoices_customer_issued").on(table.customerId, table.issuedAt.desc()),
     index("idx_invoices_status_due").on(table.status, table.dueAt),
     index("idx_invoices_subscription_issued").on(table.subscriptionId, table.issuedAt.desc()),
+    check("invoices_invoice_type_check", sql`"invoice_type" IN ('initial', 'renewal', 'adjustment', 'credit_note')`),
+    check("invoices_status_check", sql`"status" IN ('draft', 'open', 'paid', 'void', 'uncollectible', 'partially_paid')`),
+    check("invoices_subtotal_minor_check", sql`"subtotal_minor" >= 0`),
+    check("invoices_discount_minor_check", sql`"discount_minor" >= 0`),
+    check("invoices_tax_minor_check", sql`"tax_minor" >= 0`),
+    check("invoices_total_minor_check", sql`"total_minor" >= 0`),
+    check("invoices_amount_paid_minor_check", sql`"amount_paid_minor" >= 0`),
+    check("invoices_amount_due_minor_check", sql`"amount_due_minor" >= 0`),
   ]
 );
 
@@ -68,4 +78,10 @@ export const invoiceItems = pgTable("invoice_items", {
     .notNull()
     .references(() => currencies.code, { onDelete: "restrict" }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  check("invoice_items_quantity_check", sql`"quantity" >= 1`),
+  check("invoice_items_unit_amount_minor_check", sql`"unit_amount_minor" >= 0`),
+  check("invoice_items_line_amount_minor_check", sql`"line_amount_minor" >= 0`),
+  check("invoice_items_tax_amount_minor_check", sql`"tax_amount_minor" >= 0`),
+]);
