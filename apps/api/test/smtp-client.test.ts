@@ -824,6 +824,80 @@ describe.skipIf(!DATABASE_URL)(
       );
       expect(result.error).not.toBe("Email could not be sent.");
     });
+
+    it("SMTP settings length caps: over-long values 422, max-length values save", async () => {
+      // The smtp_settings columns are unbounded `text`, so without
+      // caps an absurd value sailed into the DB/encryption layer and
+      // 500d instead of 422ing. Caps (service.ts): host ≤253,
+      // username ≤254, from_address ≤254, from_name ≤160,
+      // password ≤512.
+      const valid = {
+        host: "smtp.example.com",
+        port: 587,
+        username: "smtp-user",
+        password: "smtp-pass-TEST-ONLY",
+        tls_mode: "starttls",
+        from_address: "noreply@example.com",
+        from_name: "StackMate",
+        enabled: false,
+      };
+      const expect422 = async (
+        input: Parameters<typeof saveSmtpSettings>[2],
+        message: string
+      ) => {
+        let caught: unknown;
+        try {
+          await saveSmtpSettings(db, deps, input);
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught, "over-long value must be rejected").toBeDefined();
+        expect((caught as { statusCode?: number }).statusCode).toBe(422);
+        expect((caught as { code?: string }).code).toBe("VALIDATION_ERROR");
+        expect((caught as Error).message).toBe(message);
+      };
+      await expect422(
+        { ...valid, host: "h".repeat(254) },
+        "host must be at most 253 characters."
+      );
+      await expect422(
+        { ...valid, username: "u".repeat(255) },
+        "username must be at most 254 characters."
+      );
+      await expect422(
+        { ...valid, password: "p".repeat(513) },
+        "password must be at most 512 characters."
+      );
+      await expect422(
+        { ...valid, from_name: "n".repeat(161) },
+        "from_name must be at most 160 characters."
+      );
+      // 255-char email-shaped address: the format regex still
+      // passes, so only the length cap must trip.
+      const longEmail = `${"a".repeat(64)}@${"b".repeat(63)}.${"c".repeat(63)}.${"d".repeat(62)}`;
+      expect(longEmail.length).toBe(255);
+      await expect422(
+        { ...valid, from_address: longEmail },
+        "from_address must be at most 254 characters."
+      );
+      // Max-length values save cleanly (last test in this describe,
+      // so the disabled state it leaves behind affects nothing).
+      const maxEmail = `${"a".repeat(64)}@${"b".repeat(63)}.${"c".repeat(63)}.${"d".repeat(61)}`;
+      expect(maxEmail.length).toBe(254);
+      const saved = await saveSmtpSettings(db, deps, {
+        ...valid,
+        host: "h".repeat(253),
+        username: "u".repeat(254),
+        password: "p".repeat(512),
+        from_address: maxEmail,
+        from_name: "n".repeat(160),
+      });
+      expect(saved.host).toBe("h".repeat(253));
+      expect(saved.username).toBe("u".repeat(254));
+      expect(saved.from_address).toBe(maxEmail);
+      expect(saved.from_name).toBe("n".repeat(160));
+      expect(saved.has_password).toBe(true);
+    });
   }
 );
 describe("SMTP client (real local TCP server, TLS mode none)", () => {

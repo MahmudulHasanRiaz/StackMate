@@ -45,6 +45,12 @@ import { createHash } from "node:crypto";
 import { createStackMateApp } from "../src/app.ts";
 import { resolveRuntimeConfig } from "../src/env.ts";
 import { StackMateDataStore } from "../src/platform/db/store.ts";
+import {
+  seedCustomer,
+  seedOrder,
+  seedProduct,
+  seedSite,
+} from "./customer-order-helpers.ts";
 
 const TEST_SETUP_TOKEN =
   "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -774,6 +780,85 @@ describe("API-core batch", () => {
     }
   });
 
+  it("outbox-events: server-side ?q= matches event_type / aggregate_type / aggregate_id / status", async () => {
+    // Seeded rows carry a unique "qprobe" marker so assertions can
+    // pick them out of whatever other tests already recorded.
+    const now = new Date().toISOString();
+    const seed = (
+      id: string,
+      event_type: string,
+      aggregate_type: string,
+      aggregate_id: string,
+      status: "pending" | "delivered" | "simulated" | "skipped",
+    ) => ({
+      id,
+      event_key: `${event_type}:${aggregate_id}`,
+      aggregate_type,
+      aggregate_id,
+      event_type,
+      payload: {},
+      status,
+      attempt_count: 1,
+      available_at: now,
+      locked_until: null,
+      locked_by: null,
+      last_error_code: null,
+      created_at: now,
+      processed_at: now,
+    });
+    store.state.outbox_events.push(
+      seed("obx-q-a", "payment.approved", "payment_submission", "qprobe-sub-001", "skipped"),
+      seed("obx-q-b", "order.created", "order", "qprobe-ord-002", "delivered"),
+      seed("obx-q-c", "meta_capi.purchase", "tracking_event", "qprobe-trk-003", "simulated"),
+    );
+    const qprobeKeys = (items: Array<{ event_key: string }>) =>
+      items
+        .map((i) => i.event_key)
+        .filter((k) => k.includes("qprobe"))
+        .sort();
+    const list = async (query: string) => {
+      const res = await apiRequest(`/api/v1/admin/outbox-events${query}`, {
+        cookie: superCookie,
+      });
+      assert.equal(res.status, 200, JSON.stringify(res.body));
+      assert.ok(Array.isArray(res.body.data.items));
+      return res.body.data.items as Array<{ event_key: string }>;
+    };
+    // event_type substring.
+    assert.deepEqual(qprobeKeys(await list("?q=payment.approved")), [
+      "payment.approved:qprobe-sub-001",
+    ]);
+    // aggregate_id substring, case-insensitive (uppercase query).
+    assert.deepEqual(qprobeKeys(await list("?q=QPROBE-ORD")), [
+      "order.created:qprobe-ord-002",
+    ]);
+    // aggregate_type substring.
+    assert.deepEqual(qprobeKeys(await list("?q=tracking_event")), [
+      "meta_capi.purchase:qprobe-trk-003",
+    ]);
+    // status substring.
+    assert.deepEqual(qprobeKeys(await list("?q=simulated")), [
+      "meta_capi.purchase:qprobe-trk-003",
+    ]);
+    // ?q= composes with ?status=.
+    assert.deepEqual(qprobeKeys(await list("?status=skipped&q=payment")), [
+      "payment.approved:qprobe-sub-001",
+    ]);
+    // A query matching nothing returns an empty page (total 0).
+    const none = await apiRequest("/api/v1/admin/outbox-events?q=qprobe-nomatch-zzz", {
+      cookie: superCookie,
+    });
+    assert.equal(none.status, 200, JSON.stringify(none.body));
+    assert.deepEqual(none.body.data.items, []);
+    assert.equal(none.body.data.total, 0);
+    // No query returns all three seeded rows.
+    assert.deepEqual(qprobeKeys(await list("")), [
+      "meta_capi.purchase:qprobe-trk-003",
+      "order.created:qprobe-ord-002",
+      "payment.approved:qprobe-sub-001",
+    ]);
+  });
+
   it("L-20: preflight advertises methods/headers only to trusted origins", async () => {
     const evil = await apiRequest("/api/v1/admin/products", {
       method: "OPTIONS",
@@ -1015,5 +1100,38 @@ describe("API-core batch", () => {
       store.state.outbox_events.find((e) => e.id === "obx-sim")?.status,
       "simulated"
     );
+  });
+
+  it("order detail returns site_name for site-linked orders, null for admin orders", async () => {
+    // Live gap: ORD-10005 (a Test-site website order) showed source
+    // "website" with no site-name field anywhere on the detail page.
+    let siteOrderId = "";
+    let adminOrderId = "";
+    let siteId = "";
+    await store.withTransaction((state) => {
+      const site = seedSite(state);
+      const customer = seedCustomer(state);
+      const product = seedProduct(state);
+      siteId = site.id;
+      siteOrderId = seedOrder(state, customer.id, product, {
+        source: "website",
+        integrated_site_id: site.id,
+      }).id;
+      adminOrderId = seedOrder(state, customer.id, product).id;
+    });
+    const siteRes = await apiRequest(`/api/v1/admin/orders/${siteOrderId}`, {
+      cookie: superCookie,
+    });
+    assert.equal(siteRes.status, 200, JSON.stringify(siteRes.body));
+    assert.equal(siteRes.body.data.source, "website");
+    assert.equal(siteRes.body.data.integrated_site_id, siteId);
+    assert.equal(siteRes.body.data.site_name, "Test Site");
+    const adminRes = await apiRequest(`/api/v1/admin/orders/${adminOrderId}`, {
+      cookie: superCookie,
+    });
+    assert.equal(adminRes.status, 200, JSON.stringify(adminRes.body));
+    assert.equal(adminRes.body.data.source, "admin");
+    assert.equal(adminRes.body.data.integrated_site_id, null);
+    assert.equal(adminRes.body.data.site_name, null);
   });
 });

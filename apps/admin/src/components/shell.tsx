@@ -2,7 +2,7 @@
  * Admin shell (design spec §12 + owner decisions 2026-11-15).
  *
  * Two layouts, chosen by route — never both at once:
- *  - MainShell: operational nav (5 groups, 13 sections) + topbar.
+ *  - MainShell: operational nav (5 groups, 14 sections) + topbar.
  *    Sidebar is 248px; the "Collapse menu" button at the sidebar
  *    bottom toggles it to a 64px icon rail (persisted in localStorage
  *    `sm-nav-collapsed`); 900–1280px it is a rail regardless;
@@ -67,6 +67,7 @@ import {
   ShoppingCart,
   SunMoon,
   Tags,
+  Undo2,
   User,
   UserPlus,
   Users,
@@ -161,7 +162,7 @@ export function AuthProvider({
 }
 
 /* ------------------------------------------------------------------ */
-/* Navigation model — the 13 operational sections (PRD §2.1).           */
+/* Navigation model — the 14 operational sections (PRD §2.1).           */
 /* Configuration lives ONLY in Settings (restructure batch): the       */
 /* Integrations group is gone — Websites / Webhooks / Tracking config  */
 /* moved to /settings/*, Payment Methods to /settings/payment-methods; */
@@ -198,6 +199,7 @@ export const NAVIGATION_GROUPS: ReadonlyArray<{
       { to: "/customers", label: "Customers", icon: Users, permission: "customers.read" },
       { to: "/orders", label: "Orders & Invoices", icon: ShoppingCart, permission: "orders.read" },
       { to: "/payment-review", label: "Payment Review", icon: ClipboardCheck, permission: "payments.read" },
+      { to: "/refunds", label: "Refunds", icon: Undo2, permission: "payments.read" },
       { to: "/leads", label: "Leads", icon: UserPlus, permission: "leads.view" },
     ],
   },

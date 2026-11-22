@@ -2,7 +2,7 @@
  * TanStack Router tree (design spec §12.1, PRD §2.1).
  *
  * Two layout routes — never both mounted at once:
- *  - _main: the operational shell (13 sections, grouped sidebar).
+ *  - _main: the operational shell (14 sections, grouped sidebar).
  *  - /settings: the DEDICATED Settings shell (path route, no `id` —
  *    TanStack Router forbids a route having both `id` and `path`;
  *    2026-11-15 this threw at bundle load and blanked the whole SPA).
@@ -128,6 +128,9 @@ const PaymentSubmissionDetailSection = lazy(() =>
   import("./sections/payment-review").then((m) => ({
     default: m.PaymentSubmissionDetailSection,
   })),
+);
+const RefundsSection = lazy(() =>
+  import("./sections/refunds").then((m) => ({ default: m.RefundsSection })),
 );
 const ProductsSection = lazy(() =>
   import("./sections/products").then((m) => ({ default: m.ProductsSection })),
@@ -428,6 +431,9 @@ const ordersRoute = makeListRoute("/orders", OrdersSection);
 const orderDetailRoute = makeDetailRoute("/orders/$orderId", "orderId", OrderDetailSection);
 const paymentReviewRoute = makeListRoute("/payment-review", PaymentReviewSection);
 const paymentSubmissionDetailRoute = makeDetailRoute("/payment-review/$submissionId", "submissionId", PaymentSubmissionDetailSection);
+// Refunds standalone list — same list as the Payment Review Refunds tab
+// (D-4), on its own Commerce nav entry.
+const refundsRoute = makeListRoute("/refunds", RefundsSection);
 const subscriptionsRoute = makeListRoute("/subscriptions", SubscriptionsSection);
 const subscriptionDetailRoute = makeDetailRoute("/subscriptions/$subscriptionId", "subscriptionId", SubscriptionDetailSection);
 const licensesRoute = makeListRoute("/licenses", LicensesSection);
@@ -552,6 +558,7 @@ const routeTree = rootRoute.addChildren([
     orderDetailRoute,
     paymentReviewRoute,
     paymentSubmissionDetailRoute,
+    refundsRoute,
     subscriptionsRoute,
     subscriptionDetailRoute,
     licensesRoute,

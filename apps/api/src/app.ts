@@ -725,6 +725,30 @@ export function createStackMateApp(
     };
     const applyListPage = <T>(items: T[], limit: number, page: number): T[] =>
       items.slice((page - 1) * limit, page * limit);
+    // Dashboard ordering (fix for the "ordering beyond 100 rows" gap):
+    // pagedCollectionResponse slices the window AFTER filtering, so a
+    // ?limit=100 window only holds a deterministic set when the list is
+    // sorted FIRST. The dashboard panels request an explicit sort
+    // (?sort=<field>:desc|asc); the default — and any unknown value —
+    // is newest-first. The tiebreak is always id ASC, so rows sharing a
+    // timestamp still come back in one stable order on every page.
+    const parseTimestampSort = (params: URLSearchParams, field: string): "desc" | "asc" =>
+      params.get("sort") === `${field}:asc` ? "asc" : "desc";
+    const sortByTimestamp = <T extends { id: string }>(
+      items: T[],
+      field: string,
+      direction: "desc" | "asc",
+    ): T[] => {
+      const timeOf = (row: T): number => {
+        const n = new Date(String((row as Record<string, unknown>)[field] ?? "")).getTime();
+        return Number.isFinite(n) ? n : 0;
+      };
+      return [...items].sort((a, b) => {
+        const byTime = timeOf(a) - timeOf(b);
+        if (byTime !== 0) return direction === "desc" ? -byTime : byTime;
+        return a.id.localeCompare(b.id);
+      });
+    };
     // Paged list response: slices the (page-1)*limit window AFTER
     // filtering and reports the pre-limit total, so the client can
     // paginate (M-1). `page` is 3rd so every call site reads
@@ -3892,7 +3916,7 @@ export function createStackMateApp(
           // order picker. Unknown params are ignored.
           const openOnly = url.searchParams.get("open_only") === "true";
           const { q, limit, page } = parseListQuery(url.searchParams);
-          const items = store.state.orders
+          const filteredOrders = store.state.orders
             .filter((o) => (!statusFilter ? true : o.payment_status === statusFilter))
             .filter((o) => (!openOnly ? true : computeOrderRemaining(store.state, o) > 0))
             .filter(
@@ -3903,8 +3927,15 @@ export function createStackMateApp(
                   store.state.customers.find((c) => c.id === o.customer_id)?.name,
                   q,
                 ),
-            )
-            .map((o) => ({
+            );
+          // Dashboard ordering: sort BEFORE the ?limit=100 window slices,
+          // otherwise the newest rows past 100 never reach the client
+          // (the dashboard panels sort client-side over the loaded set).
+          const items = sortByTimestamp(
+            filteredOrders,
+            "created_at",
+            parseTimestampSort(url.searchParams, "created_at"),
+          ).map((o) => ({
               ...o,
               customer: store.state.customers.find((c) => c.id === o.customer_id) ?? null,
               // Paid/remaining are computed from verified payments
@@ -3940,6 +3971,15 @@ export function createStackMateApp(
           if (!order) throw new AppError("NOT_FOUND", "Order not found.", 404);
           return jsonResponse({
             ...order,
+            // Site name for the detail page: the order shows source
+            // "website" but never named the site (live gap on ORD-10005,
+            // a Test-site order). Null for admin orders (no site).
+            site_name:
+              order.integrated_site_id === null
+                ? null
+                : store.state.integrated_sites.find(
+                    (s) => s.id === order.integrated_site_id
+                  )?.name ?? null,
             customer: store.state.customers.find((c) => c.id === order.customer_id) ?? null,
             paid_amount_minor: computeOrderPaid(store.state, order.id),
             remaining_minor: computeOrderRemaining(store.state, order),
@@ -4986,17 +5026,20 @@ export function createStackMateApp(
         if (method === "GET" && pathname === "/api/v1/admin/payment-submissions") {
           assertStaffPermission(principal, "payments.read");
           const statusFilter = url.searchParams.get("status");
-          const items = store.state.payment_submissions
-            .filter((s) => (!statusFilter ? true : s.status === statusFilter))
-            // M-22: deterministic newest-first order (submitted_at DESC,
-            // id ASC) — the SPA's "transient inconsistency" was partly
-            // this list arriving unsorted while the client paginated.
-            .sort((a, b) => {
-              const byTime =
-                new Date(b.submitted_at).getTime() - new Date(a.submitted_at).getTime();
-              return byTime !== 0 ? byTime : a.id.localeCompare(b.id);
-            })
-            .map((s) => {
+          const filteredSubmissions = store.state.payment_submissions.filter(
+            (s) => (!statusFilter ? true : s.status === statusFilter),
+          );
+          // M-22: deterministic newest-first order (submitted_at DESC,
+          // id ASC) — the SPA's "transient inconsistency" was partly
+          // this list arriving unsorted while the client paginated.
+          // ?sort=submitted_at:asc flips the time direction; anything
+          // else keeps the M-22 default. Sorted BEFORE the window
+          // slices, so the ?limit=100 window holds the newest rows.
+          const items = sortByTimestamp(
+            filteredSubmissions,
+            "submitted_at",
+            parseTimestampSort(url.searchParams, "submitted_at"),
+          ).map((s) => {
               const order = store.state.orders.find((o) => o.id === s.order_id);
               const customer = store.state.customers.find((c) => c.id === s.customer_id);
               const method = store.state.payment_methods.find((m) => m.id === s.payment_method_id);
@@ -5237,20 +5280,26 @@ export function createStackMateApp(
           assertStaffPermission(principal, "licenses.read");
           // Never expose license_key_hash or raw keys in list responses (API Spec §12.3)
           const { q, limit, page } = parseListQuery(url.searchParams);
-          const items = store.state.licenses
-            .filter(
-              (l) =>
-                includesQuery(l.license_number, q) ||
-                includesQuery(
-                  store.state.customers.find((c) => c.id === l.customer_id)?.name,
-                  q,
-                ) ||
-                includesQuery(
-                  store.state.products.find((p) => p.id === l.product_id)?.code,
-                  q,
-                ),
-            )
-            .map((l) => {
+          const filteredLicenses = store.state.licenses.filter(
+            (l) =>
+              includesQuery(l.license_number, q) ||
+              includesQuery(
+                store.state.customers.find((c) => c.id === l.customer_id)?.name,
+                q,
+              ) ||
+              includesQuery(
+                store.state.products.find((p) => p.id === l.product_id)?.code,
+                q,
+              ),
+          );
+          // Dashboard ordering: sort BEFORE the ?limit=100 window slices
+          // (same gap as orders — the expiring-licenses panel sorts
+          // client-side over the loaded set).
+          const items = sortByTimestamp(
+            filteredLicenses,
+            "created_at",
+            parseTimestampSort(url.searchParams, "created_at"),
+          ).map((l) => {
           const { license_key_hash: _h, issued_raw_key_once: _r, ...safe } = l;
           const customer = store.state.customers.find((c) => c.id === l.customer_id);
           const product = store.state.products.find((p) => p.id === l.product_id);
@@ -5893,10 +5942,21 @@ export function createStackMateApp(
           // L-6: read-only roles hold integrations.read (migration 0016).
           assertStaffPermission(principal, "integrations.read");
           const statusFilter = url.searchParams.get("status");
-          const items = store.state.outbox_events.filter((e) =>
-            !statusFilter ? true : e.status === statusFilter
-          );
-          const { limit, page } = parseListQuery(url.searchParams);
+          // Server-side `?q=` (search batch): matches event_type /
+          // aggregate_type / aggregate_id / status substrings,
+          // case-insensitive — the same `includesQuery` helper every
+          // other list endpoint uses, so a match past the loaded
+          // window is never missed.
+          const { q, limit, page } = parseListQuery(url.searchParams);
+          const items = store.state.outbox_events
+            .filter((e) => (!statusFilter ? true : e.status === statusFilter))
+            .filter(
+              (e) =>
+                includesQuery(e.event_type, q) ||
+                includesQuery(e.aggregate_type, q) ||
+                includesQuery(e.aggregate_id, q) ||
+                includesQuery(e.status, q),
+            );
           return pagedCollectionResponse(items, limit, page);
         }
 
