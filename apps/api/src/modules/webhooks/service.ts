@@ -599,6 +599,15 @@ export function createRealWebhookTransport(options?: {
  * - `options.transport` given (e.g. `createRealWebhookTransport()`)
  *   → real HTTP delivery: a 2xx records "delivered" + `delivered_at`
  *   and counts in `delivered`.
+ * - A non-CAPI event with NO subscribed active endpoints is "skipped"
+ *   (Q3, 2026-11-22): nothing received it, so it must never be
+ *   recorded "delivered" — the endpoint loop simply runs zero times.
+ *   The outbox row is terminal "skipped" (`delivered_at` stays null —
+ *   no delivery row exists at all), the audit action is
+ *   `webhooks.outbox_event.skipped_no_subscribers`, and the result
+ *   counts it in `skipped`, never in `delivered` / `retrying` /
+ *   `dead_lettered`. CAPI events never take this branch — they are
+ *   always simulated (see below).
  * - `tracking.meta_capi.dispatch` events are ALWAYS simulated (Batch 4
  *   builds the real Meta client): the tracking event is marked
  *   "simulated" with no delivery attempt and no `delivered_at` — and
@@ -622,6 +631,9 @@ export async function processTransactionalOutboxBatch(
   claimed: number;
   delivered: number;
   simulated: number;
+  // Q3: events with no subscribed active endpoint — terminal
+  // "skipped", counted apart from delivered / retrying / dead-lettered.
+  skipped: number;
   retrying: number;
   dead_lettered: number;
 }> {
@@ -658,6 +670,7 @@ export async function processTransactionalOutboxBatch(
 
   let delivered = 0;
   let simulatedCount = 0;
+  let skippedCount = 0;
   let retrying = 0;
   let deadLettered = 0;
 
@@ -670,6 +683,10 @@ export async function processTransactionalOutboxBatch(
     // delivery. (Caught by the audit-fix test suite: the terminal
     // block below used to follow the global `simulated` flag.)
     const eventSimulated = simulated || ev.event_type === "tracking.meta_capi.dispatch";
+    // Q3: set in the non-CAPI branch below when no active endpoint
+    // subscribes to this event type. CAPI events never reach that
+    // branch, so they can never be marked skipped.
+    let noSubscribers = false;
     try {
       if (ev.event_type === "tracking.meta_capi.dispatch") {
         // D-6 / C-2: Meta CAPI delivery is a KNOWN STUB — there is no
@@ -692,6 +709,12 @@ export async function processTransactionalOutboxBatch(
             ep.status === "active" &&
             (ep.subscribed_events.includes(ev.event_type) || ep.subscribed_events.includes("*"))
         );
+        // Q3: with zero subscribers the loop below runs zero times and
+        // the terminal block used to record "delivered" anyway — a
+        // delivery that never happened. Mark it skipped instead (the
+        // terminal block below); no delivery row is created, so no
+        // delivered_at is recorded anywhere.
+        if (endpoints.length === 0) noSubscribers = true;
 
         for (const ep of endpoints) {
           await validateSafeExternalUrlAsync(ep.url, options.allowHttpLocal ?? false);
@@ -772,11 +795,13 @@ export async function processTransactionalOutboxBatch(
         }
       }
 
-      // Mark outbox event terminal: delivered (real) or simulated.
+      // Mark outbox event terminal: delivered (real), simulated, or
+      // skipped (no subscribed active endpoints — Q3).
       await store.withTransaction((state) => {
         const target = state.outbox_events.find((e) => e.id === ev.id);
         if (target) {
-          if (eventSimulated) markSimulated(target);
+          if (noSubscribers) target.status = "skipped";
+          else if (eventSimulated) markSimulated(target);
           else target.status = "delivered";
           target.locked_until = null;
           target.locked_by = null;
@@ -786,17 +811,22 @@ export async function processTransactionalOutboxBatch(
         // the dispatcher, not a staff member; the worker id correlates).
         appendAuditLog(state, {
           actor_type: "system",
-          action: eventSimulated
-            ? "webhooks.outbox_event.simulated"
-            : "webhooks.outbox_event.delivered",
+          action: noSubscribers
+            ? "webhooks.outbox_event.skipped_no_subscribers"
+            : eventSimulated
+              ? "webhooks.outbox_event.simulated"
+              : "webhooks.outbox_event.delivered",
           resource_type: "outbox_event",
           resource_id: ev.id,
           outcome: "success",
           request_id: `worker:${workerId}`,
-          changes: { event_type: ev.event_type },
+          changes: noSubscribers
+            ? { event_type: ev.event_type, reason: "no_active_subscribers" }
+            : { event_type: ev.event_type },
         });
       });
-      if (eventSimulated) simulatedCount += 1;
+      if (noSubscribers) skippedCount += 1;
+      else if (eventSimulated) simulatedCount += 1;
       else delivered += 1;
     } catch (err) {
       const errorCode = (err as Error).message.slice(0, 80) || "DELIVERY_FAILED";
@@ -838,6 +868,7 @@ export async function processTransactionalOutboxBatch(
     claimed: claimedEvents.length,
     delivered,
     simulated: simulatedCount,
+    skipped: skippedCount,
     retrying,
     dead_lettered: deadLettered,
   };

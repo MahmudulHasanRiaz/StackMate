@@ -14,7 +14,7 @@
  *   GET /api/v1/admin/integrated-sites (site names for the Site column)
  *
  * HONESTY NOTE — Meta CAPI delivery is a STUB in the current API:
- * the outbox dispatcher marks a tracking event "processed" without
+ * the outbox dispatcher marks a tracking event "simulated" without
  * ever calling graph.facebook.com (apps/api/src/modules/webhooks/
  * service.ts, `tracking.meta_capi.dispatch`). This UI therefore shows
  * the event and its RECORDED status only, and says plainly that no
@@ -77,7 +77,9 @@ export interface TrackingEvent {
   consent_state: "granted" | "denied";
   consent_policy_version: string;
   sanitized_payload: Record<string, unknown>;
-  status: "received" | "queued" | "processed" | "rejected";
+  // "simulated" (audit C-2/D-6): recorded but never sent to Meta —
+  // the dispatcher marks Meta CAPI events simulated, never processed.
+  status: "received" | "queued" | "processed" | "rejected" | "simulated";
   delivery_attempts: number;
   delivered_at: string | null;
   created_at: string;
@@ -89,6 +91,7 @@ const STATUS_FILTERS = [
   "queued",
   "processed",
   "rejected",
+  "simulated",
 ] as const;
 
 type StatusFilter = (typeof STATUS_FILTERS)[number];
@@ -244,7 +247,7 @@ export function TrackingSection() {
         onRetry={() => void query.refetch()}
         emptyIcon={BarChart3}
         emptyTitle="No tracking events yet"
-        emptyBody="Events appear here when an integrated site sends them."
+        emptyBody="Events appear here when an integrated site sends one, or when the platform records one itself (for example a Purchase event from an approved payment)."
         getRowId={(row) => row.id}
       />
       <p className="sm-hint">

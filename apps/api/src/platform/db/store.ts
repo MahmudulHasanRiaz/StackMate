@@ -694,7 +694,10 @@ export interface OutboxEventRecord {
   // C-2/D-6: "simulated" — the outbox row was recorded but never
   // delivered to any receiver (no transport configured). It must
   // never be mistaken for "delivered".
-  status: "pending" | "processing" | "delivered" | "dead_letter" | "simulated";
+  // Q3 (2026-11-22): "skipped" — no active endpoint subscribed to
+  // this event type, so nothing received it. Terminal, like
+  // dead_letter; never re-claimed by the dispatcher.
+  status: "pending" | "processing" | "delivered" | "dead_letter" | "simulated" | "skipped";
   attempt_count: number;
   available_at: string;
   locked_until: string | null;

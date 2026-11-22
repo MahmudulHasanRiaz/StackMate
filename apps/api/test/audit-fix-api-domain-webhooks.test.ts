@@ -8,6 +8,10 @@
  *    real transport a 2xx records "delivered" + `delivered_at`.
  *  - C-2: `tracking.meta_capi.dispatch` is ALWAYS simulated (the
  *    Meta client is a known stub) — no delivery attempt is counted.
+ *  - Q3 (2026-11-22): a non-CAPI event with NO subscribed active
+ *    endpoint is "skipped" (never "delivered") — no delivery row,
+ *    audit action `webhooks.outbox_event.skipped_no_subscribers`,
+ *    counted in `skipped`. CAPI events never take that branch.
  *  - M-3: delivery-time DNS re-check + redirect re-validation —
  *    a redirect to a private IP is blocked, a hostname resolving
  *    to a private IP is blocked, a public destination delivers.
@@ -94,6 +98,7 @@ describe("webhooks/outbox — audit fixes (C-2, M-3, M-14e)", () => {
       claimed: 1,
       delivered: 0,
       simulated: 1,
+      skipped: 0,
       retrying: 0,
       dead_lettered: 0,
     });
@@ -168,10 +173,68 @@ describe("webhooks/outbox — audit fixes (C-2, M-3, M-14e)", () => {
     // Even with a REAL transport, the CAPI branch stays simulated.
     assert.equal(result.simulated, 1);
     assert.equal(result.delivered, 0);
+    // Q3: the CAPI branch never takes the skipped path — there is no
+    // endpoint list involved at all.
+    assert.equal(result.skipped, 0);
     const track = store.state.tracking_events.find((t) => t.id === trackId)!;
     assert.equal(track.status as string, "simulated");
     assert.equal(track.delivery_attempts, 0);
     assert.equal(track.delivered_at, null);
+  });
+
+  it("Q3: zero subscribed endpoints + real transport → 'skipped', never 'delivered'", async () => {
+    // No endpoint seeded on purpose — the bug (confirmed live
+    // 2026-11-22): the endpoint loop ran zero times and the terminal
+    // block still recorded "delivered" with delivered_at set.
+    const ev = outboxRow();
+    store.state.outbox_events.push(ev);
+
+    const result = await processTransactionalOutboxBatch(store, {
+      workerId: "test-worker",
+      encryptionKey: ENCRYPTION_KEY,
+      transport: async () => ({ status: 200 }),
+    });
+
+    assert.deepEqual(result, {
+      claimed: 1,
+      delivered: 0,
+      simulated: 0,
+      skipped: 1,
+      retrying: 0,
+      dead_lettered: 0,
+    });
+    const outbox = store.state.outbox_events.find((e) => e.id === ev.id)!;
+    assert.equal(outbox.status as string, "skipped");
+    assert.ok(outbox.processed_at);
+    // No delivery was attempted: no delivery row exists at all, so
+    // no delivered_at is recorded anywhere.
+    assert.equal(
+      store.state.webhook_deliveries.filter((d) => d.event_id === ev.id).length,
+      0,
+    );
+    const audit = store.state.audit_logs.find(
+      (l) => l.action === "webhooks.outbox_event.skipped_no_subscribers",
+    );
+    assert.ok(audit);
+    assert.equal(audit?.outcome, "success");
+    assert.equal(audit?.changes?.reason, "no_active_subscribers");
+  });
+
+  it("Q3: zero subscribed endpoints + simulated mode → 'skipped' as well", async () => {
+    // Nothing was even simulated — there was nobody to dispatch to.
+    const ev = outboxRow();
+    store.state.outbox_events.push(ev);
+
+    const result = await processTransactionalOutboxBatch(store, {
+      workerId: "test-worker",
+      encryptionKey: ENCRYPTION_KEY,
+    });
+
+    assert.equal(result.skipped, 1);
+    assert.equal(result.simulated, 0);
+    assert.equal(result.delivered, 0);
+    const outbox = store.state.outbox_events.find((e) => e.id === ev.id)!;
+    assert.equal(outbox.status as string, "skipped");
   });
 
   it("M-14e: a dead-lettered dispatch writes a failed audit row; a retry writes none", async () => {

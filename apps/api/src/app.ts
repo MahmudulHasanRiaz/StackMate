@@ -366,6 +366,8 @@ export interface StackMateAppInstance {
     delivered: number;
     // C-2/D-6: the dispatcher also counts simulated deliveries.
     simulated: number;
+    // Q3: events with no subscribed active endpoint.
+    skipped: number;
     retrying: number;
     dead_lettered: number;
   }>;
