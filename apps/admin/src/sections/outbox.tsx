@@ -112,8 +112,8 @@ function filterLabel(f: OutboxFilter): string {
 function useOutboxEvents(filter: OutboxFilter, search: string) {
   // H-01: the search value is debounced 250ms (same as useAdminList)
   // and sent as a server `?q=` — the API searches the FULL dataset
-  // (event_type / aggregate_type / aggregate_id / status), so a match
-  // past the loaded window is never missed. The debounced value joins
+  // (event_key / event_type / aggregate_type / aggregate_id / status),
+  // so a match past the loaded window is never missed. The debounced value joins
   // the query key, so each distinct search caches separately — and
   // invalidation by OUTBOX_LIST_KEYS still matches by prefix.
   const [debouncedSearch, setDebouncedSearch] = useState(search);
@@ -153,7 +153,7 @@ export function OutboxSection() {
   // Search is server-side now (H-01): the `?q=` in useOutboxEvents
   // searches the full dataset, so the old client-side filter memo
   // (M-05) is retired — `rows` already holds only the matches.
-  // Note: the server matches event_type / aggregate_type /
+  // Note: the server matches event_key / event_type / aggregate_type /
   // aggregate_id / status; searching a resolved display name (e.g.
   // an order number) no longer matches — the order detail page is
   // the way to an order's events.

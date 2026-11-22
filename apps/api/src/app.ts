@@ -5942,16 +5942,22 @@ export function createStackMateApp(
           // L-6: read-only roles hold integrations.read (migration 0016).
           assertStaffPermission(principal, "integrations.read");
           const statusFilter = url.searchParams.get("status");
-          // Server-side `?q=` (search batch): matches event_type /
-          // aggregate_type / aggregate_id / status substrings,
-          // case-insensitive — the same `includesQuery` helper every
-          // other list endpoint uses, so a match past the loaded
-          // window is never missed.
+          // Server-side `?q=` (search batch): matches event_key /
+          // event_type / aggregate_type / aggregate_id / status
+          // substrings, case-insensitive — the same `includesQuery`
+          // helper every other list endpoint uses, so a match past the
+          // loaded window is never missed. event_key MUST be in the
+          // list: it is the first column the user reads, and for the
+          // CAPI rows it carries words the event_type does not
+          // (event_key "meta_capi.purchase:<id>" vs event_type
+          // "tracking.meta_capi.dispatch" — "purchase" matched nothing
+          // live until this was added, 2026-11-22).
           const { q, limit, page } = parseListQuery(url.searchParams);
           const items = store.state.outbox_events
             .filter((e) => (!statusFilter ? true : e.status === statusFilter))
             .filter(
               (e) =>
+                includesQuery(e.event_key, q) ||
                 includesQuery(e.event_type, q) ||
                 includesQuery(e.aggregate_type, q) ||
                 includesQuery(e.aggregate_id, q) ||
