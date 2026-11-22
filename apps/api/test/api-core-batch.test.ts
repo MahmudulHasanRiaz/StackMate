@@ -780,7 +780,7 @@ describe("API-core batch", () => {
     }
   });
 
-  it("outbox-events: server-side ?q= matches event_type / aggregate_type / aggregate_id / status", async () => {
+  it("outbox-events: server-side ?q= matches event_key / event_type / aggregate_type / aggregate_id / status", async () => {
     // Seeded rows carry a unique "qprobe" marker so assertions can
     // pick them out of whatever other tests already recorded.
     const now = new Date().toISOString();
@@ -790,9 +790,10 @@ describe("API-core batch", () => {
       aggregate_type: string,
       aggregate_id: string,
       status: "pending" | "delivered" | "simulated" | "skipped",
+      eventKey?: string,
     ) => ({
       id,
-      event_key: `${event_type}:${aggregate_id}`,
+      event_key: eventKey ?? `${event_type}:${aggregate_id}`,
       aggregate_type,
       aggregate_id,
       event_type,
@@ -809,7 +810,12 @@ describe("API-core batch", () => {
     store.state.outbox_events.push(
       seed("obx-q-a", "payment.approved", "payment_submission", "qprobe-sub-001", "skipped"),
       seed("obx-q-b", "order.created", "order", "qprobe-ord-002", "delivered"),
-      seed("obx-q-c", "meta_capi.purchase", "tracking_event", "qprobe-trk-003", "simulated"),
+      // Row C diverges like the production CAPI row: the event_key the
+      // user reads ("meta_capi.purchase:<id>") carries "purchase",
+      // while the stored event_type ("tracking.meta_capi.dispatch")
+      // does not — "purchase" matched nothing live until event_key
+      // joined the server filter (2026-11-22).
+      seed("obx-q-c", "tracking.meta_capi.dispatch", "tracking_event", "qprobe-trk-003", "simulated", "meta_capi.purchase:qprobe-trk-003"),
     );
     const qprobeKeys = (items: Array<{ event_key: string }>) =>
       items
@@ -827,6 +833,12 @@ describe("API-core batch", () => {
     // event_type substring.
     assert.deepEqual(qprobeKeys(await list("?q=payment.approved")), [
       "payment.approved:qprobe-sub-001",
+    ]);
+    // event_key substring — the word the user reads in the first
+    // column ("purchase" in "meta_capi.purchase:<id>") must match even
+    // though the stored event_type has no such word.
+    assert.deepEqual(qprobeKeys(await list("?q=purchase")), [
+      "meta_capi.purchase:qprobe-trk-003",
     ]);
     // aggregate_id substring, case-insensitive (uppercase query).
     assert.deepEqual(qprobeKeys(await list("?q=QPROBE-ORD")), [
