@@ -34,6 +34,33 @@ export class ApiClientError extends Error {
 }
 
 /**
+ * Global 401 handler (live bug 2026-11-22): when a signed-in tab's
+ * session dies mid-session (12h expiry, suspension), every section
+ * query 401s and each section shows "Something went wrong" instead
+ * of the sign-in screen — the user only discovers they are signed
+ * out after a reload. A registered handler is called for 401s from
+ * /api/v1/admin/* while a principal is held (RootComponent registers
+ * it only then), so the app drops to the sign-in screen at once.
+ * Auth endpoints are excluded by the path check: a wrong-password
+ * 401 from sign-in must never clear a principal.
+ */
+type UnauthorizedHandler = (error: ApiClientError) => void;
+let unauthorizedHandler: UnauthorizedHandler | null = null;
+export function onApiUnauthorized(handler: UnauthorizedHandler | null): void {
+  unauthorizedHandler = handler;
+}
+
+function notifyUnauthorized(error: ApiClientError, path: string): void {
+  if (
+    error.statusCode === 401 &&
+    path.startsWith("/api/v1/admin/") &&
+    unauthorizedHandler
+  ) {
+    unauthorizedHandler(error);
+  }
+}
+
+/**
  * Client-side request bound (SMTP timeout fix, 2026-11-16): no admin
  * request may hang forever. Live 2026-11-16 21:23 +06: "Send test
  * email" stayed on "Sending…" for 90+s while the Worker recorded no
@@ -98,13 +125,15 @@ export async function apiRequest<T>(
 
   if (!res.ok || !json || json.error) {
     const err = json?.error;
-    throw new ApiClientError(
+    const apiError = new ApiClientError(
       err?.code ?? "HTTP_ERROR",
       err?.message ?? `Request failed with status ${res.status}`,
       err?.request_id ?? "unknown",
       res.status,
       err?.details ?? null
     );
+    notifyUnauthorized(apiError, path);
+    throw apiError;
   }
 
   return json.data as T;
@@ -158,13 +187,15 @@ export async function rawApiRequest<T>(
       err?.message ??
       (typeof json?.message === "string" ? json.message : undefined) ??
       `Request failed with status ${res.status}`;
-    throw new ApiClientError(
+    const apiError = new ApiClientError(
       code,
       message,
       err?.request_id ?? "unknown",
       res.status,
       err?.details ?? null
     );
+    notifyUnauthorized(apiError, path);
+    throw apiError;
   }
 
   return json as T;

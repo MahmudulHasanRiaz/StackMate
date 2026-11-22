@@ -22,8 +22,10 @@ import {
   createStaffUserByAdmin,
   changeStaffPassword,
   recordTwoFactorStateChange,
+  resolveStaffPrincipal,
   suspendStaffUser,
   unsuspendStaffUser,
+  type BetterAuthInstance,
   type StaffPrincipal,
 } from "../src/modules/identity/service.ts";
 import { AppError } from "../src/shared/errors.ts";
@@ -515,6 +517,53 @@ describe("Audit identity/auth fixes (in-memory)", () => {
     assert.equal(res.body.data.email_sent, false, "SMTP is not configured in tests, so sent must be false");
     assert.equal(typeof res.body.data.email_error, "string");
     assert.ok(res.body.data.token_once, "token_once is still returned once");
+  });
+
+  // -- Session-gate fix (live bug 2026-11-22): resolveStaffPrincipal
+  // must distinguish "no session" from "backend failure". Better
+  // Auth's getSession returns null for a missing/expired session and
+  // throws UNAUTHORIZED (401) only when the session's user is gone;
+  // anything else it throws is an infrastructure failure (DB /
+  // Hyperdrive) and must propagate as a 500 — the old `catch { return
+  // null }` turned every transient blip into a 401, and the SPA
+  // rendered the sign-in screen, so the owner perceived a sign-out.
+  it("session gate: getSession 500 rethrows, 401 returns null, valid session resolves", async () => {
+    // storeSupportsBetterAuth needs a drizzleDb marker; the in-memory
+    // store has none, so attach a stub — the cookie path only calls
+    // auth.api.getSession and reloadStateIfPossible (a no-op here).
+    (store as unknown as { drizzleDb: unknown }).drizzleDb = {};
+    const cookie = "better-auth.session_token=stub-token";
+    const stubAuth = (getSession: () => Promise<unknown>) =>
+      ({ api: { getSession } }) as unknown as BetterAuthInstance;
+    const err500 = Object.assign(new Error("db down"), { status: 500 });
+    await assert.rejects(
+      resolveStaffPrincipal(store, {
+        auth: stubAuth(async () => {
+          throw err500;
+        }),
+        cookieHeader: cookie,
+      }),
+      (e: unknown) => (e as { status?: unknown })?.status === 500,
+    );
+    const err401 = Object.assign(new Error("no such user"), { status: 401 });
+    assert.equal(
+      await resolveStaffPrincipal(store, {
+        auth: stubAuth(async () => {
+          throw err401;
+        }),
+        cookieHeader: cookie,
+      }),
+      null,
+    );
+    const principal = await resolveStaffPrincipal(store, {
+      auth: stubAuth(async () => ({
+        session: { id: "s-1" },
+        user: { email: "fix-admin@stackmate.local" },
+      })),
+      cookieHeader: cookie,
+    });
+    assert.ok(principal);
+    assert.equal(principal.user.email, "fix-admin@stackmate.local");
   });
 });
 
