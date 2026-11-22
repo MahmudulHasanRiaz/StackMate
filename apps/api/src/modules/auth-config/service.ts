@@ -429,6 +429,32 @@ export async function saveSmtpSettings(
   if (fromAddress && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(fromAddress)) {
     throw new AppError("VALIDATION_ERROR", "from_address must be a valid email address.", 422);
   }
+  // Length caps (audit follow-up): the smtp_settings columns are
+  // unbounded `text`, so without caps an absurd value sailed past
+  // validation into the DB/encryption layer and 500d instead of
+  // 422ing. Caps sit at the real-world maxima: host is a DNS name
+  // (≤253), username and from_address are email-shaped (≤254),
+  // from_name is a display name (≤160), password is an app
+  // password/token (≤512). Lengths are checked on the trimmed
+  // values — the same values that get stored.
+  const username = (input.username ?? row?.username ?? "").trim();
+  const password = input.password?.trim() ?? "";
+  const fromName = (input.from_name ?? row?.fromName ?? "StackMate").trim() || "StackMate";
+  if (host.length > 253) {
+    throw new AppError("VALIDATION_ERROR", "host must be at most 253 characters.", 422);
+  }
+  if (username.length > 254) {
+    throw new AppError("VALIDATION_ERROR", "username must be at most 254 characters.", 422);
+  }
+  if (password.length > 512) {
+    throw new AppError("VALIDATION_ERROR", "password must be at most 512 characters.", 422);
+  }
+  if (fromAddress.length > 254) {
+    throw new AppError("VALIDATION_ERROR", "from_address must be at most 254 characters.", 422);
+  }
+  if (fromName.length > 160) {
+    throw new AppError("VALIDATION_ERROR", "from_name must be at most 160 characters.", 422);
+  }
   const now = new Date();
   await db
     .insert(schema.smtpSettings)

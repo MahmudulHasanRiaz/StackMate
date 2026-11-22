@@ -9,7 +9,7 @@
  * configuration.
  *
  * Endpoints used (all `integrations.manage`):
- *   GET  /api/v1/admin/outbox-events[?status=]
+ *   GET  /api/v1/admin/outbox-events[?status=][?q=]
  *   POST /api/v1/admin/outbox-events/:id/replay
  *   POST /api/v1/admin/outbox/dispatch
  *
@@ -20,7 +20,7 @@
  * claimed / delivered / simulated / skipped / retrying /
  * dead-lettered counts.
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Webhook } from "lucide-react";
 import { apiRequest } from "../lib/api-client";
@@ -109,18 +109,29 @@ function filterLabel(f: OutboxFilter): string {
   return f[0]!.toUpperCase() + f.slice(1);
 }
 
-function useOutboxEvents(filter: OutboxFilter) {
+function useOutboxEvents(filter: OutboxFilter, search: string) {
+  // H-01: the search value is debounced 250ms (same as useAdminList)
+  // and sent as a server `?q=` — the API searches the FULL dataset
+  // (event_type / aggregate_type / aggregate_id / status), so a match
+  // past the loaded window is never missed. The debounced value joins
+  // the query key, so each distinct search caches separately — and
+  // invalidation by OUTBOX_LIST_KEYS still matches by prefix.
+  const [debouncedSearch, setDebouncedSearch] = useState(search);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedSearch(search), 250);
+    return () => window.clearTimeout(timer);
+  }, [search]);
+  const q = debouncedSearch.trim();
   return useQuery({
-    queryKey: ["admin", "outbox-events", "list", filter],
+    queryKey: ["admin", "outbox-events", "list", filter, ...(q ? [{ q }] : [])],
     queryFn: async () => {
-      // The API defaults lists to 25 rows — ask for the max window
-      // (100). The endpoint has no ?q=, so search stays client-side
-      // over the loaded collection (see the M-05 note below).
-      const path =
-        filter === "all"
-          ? "/api/v1/admin/outbox-events?limit=100"
-          : `/api/v1/admin/outbox-events?status=${filter}&limit=100`;
-      const res = await apiRequest<{ items: OutboxEvent[] }>(path);
+      // The API defaults lists to 25 rows — ask for the max window (100).
+      const params = new URLSearchParams({ limit: "100" });
+      if (filter !== "all") params.set("status", filter);
+      if (q) params.set("q", q);
+      const res = await apiRequest<{ items: OutboxEvent[] }>(
+        `/api/v1/admin/outbox-events?${params}`,
+      );
       return res.items;
     },
   });
@@ -135,34 +146,20 @@ export function OutboxSection() {
   const [pageSize, setPageSize] = useState(25);
   const [search, setSearch] = useState("");
   const [viewEvent, setViewEvent] = useState<OutboxEvent | null>(null);
-  const query = useOutboxEvents(filter);
+  const query = useOutboxEvents(filter, search);
   const confirm = useConfirm();
   const rows = query.data ?? [];
   const resourceMaps = useResourceMaps();
-  // M-05: search. The endpoint has no ?q= (it only reads ?status=),
-  // so this filters client-side over the loaded collection — the same
-  // established pattern as this page's client-side paging (F6). A
-  // server ?q= is the core API agent's follow-up if the outbox grows.
-  const needle = search.trim().toLowerCase();
-  const filteredRows =
-    needle.length === 0
-      ? rows
-      : rows.filter((e) => {
-          const hay = [
-            e.event_key,
-            e.event_type,
-            e.aggregate_type,
-            e.aggregate_id,
-            resolveResourceName(e.aggregate_type, e.aggregate_id, resourceMaps) ?? "",
-            e.last_error_code ?? "",
-          ]
-            .join(" ")
-            .toLowerCase();
-          return hay.includes(needle);
-        });
+  // Search is server-side now (H-01): the `?q=` in useOutboxEvents
+  // searches the full dataset, so the old client-side filter memo
+  // (M-05) is retired — `rows` already holds only the matches.
+  // Note: the server matches event_type / aggregate_type /
+  // aggregate_id / status; searching a resolved display name (e.g.
+  // an order number) no longer matches — the order detail page is
+  // the way to an order's events.
   /* F6 (2026-11-16): the outbox had no pagination — client-side paging
      over the loaded collection, like ListTable. */
-  const pageRows = filteredRows.slice((page - 1) * pageSize, page * pageSize);
+  const pageRows = rows.slice((page - 1) * pageSize, page * pageSize);
 
   const replay = useAdminMutation<OutboxEvent, string>({
     mutationFn: (eventId) =>
@@ -270,7 +267,7 @@ export function OutboxSection() {
             onRetry={() => void query.refetch()}
           />
         </div>
-      ) : filteredRows.length === 0 ? (
+      ) : rows.length === 0 ? (
         <div className="sm-table-flat">
           <div className="sm-empty">
             <Webhook size={18} strokeWidth={2} className="sm-empty-icon" />
@@ -374,7 +371,7 @@ export function OutboxSection() {
           <Pagination
             page={page}
             pageSize={pageSize}
-            total={filteredRows.length}
+            total={rows.length}
             onPageChange={setPage}
             onPageSizeChange={(size) => {
               setPageSize(size);

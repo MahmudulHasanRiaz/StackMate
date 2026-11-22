@@ -138,6 +138,20 @@ type TabKey = "users" | "roles" | "invitations";
 const ROLE_KEY_PATTERN = /^[a-z][a-z0-9_]*$/;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+/* Q2 (2026-11-22): the invite dialog takes ONE email, but a pasted list
+ * gave no visible feedback — a comma list sat in the field looking
+ * accepted, and a newline list was silently glued into one invalid
+ * string by the single-line input. A value with a list separator
+ * (comma, semicolon, or any whitespace between addresses) is never a
+ * single email, so flag it live — on change, not only on submit. The
+ * trimmed value is tested so a trailing space while typing does not
+ * trip the error. There is deliberately NO bulk-invite feature: one
+ * invitation per person. */
+const INVITE_SINGLE_EMAIL_MESSAGE =
+  "Enter a single email address — send one invitation per person.";
+const inviteEmailHasListSeparator = (value: string) =>
+  /[,;\s]/.test(value.trim());
+
 function roleKeysLabel(keys: string[]): string {
   return keys.length > 0 ? keys.join(", ") : "—";
 }
@@ -324,6 +338,14 @@ export function StaffSection() {
   }>({});
   const [tokenResult, setTokenResult] = useState<CreateInvitationResult | null>(null);
 
+  /* Q2: live list check — derived from the value on every render, so
+   * the visible error appears as soon as a separator is typed or
+   * pasted, and clears as soon as it is removed. Submit errors (from
+   * submitInvitation) take precedence via `??` at the Field. */
+  const inviteEmailListError = inviteEmailHasListSeparator(inviteEmail)
+    ? INVITE_SINGLE_EMAIL_MESSAGE
+    : undefined;
+
   const openInvite = () => {
     setInviteName("");
     setInviteEmail("");
@@ -355,7 +377,9 @@ export function StaffSection() {
     if (inviteName.trim().length < 2 || inviteName.trim().length > 200) {
       errors.name = "Name must be 2–200 characters.";
     }
-    if (!EMAIL_PATTERN.test(inviteEmail.trim())) {
+    if (inviteEmailHasListSeparator(inviteEmail)) {
+      errors.email = INVITE_SINGLE_EMAIL_MESSAGE;
+    } else if (!EMAIL_PATTERN.test(inviteEmail.trim())) {
       errors.email = "Enter a valid email address.";
     }
     if (inviteRoles.length === 0) {
@@ -1008,7 +1032,7 @@ export function StaffSection() {
         <Field
           label="Email"
           required
-          {...fieldError(inviteErrors.email)}
+          {...fieldError(inviteErrors.email ?? inviteEmailListError)}
           htmlFor="invite-email"
         >
           <Input
@@ -1017,7 +1041,9 @@ export function StaffSection() {
             type="email"
             autoComplete="email"
             value={inviteEmail}
-            aria-invalid={inviteErrors.email ? true : undefined}
+            aria-invalid={
+              inviteErrors.email || inviteEmailListError ? true : undefined
+            }
             onChange={(e) => setInviteEmail(e.target.value)}
             placeholder="name@example.com"
           />

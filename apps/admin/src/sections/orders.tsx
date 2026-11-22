@@ -93,6 +93,7 @@ import {
 } from "./customers";
 import type { FeatureDto } from "./features";
 import type { PackageDto, PackagePriceDto } from "./packages";
+import { humanizeType } from "../lib/resolve-names";
 
 /* ------------------------------------------------------------------ */
 /* DTOs (apps/api/src/platform/db/store.ts record shapes)              */
@@ -217,6 +218,9 @@ export interface OrderInstallmentDto {
 
 export interface OrderDetailDto extends OrderDto {
   customer: OrderCustomerDto | null;
+  // Site name for website orders (GET detail resolves it from
+  // integrated_site_id); null for admin orders, which have no site.
+  site_name: string | null;
   paid_amount_minor: number;
   remaining_minor: number;
   installments: OrderInstallmentDto[];
@@ -662,7 +666,7 @@ export function OrderDetailSection({ id }: { id: string }) {
       <PageHeader
         breadcrumb={[{ label: "Orders", href: "/orders" }, { label: order.order_number }]}
         title={`Order ${order.order_number}`}
-        subtitle={`${order.public_reference} · ${order.source}`}
+        subtitle={`${order.public_reference} · ${humanizeType(order.source)}${order.site_name ? ` · ${order.site_name}` : ""}`}
         action={
           <>
             {canComplete ? (

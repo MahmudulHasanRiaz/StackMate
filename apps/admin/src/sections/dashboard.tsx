@@ -237,13 +237,17 @@ export function DashboardSection() {
   });
 
   // Report panels — existing list endpoints only, no new API.
-  // ?limit=100 (the API max): the panels sort/filter client-side
-  // over the loaded set, so the 25-row default would silently drop
-  // recent rows once the collection grows past it.
+  // ?limit=100 (the API max) + an explicit sort: the server returns
+  // newest-first (created_at DESC, id ASC tiebreak — submitted_at for
+  // submissions) and slices the window AFTER sorting, so the loaded
+  // set is deterministically the newest 100 rows. The panels still
+  // sort/filter client-side over that set (range + status filters).
   const ordersQuery = useQuery({
     queryKey: ["admin", "dashboard", "recent-orders"],
     queryFn: async () => {
-      const res = await apiRequest<{ items: DashboardOrderRow[] }>("/api/v1/admin/orders?limit=100");
+      const res = await apiRequest<{ items: DashboardOrderRow[] }>(
+        "/api/v1/admin/orders?limit=100&sort=created_at:desc",
+      );
       return res.items;
     },
   });
@@ -251,7 +255,7 @@ export function DashboardSection() {
     queryKey: ["admin", "dashboard", "pending-submissions"],
     queryFn: async () => {
       const res = await apiRequest<{ items: DashboardSubmissionRow[] }>(
-        "/api/v1/admin/payment-submissions?limit=100",
+        "/api/v1/admin/payment-submissions?limit=100&sort=submitted_at:desc",
       );
       return res.items;
     },
@@ -260,7 +264,7 @@ export function DashboardSection() {
     queryKey: ["admin", "dashboard", "expiring-licenses"],
     queryFn: async () => {
       const res = await apiRequest<{ items: DashboardLicenseRow[] }>(
-        "/api/v1/admin/licenses?limit=100",
+        "/api/v1/admin/licenses?limit=100&sort=created_at:desc",
       );
       return res.items;
     },
