@@ -11,14 +11,20 @@
  * Endpoints used (all `integrations.manage`):
  *   GET  /api/v1/admin/outbox-events[?status=]
  *   POST /api/v1/admin/outbox-events/:id/replay
+ *   POST /api/v1/admin/outbox/dispatch
  *
  * Replay is dead-letter only: the API refuses other statuses.
+ * "Dispatch now" runs the same drain the cron runs every minute
+ * (real transport — a 2xx records "delivered", no subscribers
+ * records "skipped", Meta CAPI stays "simulated") and reports the
+ * claimed / delivered / simulated / skipped / retrying /
+ * dead-lettered counts.
  */
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Webhook } from "lucide-react";
 import { apiRequest } from "../lib/api-client";
-import { PageHeader, useAdminMutation } from "../lib/section-kit";
+import { apiErrorMessage, PageHeader, useAdminMutation } from "../lib/section-kit";
 import {
   humanizeType,
   resolveResourceName,
@@ -37,6 +43,7 @@ import {
   TableSkeleton,
   Toolbar,
   useConfirm,
+  useToast,
 } from "../components/primitives";
 
 /* ------------------------------------------------------------------ */
@@ -49,7 +56,11 @@ export interface OutboxEvent {
   aggregate_id: string;
   event_type: string;
   payload: Record<string, unknown>;
-  status: "pending" | "processing" | "delivered" | "dead_letter";
+  // Q3 (2026-11-22): "simulated" — recorded but never sent (no
+  // transport configured / Meta CAPI stub). "skipped" — no active
+  // endpoint subscribed, so nothing received the event. Both are
+  // terminal and must never be mistaken for "delivered".
+  status: "pending" | "processing" | "delivered" | "dead_letter" | "simulated" | "skipped";
   attempt_count: number;
   available_at: string;
   locked_until: string | null;
@@ -59,14 +70,35 @@ export interface OutboxEvent {
   processed_at: string | null;
 }
 
+/* Dispatch summary — POST /api/v1/admin/outbox/dispatch returns the
+   batch counts (apps/api/src/modules/webhooks/service.ts,
+   processTransactionalOutboxBatch). Every field is surfaced in the
+   toast, including "skipped" (Q3). */
+interface DispatchSummary {
+  claimed: number;
+  delivered: number;
+  simulated: number;
+  skipped: number;
+  retrying: number;
+  dead_lettered: number;
+}
+
 const OUTBOX_FILTERS = [
   "all",
   "pending",
   "processing",
   "delivered",
   "dead_letter",
+  "simulated",
+  "skipped",
 ] as const;
 type OutboxFilter = (typeof OUTBOX_FILTERS)[number];
+
+/* One list key per filter — replay and dispatch both invalidate all
+   of them, so a row never sits stale under a filter it just left. */
+const OUTBOX_LIST_KEYS = OUTBOX_FILTERS.map(
+  (f) => ["admin", "outbox-events", "list", f] as const,
+);
 
 /* F5 (2026-11-16): filter chips use ONE capitalisation everywhere —
    first letter capitalised ("Pending", "Dead letter"), never a mix
@@ -140,16 +172,43 @@ export function OutboxSection() {
           method: "POST",
         },
       ),
-    invalidateKeys: [
-      ["admin", "outbox-events", "list", "all"],
-      ["admin", "outbox-events", "list", "pending"],
-      ["admin", "outbox-events", "list", "processing"],
-      ["admin", "outbox-events", "list", "delivered"],
-      ["admin", "outbox-events", "list", "dead_letter"],
-    ],
+    invalidateKeys: OUTBOX_LIST_KEYS,
     successTitle: "Outbox event replayed",
     successMessage:
       "The event is pending again with its attempt count reset.",
+  });
+
+  // Q4: the manual dispatch endpoint existed but nothing called it —
+  // the only trigger was the cron. "Dispatch now" runs the same drain
+  // on demand and toasts every count the endpoint returns (claimed,
+  // delivered, simulated, skipped, retrying, dead-lettered).
+  const queryClient = useQueryClient();
+  const { toast } = useToast();
+  const dispatch = useMutation({
+    mutationFn: () =>
+      apiRequest<DispatchSummary>("/api/v1/admin/outbox/dispatch", {
+        method: "POST",
+      }),
+    onSuccess: async (summary) => {
+      for (const key of OUTBOX_LIST_KEYS) {
+        await queryClient.invalidateQueries({ queryKey: key });
+      }
+      toast({
+        title: "Outbox dispatched",
+        message:
+          `Claimed ${summary.claimed} · delivered ${summary.delivered} · ` +
+          `simulated ${summary.simulated} · skipped ${summary.skipped} · ` +
+          `retrying ${summary.retrying} · dead-lettered ${summary.dead_lettered}.`,
+        variant: "success",
+      });
+    },
+    onError: (err) => {
+      toast({
+        title: "Dispatch failed",
+        message: apiErrorMessage(err),
+        variant: "danger",
+      });
+    },
   });
 
   return (
@@ -161,6 +220,15 @@ export function OutboxSection() {
         ]}
         title="Outbox & Deliveries"
         help="Transactional outbox — every event the platform must deliver, and its retries"
+        action={
+          <Button
+            variant="primary"
+            loading={dispatch.isPending}
+            onClick={() => dispatch.mutate()}
+          >
+            Dispatch now
+          </Button>
+        }
       />
       <Toolbar>
         <Input

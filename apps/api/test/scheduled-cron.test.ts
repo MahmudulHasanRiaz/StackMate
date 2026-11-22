@@ -184,18 +184,21 @@ describe.skipIf(!DATABASE_URL)("scheduled (cron) handler — live-path repro", (
 
   it("empty outbox: scheduled resolves (no throw) and claims nothing", async () => {
     const result = await app.scheduled({}, envStaging, { waitUntil: () => {} });
-    assert.deepEqual(result, { claimed: 0, delivered: 0, simulated: 0, retrying: 0, dead_lettered: 0 });
+    assert.deepEqual(result, { claimed: 0, delivered: 0, simulated: 0, skipped: 0, retrying: 0, dead_lettered: 0 });
   }, 60_000);
 
-  it("webhook event with no subscribed endpoints: delivered, no throw", async () => {
+  it("webhook event with no subscribed endpoints: skipped, no throw", async () => {
     const id = await seedOutboxEvent({
       event_type: "catalog.product.created",
       payload: { product_id: "prod_test" },
     });
     const result = await app.scheduled({}, envStaging, { waitUntil: () => {} });
     assert.equal(result.claimed, 1, JSON.stringify(result));
-    assert.equal(result.delivered, 1, JSON.stringify(result));
-    assert.equal((await readOutboxStatus(id)).status, "delivered");
+    // Q3: nothing subscribed, so nothing was delivered — the row is
+    // terminal "skipped", never "delivered".
+    assert.equal(result.delivered, 0, JSON.stringify(result));
+    assert.equal(result.skipped, 1, JSON.stringify(result));
+    assert.equal((await readOutboxStatus(id)).status, "skipped");
   }, 60_000);
 
   it("Meta CAPI dispatch event: simulated, no throw", async () => {

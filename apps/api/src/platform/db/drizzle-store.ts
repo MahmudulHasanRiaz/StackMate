@@ -3181,7 +3181,10 @@ async function loadStateInternalImpl(
       // C-2/D-6: "simulated" must survive the load — without it a
       // simulated outbox row would silently reload as "pending"
       // and the next cron would try to deliver it for real.
-      ["pending", "processing", "delivered", "dead_letter", "simulated"] as const,
+      // Q3: same for "skipped" — without it a skipped row would
+      // reload as "pending" and be re-claimed (and re-skipped)
+      // on every cron run.
+      ["pending", "processing", "delivered", "dead_letter", "simulated", "skipped"] as const,
       "pending"
     ),
     attempt_count: reqNum(row, "attempt_count", "outbox_events"),

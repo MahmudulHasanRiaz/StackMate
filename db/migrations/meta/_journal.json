@@ -120,6 +120,13 @@
       "when": 1795110875254,
       "tag": "0016_rate_limit_buckets_read_permissions",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "8",
+      "when": 1795322278959,
+      "tag": "0017_outbox_skipped_status",
+      "breakpoints": true
     }
   ]
 }

@@ -24,7 +24,7 @@ export const outboxEvents = pgTable(
     aggregateId: uuid("aggregate_id").notNull(),
     eventType: varchar("event_type", { length: 120 }).notNull(),
     payload: jsonb("payload").notNull().default({}),
-    status: text("status").notNull().default("pending"), // pending | processing | delivered | dead_letter | simulated (migration 0015, audit C-2/D-6)
+    status: text("status").notNull().default("pending"), // pending | processing | delivered | dead_letter | simulated (migration 0015, audit C-2/D-6) | skipped (migration 0017, Q3 — no subscribed active endpoint)
     attemptCount: integer("attempt_count").notNull().default(0),
     availableAt: timestamp("available_at", { withTimezone: true }).notNull().defaultNow(),
     lockedUntil: timestamp("locked_until", { withTimezone: true }),
@@ -36,7 +36,7 @@ export const outboxEvents = pgTable(
   (table) => [
     index("idx_outbox_events_status_available").on(table.status, table.availableAt),
     index("idx_outbox_events_aggregate").on(table.aggregateType, table.aggregateId, table.createdAt),
-    check("outbox_events_status_check", sql`"status" IN ('pending', 'processing', 'delivered', 'dead_letter', 'simulated')`),
+    check("outbox_events_status_check", sql`"status" IN ('pending', 'processing', 'delivered', 'dead_letter', 'simulated', 'skipped')`),
   ]
 );
 

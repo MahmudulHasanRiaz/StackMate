@@ -1396,6 +1396,11 @@ function ApproveForm({
       detailKey("payment-submissions", submission.id),
       listKey("payment-submissions"),
       listKey("orders"),
+      // Q5: the detail page also reads the verification history
+      // (["admin", "payment-submissions", "history", id]) — without
+      // this the "Verification history" section kept showing the
+      // stale (pre-approval) logs after approve/reject.
+      ["admin", "payment-submissions", "history", submission.id],
     ],
     successTitle: "Payment approved",
     // ADR-0009: approval may leave the order partially paid — the
@@ -1552,6 +1557,9 @@ function RejectForm({
       detailKey("payment-submissions", submission.id),
       listKey("payment-submissions"),
       listKey("orders"),
+      // Q5: same history invalidation as the approve form — the
+      // "Verification history" section must refetch after a reject.
+      ["admin", "payment-submissions", "history", submission.id],
     ],
     successTitle: "Payment rejected",
     onSuccess: onDone,
