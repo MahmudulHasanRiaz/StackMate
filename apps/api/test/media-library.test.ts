@@ -21,7 +21,6 @@
 import { describe, it, beforeAll, afterAll } from "vitest";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "pg";
@@ -78,6 +77,7 @@ describe.skipIf(!DATABASE_URL)("media library — upload, search, drivers", () =
   let adminClient: Client;
   let sessionCookie = "";
   let localRoot = "";
+  let localRel = "";
 
   let pngId = "";
   let svgId = "";
@@ -226,7 +226,13 @@ describe.skipIf(!DATABASE_URL)("media library — upload, search, drivers", () =
     sessionCookie = cookiePairs(signedIn.headers);
     assert.ok(sessionCookie.length > 0, "sign-in must set a session cookie");
 
-    localRoot = await mkdtemp(path.join(tmpdir(), "stackmate-media-"));
+    // M-5: the Local driver's root must be a RELATIVE path (an
+    // absolute path is an arbitrary-directory write primitive from
+    // the admin panel). The temp dir lives under the process working
+    // directory and is passed to the API as a cwd-relative path; the
+    // absolute form is kept for the on-disk assertions + cleanup.
+    localRoot = await mkdtemp(path.join(process.cwd(), ".tmp-stackmate-media-"));
+    localRel = path.relative(process.cwd(), localRoot);
 
     // Baseline files: one PNG (dimensions prove the header parser) + one
     // nasty SVG (sanitization is proved on read-back below).
@@ -643,7 +649,7 @@ describe.skipIf(!DATABASE_URL)("media library — upload, search, drivers", () =
   it("Local driver round-trip: upload lands on disk, reads back, delete removes the file", async () => {
     const switched = await authed("/api/v1/admin/storage-settings", {
       method: "PUT",
-      body: { driver: "local", local_path: localRoot },
+      body: { driver: "local", local_path: localRel },
     });
     assert.equal(switched.status, 200, JSON.stringify(switched.body));
     assert.equal(dataOf(switched).driver, "local");
@@ -685,5 +691,64 @@ describe.skipIf(!DATABASE_URL)("media library — upload, search, drivers", () =
   it("unauthenticated list is rejected with 401", async () => {
     const res = await apiRequest("/api/v1/admin/media");
     assert.equal(res.status, 401, JSON.stringify(res.body));
+  });
+
+  it("M-23(b): PATCH avatar_url accepts a media-library content URL", async () => {
+    // Moved from api-core-batch.test.ts (2026-11-20): the media library
+    // requires a database, so this test cannot run in that in-memory
+    // suite. Same 1x1 transparent PNG as the api-core-batch M-23 test.
+    const png = new Uint8Array([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49,
+      0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06,
+      0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44,
+      0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d,
+      0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42,
+      0x60, 0x82,
+    ]);
+    const uploaded = await uploadFile("library-avatar.png", png, "image/png");
+    assert.equal(uploaded.status, 201, JSON.stringify(uploaded.body));
+    const contentUrl = uploaded.body.data.content_url as string;
+    assert.ok(contentUrl.startsWith("/api/v1/admin/media/"), contentUrl);
+
+    // The content URL resolves to the stored object key (never a URL).
+    const set = await authed("/api/v1/admin/me", {
+      method: "PATCH",
+      body: { avatar_url: contentUrl },
+    });
+    assert.equal(set.status, 200, JSON.stringify(set.body));
+    const key = set.body.data.avatar_url as string;
+    assert.equal(typeof key, "string");
+    assert.ok(!key.startsWith("/api/") && !key.startsWith("http"), key);
+    assert.notEqual(key, contentUrl);
+
+    // The resolved key serves through GET /me/avatar.
+    const served = await authed("/api/v1/admin/me/avatar");
+    assert.equal(served.status, 200, JSON.stringify(served.body));
+    assert.equal(served.headers.get("Content-Type"), "image/png");
+
+    // A non-image library asset is rejected, and an unknown media id 404s.
+    const txtUploaded = await uploadFile(
+      "notes.txt",
+      new TextEncoder().encode("hello"),
+      "text/plain",
+    );
+    assert.equal(txtUploaded.status, 201, JSON.stringify(txtUploaded.body));
+    const badKind = await authed("/api/v1/admin/me", {
+      method: "PATCH",
+      body: { avatar_url: txtUploaded.body.data.content_url },
+    });
+    assert.equal(badKind.status, 422, JSON.stringify(badKind.body));
+    const missing = await authed("/api/v1/admin/me", {
+      method: "PATCH",
+      body: { avatar_url: "/api/v1/admin/media/00000000-0000-0000-0000-000000000000/content" },
+    });
+    assert.equal(missing.status, 404, JSON.stringify(missing.body));
+
+    // Leave the account clean for later tests.
+    const cleared = await authed("/api/v1/admin/me", {
+      method: "PATCH",
+      body: { avatar_url: null },
+    });
+    assert.equal(cleared.status, 200, JSON.stringify(cleared.body));
   });
 });

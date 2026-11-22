@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   pgTable,
   uuid,
@@ -8,6 +9,7 @@ import {
   timestamp,
   unique,
   index,
+  check,
 } from "drizzle-orm/pg-core";
 import { users } from "./auth.ts";
 import { customers } from "./customers.ts";
@@ -22,7 +24,7 @@ export const outboxEvents = pgTable(
     aggregateId: uuid("aggregate_id").notNull(),
     eventType: varchar("event_type", { length: 120 }).notNull(),
     payload: jsonb("payload").notNull().default({}),
-    status: text("status").notNull().default("pending"), // pending | processing | delivered | dead_letter
+    status: text("status").notNull().default("pending"), // pending | processing | delivered | dead_letter | simulated (migration 0015, audit C-2/D-6)
     attemptCount: integer("attempt_count").notNull().default(0),
     availableAt: timestamp("available_at", { withTimezone: true }).notNull().defaultNow(),
     lockedUntil: timestamp("locked_until", { withTimezone: true }),
@@ -34,6 +36,7 @@ export const outboxEvents = pgTable(
   (table) => [
     index("idx_outbox_events_status_available").on(table.status, table.availableAt),
     index("idx_outbox_events_aggregate").on(table.aggregateType, table.aggregateId, table.createdAt),
+    check("outbox_events_status_check", sql`"status" IN ('pending', 'processing', 'delivered', 'dead_letter', 'simulated')`),
   ]
 );
 
@@ -48,7 +51,10 @@ export const webhookEndpoints = pgTable("webhook_endpoints", {
   status: text("status").notNull().default("active"), // active | disabled | revoked
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  check("webhook_endpoints_status_check", sql`"status" IN ('active', 'disabled', 'revoked')`),
+]);
 
 export const webhookEndpointSecrets = pgTable("webhook_endpoint_secrets", {
   id: uuid("id").primaryKey(),
@@ -62,7 +68,10 @@ export const webhookEndpointSecrets = pgTable("webhook_endpoint_secrets", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   expiresAt: timestamp("expires_at", { withTimezone: true }),
   revokedAt: timestamp("revoked_at", { withTimezone: true }),
-});
+},
+(table) => [
+  check("webhook_endpoint_secrets_status_check", sql`"status" IN ('active', 'retiring', 'revoked')`),
+]);
 
 export const webhookDeliveries = pgTable(
   "webhook_deliveries",
@@ -75,7 +84,7 @@ export const webhookDeliveries = pgTable(
       .notNull()
       .references(() => outboxEvents.id, { onDelete: "cascade" }),
     deliveryId: varchar("delivery_id", { length: 80 }).notNull(),
-    status: text("status").notNull().default("pending"), // pending | delivered | retrying | failed
+    status: text("status").notNull().default("pending"), // pending | delivered | retrying | failed | simulated (migration 0015, audit C-2/D-6)
     attemptCount: integer("attempt_count").notNull().default(0),
     nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
     lastHttpStatus: integer("last_http_status"),
@@ -84,7 +93,10 @@ export const webhookDeliveries = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [unique("uq_webhook_deliveries_endpoint_delivery").on(table.webhookEndpointId, table.deliveryId)]
+  (table) => [
+    unique("uq_webhook_deliveries_endpoint_delivery").on(table.webhookEndpointId, table.deliveryId),
+    check("webhook_deliveries_status_check", sql`"status" IN ('pending', 'delivered', 'retrying', 'failed', 'simulated')`),
+  ]
 );
 
 export const idempotencyRecords = pgTable(
@@ -106,7 +118,10 @@ export const idempotencyRecords = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [unique("uq_idempotency_records_scope_key").on(table.scopeKey, table.idempotencyKey)]
+  (table) => [
+    unique("uq_idempotency_records_scope_key").on(table.scopeKey, table.idempotencyKey),
+    check("idempotency_records_status_check", sql`"status" IN ('processing', 'completed', 'failed')`),
+  ]
 );
 
 export const notifications = pgTable("notifications", {
@@ -120,4 +135,8 @@ export const notifications = pgTable("notifications", {
   status: text("status").notNull().default("pending"), // pending | sent | failed | cancelled
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   sentAt: timestamp("sent_at", { withTimezone: true }),
-});
+},
+(table) => [
+  check("notifications_channel_check", sql`"channel" IN ('email', 'in_app')`),
+  check("notifications_status_check", sql`"status" IN ('pending', 'sent', 'failed', 'cancelled')`),
+]);

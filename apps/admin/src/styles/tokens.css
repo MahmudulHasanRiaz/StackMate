@@ -70,6 +70,14 @@
   --sm-nav-hover-bg: #212222;
   --sm-nav-active-bg: #2b2c2d;
   --sm-dialog-bg: #0b0b0b;
+  /* Two border tokens, by role (audit L-11, documented not collapsed):
+     --sm-border is the divider/surface border; --sm-border-strong is
+     the INTERACTIVE-control border (inputs, selects, buttons, chips,
+     kbd, scrollbars) — the plain border is nearly invisible against
+     the dark surface, so controls need the stronger step. Do not add
+     a third border token; dividers use --sm-border, controls use
+     --sm-border-strong. Alert borders are separate semantic tokens
+     (--sm-success-border etc., already tokenized). */
   --sm-border: #232323;
   --sm-border-strong: #333333;
   --sm-text: #f5f5f5;
@@ -255,6 +263,10 @@
   --sm-nav-hover-bg: #f1f5f9;
   --sm-nav-active-bg: #e2e8f0;
   --sm-dialog-bg: #ffffff;
+  /* Two border tokens, by role (audit L-11, documented not collapsed):
+     --sm-border is the divider/surface border; --sm-border-strong is
+     the INTERACTIVE-control border (inputs, selects, buttons, chips,
+     kbd, scrollbars). See the dark-theme note above. */
   --sm-border: #e2e8f0;
   --sm-border-strong: #cbd5e1;
   --sm-text: #0f172a;
@@ -468,10 +480,6 @@ a:hover {
      overlaying the canvas — this transition is what animates it. */
   transition: grid-template-columns var(--sm-transition-slow);
 }
-.sm-shell[data-sidebar="rail"] {
-  grid-template-columns: var(--sm-sidebar-rail-width) 1fr;
-}
-
 .sm-sidebar {
   background: var(--sm-surface);
   border-right: 1px solid var(--sm-border);
@@ -593,30 +601,16 @@ a:hover {
     display var(--sm-transition-slow) allow-discrete,
     visibility var(--sm-transition-slow) allow-discrete;
 }
-/* Rail rows keep the expanded row's height (32px): only the horizontal
-   centering changes, so a row never moves vertically between states.
-   The icon is centered NOT with justify-content (not animatable — it
-   snapped) but with a padding-left that animates to the expanded 10px
-   (PLAN §35): 16px centers the 16px icon in the 48px button box
-   (8px sidebar pad + 16px = icon x 24, same as the old centered
-   position), so the icon glides instead of jumping. */
-.sm-shell[data-sidebar="rail"] .sm-nav-btn {
-  justify-content: flex-start;
-  padding: 0 var(--sm-space-2-5) 0 16px;
-}
 /* The label spans inside rows hide completely (the fixed 32px row
    height does not depend on them). Group labels + the brand name keep
    their height while invisible (visibility, not display:none) — the
    rail and the expanded sidebar share the same vertical geometry, so
    the hover-peek never moves an item under the pointer (owner
    2026-11-18: re-aiming after a peek is bad UX). */
-.sm-shell[data-sidebar="rail"] .sm-nav-btn .sm-nav-label,
 .sm-shell[data-nav-collapsed="true"] .sm-nav-btn .sm-nav-label {
   display: none;
   opacity: 0;
 }
-.sm-shell[data-sidebar="rail"] .sm-nav-group-label,
-.sm-shell[data-sidebar="rail"] .sm-sidebar-brand .sm-brand-name,
 .sm-shell[data-nav-collapsed="true"] .sm-nav-group-label,
 .sm-shell[data-nav-collapsed="true"] .sm-sidebar-brand .sm-brand-name {
   visibility: hidden;
@@ -627,6 +621,13 @@ a:hover {
 .sm-shell[data-nav-collapsed="true"] {
   grid-template-columns: var(--sm-sidebar-rail-width) 1fr;
 }
+/* Rail rows keep the expanded row's height (32px): only the horizontal
+   centering changes, so a row never moves vertically between states.
+   The icon is centered NOT with justify-content (not animatable — it
+   snapped) but with a padding-left that animates to the expanded 10px
+   (PLAN §35): 16px centers the 16px icon in the 48px button box
+   (8px sidebar pad + 16px = icon x 24, same as the old centered
+   position), so the icon glides instead of jumping. */
 .sm-shell[data-nav-collapsed="true"] .sm-nav-btn {
   justify-content: flex-start;
   padding: 0 var(--sm-space-2-5) 0 16px;
@@ -680,6 +681,31 @@ a:hover {
 .sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-nav-collapse-btn .sm-nav-label {
   display: inline;
   opacity: 1;
+}
+
+/* Pinned-open labels (audit L-15, PLAN §35 mechanism): pinning open
+   flips the labels out of `display: none` with no before-change
+   style, so — exactly like the hover-peek — they pop instantly while
+   the column animates unless an explicit show rule plus a matching
+   @starting-style entry (below) supplies the 0 they fade from. The
+   show rules state the default explicitly so the @starting-style
+   selectors are IDENTICAL to them (the probe-proven condition).
+   Scoped to ≥1281px: at 901–1280px the rail is FORCED whatever the
+   persisted state is, and below 900px the drawer always shows full
+   labels. (The settings rail already had its own pinned-open show
+   rules — see the Settings shell section — and its @starting-style
+   entries below.) */
+@media (min-width: 1281px) {
+  .sm-shell[data-nav-collapsed="false"] .sm-nav-btn .sm-nav-label,
+  .sm-shell[data-nav-collapsed="false"] .sm-nav-collapse-btn .sm-nav-label {
+    display: inline;
+    opacity: 1;
+  }
+  .sm-shell[data-nav-collapsed="false"] .sm-nav-group-label,
+  .sm-shell[data-nav-collapsed="false"] .sm-sidebar-brand .sm-brand-name {
+    visibility: visible;
+    opacity: 1;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1261,7 +1287,16 @@ a:hover {
 }
 /* Full-width search directly under the breadcrumb (Neon list pattern). */
 .sm-list-search {
+  display: flex;
+  align-items: center;
+  gap: var(--sm-space-2);
   margin-bottom: var(--sm-space-3);
+}
+/* The search input flexes; the Refresh affordance (audit L-04) sits
+   at its right inside the same row. */
+.sm-list-search .sm-search-input {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 .sm-list-search .sm-search-input {
   width: 100%;
@@ -2082,6 +2117,20 @@ a:hover {
 .sm-table-flat .sm-table th {
   background: var(--sm-bg);
 }
+/* List tables only (audit LIVE L1, 2026-11-19): horizontal padding
+   16px → 8px inside .sm-table-flat. At 1509px desktop the Orders
+   table measured 1566px against 1221px available (345px overflow,
+   View off-screen) and Tickets 1797px (576px over) — 32px of
+   horizontal padding per column across 8–9 columns was a third of
+   the table. Detail tables (.sm-table-wrap) keep 16px — they are
+   narrow and never overflow. Scoped here (not on the base rule) so
+   the base 8px-vertical / 16px-horizontal declaration stays the
+   documented default. */
+.sm-table-flat .sm-table th,
+.sm-table-flat .sm-table td {
+  padding-left: var(--sm-space-2);
+  padding-right: var(--sm-space-2);
+}
 .sm-table tbody tr:hover {
   background: var(--sm-surface-muted);
 }
@@ -2107,18 +2156,24 @@ a:hover {
    imply 25.6px nav rows, which cannot hold 13px text). Neon never
    stacks a primary + secondary line in a cell: name + status pill sit
    inline, long values truncate with an ellipsis ("producti…", "Com…").
-   Our text-only rows were already 37px and control rows 43px (denser
+   Our text-only rows measure 36px and control rows 43px (denser
    than Neon's 46px) — the tall rows were the STACKED cells (Customers
    ~65px, Orders ~82px). So: collapse stacked cells into one flex line
    (primary + muted secondary inline, ellipsis truncation, max-width so
    a long value cannot stretch the column). Controls stay 26px — already
-   smaller than Neon's 32px buttons — and cell padding stays 8px. */
+   smaller than Neon's 32px buttons — and cell padding stays 8px.
+   Max-width 480px → 200px (audit LIVE L1, 2026-11-19): a 480px cap let
+   the Customer cell alone reach 512px, so Orders + Tickets overflowed
+   at 1509px desktop. 200px keeps the two widest list tables inside
+   the viewport at 1440px and 1509px with the sidebar expanded (probe:
+   Orders 1142px, Tickets 1130px against 1152px available at 1440px);
+   long values truncate with an ellipsis, full text on the detail page. */
 .sm-cell-line {
   display: flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
-  max-width: 480px;
+  max-width: 200px;
   white-space: nowrap;
 }
 .sm-cell-line > .sm-cell-text {
@@ -2135,11 +2190,16 @@ a:hover {
 }
 
 /* ------------------------------------------------------------------ */
-/* Buttons — three variants + ghost text forms (Neon, images 80/81/82). */
-/* PRIMARY is white/black, SECONDARY is a grey outline, ACCENT is a    */
-/* green outline for brand CTAs only. One primary per page. NO solid   */
-/* green fill anywhere. DANGER is the solid red confirm action (Defect */
-/* B — see .sm-btn-danger).                                            */
+/* Buttons — six variants (Neon, images 80/81/82; system decided      */
+/* 2026-11-19, audit D-2 — the old "exactly three" rule is retired).   */
+/* Three MAIN variants — PRIMARY (white/black), SECONDARY (grey        */
+/* outline), ACCENT (green outline for brand CTAs only) — plus DANGER */
+/* (solid red confirm action, owner-approved Defect B — see            */
+/* .sm-btn-danger) and GHOST forms (ghost + danger-ghost, the          */
+/* text-button pattern for icon actions, menus and low-emphasis        */
+/* actions). One white PRIMARY per page (audit D-3) — the single       */
+/* most-important action only; every other main action is ACCENT. NO   */
+/* solid green fill anywhere.                                          */
 /* ------------------------------------------------------------------ */
 .sm-btn {
   display: inline-flex;
@@ -3146,9 +3206,9 @@ a:hover {
      here used to collapse them in the rail, and the peek's
      display:block pushed every row below them down (the
      geometry-parity bug, 901–1280px edition). NOTE: the
-     [data-sidebar="rail"] rules elsewhere are dead — the JSX never
-     sets data-sidebar="rail" — so this block is what hides them at
-     this width; do not remove these two rules. */
+     [data-sidebar="rail"] rules were deleted (audit L-16 — the JSX
+     never sets data-sidebar="rail"), so this block is what hides them
+     at this width; do not remove these two rules. */
   .sm-shell .sm-nav-btn .sm-nav-label {
     display: none;
     opacity: 0;
@@ -3206,7 +3266,11 @@ a:hover {
    `opacity: 1` and the label still jumps. Covers both shells: the
    Settings rail is `.sm-sidebar.sm-main-rail` (shell.tsx:1352). One
    harmless side effect: on first load with an expanded sidebar the
-   labels fade in once over 200ms. */
+   labels fade in once over 200ms. The pinned-open entries at the end
+   (audit L-15) are the same treatment for the pin action — their
+   selectors are IDENTICAL to the pinned-open show rules above, and
+   to the settings rail's pinned-open show rules in the Settings
+   shell section. */
 @starting-style {
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-nav-btn .sm-nav-label,
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-btn .sm-nav-label,
@@ -3227,7 +3291,14 @@ a:hover {
   .sm-shell .sm-sidebar:not(.sm-peek-off):hover .sm-sidebar-brand .sm-brand-name,
   .sm-shell .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-sidebar-brand .sm-brand-name,
   .sm-shell .sm-sidebar:not(.sm-peek-off):hover .sm-nav-collapse-btn .sm-nav-label,
-  .sm-shell .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-collapse-btn .sm-nav-label {
+  .sm-shell .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-collapse-btn .sm-nav-label,
+  .sm-shell[data-nav-collapsed="false"] .sm-nav-btn .sm-nav-label,
+  .sm-shell[data-nav-collapsed="false"] .sm-sidebar-brand .sm-brand-name,
+  .sm-shell[data-nav-collapsed="false"] .sm-nav-collapse-btn .sm-nav-label,
+  .sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-nav-btn .sm-nav-label,
+  .sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-sidebar-brand .sm-brand-name,
+  .sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-nav-group-label,
+  .sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-nav-collapse-btn .sm-nav-label {
     opacity: 0;
   }
 }
@@ -3242,8 +3313,7 @@ a:hover {
      and its menu cut off at left -110. These selectors match the
      (0,2,0) specificity so one column always wins below 900px. */
   .sm-shell,
-  .sm-shell[data-nav-collapsed="true"],
-  .sm-shell[data-sidebar="rail"] {
+  .sm-shell[data-nav-collapsed="true"] {
     grid-template-columns: 1fr;
   }
   .sm-sidebar {
@@ -3275,22 +3345,18 @@ a:hover {
      rail — touch users have no tooltips, and an unlabeled icon list
      is unusable. The collapse rules above are (0,2,0)/(0,3,0); these
      add .sm-sidebar for (0,3,0)/(0,4,0) so full labels win <900px. */
-  .sm-shell[data-nav-collapsed="true"] .sm-sidebar .sm-nav-btn,
-  .sm-shell[data-sidebar="rail"] .sm-sidebar .sm-nav-btn {
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar .sm-nav-btn {
     justify-content: flex-start;
     padding: var(--sm-space-1-5) var(--sm-space-2-5);
   }
   .sm-shell[data-nav-collapsed="true"] .sm-sidebar .sm-nav-btn .sm-nav-label,
-  .sm-shell[data-sidebar="rail"] .sm-sidebar .sm-nav-btn .sm-nav-label,
-  .sm-shell[data-nav-collapsed="true"] .sm-sidebar .sm-sidebar-brand .sm-brand-name,
-  .sm-shell[data-sidebar="rail"] .sm-sidebar .sm-sidebar-brand .sm-brand-name {
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar .sm-sidebar-brand .sm-brand-name {
     display: inline;
     /* The rail rules above set opacity: 0 — the drawer always shows
        full labels, so it must reset it (PLAN §35). */
     opacity: 1;
   }
-  .sm-shell[data-nav-collapsed="true"] .sm-sidebar .sm-nav-group-label,
-  .sm-shell[data-sidebar="rail"] .sm-sidebar .sm-nav-group-label {
+  .sm-shell[data-nav-collapsed="true"] .sm-sidebar .sm-nav-group-label {
     display: block;
     opacity: 1;
   }

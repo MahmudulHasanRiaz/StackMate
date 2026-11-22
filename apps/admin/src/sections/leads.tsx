@@ -58,10 +58,12 @@ import {
   Select,
   StatusBadge,
   TableSkeleton,
+  type SearchableOption,
   Textarea,
 } from "../components/primitives";
 import type { CustomerDto } from "./customers";
 import type { StaffUserDto } from "./tickets";
+import { humanizeType } from "../lib/resolve-names";
 
 /* ------------------------------------------------------------------ */
 /* DTOs                                                                */
@@ -150,7 +152,21 @@ export function LeadsSection() {
     typeof rawSearch.utm_campaign === "string" ? rawSearch.utm_campaign : "";
   const fromFilter = typeof rawSearch.from === "string" ? rawSearch.from : "";
   const toFilter = typeof rawSearch.to === "string" ? rawSearch.to : "";
-  const query = useAdminList<LeadDto>("leads", "/api/v1/admin/leads");
+  const query = useAdminList<LeadDto>("leads", "/api/v1/admin/leads", {
+    q: parsed.q,
+    page: parsed.page,
+    pageSize: parsed.pageSize,
+    // Server-side: the endpoint reads ?status=, ?source_site_id=,
+    // ?utm_campaign=, ?from= and ?to= (created-date range, same
+    // inclusive day comparison as the client memo below).
+    extra: {
+      ...(statusFilter ? { status: statusFilter } : {}),
+      ...(siteFilter ? { source_site_id: siteFilter } : {}),
+      ...(campaignFilter ? { utm_campaign: campaignFilter } : {}),
+      ...(fromFilter ? { from: fromFilter } : {}),
+      ...(toFilter ? { to: toFilter } : {}),
+    },
+  });
 
   const columns: ColumnDef<LeadDto, unknown>[] = [
     {
@@ -244,6 +260,17 @@ export function LeadsSection() {
       <ListTable<LeadDto>
         columns={columns}
         data={filtered}
+        serverSearch
+        serverPagination
+        refreshSection="leads"
+        filtersActive={
+          statusFilter !== "" ||
+          siteFilter !== "" ||
+          campaignFilter !== "" ||
+          fromFilter !== "" ||
+          toFilter !== ""
+        }
+        total={query.total}
         search={parsed.q ?? ""}
         onSearchChange={(q) => updateSearch({ q: q === "" ? undefined : q, page: 1 })}
         page={parsed.page ?? 1}
@@ -260,6 +287,8 @@ export function LeadsSection() {
         toolbar={
           <>
             <Select
+              id="leads-status-filter"
+              name="status"
               value={statusFilter}
               onChange={(e) =>
                 updateSearch({ status: e.target.value === "" ? undefined : e.target.value, page: 1 })
@@ -269,13 +298,14 @@ export function LeadsSection() {
               <option value="">All statuses</option>
               {LEAD_STATUSES.map((s) => (
                 <option key={s} value={s}>
-                  {s}
+                  {humanizeType(s)}
                 </option>
               ))}
             </Select>
             {/* Searchable (PLAN §29): integrated sites are unbounded.
                Status (5) stays a native select (fixed-enum exception). */}
             <SearchableSelect
+              id="leads-site-filter"
               value={siteFilter}
               onChange={(v) =>
                 updateSearch({
@@ -300,6 +330,8 @@ export function LeadsSection() {
               ariaLabel="Filter by source website"
             />
             <Input
+              id="leads-campaign-filter"
+              name="utm_campaign"
               value={campaignFilter}
               onChange={(e) =>
                 updateSearch({
@@ -312,6 +344,8 @@ export function LeadsSection() {
               autoComplete="off"
             />
             <Input
+              id="leads-from-filter"
+              name="from"
               value={fromFilter}
               onChange={(e) =>
                 updateSearch({ from: e.target.value === "" ? undefined : e.target.value, page: 1 })
@@ -321,6 +355,8 @@ export function LeadsSection() {
               autoComplete="off"
             />
             <Input
+              id="leads-to-filter"
+              name="to"
               value={toFilter}
               onChange={(e) =>
                 updateSearch({ to: e.target.value === "" ? undefined : e.target.value, page: 1 })
@@ -425,7 +461,7 @@ function CreateLeadDialog({
             Cancel
           </Button>
           <Button
-            variant="primary"
+            variant="accent"
             type="submit"
             form="create-lead-form"
             loading={mutation.isPending}
@@ -441,39 +477,49 @@ function CreateLeadDialog({
           Manual entry — most leads arrive automatically from connected
           websites. A Lead tracking event is recorded for every capture.
         </p>
-        <Field label="Name" required error={errors.name ?? ""}>
-          <Input value={name} onChange={(e) => setName(e.target.value)} maxLength={200} />
+        <Field label="Name" required htmlFor="lead-name" error={errors.name ?? ""}>
+          <Input id="lead-name" name="name" autoComplete="name" value={name} onChange={(e) => setName(e.target.value)} maxLength={200} />
         </Field>
-        <Field label="Email" error={errors.email ?? ""}>
+        <Field label="Email" htmlFor="lead-email" error={errors.email ?? ""}>
           <Input
+            id="lead-email"
+            name="email"
             type="email"
+            autoComplete="email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
             maxLength={200}
           />
         </Field>
-        <Field label="Phone" error={errors.phone ?? ""}>
+        <Field label="Phone" htmlFor="lead-phone" error={errors.phone ?? ""}>
           <Input
+            id="lead-phone"
+            name="phone"
             type="tel"
+            autoComplete="tel"
             value={phone}
             onChange={(e) => setPhone(e.target.value)}
             maxLength={40}
           />
         </Field>
-        <Field label="WhatsApp">
+        <Field label="WhatsApp" htmlFor="lead-whatsapp">
           <Input
+            id="lead-whatsapp"
+            name="whatsapp"
             type="tel"
+            autoComplete="tel"
             value={whatsapp}
             onChange={(e) => setWhatsapp(e.target.value)}
             maxLength={40}
           />
         </Field>
-        <Field label="Interest" hint="What product or service they are interested in.">
-          <Input value={interest} onChange={(e) => setInterest(e.target.value)} maxLength={300} />
+        <Field label="Interest" htmlFor="lead-interest" hint="What product or service they are interested in.">
+          <Input id="lead-interest" name="interest" value={interest} onChange={(e) => setInterest(e.target.value)} maxLength={300} />
         </Field>
-        <Field label="Product">
+        <Field label="Product" htmlFor="lead-product">
           {/* Searchable (PLAN §29): products are unbounded. */}
           <SearchableSelect
+            id="lead-product"
             value={productId}
             onChange={(v) => setProductId(v)}
             loadOptions={(q, signal) =>
@@ -489,11 +535,11 @@ function CreateLeadDialog({
             ariaLabel="Product"
           />
         </Field>
-        <Field label="Message">
-          <Textarea value={message} onChange={(e) => setMessage(e.target.value)} maxLength={5000} />
+        <Field label="Message" htmlFor="lead-message">
+          <Textarea id="lead-message" name="message" value={message} onChange={(e) => setMessage(e.target.value)} maxLength={5000} />
         </Field>
-        <Field label="Notes">
-          <Textarea value={notes} onChange={(e) => setNotes(e.target.value)} maxLength={5000} />
+        <Field label="Notes" htmlFor="lead-notes">
+          <Textarea id="lead-notes" name="notes" value={notes} onChange={(e) => setNotes(e.target.value)} maxLength={5000} />
         </Field>
       </form>
     </Dialog>
@@ -573,7 +619,13 @@ export function LeadDetailSection({ id }: { id: string }) {
       );
       // The wizard opens with the resolved customer prefilled; the
       // lead is marked converted only when the order is created.
-      goTo(`/orders?new=1&customer=${res.customer.id}&lead=${lead.id}`);
+      // The lead's linked product / interest travel in the URL so the
+      // wizard can prefill them (audit L-16).
+      const extra = new URLSearchParams();
+      if (res.lead.product_id) extra.set("product", res.lead.product_id);
+      if (res.lead.interest) extra.set("interest", res.lead.interest);
+      const suffix = extra.toString() ? `&${extra.toString()}` : "";
+      goTo(`/orders?new=1&customer=${res.customer.id}&lead=${lead.id}${suffix}`);
     } catch (err) {
       setConvertError(err instanceof Error ? err.message : "Could not convert the lead.");
     } finally {
@@ -586,7 +638,7 @@ export function LeadDetailSection({ id }: { id: string }) {
       <PageHeader
         breadcrumb={[{ label: "Leads", href: "/leads" }, { label: lead.lead_number }]}
         title={lead.name}
-        subtitle={`${lead.lead_number} · ${lead.status}`}
+        subtitle={`${lead.lead_number} · ${humanizeType(lead.status)}`}
         action={
           canConvert ? (
             <Button variant="primary" icon={UserPlus} loading={converting} onClick={() => void onConvert()}>
@@ -689,26 +741,25 @@ export function LeadDetailSection({ id }: { id: string }) {
               label: "Assignee",
               value: (
                 /* Searchable (PLAN §29): staff grows; only active staff
-                   are offered (the loader filters). The current
-                   assignee label comes from the lead detail. */
+                   are offered (status=active is a server param now).
+                   The current assignee label comes from the lead detail. */
                 <SearchableSelect
+                  id="lead-assignee"
                   value={lead.assignee_user_id ?? ""}
                   onChange={(v) =>
                     assignMutation.mutate({
                       assignee_user_id: v === "" ? null : v,
                     })
                   }
-                  loadOptions={async (q, signal) => {
-                    const all = await loadListOptions<StaffUserDto>(
+                  loadOptions={(q, signal) =>
+                    loadListOptions<StaffUserDto>(
                       "/api/v1/admin/users",
                       q,
                       (u) => ({ value: u.id, label: u.name, data: u }),
                       signal,
-                    );
-                    return all.filter(
-                      (o) => (o.data as StaffUserDto | undefined)?.status === "active",
-                    );
-                  }}
+                      { extra: { status: "active" } },
+                    )
+                  }
                   selectedLabel={lead.assignee_name ?? undefined}
                   leadingOptions={[{ value: "", label: "Unassigned" }]}
                   placeholder="Unassigned"

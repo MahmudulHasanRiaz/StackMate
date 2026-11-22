@@ -30,7 +30,7 @@
  * lands (they work on the in-memory store). The server's message is shown
  * via the mutation error toast; the invitations list itself still loads.
  */
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import {
   KeyRound,
@@ -40,7 +40,7 @@ import {
   Users,
 } from "lucide-react";
 import { apiRequest } from "../lib/api-client";
-import { listKey } from "../lib/query";
+import { detailKey, listKey } from "../lib/query";
 import { useAuth } from "../components/shell";
 import {
   Alert,
@@ -127,6 +127,10 @@ interface StaffInvitation {
 interface CreateInvitationResult {
   invitation: StaffInvitation;
   token_once: string;
+  // Set by the API (audit M-21): whether the invitation email was
+  // actually sent, and the delivery error when it was not.
+  email_sent?: boolean;
+  email_error?: string | null;
 }
 
 type TabKey = "users" | "roles" | "invitations";
@@ -181,8 +185,19 @@ export function StaffSection() {
     "all" | "pending" | "accepted" | "revoked" | "expired"
   >("all");
 
-  const usersQuery = useAdminList<StaffUser>("staff-users", "/api/v1/admin/users");
-  const rolesQuery = useAdminList<Role>("staff-roles", "/api/v1/admin/roles");
+  const usersQuery = useAdminList<StaffUser>("staff-users", "/api/v1/admin/users", {
+    q: listSearch.q,
+    page: listSearch.page,
+    pageSize: listSearch.pageSize,
+    // Server-side: ?status= filters the full set; the client-side
+    // `filteredUsers` memo below re-applies the same predicate.
+    extra: userStatus !== "all" ? { status: userStatus } : undefined,
+  });
+  const rolesQuery = useAdminList<Role>("staff-roles", "/api/v1/admin/roles", {
+    q: rolesSearch,
+    page: rolesPage,
+    pageSize: rolesPageSize,
+  });
   const permissionsQuery = useAdminList<PermissionItem>(
     "staff-permissions",
     "/api/v1/admin/permissions",
@@ -190,6 +205,7 @@ export function StaffSection() {
   const invitationsQuery = useAdminList<StaffInvitation>(
     "staff-invitations",
     "/api/v1/admin/users/invitations",
+    { q: invSearch, page: invPage, pageSize: invPageSize },
   );
 
   /* ---- Role dialog state ---- */
@@ -327,7 +343,7 @@ export function StaffSection() {
       }),
     invalidateKeys: [listKey("staff-invitations")],
     successTitle: "Invitation created",
-    successMessage: "Share the one-time token with the invitee — it is shown once.",
+    successMessage: "See the dialog for the email status and the one-time token.",
     onSuccess: (data) => {
       setInviteDialog(false);
       setTokenResult(data);
@@ -412,6 +428,58 @@ export function StaffSection() {
     [invitationsQuery.data, invStatus],
   );
 
+  // API H-3 (UI part): suspend/unsuspend a staff member. Endpoints:
+  // PATCH /api/v1/admin/users/:id/suspend and .../unsuspend (no
+  // body) — suspend flips staff_profiles.status and revokes all
+  // sessions. The suspend checks (sign-in, session validation, OAuth
+  // hook) already exist; this is the control that makes them reachable.
+  const suspendUser = useAdminMutation<
+    StaffUser,
+    { id: string; name: string; status: "suspended" | "active" }
+  >({
+    mutationFn: (body) =>
+      apiRequest<StaffUser>(
+        `/api/v1/admin/users/${body.id}/${body.status === "suspended" ? "suspend" : "unsuspend"}`,
+        { method: "PATCH" },
+      ),
+    invalidateKeys: [listKey("staff-users")],
+    successTitle: "Staff status updated",
+    successMessage: "The change takes effect immediately.",
+  });
+
+  const onToggleSuspend = useCallback(
+    async (user: StaffUser) => {
+      const suspending = user.status !== "suspended";
+      const ok = await confirm({
+        title: suspending ? `Suspend ${user.name}?` : `Unsuspend ${user.name}?`,
+        body: (
+          <div>
+            {suspending ? (
+              <p>
+                {user.name} is signed out of all sessions immediately and
+                cannot sign in again until unsuspended.
+              </p>
+            ) : (
+              <p>{user.name} can sign in again.</p>
+            )}
+          </div>
+        ),
+        confirmLabel: suspending ? "Suspend" : "Unsuspend",
+        danger: suspending,
+        warning: suspending
+          ? `${user.name} is signed out of all sessions immediately and cannot sign in again until unsuspended.`
+          : undefined,
+      });
+      if (ok)
+        suspendUser.mutate({
+          id: user.id,
+          name: user.name,
+          status: suspending ? "suspended" : "active",
+        });
+    },
+    [confirm, suspendUser],
+  );
+
   const userColumns = useMemo(
     () => [
       {
@@ -460,22 +528,32 @@ export function StaffSection() {
         header: "Actions",
         enableSorting: false,
         cell: ({ row }: { row: { original: StaffUser } }) => (
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() =>
-              void navigate({
-                to: "/staff/$userId",
-                params: { userId: row.original.id },
-              } as never)
-            }
-          >
-            View
-          </Button>
+          <span style={{ display: "inline-flex", gap: 8 }}>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() =>
+                void navigate({
+                  to: "/staff/$userId",
+                  params: { userId: row.original.id },
+                } as never)
+              }
+            >
+              View
+            </Button>
+            <Button
+              variant={row.original.status === "suspended" ? "accent" : "danger-ghost"}
+              size="sm"
+              loading={suspendUser.isPending}
+              onClick={() => void onToggleSuspend(row.original)}
+            >
+              {row.original.status === "suspended" ? "Unsuspend" : "Suspend"}
+            </Button>
+          </span>
         ),
       },
     ],
-    [navigate],
+    [navigate, onToggleSuspend, suspendUser.isPending],
   );
 
   const roleColumns = useMemo(
@@ -589,11 +667,11 @@ export function StaffSection() {
 
   const headerAction =
     tab === "roles" ? (
-      <Button variant="accent" icon={KeyRound} onClick={openCreateRole}>
+      <Button variant="primary" icon={KeyRound} onClick={openCreateRole}>
         Create role
       </Button>
     ) : (
-      <Button variant="accent" icon={UserPlus} onClick={openInvite}>
+      <Button variant="primary" icon={UserPlus} onClick={openInvite}>
         Invite staff
       </Button>
     );
@@ -620,6 +698,11 @@ export function StaffSection() {
         <ListTable<StaffUser>
           columns={userColumns}
           data={filteredUsers}
+          serverSearch
+          serverPagination
+          refreshSection="staff-users"
+          filtersActive={userStatus !== "all"}
+          total={usersQuery.total}
           search={listSearch.q ?? ""}
           onSearchChange={(q) => setListSearch({ q: q || undefined, page: 1 })}
           page={listSearch.page ?? 1}
@@ -674,6 +757,10 @@ export function StaffSection() {
         <ListTable<Role>
           columns={roleColumns}
           data={rolesQuery.data}
+          serverSearch
+          serverPagination
+          refreshSection="staff-roles"
+          total={rolesQuery.total}
           search={rolesSearch}
           onSearchChange={(q) => {
             setRolesSearch(q);
@@ -702,12 +789,18 @@ export function StaffSection() {
       {tab === "invitations" ? (
         <div>
           <Alert variant="info">
-            No email is sent for invitations. Deliver the one-time token to the
-            invitee out of band. Invitations expire after 7 days.
+            An invitation email is sent to the invitee when email delivery is
+            configured; otherwise deliver the one-time token out of band.
+            Invitations expire after 7 days.
           </Alert>
           <ListTable<StaffInvitation>
             columns={invitationColumns}
             data={filteredInvitations}
+            serverSearch
+            serverPagination
+            refreshSection="staff-invitations"
+            filtersActive={invStatus !== "all"}
+            total={invitationsQuery.total}
             search={invSearch}
             onSearchChange={(q) => {
               setInvSearch(q);
@@ -904,6 +997,8 @@ export function StaffSection() {
         >
           <Input
             id="invite-name"
+            name="name"
+            autoComplete="name"
             value={inviteName}
             aria-invalid={inviteErrors.name ? true : undefined}
             onChange={(e) => setInviteName(e.target.value)}
@@ -918,7 +1013,9 @@ export function StaffSection() {
         >
           <Input
             id="invite-email"
+            name="email"
             type="email"
+            autoComplete="email"
             value={inviteEmail}
             aria-invalid={inviteErrors.email ? true : undefined}
             onChange={(e) => setInviteEmail(e.target.value)}
@@ -980,10 +1077,24 @@ export function StaffSection() {
       >
         {tokenResult ? (
           <div>
-            <Alert variant="warning">
-              Share this token with {tokenResult.invitation.name} out of band —
-              it is shown once and cannot be recovered. No email is sent.
-            </Alert>
+            {tokenResult.email_sent === true ? (
+              <Alert variant="success">
+                Invitation email sent to {tokenResult.invitation.email}. The
+                one-time token below is also shown once, as a fallback.
+              </Alert>
+            ) : tokenResult.email_sent === false ? (
+              <Alert variant="warning">
+                Invitation email could not be sent
+                {tokenResult.email_error ? ` (${tokenResult.email_error})` : ""}.
+                Share this token with {tokenResult.invitation.name} out of
+                band — it is shown once and cannot be recovered.
+              </Alert>
+            ) : (
+              <Alert variant="warning">
+                Share this token with {tokenResult.invitation.name} out of
+                band — it is shown once and cannot be recovered.
+              </Alert>
+            )}
             <Field label="One-time invitation token" htmlFor="invite-token">
               <span className="sm-mono" id="invite-token">
                 {tokenResult.token_once}
@@ -1042,6 +1153,49 @@ export function StaffUserDetailSection({ id }: { id: string }) {
     (currentRoles.length !== user.roles.length ||
       currentRoles.some((k) => !user.roles.includes(k)));
 
+  // API H-3 (UI part, detail): same endpoints as the list — see the
+  // note above the list's suspendUser mutation.
+  const suspendDetailUser = useAdminMutation<
+    StaffUser,
+    { status: "suspended" | "active" }
+  >({
+    mutationFn: (body) =>
+      apiRequest<StaffUser>(
+        `/api/v1/admin/users/${id}/${body.status === "suspended" ? "suspend" : "unsuspend"}`,
+        { method: "PATCH" },
+      ),
+    invalidateKeys: [listKey("staff-users"), detailKey("staff-users", id)],
+    successTitle: "Staff status updated",
+    successMessage: "The change takes effect immediately.",
+  });
+
+  const onToggleSuspendDetail = async () => {
+    if (!user) return;
+    const suspending = user.status !== "suspended";
+    const ok = await confirm({
+      title: suspending ? `Suspend ${user.name}?` : `Unsuspend ${user.name}?`,
+      body: (
+        <div>
+          {suspending ? (
+            <p>
+              {user.name} is signed out of all sessions immediately and
+              cannot sign in again until unsuspended.
+            </p>
+          ) : (
+            <p>{user.name} can sign in again.</p>
+          )}
+        </div>
+      ),
+      confirmLabel: suspending ? "Suspend" : "Unsuspend",
+      danger: suspending,
+      warning: suspending
+        ? `${user.name} is signed out of all sessions immediately and cannot sign in again until unsuspended.`
+        : undefined,
+    });
+    if (ok)
+      suspendDetailUser.mutate({ status: suspending ? "suspended" : "active" });
+  };
+
   const updateRoles = useAdminMutation<
     { user_id: string; roles: string[]; revoked_sessions: number },
     { role_keys: string[] }
@@ -1051,7 +1205,7 @@ export function StaffUserDetailSection({ id }: { id: string }) {
         `/api/v1/admin/users/${id}/roles`,
         { method: "PUT", body: JSON.stringify(body) },
       ),
-    invalidateKeys: [listKey("staff-users")],
+    invalidateKeys: [listKey("staff-users"), detailKey("staff-users", id)],
     successTitle: "Roles updated",
     successMessage:
       "The user's active sessions were signed out immediately.",
@@ -1089,6 +1243,17 @@ export function StaffUserDetailSection({ id }: { id: string }) {
         ]}
         title={user ? user.name : "Staff user"}
         help="Staff user detail"
+        action={
+          user ? (
+            <Button
+              variant={user.status === "suspended" ? "accent" : "danger-ghost"}
+              loading={suspendDetailUser.isPending}
+              onClick={() => void onToggleSuspendDetail()}
+            >
+              {user.status === "suspended" ? "Unsuspend" : "Suspend"}
+            </Button>
+          ) : undefined
+        }
       />
       {detailQuery.isPending ? (
         <div className="sm-card">

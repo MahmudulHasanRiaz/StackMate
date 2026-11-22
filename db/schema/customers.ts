@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { pgTable, uuid, varchar, char, text, boolean, bigint, timestamp, index, unique } from "drizzle-orm/pg-core";
+import { pgTable, uuid, varchar, char, text, boolean, bigint, timestamp, index, unique, uniqueIndex, check } from "drizzle-orm/pg-core";
 
 export const customers = pgTable(
   "customers",
@@ -29,9 +29,18 @@ export const customers = pgTable(
     archivedAt: timestamp("archived_at", { withTimezone: true }),
   },
   (table) => [
-    index("idx_customers_normalized_email").on(table.normalizedEmail).where(sql`"normalized_email" IS NOT NULL`),
-    index("idx_customers_normalized_phone").on(table.normalizedPhone).where(sql`"normalized_phone" IS NOT NULL`),
+    // Migration 0014 (audit F-02): the dedupe invariant ("same email OR
+    // phone never makes a second customer") is enforced in the DB, not
+    // just by the app-level resolver — partial unique indexes, created
+    // by the migration only when no duplicates exist (see 0014).
+    uniqueIndex("uq_customers_normalized_email").on(table.normalizedEmail).where(sql`"normalized_email" IS NOT NULL`),
+    uniqueIndex("uq_customers_normalized_phone").on(table.normalizedPhone).where(sql`"normalized_phone" IS NOT NULL`),
     index("idx_customers_status_created_at").on(table.status, table.createdAt.desc()),
+    // CHECKs declared in Drizzle (migration 0014 / audit F-11) so
+    // drizzle-kit generate reproduces them; previously SQL-only.
+    check("customers_customer_type_check", sql`"customer_type" IN ('person', 'business')`),
+    check("customers_status_check", sql`"status" IN ('active', 'inactive', 'blocked')`),
+    check("customers_credit_balance_minor_check", sql`"credit_balance_minor" >= 0`),
   ]
 );
 
@@ -95,5 +104,8 @@ export const customerAddresses = pgTable(
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [index("idx_customer_addresses_customer_type").on(table.customerId, table.addressType)]
+  (table) => [
+    index("idx_customer_addresses_customer_type").on(table.customerId, table.addressType),
+    check("customer_addresses_address_type_check", sql`"address_type" IN ('billing', 'shipping', 'other')`),
+  ]
 );

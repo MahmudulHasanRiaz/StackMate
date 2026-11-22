@@ -12,6 +12,8 @@ import {
   timestamp,
   unique,
   index,
+  uniqueIndex,
+  check,
 } from "drizzle-orm/pg-core";
 import { users } from "./auth.ts";
 import { customers } from "./customers.ts";
@@ -28,7 +30,11 @@ export const paymentProviders = pgTable("payment_providers", {
   status: text("status").notNull().default("enabled"), // enabled | disabled
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  check("payment_providers_provider_type_check", sql`"provider_type" IN ('manual_mfs', 'manual_bank', 'automated')`),
+  check("payment_providers_status_check", sql`"status" IN ('enabled', 'disabled')`),
+]);
 
 export const paymentMethods = pgTable(
   "payment_methods",
@@ -62,6 +68,7 @@ export const paymentMethods = pgTable(
       table.isEnabled,
       table.sortOrder
     ),
+    check("payment_methods_method_kind_check", sql`"method_kind" IN ('mfs_account', 'bank_account', 'automated_checkout')`),
   ]
 );
 
@@ -79,6 +86,7 @@ export const paymentMethodTransferRails = pgTable(
   },
   (table) => [
     unique("uq_payment_method_transfer_rails").on(table.paymentMethodId, table.railKey),
+    check("payment_method_transfer_rails_rail_key_check", sql`"rail_key" IN ('npsb', 'beftn', 'rtgs')`),
   ]
 );
 
@@ -136,6 +144,8 @@ export const paymentSubmissions = pgTable(
       .on(table.paymentMethodId, table.normalizedTransactionReference)
       .where(sql`"normalized_transaction_reference" IS NOT NULL`),
     index("idx_payment_submissions_customer_submitted").on(table.customerId, table.submittedAt.desc()),
+    check("payment_submissions_amount_minor_check", sql`"amount_minor" > 0`),
+    check("payment_submissions_status_check", sql`"status" IN ('submitted', 'under_review', 'approved', 'rejected', 'cancelled')`),
   ]
 );
 
@@ -175,7 +185,18 @@ export const paymentTransactions = pgTable(
     index("idx_payment_transactions_provider_txn")
       .on(table.providerId, table.providerTransactionId)
       .where(sql`"provider_transaction_id" IS NOT NULL`),
+    // Migration 0015 (audit F-01, defense-in-depth): a succeeded provider
+    // transaction may credit money only once — the partial unique index
+    // makes the invariant hold even if two approvals race. The
+    // non-unique idx above is kept: it covers all non-NULL provider
+    // transactions, not just succeeded ones.
+    uniqueIndex("uq_payment_transactions_provider_txn_succeeded")
+      .on(table.providerId, table.providerTransactionId)
+      .where(sql`"status" = 'succeeded' AND "provider_transaction_id" IS NOT NULL`),
     index("idx_payment_transactions_status_paid").on(table.status, table.paidAt.desc()),
+    check("payment_transactions_amount_minor_check", sql`"amount_minor" > 0`),
+    check("payment_transactions_status_check", sql`"status" IN ('succeeded', 'pending', 'failed', 'partially_refunded', 'refunded')`),
+    check("payment_transactions_verification_source_check", sql`"verification_source" IN ('manual_staff', 'provider_webhook', 'provider_query', 'import')`),
   ]
 );
 
@@ -192,7 +213,10 @@ export const paymentVerificationLogs = pgTable("payment_verification_logs", {
   customerMessage: text("customer_message"),
   notes: text("notes"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  check("payment_verification_logs_decision_check", sql`"decision" IN ('approved', 'rejected', 'requested_information', 'reopened')`),
+]);
 
 export const paymentRefunds = pgTable("payment_refunds", {
   id: uuid("id").primaryKey(),
@@ -214,4 +238,8 @@ export const paymentRefunds = pgTable("payment_refunds", {
   }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  check("payment_refunds_amount_minor_check", sql`"amount_minor" > 0`),
+  check("payment_refunds_status_check", sql`"status" IN ('requested', 'pending', 'succeeded', 'failed', 'cancelled')`),
+]);

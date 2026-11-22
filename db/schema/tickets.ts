@@ -1,4 +1,5 @@
-import { pgTable, uuid, varchar, text, boolean, timestamp, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { pgTable, uuid, varchar, text, boolean, timestamp, index, check } from "drizzle-orm/pg-core";
 import { customers } from "./customers.ts";
 import { orders } from "./orders.ts";
 import { subscriptions } from "./subscriptions.ts";
@@ -47,6 +48,12 @@ export const supportTickets = pgTable(
     index("idx_support_tickets_customer_created").on(table.customerId, table.createdAt.desc()),
     index("idx_support_tickets_status_created").on(table.status, table.createdAt.desc()),
     index("idx_support_tickets_assignee").on(table.assigneeUserId, table.createdAt.desc()),
+    // CHECKs declared in Drizzle (migration 0014 / audit F-11) so
+    // drizzle-kit generate reproduces them; previously SQL-only (the
+    // 0009 tables carried plain text status columns with no check).
+    check("support_tickets_status_check", sql`"status" IN ('open', 'in_progress', 'waiting_on_customer', 'resolved', 'closed')`),
+    check("support_tickets_priority_check", sql`"priority" IN ('low', 'medium', 'high', 'urgent')`),
+    check("support_tickets_category_check", sql`"category" IN ('billing', 'technical', 'license', 'order', 'other')`),
   ]
 );
 

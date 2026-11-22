@@ -99,6 +99,27 @@
       "when": 1795002763000,
       "tag": "0013_media_thumbnails",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "8",
+      "when": 1795107735000,
+      "tag": "0014_audit_fix_batch",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "8",
+      "when": 1795110091751,
+      "tag": "0015_simulated_status_f01_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "8",
+      "when": 1795110875254,
+      "tag": "0016_rate_limit_buckets_read_permissions",
+      "breakpoints": true
     }
   ]
 }

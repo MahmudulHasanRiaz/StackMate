@@ -222,6 +222,7 @@ export function IntegrationsSection() {
   const query = useAdminList<IntegratedSite>(
     "integrated-sites",
     "/api/v1/admin/integrated-sites",
+    { q: search.q, page: search.page, pageSize: search.pageSize },
   );
 
   const setSearch = (patch: Record<string, string | number | undefined>) => {
@@ -332,6 +333,10 @@ export function IntegrationsSection() {
       <ListTable<IntegratedSite>
         columns={columns}
         data={query.data}
+        serverSearch
+        serverPagination
+        refreshSection="integrated-sites"
+        total={query.total}
         search={search.q ?? ""}
         onSearchChange={(q) => setSearch({ q: q || undefined, page: 1 })}
         page={search.page ?? 1}
@@ -1093,6 +1098,7 @@ function SiteCredentialsTab({ siteId }: { siteId: string }) {
   const query = useAdminList<SiteCredential>(
     "site-credentials",
     `/api/v1/admin/integrated-sites/${siteId}/credentials`,
+    { q: search, page, pageSize },
   );
 
   const revoke = useAdminMutation<SiteCredential, string>({
@@ -1252,6 +1258,10 @@ function SiteCredentialsTab({ siteId }: { siteId: string }) {
       <ListTable<SiteCredential>
         columns={columns}
         data={query.data}
+        serverSearch
+        serverPagination
+        refreshSection="site-credentials"
+        total={query.total}
         search={search}
         onSearchChange={(q) => {
           setSearch(q);

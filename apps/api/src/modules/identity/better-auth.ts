@@ -133,8 +133,27 @@ export function createBetterAuth(
       // TOTP (authenticator app) + backup codes. Backup codes MUST be
       // stored encrypted — the plugin's default is plaintext JSON
       // (encodeBackupCodes returns raw JSON without the option).
+      //
+      // TRUST DEVICE IS DISABLED (audit API M-12, 2026-11-19):
+      // `trustDeviceMaxAge: 0` means a successful TOTP/backup-code
+      // verification can never mint the 30-day trust cookie the plugin
+      // otherwise sets when the verify body carries `trustDevice: true`
+      // (better-auth 1.7.23 dist/plugins/two-factor/verify-two-factor.mjs:
+      // the cookie is created with maxAge = trustDeviceMaxAge, and the
+      // sign-in after-hook skips the 2FA challenge entirely while a
+      // valid trust cookie is presented). The SPA never sends
+      // `trustDevice`, so disabling changes nothing for the product's
+      // own client — but any direct API caller could otherwise buy 30
+      // days of password-only sign-in with one verified code, and
+      // cookie theft in that window would be a full 2FA bypass, with
+      // no UI or admin view of trusted devices. If the owner ever
+      // wants trusted devices, do NOT just raise this number: the
+      // mint must go through an allowlisted app.ts path that records
+      // it in the audit log, and the device list must be visible to
+      // the user.
       twoFactor({
         issuer: "StackMate",
+        trustDeviceMaxAge: 0,
         totpOptions: { digits: 6, period: 30 },
         backupCodeOptions: { storeBackupCodes: "encrypted" },
       }),

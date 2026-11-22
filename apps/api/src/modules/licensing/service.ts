@@ -28,6 +28,7 @@ import type {
   DatabaseState,
   LicenseActivationRecord,
   LicenseEntitlementSnapshotRecord,
+  LicenseEventRecord,
   LicenseRecord,
   OrderItemRecord,
   OrderRecord,
@@ -37,6 +38,45 @@ import type {
 import { AppError } from "../../shared/errors.ts";
 import { appendAuditLog } from "../audit/service.ts";
 import { assertStaffPermission, type StaffPrincipal } from "../identity/service.ts";
+
+/**
+ * Append one license_events row (F-04). The single implementation for
+ * every license transition — the activation module imports this (it
+ * already imports `issueLicenseForOrderItemInTx` from here, so the
+ * dependency runs one way: activation → licensing, never a cycle).
+ * Returns the created row: callers thread its id into the outbox
+ * `event_key` (F-06) so the key is deterministic.
+ *
+ * WHY THIS MATTERS (F-04): the missed-schedule sweep decides
+ * reactivation purely from the LATEST license_events row
+ * (`missedScheduleSuspendedLicenses`). A manual suspend/resume that
+ * writes no row is invisible to the sweep, so a staff suspension
+ * could be silently auto-reactivated the next time an installment
+ * was paid. Manual transitions therefore write rows with
+ * `metadata.reason === "manual"`.
+ */
+export function recordLicenseEventInTx(
+  state: DatabaseState,
+  license: LicenseRecord,
+  eventType: "activated" | "suspended" | "reactivated" | "expired",
+  actorType: "system" | "staff" | "client",
+  actorUserId: string | null,
+  metadata: Record<string, unknown>,
+  nowIso: string
+): LicenseEventRecord {
+  const row: LicenseEventRecord = {
+    id: randomUUID(),
+    license_id: license.id,
+    event_type: eventType,
+    actor_type: actorType,
+    actor_user_id: actorUserId,
+    activation_id: null,
+    metadata,
+    created_at: nowIso,
+  };
+  state.license_events.push(row);
+  return row;
+}
 
 export function issueLicenseForOrderItemInTx(
   state: DatabaseState,
@@ -239,7 +279,7 @@ function assertLicenseIsUsable(
 export async function activateLicenseInstallation(
   store: StackMateDataStore,
   rawInput: unknown,
-  config: { verifierSecret: string; issuerUrl: string }
+  config: { verifierSecret: string; issuerUrl: string; requestId: string }
 ): Promise<{
   valid: true;
   license_number: string;
@@ -280,6 +320,10 @@ export async function activateLicenseInstallation(
     let activation = license.activations.find(
       (a) => a.installation_id_hash === installHash
     );
+    // M-14: audit only real transitions (a new activation row, or a
+    // non-active one flipped back to active) — not heartbeat
+    // re-activations of an already-active installation.
+    let changed = false;
 
     if (activation) {
       if (activation.status === "blocked") {
@@ -296,6 +340,7 @@ export async function activateLicenseInstallation(
         }
         activation.status = "active";
         activation.deactivated_at = null;
+        changed = true;
       }
       activation.last_seen_at = nowIso;
       if (normalizedDomain) activation.domain_normalized = normalizedDomain;
@@ -327,10 +372,33 @@ export async function activateLicenseInstallation(
         created_at: nowIso,
       };
       license.activations.push(activation);
+      changed = true;
     }
 
     const signed = buildSignedEntitlementToken(store, license, productCode, config.issuerUrl);
     const activeCountAfter = license.activations.filter((a) => a.status === "active").length;
+
+    // M-14: a license activation is a mutation (a seat is consumed) —
+    // it belongs in the audit log. Actor "system": the caller proved a
+    // license key, not a staff session. The activation id (not the
+    // installation hash) is what staff correlate on.
+    if (changed) {
+      appendAuditLog(state, {
+        actor_type: "system",
+        action: "licensing.activation.activated",
+        resource_type: "license",
+        resource_id: license.id,
+        outcome: "success",
+        request_id: config.requestId,
+        changes: {
+          license_number: license.license_number,
+          activation_id: activation.id,
+          environment: activation.environment,
+          active_count: activeCountAfter,
+          activation_limit: license.activation_limit,
+        },
+      });
+    }
 
     return {
       valid: true,
@@ -404,7 +472,7 @@ export async function validateLicenseInstallation(
 export async function deactivateLicenseInstallation(
   store: StackMateDataStore,
   rawInput: unknown,
-  config: { verifierSecret: string }
+  config: { verifierSecret: string; requestId: string }
 ): Promise<{
   deactivated: true;
   license_number: string;
@@ -437,6 +505,21 @@ export async function deactivateLicenseInstallation(
     if (activation.status === "active") {
       activation.status = "deactivated";
       activation.deactivated_at = new Date().toISOString();
+      // M-14: freeing a seat is a mutation — audit the transition
+      // (idempotent re-deactivations of an already-deactivated
+      // installation write no row).
+      appendAuditLog(state, {
+        actor_type: "system",
+        action: "licensing.activation.deactivated",
+        resource_type: "license",
+        resource_id: license.id,
+        outcome: "success",
+        request_id: config.requestId,
+        changes: {
+          license_number: license.license_number,
+          activation_id: activation.id,
+        },
+      });
     }
 
     const activeCount = license.activations.filter((a) => a.status === "active").length;
@@ -579,16 +662,40 @@ export async function transitionLicenseStatusByAdmin(
     const prev = license.status;
     const now = new Date().toISOString();
 
+    // F-15: revoke is terminal — revoking an already-revoked license
+    // must 409 instead of writing a duplicate outbox event + audit row.
+    if (action === "revoke" && license.status === "revoked") {
+      throw new AppError("CONFLICT", "License is already revoked.", 409);
+    }
+
+    // F-04: manual suspend/resume MUST write license_events rows. The
+    // missed-schedule sweep decides reactivation purely from the
+    // LATEST license_events row — without a row here, a staff
+    // suspension is invisible to the sweep and gets silently
+    // auto-reactivated the next time an installment is paid. The rows
+    // carry `reason: "manual"` so the sweep never treats them as
+    // missed-schedule suspensions.
+    let licenseEventId: string | null = null;
     if (action === "suspend") {
       if (license.status !== "active") {
         throw new AppError("CONFLICT", "Only active licenses can be suspended.", 409);
       }
       license.status = "suspended";
+      licenseEventId = recordLicenseEventInTx(state, license, "suspended", "staff", actor.user.id, {
+        reason: "manual",
+        from_status: prev,
+        to_status: "suspended",
+      }, now).id;
     } else if (action === "resume") {
       if (license.status !== "suspended") {
         throw new AppError("CONFLICT", "Only suspended licenses can be resumed.", 409);
       }
       license.status = "active";
+      licenseEventId = recordLicenseEventInTx(state, license, "reactivated", "staff", actor.user.id, {
+        reason: "manual",
+        from_status: prev,
+        to_status: "active",
+      }, now).id;
     } else if (action === "revoke") {
       license.status = "revoked";
       for (const act of license.activations) {
@@ -600,9 +707,20 @@ export async function transitionLicenseStatusByAdmin(
     }
     license.updated_at = now;
 
+    // F-06: the outbox key is deterministic. Suspend/resume keys carry
+    // the license_events row id they describe; revoke has no event row
+    // (there is no "revoked" license event type) but the F-15 guard
+    // above guarantees exactly one successful revoke, so
+    // `license.revoke:<id>` can never collide.
+    const eventKey =
+      action === "revoke"
+        ? `license.revoke:${license.id}`
+        : action === "suspend"
+          ? `license.suspended:${license.id}:${licenseEventId}`
+          : `entitlement.updated:${license.id}:${licenseEventId}`;
     state.outbox_events.push({
       id: randomUUID(),
-      event_key: `license.${action}:${license.id}:${Date.now()}`,
+      event_key: eventKey,
       aggregate_type: "license",
       aggregate_id: license.id,
       event_type:

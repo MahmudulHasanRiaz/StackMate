@@ -15,6 +15,8 @@ import {
   ApprovePaymentSubmissionSchema,
   CreatePaymentMethodSchema,
   CreatePaymentProviderSchema,
+  formatDisplayDateDDMMYYYY,
+  isValidIsoDateOnly,
   parseStrictDDMMYYYYToIsoDate,
   RejectPaymentSubmissionSchema,
   SubmitManualPaymentSchema,
@@ -22,6 +24,7 @@ import {
   UpdatePaymentMethodSchema,
   UpdatePaymentProviderSchema,
 } from "../../../../../packages/contracts/src/index.ts";
+import { businessTodayIso } from "../activation/service.ts";
 import { storeValidatedPrivateObject } from "../../platform/storage/driver.ts";
 import type { StorageDriver } from "../../platform/storage/driver.ts";
 import type {
@@ -31,12 +34,14 @@ import type {
   OrderRecord,
   PaymentMethodRecord,
   PaymentProviderRecord,
+  PaymentRefundRecord,
   PaymentSubmissionRecord,
   PaymentTransactionRecord,
   StackMateDataStore,
   SubscriptionRecord,
   UploadedAssetRecord,
 } from "../../platform/db/store.ts";
+export type { PaymentRefundRecord } from "../../platform/db/store.ts";
 import { AppError } from "../../shared/errors.ts";
 import {
   evaluateActivationForOrderInTx,
@@ -185,8 +190,23 @@ export async function uploadPrivatePaymentEvidence(
     bucketName: string;
     /** Resolved storage driver (R2 or Local, per Settings → Storage). */
     driver: StorageDriver;
+    /**
+     * H-1: who uploaded. Staff (admin route) → the permission is
+     * asserted here and the upload is audited as staff. Null (public
+     * checkout route) → the route already proved the site key +
+     * checkout token + order reference; the upload is audited as the
+     * integration instead. There is no unauthenticated path.
+     */
+    actor: StaffPrincipal | null;
+    integratedSiteId?: string | null;
+    requestId: string;
   }
-): Promise<UploadedAssetRecord> {
+): Promise<PaymentEvidenceUploadDto> {
+  // H-1: the admin upload path has a service-level permission check
+  // (the route-level check is the core agent's part). The public path
+  // passes actor null — its authorization is the checkout token, which
+  // the route verified before calling here.
+  if (input.actor) assertStaffPermission(input.actor, "payments.approve");
   const assetId = randomUUID();
   const objectKey = `payment-evidence/${input.orderId}/${assetId}`;
   const stored = await storeValidatedPrivateObject({
@@ -208,13 +228,62 @@ export async function uploadPrivatePaymentEvidence(
       byte_size: stored.byteSize,
       checksum_sha256: stored.checksumSha256,
       visibility: "private",
-      uploaded_by_user_id: null,
+      uploaded_by_user_id: input.actor ? input.actor.user.id : null,
       owner_customer_id: input.customerId,
       created_at: new Date().toISOString(),
     };
     state.uploaded_assets.push(asset);
-    return asset;
+    // H-1: the upload is auditable — who, for which order, what file.
+    appendAuditLog(state, {
+      actor_type: input.actor ? "staff" : "integration",
+      actor_user_id: input.actor ? input.actor.user.id : null,
+      integrated_site_id: input.actor ? null : (input.integratedSiteId ?? null),
+      action: "payments.evidence.uploaded",
+      resource_type: "uploaded_asset",
+      resource_id: asset.id,
+      outcome: "success",
+      request_id: input.requestId,
+      changes: {
+        order_id: input.orderId,
+        customer_id: input.customerId,
+        original_filename: asset.original_filename,
+        content_type: asset.content_type,
+        byte_size: asset.byte_size,
+      },
+    });
+    // L-10: the response is a MINIMAL DTO — never the full asset
+    // record. The R2 object key / bucket name must never reach a
+    // client (the old code returned them verbatim on the admin route).
+    return toPaymentEvidenceUploadDto(asset);
   });
+}
+
+/**
+ * Minimal evidence-upload response (L-10). The client needs the asset
+ * id to attach it to a claim — nothing else. Storage keys stay
+ * server-side; downloads go through the authenticated content
+ * endpoint, which resolves the driver.
+ */
+export interface PaymentEvidenceUploadDto {
+  id: string;
+  original_filename: string;
+  content_type: string;
+  byte_size: number;
+  checksum_sha256: string;
+  visibility: "private";
+  created_at: string;
+}
+
+export function toPaymentEvidenceUploadDto(asset: UploadedAssetRecord): PaymentEvidenceUploadDto {
+  return {
+    id: asset.id,
+    original_filename: asset.original_filename,
+    content_type: asset.content_type,
+    byte_size: asset.byte_size,
+    checksum_sha256: asset.checksum_sha256,
+    visibility: "private",
+    created_at: asset.created_at,
+  };
 }
 
 /**
@@ -341,10 +410,16 @@ export function createInstallmentsForOrderInTx(
   state: DatabaseState,
   order: OrderRecord,
   plan: PaymentPlanInput | undefined,
-  now: Date
+  now: Date,
+  /**
+   * F-12: the default due date is TODAY IN THE BUSINESS TIMEZONE, not
+   * the UTC date — an order created at 01:00 Dhaka would otherwise
+   * get a due date of "yesterday" (UTC) and read as missed on day one.
+   */
+  timeZone = "Asia/Dhaka"
 ): OrderInstallmentRecord[] {
   const nowIso = now.toISOString();
-  const today = nowIso.slice(0, 10);
+  const today = businessTodayIso(now, timeZone);
   const kind = plan?.kind ?? "full";
   const rows: Array<{ amount_minor: number; due_date: string }> = [];
 
@@ -402,12 +477,26 @@ export function createInstallmentsForOrderInTx(
   return created;
 }
 
+/**
+ * Canonical transaction-reference form (F-01): uppercase, all
+ * whitespace stripped. "bkash 123", "BKASH123" and "Bkash  123" are
+ * the SAME reference — every comparison (claim-time duplicate check,
+ * approval-time double-approval guard, stored
+ * `provider_transaction_id`) must use this form, or the same money
+ * approves twice under two spellings.
+ */
+export function normalizeTransactionReference(raw: string): string {
+  return raw.toUpperCase().replace(/\s+/g, "");
+}
+
 export async function submitManualPaymentClaim(
   store: StackMateDataStore,
   input: {
     orderPublicReference: string;
     idempotencyKey: string;
     rawBody: unknown;
+    /** M-14: the HTTP request id, for the claim audit row. */
+    requestId: string;
   }
 ): Promise<{
   replayed: boolean;
@@ -503,7 +592,7 @@ export async function submitManualPaymentClaim(
         }
       }
 
-      const normalizedTxn = rawTxn ? rawTxn.toUpperCase().replace(/\s+/g, "") : null;
+      const normalizedTxn = rawTxn ? normalizeTransactionReference(rawTxn) : null;
       let duplicateWarning = false;
       if (normalizedTxn) {
         const existingSubmissionWithRef = state.payment_submissions.find(
@@ -553,6 +642,26 @@ export async function submitManualPaymentClaim(
       state.payment_submissions.push(submission);
       order.payment_status = "pending_verification";
       order.updated_at = nowIso;
+
+      // M-14: a public payment claim is a money mutation — it belongs
+      // in the audit log (actor "integration": the claim arrived
+      // through the site's checkout token; the order's site id is the
+      // attribution). Idempotent replays do not re-run this callback,
+      // so the row is written exactly once per claim.
+      appendAuditLog(state, {
+        actor_type: "integration",
+        integrated_site_id: order.integrated_site_id,
+        action: "payments.submission.claimed",
+        resource_type: "payment_submission",
+        resource_id: submission.id,
+        outcome: "success",
+        request_id: input.requestId,
+        changes: {
+          order_id: order.id,
+          amount_minor: submission.amount_minor,
+          currency_code: submission.currency_code,
+        },
+      });
 
       state.outbox_events.push({
         id: randomUUID(),
@@ -612,7 +721,16 @@ export async function approvePaymentSubmissionByStaff(
   actor: StaffPrincipal,
   submissionId: string,
   rawInput: unknown,
-  config: { licenseVerifierSecret: string; requestId: string }
+  config: {
+    licenseVerifierSecret: string;
+    requestId: string;
+    /**
+     * F-12: business timezone for the activation/suspension date
+     * boundaries (callers pass `env.DEFAULT_TIMEZONE`). Omitted →
+     * Asia/Dhaka (the env default) inside the evaluation functions.
+     */
+    timeZone?: string | undefined;
+  }
 ): Promise<{
   submission: PaymentSubmissionRecord;
   transaction: PaymentTransactionRecord;
@@ -693,6 +811,34 @@ export async function approvePaymentSubmissionByStaff(
       throw new AppError("NOT_FOUND", "Payment method not found.", 404);
     }
 
+    // F-01: the claim-time check only rejects a ref already approved
+    // on ANOTHER submission. Two submissions carrying the same ref can
+    // both sit in "submitted" and both be approved in sequence — the
+    // second approval would mint a second transaction and phantom
+    // credit. Guard here, inside the serialized transaction (the
+    // drizzle store takes a global writer advisory lock, so two
+    // approvals can never interleave): a succeeded transaction already
+    // exists for this (provider, normalized ref).
+    const approvalRef = normalizeTransactionReference(
+      submission.normalized_transaction_reference ?? input.verification_reference
+    );
+    if (approvalRef !== "") {
+      const alreadySettled = state.payment_transactions.find(
+        (t) =>
+          t.provider_id === method.provider_id &&
+          t.status === "succeeded" &&
+          t.provider_transaction_id !== null &&
+          normalizeTransactionReference(t.provider_transaction_id) === approvalRef
+      );
+      if (alreadySettled) {
+        throw new AppError(
+          "DUPLICATE_TRANSACTION_REFERENCE",
+          "This transaction reference has already been verified and approved on another payment.",
+          409
+        );
+      }
+    }
+
     const nowIso = new Date().toISOString();
     submission.status = "approved";
     submission.reviewed_at = nowIso;
@@ -719,8 +865,12 @@ export async function approvePaymentSubmissionByStaff(
       payment_method_id: method.id,
       payment_submission_id: submission.id,
       provider_id: method.provider_id,
+      // Stored NORMALIZED (F-01): the raw verification_reference may
+      // carry spaces/case that would defeat the duplicate guard on the
+      // next approval of the same money.
       provider_transaction_id:
-        submission.normalized_transaction_reference ?? input.verification_reference,
+        submission.normalized_transaction_reference ??
+        (approvalRef !== "" ? approvalRef : null),
       amount_minor: input.verified_amount_minor,
       currency_code: order.currency_code,
       status: "succeeded",
@@ -774,12 +924,14 @@ export async function approvePaymentSubmissionByStaff(
       paymentTransactionId: transaction.id,
       actorUserId: actor.user.id,
       requestId: config.requestId,
+      timeZone: config.timeZone,
     });
     const subscriptionsCreated = activation.subscriptions;
     const licensesIssued = activation.issued_licenses;
     evaluateSuspensionForOrderInTx(state, order, new Date(nowIso), {
       actorUserId: actor.user.id,
       requestId: config.requestId,
+      timeZone: config.timeZone,
     });
 
     // Outbox events: payment.approved, order.paid, and verified Meta Purchase event (API Spec §17.4)
@@ -979,6 +1131,308 @@ export async function rejectPaymentSubmissionByStaff(
     });
 
     return submission;
+  });
+}
+
+// -- Manual refunds (audit F-03, decision D-4) -----------------------------
+// Manual refunds ONLY — no gateway, no provider API call. Staff records
+// money handed back by hand; the refund is "succeeded" the moment it
+// is recorded. The refund facts live in `payment_refunds` (DB spec
+// §13.8); the original transaction row is never overwritten — its
+// status only reflects the refunded state (succeeded →
+// Refund record (DB spec §13.8, table `payment_refunds` since
+// migration 0000). Lives in platform/db/store.ts — imported +
+// re-exported here so existing import sites keep working.
+
+/** The `payment_refunds` collection. Fails closed when the collection
+ * is not wired rather than silently dropping the refund row. */
+function refundState(state: DatabaseState): PaymentRefundRecord[] {
+  const refunds = state.payment_refunds;
+  if (!Array.isArray(refunds)) {
+    throw new AppError(
+      "INTERNAL_ERROR",
+      "Manual refunds are unavailable: the payment_refunds state collection is not wired.",
+      500
+    );
+  }
+  return refunds;
+}
+
+export interface RecordManualRefundInput {
+  /** Refund against this transaction (preferred). */
+  payment_transaction_id?: string | null;
+  /** Or the latest refundable transaction of this order. */
+  order_id?: string | null;
+  amount_minor: number;
+  currency_code: string;
+  /** Why the money is going back (required, max 1000 chars). */
+  reason: string;
+  /** Optional provider/bank refund reference (e.g. a bKash refund TrxID). */
+  provider_refund_id?: string | null;
+}
+
+/**
+ * Reverse a refund out of installments, NEWEST-first — the mirror of
+ * approval's oldest-first allocation, so the most recent money comes
+ * back first. Never drives a paid amount below zero.
+ */
+export function reverseRefundFromInstallmentsInTx(
+  state: DatabaseState,
+  order: OrderRecord,
+  amountMinor: number
+): InstallmentAllocation[] {
+  const nowIso = new Date().toISOString();
+  const installments = state.order_installments
+    .filter((i) => i.order_id === order.id && i.paid_amount_minor > 0)
+    .sort((a, b) =>
+      a.due_date === b.due_date
+        ? b.installment_number - a.installment_number
+        : a.due_date < b.due_date
+          ? 1
+          : -1
+    );
+  const allocations: InstallmentAllocation[] = [];
+  let remaining = amountMinor;
+  for (const inst of installments) {
+    if (remaining <= 0) break;
+    const take = Math.min(inst.paid_amount_minor, remaining);
+    inst.paid_amount_minor -= take;
+    inst.status = inst.paid_amount_minor === 0 ? "pending" : "partially_paid";
+    inst.paid_at = null;
+    inst.updated_at = nowIso;
+    allocations.push({ installment_id: inst.id, amount_minor: take });
+    remaining -= take;
+  }
+  return allocations;
+}
+
+export async function recordManualRefundByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  rawInput: RecordManualRefundInput,
+  requestId: string
+): Promise<{
+  refund: PaymentRefundRecord;
+  transaction: PaymentTransactionRecord;
+  order: OrderRecord;
+}> {
+  assertStaffPermission(actor, "payments.approve");
+  // No Zod schema in packages/contracts yet — the core agent adds
+  // `RecordManualRefundSchema` + the route; the service validates the
+  // plain input shape here so the rules hold whichever way it is called.
+  const input = rawInput as RecordManualRefundInput | null | undefined;
+  if (!input || typeof input !== "object") {
+    throw new AppError("VALIDATION_ERROR", "Refund input is required.", 422);
+  }
+  const amount = input.amount_minor;
+  if (!Number.isInteger(amount) || amount <= 0) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "amount_minor must be a positive integer (minor units).",
+      422
+    );
+  }
+  const currency = (input.currency_code ?? "").trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    throw new AppError("VALIDATION_ERROR", "currency_code must be a 3-letter code.", 422);
+  }
+  const reason = (input.reason ?? "").trim();
+  if (reason === "" || reason.length > 1000) {
+    throw new AppError("VALIDATION_ERROR", "reason is required (max 1000 characters).", 422);
+  }
+  const providerRefundId =
+    input.provider_refund_id?.trim() && input.provider_refund_id.trim().length > 0
+      ? input.provider_refund_id.trim().slice(0, 180)
+      : null;
+
+  return store.withTransaction((state) => {
+    // Resolve the transaction: an explicit id wins; otherwise the
+    // latest refundable transaction of the order.
+    let transaction: PaymentTransactionRecord | undefined;
+    if (input.payment_transaction_id) {
+      transaction = state.payment_transactions.find(
+        (t) => t.id === input.payment_transaction_id
+      );
+      if (!transaction) {
+        throw new AppError("NOT_FOUND", "Payment transaction not found.", 404);
+      }
+    } else if (input.order_id) {
+      const candidates = state.payment_transactions
+        .filter(
+          (t) =>
+            t.order_id === input.order_id &&
+            (t.status === "succeeded" || t.status === "partially_refunded")
+        )
+        .sort((a, b) => (a.created_at < b.created_at ? 1 : -1));
+      transaction = candidates[0];
+      if (!transaction) {
+        throw new AppError(
+          "NOT_FOUND",
+          "Order has no refundable payment transaction.",
+          404
+        );
+      }
+    } else {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        "Provide payment_transaction_id or order_id.",
+        422
+      );
+    }
+    if (transaction.status !== "succeeded" && transaction.status !== "partially_refunded") {
+      throw new AppError(
+        "CONFLICT",
+        `Payment transaction is '${transaction.status}' and cannot be refunded.`,
+        409
+      );
+    }
+    if (transaction.currency_code !== currency) {
+      throw new AppError(
+        "PAYMENT_AMOUNT_MISMATCH",
+        `Refund currency '${currency}' does not match transaction currency '${transaction.currency_code}'.`,
+        422
+      );
+    }
+    const order = state.orders.find((o) => o.id === transaction.order_id);
+    if (!order) {
+      throw new AppError("NOT_FOUND", "Associated order not found.", 404);
+    }
+    const customer = state.customers.find((c) => c.id === order.customer_id);
+    if (!customer) {
+      throw new AppError("NOT_FOUND", "Associated customer not found.", 404);
+    }
+
+    // Refundable ceiling: the transaction's own amount minus refunds
+    // already recorded against it (a second refund of the same money
+    // is a 422, not phantom negative money).
+    const refunds = refundState(state);
+    const alreadyRefunded = refunds
+      .filter(
+        (r) => r.payment_transaction_id === transaction.id && r.status === "succeeded"
+      )
+      .reduce((sum, r) => sum + r.amount_minor, 0);
+    const maxRefundable = transaction.amount_minor - alreadyRefunded;
+    if (amount > maxRefundable) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        `Refund (${amount}) exceeds the transaction's remaining refundable amount (${maxRefundable}).`,
+        422
+      );
+    }
+
+    // The refund draws from the order's paid amount first (newest
+    // installments first); any remainder comes out of the customer's
+    // credit balance — the overpayment portion of this transaction.
+    // If that credit was already spent on another order, the refund
+    // is rejected rather than driving a balance negative; staff
+    // resolve the credit first.
+    const nowIso = new Date().toISOString();
+    const orderPaidBefore = computeOrderPaid(state, order.id);
+    const fromOrder = Math.min(amount, orderPaidBefore);
+    const fromCredit = amount - fromOrder;
+    if (fromCredit > customer.credit_balance_minor) {
+      throw new AppError(
+        "CREDIT_EXCEEDS_BALANCE",
+        `Refund exceeds the order's paid amount by ${fromCredit}, but the customer's credit balance is only ${customer.credit_balance_minor} — the credit was already used. Resolve the credit before refunding this amount.`,
+        422
+      );
+    }
+
+    const refund: PaymentRefundRecord = {
+      id: randomUUID(),
+      payment_transaction_id: transaction.id,
+      amount_minor: amount,
+      currency_code: currency,
+      // D-4: manual refund — the money was handed back by hand, so
+      // there is no provider call to await; it is succeeded on record.
+      status: "succeeded",
+      reason,
+      provider_refund_id: providerRefundId,
+      requested_by_user_id: actor.user.id,
+      processed_by_user_id: actor.user.id,
+      created_at: nowIso,
+      updated_at: nowIso,
+    };
+    refunds.push(refund);
+
+    const totalRefundedAfter = alreadyRefunded + amount;
+    transaction.status =
+      totalRefundedAfter >= transaction.amount_minor ? "refunded" : "partially_refunded";
+
+    const allocations = reverseRefundFromInstallmentsInTx(state, order, fromOrder);
+    if (fromCredit > 0) {
+      customer.credit_balance_minor -= fromCredit;
+      customer.updated_at = nowIso;
+    }
+
+    const paidAfter = computeOrderPaid(state, order.id);
+    const remainingAfter = Math.max(0, order.total_minor - paidAfter);
+    order.payment_status =
+      remainingAfter === 0 ? "paid" : paidAfter > 0 ? "partially_paid" : "unpaid";
+    // order.status is deliberately untouched: fulfillment already
+    // happened (licenses/subscriptions stay). If the refund voids the
+    // entitlement, staff revoke/suspend the license as a separate,
+    // explicit action.
+    order.updated_at = nowIso;
+
+    for (const inv of state.invoices) {
+      if (
+        inv.order_id === order.id &&
+        (inv.status === "open" || inv.status === "partially_paid" || inv.status === "paid")
+      ) {
+        inv.amount_paid_minor = Math.min(inv.total_minor, paidAfter);
+        inv.amount_due_minor = Math.max(0, inv.total_minor - paidAfter);
+        inv.status =
+          inv.amount_due_minor === 0 ? "paid" : paidAfter > 0 ? "partially_paid" : "open";
+        inv.paid_at = inv.status === "paid" ? (inv.paid_at ?? nowIso) : null;
+      }
+    }
+
+    state.outbox_events.push({
+      id: randomUUID(),
+      event_key: `payment.refunded:${refund.id}`,
+      aggregate_type: "payment_transaction",
+      aggregate_id: transaction.id,
+      event_type: "payment.refunded",
+      payload: {
+        order_reference: order.public_reference,
+        payment_transaction_id: transaction.id,
+        refund_id: refund.id,
+        amount_minor: amount,
+        currency_code: currency,
+      },
+      status: "pending",
+      attempt_count: 0,
+      available_at: nowIso,
+      locked_until: null,
+      locked_by: null,
+      last_error_code: null,
+      created_at: nowIso,
+      processed_at: null,
+    });
+
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "payments.refund.recorded",
+      resource_type: "payment_refund",
+      resource_id: refund.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: {
+        order_id: order.id,
+        payment_transaction_id: transaction.id,
+        amount_minor: amount,
+        currency_code: currency,
+        reason,
+        from_order_minor: fromOrder,
+        from_credit_minor: fromCredit,
+        transaction_status: transaction.status,
+        installment_allocations: allocations,
+      },
+    });
+
+    return { refund, transaction, order };
   });
 }
 
@@ -1238,7 +1692,7 @@ export async function recordManualPaymentClaimByAdmin(
         throw new AppError("VALIDATION_ERROR", (err as Error).message, 422);
       }
     }
-    const normalizedTxn = rawTxn ? rawTxn.toUpperCase().replace(/\s+/g, "") : null;
+    const normalizedTxn = rawTxn ? normalizeTransactionReference(rawTxn) : null;
     let duplicateWarning = false;
     if (normalizedTxn) {
       const existingSubmissionWithRef = state.payment_submissions.find(
@@ -1345,8 +1799,10 @@ export async function updateInstallmentByAdmin(
     const changes: Record<string, unknown> = {};
     if (input.due_date !== undefined && input.due_date !== null) {
       const raw = input.due_date.trim();
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
-        throw new AppError("VALIDATION_ERROR", `Invalid due date '${raw}' — expected YYYY-MM-DD.`, 422);
+      // Strict ISO date (AGENTS.md §7): the old regex-only check
+      // accepted impossible dates like 2026-02-30.
+      if (!isValidIsoDateOnly(raw)) {
+        throw new AppError("VALIDATION_ERROR", `Invalid due date '${raw}' — expected a real YYYY-MM-DD date.`, 422);
       }
       inst.due_date = raw;
       changes.due_date = raw;

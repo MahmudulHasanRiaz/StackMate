@@ -407,6 +407,13 @@ SETUP_TOKEN: TEST_SETUP_TOKEN,
   // passing. The 2FA 403 INVALID_ORIGIN is unchanged (the vars are
   // still missing in this shape); the dedicated enforcement suite is
   // `csrf-gate-secure-cookie.test.ts`.
+  // UPDATE (H-7, audit fix 2026-11-19): staging/production FAILS
+  // CLOSED when any URL var points at localhost, so the literal
+  // all-localhost S3 shape can no longer boot. The env below keeps
+  // the S3 mismatch structure with placeholder hosts that still do
+  // not name the staging origin: TRUSTED_ORIGINS excludes it (the
+  // PATCH still 403s via the app CSRF gate) and BETTER_AUTH_URL
+  // names a different host (2FA enable still 403s INVALID_ORIGIN).
   it("staging cookie is __Secure- prefixed and the app CSRF gate now enforces it (S3 env, decision 10)", async () => {
     const originUrl = new URL(DATABASE_URL!);
     originUrl.pathname = `/${ORIGIN_DB_NAME}`;
@@ -421,10 +428,10 @@ SETUP_TOKEN: TEST_SETUP_TOKEN,
       LICENSE_VERIFIER_SECRET: hex64,
       CHECKOUT_TOKEN_SECRET: hex64,
       HYPERDRIVE_NO_CACHE: { connectionString: dbUrl },
-      BETTER_AUTH_URL: "http://localhost:8787",
-      TRUSTED_ORIGINS: LOCALHOST_URLS,
-      API_URL: "http://localhost:8787",
-      APP_URL: "http://localhost:5173",
+      BETTER_AUTH_URL: "https://auth.example.com",
+      TRUSTED_ORIGINS: "https://app.example.com,https://api.example.com",
+      API_URL: "https://api.example.com",
+      APP_URL: "https://app.example.com",
     });
     const stagingApp = createStackMateApp(store);
     const stagingFetch = async (
@@ -462,7 +469,7 @@ SETUP_TOKEN: TEST_SETUP_TOKEN,
     );
     // Same Origin, same cookie, S3 env: the app gate now sees the
     // __Secure- cookie and enforces — the staging Origin is NOT in
-    // this env's TRUSTED_ORIGINS (localhost only), so the PATCH 403s.
+    // this env's TRUSTED_ORIGINS (placeholder hosts only), so the PATCH 403s.
     // Before decision 10 this returned 200 (blind gate).
     const patched = await stagingFetch("/api/v1/admin/me", {
       method: "PATCH",

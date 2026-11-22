@@ -30,6 +30,7 @@ import type {
   SentReminderKind,
 } from "../../platform/db/store.ts";
 import {
+  businessTodayIso,
   evaluateActivationForOrderInTx,
   evaluateSuspensionForOrderInTx,
   expireLicenseInTx,
@@ -113,10 +114,19 @@ export function planSweepInTx(
   state: DatabaseState,
   now: Date,
   licenseVerifierSecret: string,
-  requestId: string
+  requestId: string,
+  /**
+   * F-12: business timezone for every date-only boundary in the sweep
+   * (activation dates, installment due dates, reminder offsets).
+   * Defaults to Asia/Dhaka (the env default). Instants (created_at,
+   * grace_until comparisons) stay UTC — only the `today` boundary
+   * moves: at 01:00 Dhaka the UTC date is still yesterday, so a
+   * UTC `today` would activate/suspend a day late.
+   */
+  timeZone = "Asia/Dhaka"
 ): SweepReport {
   const nowIso = now.toISOString();
-  const today = nowIso.slice(0, 10);
+  const today = businessTodayIso(now, timeZone);
   const settings = getReminderSettings(state);
   const report: SweepReport = {
     run_id: randomUUID(),
@@ -162,6 +172,7 @@ export function planSweepInTx(
         licenseVerifierSecret,
         actorUserId: null,
         requestId,
+        timeZone,
       });
       report.activations += outcome.newly_issued;
     } catch (err) {
@@ -172,7 +183,7 @@ export function planSweepInTx(
         state,
         order,
         now,
-        { actorUserId: null, requestId }
+        { actorUserId: null, requestId, timeZone }
       );
       report.suspensions += suspended.length;
       report.reactivations += reactivated.length;
@@ -338,13 +349,25 @@ export function planSweepInTx(
 /** Run the sweep in one transaction; never throws (errors land in the report). */
 export async function runRenewalExpirySweep(
   store: StackMateDataStore,
-  options: { now?: Date; licenseVerifierSecret: string; requestId?: string }
+  options: {
+    now?: Date;
+    licenseVerifierSecret: string;
+    requestId?: string;
+    /** Business timezone for date-only boundaries (F-12). Defaults to Asia/Dhaka. */
+    timeZone?: string | undefined;
+  }
 ): Promise<SweepReport> {
   const now = options.now ?? new Date();
   const requestId = options.requestId ?? `cron:sweep:${now.toISOString()}`;
   try {
     return await store.withTransaction((state) =>
-      planSweepInTx(state, now, options.licenseVerifierSecret, requestId)
+      planSweepInTx(
+        state,
+        now,
+        options.licenseVerifierSecret,
+        requestId,
+        options.timeZone ?? "Asia/Dhaka"
+      )
     );
   } catch (err) {
     // The transaction itself failed — return an empty report carrying the error.

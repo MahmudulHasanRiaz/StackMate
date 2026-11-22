@@ -157,10 +157,15 @@ export function PaymentMethodsSection() {
   const [providerPage, setProviderPage] = useState(1);
   const [providerPageSize, setProviderPageSize] = useState(25);
 
-  const methods = useAdminList<PaymentMethod>("payment-methods", "/api/v1/admin/payment-methods");
+  const methods = useAdminList<PaymentMethod>("payment-methods", "/api/v1/admin/payment-methods", {
+    q: parsed.q,
+    page: parsed.page,
+    pageSize: parsed.pageSize,
+  });
   const providers = useAdminList<PaymentProvider>(
     "payment-providers",
     "/api/v1/admin/payment-providers",
+    { q: providerSearch, page: providerPage, pageSize: providerPageSize },
   );
   const providerById = useMemo(
     () => new Map((providers.data ?? []).map((p) => [p.id, p])),
@@ -265,6 +270,10 @@ export function PaymentMethodsSection() {
         <ListTable<PaymentMethod>
           columns={columns}
           data={methods.data}
+          serverSearch
+          serverPagination
+          refreshSection="payment-methods"
+          total={methods.total}
           search={parsed.q ?? ""}
           onSearchChange={(q) => setSearch({ q: q || null, page: 1 })}
           page={parsed.page ?? 1}
@@ -385,6 +394,10 @@ function ProvidersTable({
       <ListTable<PaymentProvider>
         columns={columns}
         data={providers.data}
+        serverSearch
+        serverPagination
+        refreshSection="payment-providers"
+        total={providers.total}
         search={search}
         onSearchChange={onSearchChange}
         page={page}
@@ -487,9 +500,10 @@ function ProviderForm({
     >
       <div className="sm-form-grid">
         {!initial ? (
-          <Field label="Provider key" required hint="Lowercase, unique. Never changes." error={errors.provider_key ?? ""}>
+          <Field label="Provider key" required htmlFor="provider-key" hint="Lowercase, unique. Never changes." error={errors.provider_key ?? ""}>
             <Input
               id="provider-key"
+              name="provider_key"
               value={providerKey}
               onChange={(e) => setProviderKey(e.target.value)}
               aria-invalid={Boolean(errors.provider_key) || undefined}
@@ -497,16 +511,20 @@ function ProviderForm({
             />
           </Field>
         ) : null}
-        <Field label="Display name" required error={errors.display_name ?? ""}>
+        <Field label="Display name" required htmlFor="provider-display-name" error={errors.display_name ?? ""}>
           <Input
+            id="provider-display-name"
+            name="display_name"
             value={displayName}
             onChange={(e) => setDisplayName(e.target.value)}
             aria-invalid={Boolean(errors.display_name) || undefined}
             placeholder="bKash"
           />
         </Field>
-        <Field label="Provider type" required>
+        <Field label="Provider type" required htmlFor="provider-type">
           <Select
+            id="provider-type"
+            name="provider_type"
             value={providerType}
             onChange={(e) => setProviderType(e.target.value as PaymentProvider["provider_type"])}
             disabled={Boolean(initial)}
@@ -516,16 +534,18 @@ function ProviderForm({
             <option value="automated">Automated</option>
           </Select>
         </Field>
-        <Field label="Adapter key" required error={errors.adapter_key ?? ""}>
+        <Field label="Adapter key" required htmlFor="provider-adapter-key" error={errors.adapter_key ?? ""}>
           <Input
+            id="provider-adapter-key"
+            name="adapter_key"
             value={adapterKey}
             onChange={(e) => setAdapterKey(e.target.value)}
             aria-invalid={Boolean(errors.adapter_key) || undefined}
             placeholder="manual-mfs"
           />
         </Field>
-        <Field label="Status" required>
-          <Select value={status} onChange={(e) => setStatus(e.target.value as "enabled" | "disabled")}>
+        <Field label="Status" required htmlFor="provider-status">
+          <Select id="provider-status" name="status" value={status} onChange={(e) => setStatus(e.target.value as "enabled" | "disabled")}>
             <option value="enabled">Enabled</option>
             <option value="disabled">Disabled</option>
           </Select>
@@ -640,10 +660,11 @@ function MethodCreateForm({
       }}
     >
       <div className="sm-form-grid">
-        <Field label="Provider" required error={errors.provider_id ?? ""}>
+        <Field label="Provider" required htmlFor="pm-provider" error={errors.provider_id ?? ""}>
           {/* Searchable (PLAN §29): providers are unbounded — the
              query runs server-side over the full provider set. */}
           <SearchableSelect
+            id="pm-provider"
             value={providerId}
             onChange={(v) => setProviderId(v)}
             loadOptions={(q, signal) =>
@@ -661,74 +682,81 @@ function MethodCreateForm({
             ariaLabel="Provider"
           />
         </Field>
-        <Field label="Method key" required hint="Lowercase, unique per provider." error={errors.method_key ?? ""}>
+        <Field label="Method key" required htmlFor="pm-method-key" hint="Lowercase, unique per provider." error={errors.method_key ?? ""}>
           <Input
+            id="pm-method-key"
+            name="method_key"
             value={methodKey}
             onChange={(e) => setMethodKey(e.target.value)}
             aria-invalid={Boolean(errors.method_key) || undefined}
             placeholder="bkash-personal"
           />
         </Field>
-        <Field label="Display name" required error={errors.display_name ?? ""}>
+        <Field label="Display name" required htmlFor="pm-display-name" error={errors.display_name ?? ""}>
           <Input
+            id="pm-display-name"
+            name="display_name"
             value={displayName}
             onChange={(e) => setDisplayName(e.target.value)}
             aria-invalid={Boolean(errors.display_name) || undefined}
             placeholder="bKash Personal"
           />
         </Field>
-        <Field label="Kind" required>
-          <Select value={methodKind} onChange={(e) => setMethodKind(e.target.value as PaymentMethod["method_kind"])}>
+        <Field label="Kind" required htmlFor="pm-kind">
+          <Select id="pm-kind" name="method_kind" value={methodKind} onChange={(e) => setMethodKind(e.target.value as PaymentMethod["method_kind"])}>
             <option value="mfs_account">MFS account</option>
             <option value="bank_account">Bank account</option>
             <option value="automated_checkout">Automated checkout</option>
           </Select>
         </Field>
         {methodKind === "mfs_account" ? (
-          <Field label="Account type" required>
-            <Select value={accountType} onChange={(e) => setAccountType(e.target.value as "personal" | "merchant" | "agent")}>
+          <Field label="Account type" required htmlFor="pm-account-type">
+            <Select id="pm-account-type" name="account_type" value={accountType} onChange={(e) => setAccountType(e.target.value as "personal" | "merchant" | "agent")}>
               <option value="personal">Personal</option>
               <option value="merchant">Merchant</option>
               <option value="agent">Agent</option>
             </Select>
           </Field>
         ) : null}
-        <Field label="Account label" hint="Shown to customers, e.g. Send Money number.">
-          <Input value={accountLabel} onChange={(e) => setAccountLabel(e.target.value)} placeholder="bKash Send Money" />
+        <Field label="Account label" htmlFor="pm-account-label" hint="Shown to customers, e.g. Send Money number.">
+          <Input id="pm-account-label" name="account_label" value={accountLabel} onChange={(e) => setAccountLabel(e.target.value)} placeholder="bKash Send Money" />
         </Field>
-        <Field label="Account number" required error={errors.account_number ?? ""}>
+        <Field label="Account number" required htmlFor="pm-account-number" error={errors.account_number ?? ""}>
           <Input
+            id="pm-account-number"
+            name="account_number"
+            autoComplete="tel"
             value={accountNumber}
             onChange={(e) => setAccountNumber(e.target.value)}
             aria-invalid={Boolean(errors.account_number) || undefined}
             placeholder="01XXXXXXXXX"
           />
         </Field>
-        <Field label="Account holder name">
-          <Input value={accountHolder} onChange={(e) => setAccountHolder(e.target.value)} />
+        <Field label="Account holder name" htmlFor="pm-account-holder">
+          <Input id="pm-account-holder" name="account_holder_name" autoComplete="name" value={accountHolder} onChange={(e) => setAccountHolder(e.target.value)} />
         </Field>
         {methodKind === "bank_account" ? (
           <>
-            <Field label="Bank name">
-              <Input value={bankName} onChange={(e) => setBankName(e.target.value)} />
+            <Field label="Bank name" htmlFor="pm-bank-name">
+              <Input id="pm-bank-name" name="bank_name" value={bankName} onChange={(e) => setBankName(e.target.value)} />
             </Field>
-            <Field label="Branch name">
-              <Input value={branchName} onChange={(e) => setBranchName(e.target.value)} />
+            <Field label="Branch name" htmlFor="pm-branch-name">
+              <Input id="pm-branch-name" name="branch_name" value={branchName} onChange={(e) => setBranchName(e.target.value)} />
             </Field>
-            <Field label="Routing number">
-              <Input value={routingNumber} onChange={(e) => setRoutingNumber(e.target.value)} />
+            <Field label="Routing number" htmlFor="pm-routing-number">
+              <Input id="pm-routing-number" name="routing_number" value={routingNumber} onChange={(e) => setRoutingNumber(e.target.value)} />
             </Field>
           </>
         ) : null}
-        <Field label="Transaction ID" required hint="What customers must provide.">
-          <Select value={txnRequirement} onChange={(e) => setTxnRequirement(e.target.value as "required" | "optional" | "disabled")}>
+        <Field label="Transaction ID" required htmlFor="pm-txn-requirement" hint="What customers must provide.">
+          <Select id="pm-txn-requirement" name="transaction_id_requirement" value={txnRequirement} onChange={(e) => setTxnRequirement(e.target.value as "required" | "optional" | "disabled")}>
             <option value="required">Required</option>
             <option value="optional">Optional</option>
             <option value="disabled">Disabled</option>
           </Select>
         </Field>
-        <Field label="Sort order" error={errors.sort_order ?? ""}>
-          <Input inputMode="numeric" value={sortOrder} onChange={(e) => setSortOrder(e.target.value)} />
+        <Field label="Sort order" htmlFor="pm-sort-order" error={errors.sort_order ?? ""}>
+          <Input id="pm-sort-order" name="sort_order" inputMode="numeric" value={sortOrder} onChange={(e) => setSortOrder(e.target.value)} />
         </Field>
       </div>
       {methodKind === "bank_account" ? (
@@ -748,8 +776,10 @@ function MethodCreateForm({
         </div>
       ) : null}
       <div style={{ marginTop: 16 }}>
-        <Field label="Customer instructions" hint="Shown at checkout, max 1000 characters.">
+        <Field label="Customer instructions" htmlFor="pm-instructions" hint="Shown at checkout, max 1000 characters.">
           <Textarea
+            id="pm-instructions"
+            name="customer_instructions"
             value={instructions}
             onChange={(e) => setInstructions(e.target.value)}
             placeholder="Send the exact order total to this number, then submit the transaction ID."
@@ -994,40 +1024,40 @@ function MethodEditForm({
       }}
     >
       <div className="sm-form-grid">
-        <Field label="Display name" required error={errors.display_name ?? ""}>
-          <Input value={displayName} onChange={(e) => setDisplayName(e.target.value)} aria-invalid={Boolean(errors.display_name) || undefined} />
+        <Field label="Display name" required htmlFor="pme-display-name" error={errors.display_name ?? ""}>
+          <Input id="pme-display-name" name="display_name" value={displayName} onChange={(e) => setDisplayName(e.target.value)} aria-invalid={Boolean(errors.display_name) || undefined} />
         </Field>
-        <Field label="Account label">
-          <Input value={accountLabel} onChange={(e) => setAccountLabel(e.target.value)} />
+        <Field label="Account label" htmlFor="pme-account-label">
+          <Input id="pme-account-label" name="account_label" value={accountLabel} onChange={(e) => setAccountLabel(e.target.value)} />
         </Field>
-        <Field label="Account number" required error={errors.account_number ?? ""}>
-          <Input value={accountNumber} onChange={(e) => setAccountNumber(e.target.value)} aria-invalid={Boolean(errors.account_number) || undefined} />
+        <Field label="Account number" required htmlFor="pme-account-number" error={errors.account_number ?? ""}>
+          <Input id="pme-account-number" name="account_number" autoComplete="tel" value={accountNumber} onChange={(e) => setAccountNumber(e.target.value)} aria-invalid={Boolean(errors.account_number) || undefined} />
         </Field>
-        <Field label="Account holder name">
-          <Input value={accountHolder} onChange={(e) => setAccountHolder(e.target.value)} />
+        <Field label="Account holder name" htmlFor="pme-account-holder">
+          <Input id="pme-account-holder" name="account_holder_name" autoComplete="name" value={accountHolder} onChange={(e) => setAccountHolder(e.target.value)} />
         </Field>
         {method.method_kind === "bank_account" ? (
           <>
-            <Field label="Bank name">
-              <Input value={bankName} onChange={(e) => setBankName(e.target.value)} />
+            <Field label="Bank name" htmlFor="pme-bank-name">
+              <Input id="pme-bank-name" name="bank_name" value={bankName} onChange={(e) => setBankName(e.target.value)} />
             </Field>
-            <Field label="Branch name">
-              <Input value={branchName} onChange={(e) => setBranchName(e.target.value)} />
+            <Field label="Branch name" htmlFor="pme-branch-name">
+              <Input id="pme-branch-name" name="branch_name" value={branchName} onChange={(e) => setBranchName(e.target.value)} />
             </Field>
-            <Field label="Routing number">
-              <Input value={routingNumber} onChange={(e) => setRoutingNumber(e.target.value)} />
+            <Field label="Routing number" htmlFor="pme-routing-number">
+              <Input id="pme-routing-number" name="routing_number" value={routingNumber} onChange={(e) => setRoutingNumber(e.target.value)} />
             </Field>
           </>
         ) : null}
-        <Field label="Transaction ID" required>
-          <Select value={txnRequirement} onChange={(e) => setTxnRequirement(e.target.value as "required" | "optional" | "disabled")}>
+        <Field label="Transaction ID" required htmlFor="pme-txn-requirement">
+          <Select id="pme-txn-requirement" name="transaction_id_requirement" value={txnRequirement} onChange={(e) => setTxnRequirement(e.target.value as "required" | "optional" | "disabled")}>
             <option value="required">Required</option>
             <option value="optional">Optional</option>
             <option value="disabled">Disabled</option>
           </Select>
         </Field>
-        <Field label="Sort order" error={errors.sort_order ?? ""}>
-          <Input inputMode="numeric" value={sortOrder} onChange={(e) => setSortOrder(e.target.value)} />
+        <Field label="Sort order" htmlFor="pme-sort-order" error={errors.sort_order ?? ""}>
+          <Input id="pme-sort-order" name="sort_order" inputMode="numeric" value={sortOrder} onChange={(e) => setSortOrder(e.target.value)} />
         </Field>
       </div>
       {method.method_kind === "bank_account" ? (
@@ -1047,8 +1077,8 @@ function MethodEditForm({
         </div>
       ) : null}
       <div style={{ marginTop: 16 }}>
-        <Field label="Customer instructions">
-          <Textarea value={instructions} onChange={(e) => setInstructions(e.target.value)} />
+        <Field label="Customer instructions" htmlFor="pme-instructions">
+          <Textarea id="pme-instructions" name="customer_instructions" value={instructions} onChange={(e) => setInstructions(e.target.value)} />
         </Field>
       </div>
       {formError ? (

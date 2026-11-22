@@ -4,6 +4,7 @@ import {
   calculateLineTotals,
   calculateOrderTotals,
   computeCanonicalSnapshotHash,
+  isValidIsoDateOnly,
   PublicCreateCheckoutOrderSchema,
   validateFeatureEntitlementValue,
 } from "../../../../../packages/contracts/src/index.ts";
@@ -23,6 +24,7 @@ import type {
 } from "../../platform/db/store.ts";
 import { AppError } from "../../shared/errors.ts";
 import { appendAuditLog } from "../audit/service.ts";
+import { businessTodayIso } from "../activation/service.ts";
 import { resolveOrCreateCustomerInTx } from "../customers/service.ts";
 import { createInstallmentsForOrderInTx } from "../payments/service.ts";
 import { assertStaffPermission, type StaffPrincipal } from "../identity/service.ts";
@@ -357,6 +359,27 @@ export async function createPublicCheckoutOrder(
         processed_at: null,
       });
 
+      // M-14: a public checkout order is a money-adjacent mutation
+      // from an external site — it belongs in the audit log (actor
+      // "integration", attributed to the site). Idempotent replays do
+      // not re-run this callback, so the row is written exactly once.
+      appendAuditLog(state, {
+        actor_type: "integration",
+        integrated_site_id: site.id,
+        action: "commerce.order.created",
+        resource_type: "order",
+        resource_id: order.id,
+        outcome: "success",
+        request_id: input.requestId,
+        changes: {
+          order_number: order.order_number,
+          total_minor: order.total_minor,
+          currency_code: order.currency_code,
+          item_count: order.items.length,
+          customer_id: customer.id,
+        },
+      });
+
       const expUnix = Math.floor(Date.now() / 1000) + 2 * 3600;
       const checkoutAccessToken = issueCheckoutAccessToken(
         {
@@ -408,10 +431,55 @@ export async function createOrderByAdmin(
   store: StackMateDataStore,
   actor: StaffPrincipal,
   rawInput: unknown,
-  requestId: string
+  requestId: string,
+  /**
+   * F-12: business timezone for the on_date boundary (callers pass
+   * `env.DEFAULT_TIMEZONE`; defaults to Asia/Dhaka, the env default).
+   */
+  config?: { timeZone?: string | undefined }
 ): Promise<{ order: OrderRecord; invoice: InvoiceRecord }> {
   assertStaffPermission(actor, "orders.create");
-  const input = AdminCreateOrderSchema.parse(rawInput);
+  // The contracts schema validates activation_date strictly (F-05
+  // remainder); a schema parse failure (SchemaValidationError) must
+  // surface as the same AppError 422 the service-level checks throw
+  // — never a raw validation-library error, which has no statusCode
+  // and would reach the route (and direct service callers) as a 500.
+  const parsed = AdminCreateOrderSchema.safeParse(rawInput);
+  if (!parsed.success) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      parsed.issues[0]?.message ?? "Invalid order input.",
+      422,
+    );
+  }
+  const input = parsed.data;
+
+  // F-05: the schema only requires a non-empty activation_date string
+  // (contracts is not editable from this batch — the schema refine is
+  // the parent's remainder). Validate strictly HERE so a bad date can
+  // never reach the order: it must be a real ISO calendar date, and
+  // today-or-future in the business timezone. A past date would make
+  // the next sweep fulfill an unpaid order for ৳0; a DD/MM/YYYY value
+  // would silently never activate (lexicographic comparison).
+  if (input.activation_mode === "on_date") {
+    const rawDate = (input.activation_date ?? "").trim();
+    if (!isValidIsoDateOnly(rawDate)) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        `activation_date '${rawDate}' is not a valid ISO date (expected a real YYYY-MM-DD date).`,
+        422
+      );
+    }
+    const timeZone = config?.timeZone ?? "Asia/Dhaka";
+    const today = businessTodayIso(new Date(), timeZone);
+    if (rawDate < today) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        `activation_date '${rawDate}' is in the past (today is ${today}). Activation dates must be today or in the future.`,
+        422
+      );
+    }
+  }
 
   return store.withTransaction((state) => {
     // Customer: exactly one of customer_id / new_customer (schema refine).
@@ -701,7 +769,13 @@ export async function createOrderByAdmin(
     state.orders.push(order);
     // Payment plan (ADR-0009): installments always exist — one-time full
     // is a single installment — so paid/remaining is always computable.
-    createInstallmentsForOrderInTx(state, order, input.payment_plan, new Date(now));
+    createInstallmentsForOrderInTx(
+      state,
+      order,
+      input.payment_plan,
+      new Date(now),
+      config?.timeZone ?? "Asia/Dhaka"
+    );
     const invoice = generateInvoiceForOrderInTx(state, order, "initial");
 
     if (lead) {

@@ -62,6 +62,7 @@ import {
   StatusBadge,
   TableSkeleton,
   Textarea,
+  type SearchableOption,
 } from "../components/primitives";
 import { CollapsibleSection, type CustomerDto } from "./customers";
 import { humanizeType } from "../lib/resolve-names";
@@ -180,7 +181,20 @@ export function TicketsSection() {
     typeof rawSearch.assignee_user_id === "string" ? rawSearch.assignee_user_id : "";
   const customerFilter =
     typeof rawSearch.customer_id === "string" ? rawSearch.customer_id : "";
-  const query = useAdminList<TicketDto>("tickets", "/api/v1/admin/tickets");
+  const query = useAdminList<TicketDto>("tickets", "/api/v1/admin/tickets", {
+    q: parsed.q,
+    page: parsed.page,
+    pageSize: parsed.pageSize,
+    // Server-side: the endpoint reads ?status=, ?priority=,
+    // ?assignee_user_id= and ?customer_id=; the client-side
+    // `filtered` memo below re-applies the same predicates.
+    extra: {
+      ...(statusFilter ? { status: statusFilter } : {}),
+      ...(priorityFilter ? { priority: priorityFilter } : {}),
+      ...(assigneeFilter ? { assignee_user_id: assigneeFilter } : {}),
+      ...(customerFilter ? { customer_id: customerFilter } : {}),
+    },
+  });
 
   const columns: ColumnDef<TicketDto, unknown>[] = [
     {
@@ -279,6 +293,16 @@ export function TicketsSection() {
       <ListTable<TicketDto>
         columns={columns}
         data={filtered}
+        serverSearch
+        serverPagination
+        refreshSection="tickets"
+        filtersActive={
+          statusFilter !== "" ||
+          priorityFilter !== "" ||
+          assigneeFilter !== "" ||
+          customerFilter !== ""
+        }
+        total={query.total}
         search={parsed.q ?? ""}
         onSearchChange={(q) => updateSearch({ q: q === "" ? undefined : q, page: 1 })}
         page={parsed.page ?? 1}
@@ -295,6 +319,8 @@ export function TicketsSection() {
         toolbar={
           <>
             <Select
+              id="tickets-status-filter"
+              name="status"
               value={statusFilter}
               onChange={(e) =>
                 updateSearch({ status: e.target.value === "" ? undefined : e.target.value, page: 1 })
@@ -304,11 +330,13 @@ export function TicketsSection() {
               <option value="">All statuses</option>
               {TICKET_STATUSES.map((s) => (
                 <option key={s} value={s}>
-                  {s.replace(/_/g, " ")}
+                  {humanizeType(s)}
                 </option>
               ))}
             </Select>
             <Select
+              id="tickets-priority-filter"
+              name="priority"
               value={priorityFilter}
               onChange={(e) =>
                 updateSearch({ priority: e.target.value === "" ? undefined : e.target.value, page: 1 })
@@ -318,7 +346,7 @@ export function TicketsSection() {
               <option value="">All priorities</option>
               {TICKET_PRIORITIES.map((p) => (
                 <option key={p} value={p}>
-                  {p}
+                  {humanizeType(p)}
                 </option>
               ))}
             </Select>
@@ -328,6 +356,7 @@ export function TicketsSection() {
                Status (5) and priority (4) are fixed enums, so they stay
                native (confirmed ≤8 exception). */}
             <SearchableSelect
+              id="tickets-assignee-filter"
               value={assigneeFilter}
               onChange={(v) =>
                 updateSearch({
@@ -341,6 +370,8 @@ export function TicketsSection() {
                   q,
                   (u) => ({ value: u.id, label: staffOptionLabel(u) }),
                   signal,
+                  // Suspended staff must not appear as assignees.
+                  { extra: { status: "active" } },
                 )
               }
               resolveLabel={detailLabelResolver<StaffUserDto>(
@@ -352,6 +383,7 @@ export function TicketsSection() {
               ariaLabel="Filter by assignee"
             />
             <SearchableSelect
+              id="tickets-customer-filter"
               value={customerFilter}
               onChange={(v) =>
                 updateSearch({
@@ -506,7 +538,7 @@ function CreateTicketDialog({
             Cancel
           </Button>
           <Button
-            variant="primary"
+            variant="accent"
             type="submit"
             form="create-ticket-form"
             loading={mutation.isPending}
@@ -518,27 +550,32 @@ function CreateTicketDialog({
     >
       <form id="create-ticket-form" onSubmit={onSubmit} aria-label="Create ticket">
         {formError ? <Alert variant="danger">{formError}</Alert> : null}
-        <Field label="Title" required error={errors.title ?? ""}>
+        <Field label="Title" required htmlFor="ticket-title" error={errors.title ?? ""}>
           <Input
+            id="ticket-title"
+            name="title"
             value={title}
             onChange={(e) => setTitle(e.target.value)}
             maxLength={200}
             placeholder="e.g. License stopped working after renewal"
           />
         </Field>
-        <Field label="Description" required error={errors.description ?? ""}>
+        <Field label="Description" required htmlFor="ticket-description" error={errors.description ?? ""}>
           <Textarea
+            id="ticket-description"
+            name="description"
             value={description}
             onChange={(e) => setDescription(e.target.value)}
             maxLength={5000}
             placeholder="What the customer reported, and what you have checked so far."
           />
         </Field>
-        <Field label="Customer">
+        <Field label="Customer" htmlFor="ticket-customer">
           {/* Searchable (PLAN §29): customers are unbounded. The
              prefilled customer (lead conversion) resolves its label
              via the detail endpoint — never a raw id. */}
           <SearchableSelect
+            id="ticket-customer"
             value={customerId}
             onChange={(v) => setCustomerId(v)}
             loadOptions={(q, signal) =>
@@ -561,54 +598,59 @@ function CreateTicketDialog({
             ariaLabel="Customer"
           />
         </Field>
-        <Field label="Priority">
+        <Field label="Priority" htmlFor="ticket-priority">
           <Select
+            id="ticket-priority"
+            name="priority"
             value={priority}
             onChange={(e) => setPriority(e.target.value as TicketDto["priority"])}
           >
             {TICKET_PRIORITIES.map((p) => (
               <option key={p} value={p}>
-                {p}
+                {humanizeType(p)}
               </option>
             ))}
           </Select>
         </Field>
-        <Field label="Category">
+        <Field label="Category" htmlFor="ticket-category">
           <Select
+            id="ticket-category"
+            name="category"
             value={category}
             onChange={(e) => setCategory(e.target.value as TicketDto["category"])}
           >
             {TICKET_CATEGORIES.map((c) => (
               <option key={c} value={c}>
-                {c}
+                {humanizeType(c)}
               </option>
             ))}
           </Select>
         </Field>
-        <Field label="Assignee">
+        <Field label="Assignee" htmlFor="ticket-assignee">
           {/* Searchable (PLAN §29): staff grows; only active staff are
-             offered (the server query returns all, the loader filters). */}
+             offered (status=active is a server param now, audit H-03). */}
           <SearchableSelect
+            id="ticket-assignee"
             value={assigneeId}
             onChange={(v) => setAssigneeId(v)}
-            loadOptions={async (q, signal) => {
-              const all = await loadListOptions<StaffUserDto>(
+            loadOptions={(q, signal) =>
+              loadListOptions<StaffUserDto>(
                 "/api/v1/admin/users",
                 q,
                 (u) => ({ value: u.id, label: staffOptionLabel(u), data: u }),
                 signal,
-              );
-              return all.filter(
-                (o) => (o.data as StaffUserDto | undefined)?.status === "active",
-              );
-            }}
+                { extra: { status: "active" } },
+              )
+            }
             leadingOptions={[{ value: "", label: "Unassigned" }]}
             placeholder="Unassigned"
             ariaLabel="Assignee"
           />
         </Field>
-        <Field label="Source note" hint="How the customer reported it — phone, email, WhatsApp.">
+        <Field label="Source note" htmlFor="ticket-source-note" hint="How the customer reported it — phone, email, WhatsApp.">
           <Input
+            id="ticket-source-note"
+            name="source_note"
             value={sourceNote}
             onChange={(e) => setSourceNote(e.target.value)}
             maxLength={300}
@@ -618,9 +660,11 @@ function CreateTicketDialog({
         <CollapsibleSection title="Linked records (optional)">
           <Field
             label="Order"
+            htmlFor="ticket-order"
             hint="Picking an order sets the ticket's customer from that order."
           >
             <SearchableSelect
+              id="ticket-order"
               value={orderId}
               onChange={(v, option) => onOrderChange(v, option)}
               loadOptions={(q, signal) =>
@@ -638,9 +682,11 @@ function CreateTicketDialog({
           </Field>
           <Field
             label="Subscription"
+            htmlFor="ticket-subscription"
             hint="Picking a subscription sets the customer and product from it."
           >
             <SearchableSelect
+              id="ticket-subscription"
               value={subscriptionId}
               onChange={(v, option) => onSubscriptionChange(v, option)}
               loadOptions={(q, signal) =>
@@ -663,9 +709,11 @@ function CreateTicketDialog({
           </Field>
           <Field
             label="License"
+            htmlFor="ticket-license"
             hint="Picking a license sets the customer and product from it."
           >
             <SearchableSelect
+              id="ticket-license"
               value={licenseId}
               onChange={(v, option) => onLicenseChange(v, option)}
               loadOptions={(q, signal) =>
@@ -686,8 +734,9 @@ function CreateTicketDialog({
               ariaLabel="License"
             />
           </Field>
-          <Field label="Product">
+          <Field label="Product" htmlFor="ticket-product">
             <SearchableSelect
+              id="ticket-product"
               value={productId}
               onChange={(v) => setProductId(v)}
               loadOptions={(q, signal) =>
@@ -814,14 +863,14 @@ export function TicketDetailSection({ id }: { id: string }) {
           { label: ticket.ticket_number },
         ]}
         title={ticket.title}
-        subtitle={`${ticket.ticket_number} · ${ticket.category}`}
+        subtitle={`${ticket.ticket_number} · ${humanizeType(ticket.category)}`}
       />
       <DetailLayout
         title="Ticket"
         facts={[
           { label: "Status", value: <StatusBadge status={ticket.status} /> },
-          { label: "Priority", value: ticket.priority },
-          { label: "Category", value: ticket.category },
+          { label: "Priority", value: humanizeType(ticket.priority) },
+          { label: "Category", value: humanizeType(ticket.category) },
           {
             label: "Customer",
             value: ticket.customer ? (
@@ -839,13 +888,26 @@ export function TicketDetailSection({ id }: { id: string }) {
           { label: "Reporter", value: ticket.reporter_name ?? "—" },
           {
             label: "Assignee",
-            value: ticket.assignee_name
-              ? `${ticket.assignee_name} — ${ticket.assignee_email ?? ""}${
-                  (ticket.assignee_roles ?? []).length > 0
+            value: ticket.assignee_name ? (
+              <span style={{ display: "block", overflowWrap: "anywhere" }}>
+                {ticket.assignee_name}
+                <span
+                  style={{
+                    display: "block",
+                    fontWeight: 400,
+                    fontSize: 13,
+                    color: "var(--sm-text-muted)",
+                  }}
+                >
+                  {ticket.assignee_email ?? ""}
+                  {(ticket.assignee_roles ?? []).length > 0
                     ? ` (${(ticket.assignee_roles ?? []).map((r) => humanizeType(r)).join(", ")})`
-                    : ""
-                }`
-              : "Unassigned",
+                    : ""}
+                </span>
+              </span>
+            ) : (
+              "Unassigned"
+            ),
           },
           { label: "Source", value: ticket.source_note ?? "—" },
           { label: "Created", value: <DateTimeCell value={ticket.created_at} /> },
@@ -892,23 +954,22 @@ export function TicketDetailSection({ id }: { id: string }) {
                   // §29). The current assignee label comes from the
                   // ticket detail (name + email + roles).
                   <SearchableSelect
+                    id="ticket-detail-assignee"
                     value={ticket.assignee_user_id ?? ""}
                     onChange={(v) =>
                       assignMutation.mutate({
                         assignee_user_id: v === "" ? null : v,
                       })
                     }
-                    loadOptions={async (q, signal) => {
-                      const all = await loadListOptions<StaffUserDto>(
+                    loadOptions={(q, signal) =>
+                      loadListOptions<StaffUserDto>(
                         "/api/v1/admin/users",
                         q,
                         (u) => ({ value: u.id, label: staffOptionLabel(u), data: u }),
                         signal,
-                      );
-                      return all.filter(
-                        (o) => (o.data as StaffUserDto | undefined)?.status === "active",
-                      );
-                    }}
+                        { extra: { status: "active" } },
+                      )
+                    }
                     selectedLabel={
                       ticket.assignee_user_id && ticket.assignee_name
                         ? staffOptionLabel({
@@ -929,8 +990,10 @@ export function TicketDetailSection({ id }: { id: string }) {
               },
             ]}
           />
-          <Field label="Note on this status change (optional — saved as an internal comment)">
+          <Field label="Note on this status change (optional — saved as an internal comment)" htmlFor="ticket-transition-note">
             <Input
+              id="ticket-transition-note"
+              name="transition_note"
               value={transitionNote}
               onChange={(e) => setTransitionNote(e.target.value)}
               maxLength={2000}
@@ -1050,8 +1113,10 @@ export function TicketDetailSection({ id }: { id: string }) {
           )}
           <form onSubmit={onComment} style={{ marginTop: 16 }} aria-label="Add a comment">
             {commentError ? <Alert variant="danger">{commentError}</Alert> : null}
-            <Field label="Add a comment">
+            <Field label="Add a comment" htmlFor="ticket-comment">
               <Textarea
+                id="ticket-comment"
+                name="comment"
                 value={commentBody}
                 onChange={(e) => setCommentBody(e.target.value)}
                 maxLength={5000}

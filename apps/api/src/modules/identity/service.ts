@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import { hashPassword as hashPasswordBetterAuth } from "better-auth/crypto";
 import type * as schema from "../../../../../db/schema/index.ts";
@@ -83,6 +83,14 @@ export type BetterAuthInstance = ReturnType<typeof createBetterAuth>;
  * (re)created from the plaintext password whenever it is set or
  * changed, so they stay in sync; the legacy hash is never used to
  * authorize a production request.
+ *
+ * PASSWORD POLICY (audit API L-22, accepted as-is 2026-11-19): length
+ * only — every password in the product must be at least 10 characters
+ * (bootstrap, staff creation, invite accept, reset, change-password).
+ * No strength meter, no breach-list check, no character-class rules.
+ * That is a deliberate, recorded decision, not an oversight: keep it
+ * length-only until the owner asks for more. Do not "improve" this
+ * silently in a fix batch.
  */
 export function storeSupportsBetterAuth(store: StackMateDataStore): boolean {
   return (store as unknown as { drizzleDb?: unknown }).drizzleDb !== undefined;
@@ -244,6 +252,64 @@ export async function isSuperAdminProvisioned(store: StackMateDataStore): Promis
   });
 }
 
+/**
+ * Defensive validation for admin-created staff (audit API H-4).
+ *
+ * The app.ts handler spreads the raw JSON body straight into
+ * `createStaffUserByAdmin` with only a type cast, so this function
+ * must never trust the runtime shapes: a missing field used to throw
+ * `TypeError` (500), a 1-character password used to create a usable
+ * account, and a malformed email was stored as-is. Every failure is a
+ * 422 VALIDATION_ERROR, never a 500. The caps mirror the contracts
+ * schemas used by the sibling flows (name 2–200, password 10–200,
+ * `role_keys` an array of strings; unknown role keys are still
+ * rejected by the lookup below).
+ */
+const STAFF_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function validateCreateStaffUserInput(input: {
+  name: unknown;
+  email: unknown;
+  password: unknown;
+  role_keys: unknown;
+}): { name: string; email: string; password: string; role_keys: string[] } {
+  if (input === null || typeof input !== "object") {
+    throw new AppError("VALIDATION_ERROR", "Staff user input must be an object.", 422);
+  }
+  const name = typeof input.name === "string" ? input.name.trim() : "";
+  if (name.length < 2 || name.length > 200) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "Name must be between 2 and 200 characters.",
+      422
+    );
+  }
+  const email = typeof input.email === "string" ? input.email.trim().toLowerCase() : "";
+  if (email.length === 0 || email.length > 254 || !STAFF_EMAIL_RE.test(email)) {
+    throw new AppError("VALIDATION_ERROR", "A valid email address is required.", 422);
+  }
+  if (typeof input.password !== "string" || input.password.length < 10 || input.password.length > 200) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "Password must be between 10 and 200 characters.",
+      422
+    );
+  }
+  if (!Array.isArray(input.role_keys) || input.role_keys.some((rk) => typeof rk !== "string" || rk.trim().length === 0)) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "role_keys must be an array of role keys.",
+      422
+    );
+  }
+  return {
+    name,
+    email,
+    password: input.password,
+    role_keys: input.role_keys.map((rk) => (rk as string).trim()),
+  };
+}
+
 export async function createStaffUserByAdmin(
   store: StackMateDataStore,
   actor: StaffPrincipal,
@@ -255,16 +321,17 @@ export async function createStaffUserByAdmin(
     requestId: string;
   }
 ): Promise<{ user: Omit<UserRecord, "password_hash">; roles: string[] }> {
-  assertStaffPermission(actor, "users.manage");
+  await assertStaffPermissionAudited(store, actor, "users.manage", input.requestId);
+  const valid = validateCreateStaffUserInput(input);
   return store.withTransaction((state) => {
-    const emailNormalized = input.email.trim().toLowerCase();
+    const emailNormalized = valid.email;
     if (state.users.some((u) => u.email === emailNormalized)) {
       throw new AppError("CONFLICT", `A staff user with email '${emailNormalized}' already exists.`, 409);
     }
-    if (input.role_keys.includes("super_admin") && !actor.roles.includes("super_admin")) {
+    if (valid.role_keys.includes("super_admin") && !actor.roles.includes("super_admin")) {
       throw new AppError("FORBIDDEN", "Only a Super Admin can assign the super_admin role.", 403);
     }
-    const matchedRoles = input.role_keys.map((rk) => {
+    const matchedRoles = valid.role_keys.map((rk) => {
       const found = state.roles.find((r) => r.key === rk);
       if (!found) {
         throw new AppError("VALIDATION_ERROR", `Unknown role key '${rk}'.`, 422);
@@ -275,11 +342,11 @@ export async function createStaffUserByAdmin(
     const now = new Date().toISOString();
     const user: UserRecord = {
       id: randomUUID(),
-      name: input.name.trim(),
+      name: valid.name,
       email: emailNormalized,
       email_verified: true,
       two_factor_enabled: false,
-      password_hash: hashPasswordScrypt(input.password),
+      password_hash: hashPasswordScrypt(valid.password),
       status: "active",
       created_at: now,
       updated_at: now,
@@ -301,11 +368,11 @@ export async function createStaffUserByAdmin(
       resource_id: user.id,
       outcome: "success",
       request_id: input.requestId,
-      changes: { email: user.email, roles: input.role_keys },
+      changes: { email: user.email, roles: valid.role_keys },
     });
 
     const { password_hash: _, ...safeUser } = user;
-    return { user: safeUser, roles: input.role_keys };
+    return { user: safeUser, roles: valid.role_keys };
   });
 }
 
@@ -772,6 +839,136 @@ export async function resolveStaffPrincipal(
   return principal;
 }
 
+// ---------------------------------------------------------------------------
+// Better Auth fallback gate (audit API M-10).
+//
+// The /api/auth/* fallback in app.ts used to forward EVERY path it did
+// not explicitly block to `auth.handler(request)`, and Better Auth's
+// sessionMiddleware validates only the Better Auth session — it never
+// calls `resolveStaffPrincipal`, never re-checks staff status, and
+// never checks `two_factor_setup_required`. A suspended user with a
+// still-live session, or a user under a `required` 2FA policy who had
+// not set 2FA up, could therefore call `POST /api/auth/update-user`,
+// `GET /api/auth/list-sessions`, `POST /api/auth/revoke-session(s)`
+// and the /two-factor/* management endpoints — contradicting the
+// "restricted session cannot use anything except /me + 2FA setup"
+// claim. The dispatcher must call `checkBetterAuthFallbackAccess`
+// before `auth.handler(request)` (see the wiring note in app.ts);
+// this helper is the gate itself, so the rules live in one place and
+// are unit-testable without the dispatcher.
+// ---------------------------------------------------------------------------
+
+/**
+ * Fallback paths that need NO staff session — the auth flow itself.
+ * The two-factor verify endpoints run on the plugin's twoFactor
+ * verification cookie + code (there is no session yet at sign-in
+ * time); the OAuth entry/callback are gated by the databaseHooks in
+ * better-auth.ts (user.create.before always false, session.create
+ * .before rejects suspended staff).
+ */
+const BETTER_AUTH_FALLBACK_PUBLIC_PATHS: ReadonlySet<string> = new Set([
+  "/api/auth/sign-in/social",
+  "/api/auth/two-factor/verify-totp",
+  "/api/auth/two-factor/verify-backup-code",
+  "/api/auth/two-factor/verify-otp",
+  // Better Auth's built-in health endpoint ({ ok: true }, no session,
+  // no user data, no state change). The M-10 gate as written 404'd it
+  // because it is in neither the public nor the session set — see
+  // better-auth-smoke.test.ts ("GET /api/auth/ok returns a real
+  // Better Auth { ok: true } response").
+  "/api/auth/ok",
+]);
+
+/**
+ * Fallback paths that need a live, active staff session. Anything NOT
+ * in this set and NOT public is denied with 404 — including the raw
+ * Better Auth `/change-password` route (the app's own
+ * POST /api/auth/change-password handler is the only password-change
+ * path), `/delete-user`, and `/change-email` (both disabled).
+ */
+const BETTER_AUTH_FALLBACK_SESSION_PATHS: ReadonlySet<string> = new Set([
+  "/api/auth/get-session",
+  "/api/auth/list-sessions",
+  "/api/auth/revoke-session",
+  "/api/auth/revoke-sessions",
+  "/api/auth/revoke-other-sessions",
+  "/api/auth/update-user",
+  "/api/auth/two-factor/enable",
+  "/api/auth/two-factor/disable",
+  "/api/auth/two-factor/get-totp-uri",
+  "/api/auth/two-factor/generate-backup-codes",
+  "/api/auth/two-factor/send-otp",
+]);
+
+/**
+ * Session paths a 2FA-setup-restricted principal may still use: the
+ * setup flow itself, plus get-session (the SPA needs the principal to
+ * render the forced-setup wizard — same exception as
+ * GET /api/v1/admin/me in the admin block).
+ */
+const BETTER_AUTH_FALLBACK_SETUP_PATHS: ReadonlySet<string> = new Set([
+  "/api/auth/get-session",
+  "/api/auth/two-factor/enable",
+  "/api/auth/two-factor/get-totp-uri",
+  "/api/auth/two-factor/verify-totp",
+  "/api/auth/two-factor/verify-backup-code",
+  "/api/auth/two-factor/verify-otp",
+  "/api/auth/two-factor/generate-backup-codes",
+]);
+
+function normalizeAuthFallbackPath(pathname: string): string {
+  if (pathname.length > 1 && pathname.endsWith("/")) return pathname.slice(0, -1);
+  return pathname;
+}
+
+/**
+ * Gate for the /api/auth/* fallback. Returns the resolved principal
+ * for session paths (null for public paths). Throws 404 for any path
+ * that is neither public nor a known session path, 401 when a session
+ * path has no valid session, and 403 TWO_FACTOR_SETUP_REQUIRED when a
+ * setup-restricted principal calls a non-setup session path — the same
+ * code and message as the /api/v1/admin block in app.ts.
+ */
+export async function checkBetterAuthFallbackAccess(
+  store: StackMateDataStore,
+  input: {
+    auth?: BetterAuthInstance | null;
+    cookieHeader?: string | null;
+    bearerToken?: string | null;
+    pathname: string;
+  }
+): Promise<{ principal: StaffPrincipal | null }> {
+  const pathname = normalizeAuthFallbackPath(input.pathname);
+  if (
+    BETTER_AUTH_FALLBACK_PUBLIC_PATHS.has(pathname) ||
+    pathname.startsWith("/api/auth/callback/")
+  ) {
+    return { principal: null };
+  }
+  if (!BETTER_AUTH_FALLBACK_SESSION_PATHS.has(pathname)) {
+    throw new AppError("NOT_FOUND", "Auth endpoint not found.", 404);
+  }
+  const principal = await resolveStaffPrincipal(store, {
+    auth: input.auth ?? null,
+    cookieHeader: input.cookieHeader ?? null,
+    bearerToken: input.bearerToken ?? null,
+  });
+  if (!principal) {
+    throw new AppError("UNAUTHORIZED", "Authentication required.", 401);
+  }
+  if (
+    principal.two_factor_setup_required &&
+    !BETTER_AUTH_FALLBACK_SETUP_PATHS.has(pathname)
+  ) {
+    throw new AppError(
+      "TWO_FACTOR_SETUP_REQUIRED",
+      "Two-factor authentication setup is required for your role. Complete setup to continue.",
+      403
+    );
+  }
+  return { principal };
+}
+
 function extractStackmateSessionCookie(cookieHeader: string | null | undefined): string | null {
   if (!cookieHeader) return null;
   for (const part of cookieHeader.split(";")) {
@@ -847,7 +1044,11 @@ export async function changeStaffPassword(
   if (auth && storeSupportsBetterAuth(store)) {
     // Without `asResponse`, better-call THROWS Better Auth's APIError on
     // a wrong current password; map it to the StackMate 401 instead of
-    // letting it surface as a 500.
+    // letting it surface as a 500. ONLY the password check lives in
+    // this try (audit M-13): revocation has its own try below, because
+    // a revocation failure after a successful change must never be
+    // reported as "wrong password" — the password was already changed
+    // by then, and the other sessions would silently stay valid.
     try {
       const res = (await (auth.api.changePassword as unknown as (opts: unknown) => Promise<unknown>)({
         body: {
@@ -866,13 +1067,6 @@ export async function changeStaffPassword(
       if (!res || typeof res !== "object") {
         throw new AppError("UNAUTHORIZED", "Current password is incorrect.", 401);
       }
-      // Revoke every session except the one that made this request
-      // (dist/api/routes/session.mjs: revokeOtherSessions filters out
-      // ctx.context.session.session.token). Identified via the same
-      // signed session cookie.
-      await (auth.api.revokeOtherSessions as unknown as (opts: unknown) => Promise<unknown>)({
-        headers: new Headers({ cookie: input.cookieHeader ?? "" }),
-      });
     } catch (error) {
       if (error instanceof AppError) throw error;
       throw new AppError("UNAUTHORIZED", "Current password is incorrect.", 401);
@@ -897,6 +1091,24 @@ export async function changeStaffPassword(
         request_id: input.requestId,
       });
     });
+    // Revoke every session except the one that made this request
+    // (dist/api/routes/session.mjs: revokeOtherSessions filters out
+    // ctx.context.session.session.token). Identified via the same
+    // signed session cookie. A failure here is a distinct 500: the
+    // password IS changed (and audited above), but the other sessions
+    // are still live — the caller must know, and must not be told
+    // their current password was wrong.
+    try {
+      await (auth.api.revokeOtherSessions as unknown as (opts: unknown) => Promise<unknown>)({
+        headers: new Headers({ cookie: input.cookieHeader ?? "" }),
+      });
+    } catch {
+      throw new AppError(
+        "INTERNAL_ERROR",
+        "Password was changed, but other sessions could not be revoked. Sign out of your other devices manually.",
+        500
+      );
+    }
     // Better Auth's change-password endpoint does not report how many
     // sessions it revoked, so the count is honestly null here (the
     // revocation itself is verified by the unified-auth test: the other
@@ -994,7 +1206,13 @@ export async function updateStaffUserRoles(
   roleKeys: string[],
   requestId: string
 ): Promise<{ user_id: string; roles: string[]; revoked_sessions: number }> {
-  assertStaffPermission(actor, "users.manage");
+  await assertStaffPermissionAudited(store, actor, "users.manage", requestId);
+  // Same class as H-4: the app.ts handler passes `body.role_keys ?? []`
+  // with no array check, so a string here used to throw TypeError (500)
+  // inside the transaction. Reject it as 422 instead.
+  if (!Array.isArray(roleKeys) || roleKeys.some((rk) => typeof rk !== "string")) {
+    throw new AppError("VALIDATION_ERROR", "role_keys must be an array of role keys.", 422);
+  }
   return store.withTransaction((state) => {
     const user = state.users.find((u) => u.id === targetUserId);
     if (!user) {
@@ -1044,6 +1262,104 @@ export async function updateStaffUserRoles(
   });
 }
 
+// ---------------------------------------------------------------------------
+// Staff suspension (audit API H-3).
+//
+// Until this batch there was NO way to suspend a staff member: the
+// suspension checks in sign-in, session validation, and the OAuth
+// session.create.before hook were all correct, but nothing ever wrote
+// `status: "suspended"` — the only escape was a direct DB edit, and
+// stripping all roles still left a valid (role-less) session behind.
+// These two functions are the product path. The core agent wires the
+// route (PATCH /api/v1/admin/users/:userId/status, gated on
+// users.manage); the sections agent adds the UI.
+// ---------------------------------------------------------------------------
+
+export async function suspendStaffUser(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  targetUserId: string,
+  requestId: string
+): Promise<{ user_id: string; status: "suspended"; revoked_sessions: number }> {
+  await assertStaffPermissionAudited(store, actor, "users.manage", requestId);
+  if (actor.user.id === targetUserId) {
+    throw new AppError(
+      "CONFLICT",
+      "You cannot suspend your own account. Ask another administrator.",
+      409
+    );
+  }
+  return store.withTransaction((state) => {
+    const user = state.users.find((u) => u.id === targetUserId);
+    if (!user) {
+      throw new AppError("NOT_FOUND", "Target staff user not found.", 404);
+    }
+    if (user.status === "suspended") {
+      throw new AppError("CONFLICT", "Staff user is already suspended.", 409);
+    }
+    const previousStatus = user.status;
+    user.status = "suspended";
+    user.updated_at = new Date().toISOString();
+
+    // Revoke every session immediately: for a DrizzleStore,
+    // `state.sessions` mirrors the Better Auth `sessions` table, so
+    // removing a row here deletes the row via diff-persist and the
+    // session stops validating on the next request (same mechanism as
+    // updateStaffUserRoles, verified by better-auth-unified.test.ts).
+    const beforeCount = state.sessions.length;
+    state.sessions = state.sessions.filter((s) => s.user_id !== targetUserId);
+    const revokedCount = beforeCount - state.sessions.length;
+
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "identity.user.suspended",
+      resource_type: "user",
+      resource_id: targetUserId,
+      outcome: "success",
+      request_id: requestId,
+      changes: { previous_status: previousStatus, status: "suspended", revoked_sessions: revokedCount },
+    });
+
+    return { user_id: targetUserId, status: "suspended" as const, revoked_sessions: revokedCount };
+  });
+}
+
+export async function unsuspendStaffUser(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  targetUserId: string,
+  requestId: string
+): Promise<{ user_id: string; status: "active" }> {
+  await assertStaffPermissionAudited(store, actor, "users.manage", requestId);
+  return store.withTransaction((state) => {
+    const user = state.users.find((u) => u.id === targetUserId);
+    if (!user) {
+      throw new AppError("NOT_FOUND", "Target staff user not found.", 404);
+    }
+    if (user.status === "active") {
+      throw new AppError("CONFLICT", "Staff user is already active.", 409);
+    }
+    const previousStatus = user.status;
+    user.status = "active";
+    user.updated_at = new Date().toISOString();
+    // No session revocation here: suspend already revoked every
+    // session, so there is nothing live to kill — the user signs in
+    // fresh and gets a new session.
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "identity.user.unsuspended",
+      resource_type: "user",
+      resource_id: targetUserId,
+      outcome: "success",
+      request_id: requestId,
+      changes: { previous_status: previousStatus, status: "active" },
+    });
+    return { user_id: targetUserId, status: "active" as const };
+  });
+}
+
 export function assertStaffPermission(
   principal: StaffPrincipal | null,
   requiredPermission: string
@@ -1063,6 +1379,79 @@ export function assertStaffPermission(
   }
 }
 
+/**
+ * Permission-denial audit (audit API M-14, item (h)).
+ *
+ * `assertStaffPermission` throws on denial but leaves no trace, so
+ * permission-probing was invisible in the audit log. Service
+ * functions that take a store + requestId use this variant instead:
+ * on a 403 (an authenticated staff member lacking the permission) a
+ * best-effort `identity.auth.permission_denied` row is written before
+ * the error is rethrown. A 401 (no principal at all) has no actor to
+ * attribute, so it is not logged here — the dispatcher logs
+ * unauthenticated requests at its own layer. The audit write never
+ * masks the original error.
+ */
+export async function assertStaffPermissionAudited(
+  store: StackMateDataStore,
+  principal: StaffPrincipal | null,
+  requiredPermission: string,
+  requestId: string
+): Promise<void> {
+  try {
+    assertStaffPermission(principal, requiredPermission);
+  } catch (error) {
+    if (error instanceof AppError && error.statusCode === 403 && principal) {
+      await store
+        .withTransaction((state) => {
+          appendAuditLog(state, {
+            actor_type: "staff",
+            actor_user_id: principal.user.id,
+            action: "identity.auth.permission_denied",
+            resource_type: "permission",
+            resource_id: requiredPermission,
+            outcome: "denied",
+            request_id: requestId,
+            changes: { permission: requiredPermission },
+          });
+        })
+        .catch(() => {});
+    }
+    throw error;
+  }
+}
+
+/**
+ * Audit helper for two-factor enable/disable (audit API M-14).
+ *
+ * TOTP enable/disable runs inside Better Auth's own handler (the
+ * /api/auth/* fallback in app.ts), so no identity-service function
+ * sees the mutation. The dispatcher must call this helper after a
+ * successful enable/disable response and pass the resolved principal:
+ * without it, a consequential security change (2FA on/off) leaves no
+ * audit row. See the wiring note in app.ts (M-10 fallback gate).
+ */
+export async function recordTwoFactorStateChange(
+  store: StackMateDataStore,
+  input: { userId: string; enabled: boolean; requestId: string }
+): Promise<void> {
+  await store
+    .withTransaction((state) => {
+      appendAuditLog(state, {
+        actor_type: "staff",
+        actor_user_id: input.userId,
+        action: input.enabled
+          ? "identity.auth.two_factor_enabled"
+          : "identity.auth.two_factor_disabled",
+        resource_type: "user",
+        resource_id: input.userId,
+        outcome: "success",
+        request_id: input.requestId,
+      });
+    })
+    .catch(() => {});
+}
+
 // ---------------------------------------------------------------------------
 // Roles (API Spec §8) — custom roles. The spec names permissions
 // users.invite / roles.create / roles.update, but the seeded permission
@@ -1072,7 +1461,20 @@ export function assertStaffPermission(
 // ---------------------------------------------------------------------------
 
 function validatePermissionAllowlist(permissionKeys: string[]): void {
-  const known: Set<string> = new Set(SEED_PERMISSIONS.map((p) => p.key));
+  // Media permissions (audit API H-2, code part): the seed catalogue
+  // does not list media.view/media.manage yet — the DB agent adds them
+  // to SEED_PERMISSIONS (and migration 0012 already grants them in the
+  // DB-backed store) — but the allowlist is seed-based, so until the
+  // seed lands no custom role could ever be granted media access (the
+  // validator 422'd the keys). Accept the two keys explicitly here:
+  // they are real, spec'd permissions (API spec §18.13), and the
+  // DB-backed store already grants them, so accepting them cannot
+  // over-grant. Remove this carve-out once the seed carries them.
+  const known: Set<string> = new Set([
+    ...SEED_PERMISSIONS.map((p) => p.key),
+    "media.view",
+    "media.manage",
+  ]);
   for (const key of permissionKeys) {
     if (!known.has(key)) {
       throw new AppError("VALIDATION_ERROR", `Unknown permission key '${key}'.`, 422);
@@ -1086,7 +1488,7 @@ export async function createRoleByAdmin(
   rawInput: unknown,
   requestId: string
 ): Promise<RoleRecord> {
-  assertStaffPermission(actor, "users.manage");
+  await assertStaffPermissionAudited(store, actor, "users.manage", requestId);
   const input = CreateRoleSchema.parse(rawInput);
   if (input.key === "super_admin") {
     throw new AppError("CONFLICT", "Role key 'super_admin' is reserved.", 409);
@@ -1134,7 +1536,7 @@ export async function updateRoleByAdmin(
   rawInput: unknown,
   requestId: string
 ): Promise<RoleRecord> {
-  assertStaffPermission(actor, "users.manage");
+  await assertStaffPermissionAudited(store, actor, "users.manage", requestId);
   const input = UpdateRoleSchema.parse(rawInput);
   return store.withTransaction((state) => {
     const role = state.roles.find((r) => r.id === roleId);
@@ -1177,9 +1579,17 @@ export async function updateRoleByAdmin(
 }
 
 // ---------------------------------------------------------------------------
-// Staff invitations (API Spec §8, Batch 1). No email system exists, so the
-// invitation token is returned ONCE to the creating admin, who shares it
-// with the invitee out of band. Only the SHA-256 hash is stored.
+// Staff invitations (API Spec §8, Batch 1). The invitation token is
+// returned ONCE to the creating admin AND, when SMTP is configured,
+// emailed to the invitee by the app.ts handler (best-effort, honest
+// `email_sent` / `email_error` in the response — see
+// POST /api/v1/admin/users/invitations). The token is the fallback
+// delivery path when email is not configured, not the only one. Only
+// the SHA-256 hash is stored.
+// (Audit API M-21: the old comment here claimed no email is sent.
+// That was true before the Auth + Email batch; it is false now. The
+// matching stale comments in app.ts and the SPA dialog copy are
+// outside this module — see the fix-batch report.)
 // ---------------------------------------------------------------------------
 
 export const STAFF_INVITATION_TTL_MS = 7 * 24 * 3600 * 1000;
@@ -1230,7 +1640,7 @@ export async function createStaffInvitationByAdmin(
   invitation: Omit<StaffInvitationRecord, "token_hash">;
   token_once: string;
 }> {
-  assertStaffPermission(actor, "users.manage");
+  await assertStaffPermissionAudited(store, actor, "users.manage", requestId);
   assertInvitationPersistence(store);
   const input = CreateStaffInvitationSchema.parse(rawInput);
   return store.withTransaction((state) => {
@@ -1302,7 +1712,7 @@ export async function revokeStaffInvitationByAdmin(
   invitationId: string,
   requestId: string
 ): Promise<Omit<StaffInvitationRecord, "token_hash">> {
-  assertStaffPermission(actor, "users.manage");
+  await assertStaffPermissionAudited(store, actor, "users.manage", requestId);
   assertInvitationPersistence(store);
   return store.withTransaction((state) => {
     const invitation = (state.staff_invitations ?? []).find((i) => i.id === invitationId);
@@ -1474,6 +1884,20 @@ export async function storePasswordResetToken(
   expiresAt: Date
 ): Promise<void> {
   const db = drizzleDbOf(store);
+  // Audit API M-11: a fresh token invalidates every prior UNUSED token
+  // for the same user+purpose. Otherwise two reset emails leave two
+  // live tokens, and using one leaves the other valid — an older
+  // (forwarded / stale-inbox) email stays a live password-reset
+  // credential after the victim has already reset.
+  await db
+    .delete(baPasswordResetTokens)
+    .where(
+      and(
+        eq(baPasswordResetTokens.userId, userId),
+        eq(baPasswordResetTokens.purpose, purpose),
+        isNull(baPasswordResetTokens.usedAt)
+      )
+    );
   await db.insert(baPasswordResetTokens).values({
     id: randomUUID(),
     userId,
@@ -1482,6 +1906,54 @@ export async function storePasswordResetToken(
     expiresAt,
     createdAt: new Date(),
   });
+}
+
+/**
+ * Atomically consume one reset/recovery token (audit API L-2).
+ *
+ * The validity pre-check (`findValidResetToken`) runs outside the
+ * consuming transaction, so two concurrent requests presenting the
+ * same token could both pass it before either commits. The consume
+ * UPDATE itself is the atomic guard: it only touches a row whose
+ * `usedAt` is still NULL, and returns the rows it touched — zero
+ * rows means a concurrent request consumed it first, and the caller
+ * must fail instead of resetting twice.
+ */
+type ResetTokenTx = Parameters<
+  Parameters<NodePgDatabase<typeof schema>["transaction"]>[0]
+>[0];
+
+async function consumeResetTokenAtomically(
+  tx: ResetTokenTx,
+  tokenId: string
+): Promise<boolean> {
+  const consumed = await tx
+    .update(baPasswordResetTokens)
+    .set({ usedAt: new Date() })
+    .where(
+      and(eq(baPasswordResetTokens.id, tokenId), isNull(baPasswordResetTokens.usedAt))
+    )
+    .returning({ id: baPasswordResetTokens.id });
+  return consumed.length > 0;
+}
+
+/**
+ * Invalidate every remaining UNUSED token for a user (audit API M-11).
+ * A successful reset/recovery ends the whole token family: no sibling
+ * token — same purpose or the other purpose — stays usable afterwards.
+ */
+async function invalidateSiblingResetTokens(
+  tx: ResetTokenTx,
+  userId: string
+): Promise<void> {
+  await tx
+    .delete(baPasswordResetTokens)
+    .where(
+      and(
+        eq(baPasswordResetTokens.userId, userId),
+        isNull(baPasswordResetTokens.usedAt)
+      )
+    );
 }
 
 async function findValidResetToken(
@@ -1569,10 +2041,18 @@ export async function resetStaffPasswordByToken(
     // Revoke every session (the reset is unauthenticated — no session
     // survives it) and consume the token, atomically with the password.
     await tx.delete(baSessions).where(eq(baSessions.userId, user.id));
-    await tx
-      .update(baPasswordResetTokens)
-      .set({ usedAt: now })
-      .where(eq(baPasswordResetTokens.id, found.id));
+    // Audit L-2: the consume UPDATE only touches a row whose usedAt is
+    // still NULL — a concurrent request presenting the same token loses
+    // the race here instead of resetting twice. Throwing inside the
+    // callback rolls the whole transaction back, so the loser changes
+    // nothing.
+    const consumed = await consumeResetTokenAtomically(tx, found.id);
+    if (!consumed) {
+      throw new AppError("VALIDATION_ERROR", "Reset link is invalid or expired.", 422);
+    }
+    // Audit M-11: a successful reset ends the whole token family — no
+    // sibling token stays usable afterwards.
+    await invalidateSiblingResetTokens(tx, user.id);
   });
   // Staff scrypt hash via the store (synced by userSpec) so the state
   // copy stays consistent for the rest of this request's lifetime.
@@ -1603,11 +2083,12 @@ export async function resetStaffPasswordByToken(
  * batch). The password is verified through Better Auth's own sign-in
  * (asResponse): a correct password for a 2FA-enabled user returns
  * `{ twoFactorRedirect: true }` and NO session (the plugin deletes it),
- * so there is nothing to revoke. A wrong password returns non-OK.
- * A missing credential falls back to the stored scrypt hash (legacy
- * accounts). Disabling writes `users.two_factor_enabled = false` and
- * deletes the `two_factor` row via direct Drizzle — the store's userSpec
- * does not sync that column (the plugin owns it) — and consumes the
+ * so there is nothing to revoke from THAT attempt. A wrong password
+ * returns non-OK. A missing credential falls back to the stored scrypt
+ * hash (legacy accounts). Disabling writes `users.two_factor_enabled =
+ * false` and deletes the `two_factor` row via direct Drizzle — the
+ * store's userSpec does not sync that column (the plugin owns it) —
+ * revokes ALL pre-existing sessions (audit L-3), and consumes the
  * token. Password reset alone NEVER disables 2FA.
  */
 export async function recoverTwoFactorByToken(
@@ -1654,10 +2135,20 @@ export async function recoverTwoFactorByToken(
   await db.transaction(async (tx) => {
     await tx.update(baUsers).set({ twoFactorEnabled: false }).where(eq(baUsers.id, user.id));
     await tx.delete(baTwoFactor).where(eq(baTwoFactor.userId, user.id));
-    await tx
-      .update(baPasswordResetTokens)
-      .set({ usedAt: new Date() })
-      .where(eq(baPasswordResetTokens.id, found.id));
+    // Audit L-3: recovery revokes ALL sessions, like password reset.
+    // The old code claimed "there is nothing to revoke" because the
+    // 2FA plugin deletes the session its sign-in attempt created — but
+    // pre-existing sessions from other devices survive recovery, and
+    // after an email+password recovery the account must be forced to
+    // re-authenticate everywhere.
+    await tx.delete(baSessions).where(eq(baSessions.userId, user.id));
+    // Audit L-2: atomic consume (see resetStaffPasswordByToken).
+    const consumed = await consumeResetTokenAtomically(tx, found.id);
+    if (!consumed) {
+      throw new AppError("VALIDATION_ERROR", "Recovery link is invalid or expired.", 422);
+    }
+    // Audit M-11: a successful recovery ends the whole token family.
+    await invalidateSiblingResetTokens(tx, user.id);
   });
   await store
     .withTransaction((state) => {

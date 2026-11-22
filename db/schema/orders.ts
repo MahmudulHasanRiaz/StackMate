@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   pgTable,
   uuid,
@@ -11,6 +12,7 @@ import {
   timestamp,
   unique,
   index,
+  check,
 } from "drizzle-orm/pg-core";
 import { users } from "./auth.ts";
 import { customers } from "./customers.ts";
@@ -70,6 +72,18 @@ export const orders = pgTable(
     index("idx_orders_status_created").on(table.status, table.createdAt.desc()),
     index("idx_orders_payment_status_created").on(table.paymentStatus, table.createdAt.desc()),
     index("idx_orders_site_created").on(table.integratedSiteId, table.createdAt.desc()),
+    // CHECKs declared in Drizzle (migration 0014 / audit F-11) so
+    // drizzle-kit generate reproduces them; previously SQL-only.
+    // payment_status is the migration 0010 list (with partially_paid).
+    check("orders_status_check", sql`"status" IN ('draft', 'awaiting_payment', 'processing', 'completed', 'cancelled', 'failed')`),
+    check("orders_payment_status_check", sql`"payment_status" IN ('unpaid', 'pending_verification', 'partially_paid', 'paid', 'partially_refunded', 'refunded')`),
+    check("orders_source_check", sql`"source" IN ('admin', 'website', 'api', 'import')`),
+    check("orders_subtotal_minor_check", sql`"subtotal_minor" >= 0`),
+    check("orders_discount_minor_check", sql`"discount_minor" >= 0`),
+    check("orders_tax_minor_check", sql`"tax_minor" >= 0`),
+    check("orders_total_minor_check", sql`"total_minor" >= 0`),
+    check("orders_activation_percent_check", sql`"activation_percent" IS NULL OR ("activation_percent" >= 1 AND "activation_percent" <= 100)`),
+    check("orders_activation_mode_check", sql`"activation_mode" IN ('on_full_payment', 'on_percent', 'on_date')`),
   ]
 );
 
@@ -117,6 +131,13 @@ export const orderItems = pgTable(
   (table) => [
     index("idx_order_items_order_id").on(table.orderId),
     index("idx_order_items_product_created").on(table.productId, table.createdAt.desc()),
+    check("order_items_item_kind_check", sql`"item_kind" IN ('package', 'custom', 'one_time_product', 'other')`),
+    check("order_items_quantity_check", sql`"quantity" >= 1`),
+    check("order_items_unit_amount_minor_check", sql`"unit_amount_minor" >= 0`),
+    check("order_items_line_subtotal_minor_check", sql`"line_subtotal_minor" >= 0`),
+    check("order_items_line_discount_minor_check", sql`"line_discount_minor" >= 0`),
+    check("order_items_line_tax_minor_check", sql`"line_tax_minor" >= 0`),
+    check("order_items_line_total_minor_check", sql`"line_total_minor" >= 0`),
   ]
 );
 
@@ -134,7 +155,10 @@ export const orderItemEntitlementSnapshots = pgTable("order_item_entitlement_sna
   schemaVersion: integer("schema_version").notNull().default(1),
   snapshotHash: varchar("snapshot_hash", { length: 64 }).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  check("order_item_entitlement_snapshots_source_type_check", sql`"source_type" IN ('package_version', 'custom_offer', 'complimentary', 'manual_adjustment')`),
+]);
 
 export const orderItemEntitlementSnapshotItems = pgTable(
   "order_item_entitlement_snapshot_items",
@@ -170,7 +194,10 @@ export const orderAdjustments = pgTable("order_adjustments", {
     .references(() => currencies.code, { onDelete: "restrict" }),
   calculationMetadata: jsonb("calculation_metadata").notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  check("order_adjustments_adjustment_type_check", sql`"adjustment_type" IN ('discount', 'tax', 'fee', 'credit', 'other')`),
+]);
 
 // Migration 0009: payment plan — one row per installment of an order's
 // payment plan (ADR-0009). Amounts in minor units; due_date is a calendar
@@ -198,5 +225,6 @@ export const orderInstallments = pgTable(
   (table) => [
     unique("uq_order_installments_number").on(table.orderId, table.installmentNumber),
     index("idx_order_installments_order_due").on(table.orderId, table.dueDate),
+    check("order_installments_status_check", sql`"status" IN ('pending', 'partially_paid', 'paid', 'overdue')`),
   ]
 );

@@ -15,6 +15,7 @@ import {
   createPrivateKey,
   createPublicKey,
   randomBytes,
+  scryptSync,
   sign as nodeSign,
   verify as nodeVerify,
   timingSafeEqual,
@@ -22,8 +23,65 @@ import {
 import type { EntitlementTokenClaims } from "../../../../../packages/contracts/src/index.ts";
 import { AppError } from "../../shared/errors.ts";
 
+/**
+ * Legacy v1 derivation: a single unsalted SHA-256 of the master secret.
+ * Kept for two purposes only: (a) the HMAC keys (license verifier,
+ * checkout token) — changing those would invalidate every issued
+ * license key and checkout token; (b) decrypting v1 envelopes (below).
+ * NEVER use it for new encryption.
+ */
 function derive32ByteKey(secret: string): Buffer {
   return createHash("sha256").update(secret, "utf8").digest();
+}
+
+/**
+ * Master-secret key derivation, v2 (audit M-4): scrypt, a salted
+ * memory-hard KDF, instead of the single unsalted SHA-256 of v1.
+ *
+ * The salt is per-install: derived from the master secret itself, so
+ * it differs across installs (no cross-install precomputation) while
+ * staying inside the 4-part envelope (`v2:<iv>:<tag>:<ct>` has no room
+ * for a stored salt). A stored random salt would be stronger — that is
+ * a future step, not a silent assumption: see the rotation procedure
+ * on decryptSecretAtRest.
+ *
+ * The derived key is cached per (master secret, version) for the life
+ * of the isolate — the secret never changes at runtime, and scrypt
+ * (~50ms) must not be paid on every request that decrypts a secret.
+ * The cache holds only derived keys, never the master secret itself.
+ */
+const ENCRYPTION_KEY_VERSION_V2 = "v2";
+const ENCRYPTION_KEY_VERSION_V1 = "v1";
+const derivedEncryptionKeyCache = new Map<string, Buffer>();
+
+function deriveEncryptionKeyV2(masterSecret: string): Buffer {
+  const cacheKey = `${sha256Hex(masterSecret)}:${ENCRYPTION_KEY_VERSION_V2}`;
+  const cached = derivedEncryptionKeyCache.get(cacheKey);
+  if (cached) return cached;
+  const salt = createHash("sha256")
+    .update(`stackmate-encryption-salt-v2:${masterSecret}`, "utf8")
+    .digest();
+  const key = scryptSync(masterSecret, salt, 32, { N: 16384, r: 8, p: 1 });
+  if (derivedEncryptionKeyCache.size >= 4) derivedEncryptionKeyCache.clear();
+  derivedEncryptionKeyCache.set(cacheKey, key);
+  return key;
+}
+
+/** Key for an envelope version: v2 → scrypt, v1 → legacy SHA-256. */
+function deriveEncryptionKey(masterSecret: string, keyVersion: string): Buffer {
+  if (keyVersion === ENCRYPTION_KEY_VERSION_V2) return deriveEncryptionKeyV2(masterSecret);
+  if (keyVersion === ENCRYPTION_KEY_VERSION_V1) return derive32ByteKey(masterSecret);
+  throw new Error(`Unsupported encryption key version '${keyVersion}'.`);
+}
+
+/**
+ * True when a stored ciphertext still uses the legacy v1 derivation.
+ * Callers that hold a writable row should re-encrypt it (encrypt with
+ * the default version) when they read one — that is step (3) of the
+ * rotation procedure below.
+ */
+export function isLegacyV1Ciphertext(encodedCiphertext: string): boolean {
+  return encodedCiphertext.startsWith(`${ENCRYPTION_KEY_VERSION_V1}:`);
 }
 
 export function sha256Hex(input: string | Buffer | Uint8Array): string {
@@ -36,15 +94,21 @@ export function randomOpaqueToken(prefix: string, byteLength = 24): string {
 
 /**
  * Encrypts a secret using AES-256-GCM bound to AAD (e.g., "site_credentials:<id>").
- * Format: v1:<iv_b64url>:<tag_b64url>:<ciphertext_b64url>
+ * Format: <version>:<iv_b64url>:<tag_b64url>:<ciphertext_b64url>
+ *
+ * New ciphertexts are v2 (scrypt-derived key) by default. Callers may
+ * still pass "v1" explicitly while a rotation is in flight — the
+ * envelope version selects the key at decrypt time, so v1 and v2 rows
+ * coexist safely. `ACTIVE_ENCRYPTION_KEY_VERSION` (env) is what the
+ * auth-config callers pass; setting it to "v2" flips those writers.
  */
 export function encryptSecretAtRest(
   plaintext: string,
   masterSecret: string,
-  keyVersion = "v1",
+  keyVersion = ENCRYPTION_KEY_VERSION_V2,
   aadContext = "stackmate"
 ): string {
-  const key = derive32ByteKey(masterSecret);
+  const key = deriveEncryptionKey(masterSecret, keyVersion);
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", key, iv);
   cipher.setAAD(Buffer.from(`${keyVersion}:${aadContext}`, "utf8"));
@@ -53,6 +117,25 @@ export function encryptSecretAtRest(
   return `${keyVersion}:${iv.toString("base64url")}:${authTag.toString("base64url")}:${encrypted.toString("base64url")}`;
 }
 
+/**
+ * Decrypts a secret encrypted with encryptSecretAtRest.
+ *
+ * KEY ROTATION PROCEDURE (audit M-4):
+ * (1) Introduce the v2 derivation (scrypt, per-install salt) — done
+ *     here; new writes default to v2.
+ * (2) Dual-decrypt: try the key for the envelope's version first; on
+ *     authentication failure, try the OTHER derivation once (same AAD)
+ *     before giving up — a row whose version tag drifted still reads.
+ *     v1 rows therefore keep decrypting unchanged.
+ * (3) Re-encrypt on read: when `isLegacyV1Ciphertext` is true, the
+ *     caller that owns the row re-encrypts it with the default version
+ *     (and persists it) the next time it writes that row.
+ * (4) Remove the v1 fallback (the `catch` branch below) only once
+ *     every row is v2 — grep the tables for `v1:` envelopes first.
+ * (5) Rotate the master secret itself by re-encrypting every row under
+ *     the new secret (same procedure, new secret value); the old secret
+ *     stays readable until step (4) confirms zero v1 rows remain.
+ */
 export function decryptSecretAtRest(
   encodedCiphertext: string,
   masterSecret: string,
@@ -63,15 +146,34 @@ export function decryptSecretAtRest(
     throw new Error("Invalid encrypted secret format.");
   }
   const [keyVersion, ivB64, tagB64, dataB64] = parts as [string, string, string, string];
-  const key = derive32ByteKey(masterSecret);
+  if (keyVersion !== ENCRYPTION_KEY_VERSION_V1 && keyVersion !== ENCRYPTION_KEY_VERSION_V2) {
+    throw new Error(`Unsupported encryption key version '${keyVersion}'.`);
+  }
   const iv = Buffer.from(ivB64, "base64url");
   const authTag = Buffer.from(tagB64, "base64url");
   const ciphertext = Buffer.from(dataB64, "base64url");
-  const decipher = createDecipheriv("aes-256-gcm", key, iv);
-  decipher.setAAD(Buffer.from(`${keyVersion}:${aadContext}`, "utf8"));
-  decipher.setAuthTag(authTag);
-  const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-  return decrypted.toString("utf8");
+  // A (key, AAD-version) pair: the AAD binds the envelope version, so
+  // the fallback must pair the OTHER key with the OTHER version's AAD
+  // — retrying the other key under the tagged version's AAD can never
+  // succeed.
+  const tryKey = (key: Buffer, aadVersion: string): string => {
+    const decipher = createDecipheriv("aes-256-gcm", key, iv);
+    decipher.setAAD(Buffer.from(`${aadVersion}:${aadContext}`, "utf8"));
+    decipher.setAuthTag(authTag);
+    const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    return decrypted.toString("utf8");
+  };
+  try {
+    return tryKey(deriveEncryptionKey(masterSecret, keyVersion), keyVersion);
+  } catch {
+    // Dual-decrypt fallback (rotation step 2): the tag says one
+    // version, the bytes were derived under the other.
+    const fallbackVersion =
+      keyVersion === ENCRYPTION_KEY_VERSION_V2
+        ? ENCRYPTION_KEY_VERSION_V1
+        : ENCRYPTION_KEY_VERSION_V2;
+    return tryKey(deriveEncryptionKey(masterSecret, fallbackVersion), fallbackVersion);
+  }
 }
 
 /**
@@ -475,7 +577,163 @@ export function verifyOutboundWebhookSignature(
 
 /**
  * SSRF Protection for Webhook & External Destination URLs (Security & Threat Model §4.6).
+ *
+ * The WHATWG URL parser already normalizes dotted-quad IPv4 literals
+ * (`0x7f000001`, `0177.0.0.1`, `2130706433`, `127.1` all become
+ * `127.0.0.1`), but the checks below canonicalize explicitly anyway:
+ * the validator must not depend on one parser's normalization to stay
+ * safe, and IPv6 literals are NOT normalized into their embedded IPv4
+ * (`[::ffff:127.0.0.1]` parses to `[::ffff:7f00:1]`, so a naive
+ * `startsWith("::ffff:127.")` string check misses it).
  */
+
+/**
+ * Parse an IPv4 literal in inet_aton form: 1–4 parts, each hex (`0x`),
+ * octal (leading `0`), or decimal; a short form's last part holds the
+ * remaining bytes (`127.1` → `127.0.0.1`, `2130706433` → `127.0.0.1`).
+ * Returns the dotted-quad octets, or null when the host is not an IPv4
+ * literal at all (e.g. a hostname that merely contains digits).
+ */
+export function canonicalizeIpv4Literal(host: string): [number, number, number, number] | null {
+  const parts = host.split(".");
+  if (parts.length < 1 || parts.length > 4) return null;
+  const values: number[] = [];
+  for (const part of parts) {
+    if (part.length === 0) return null;
+    let value: number;
+    if (/^0x[0-9a-fA-F]+$/.test(part)) value = parseInt(part, 16);
+    else if (/^0[0-7]+$/.test(part)) value = parseInt(part, 8);
+    else if (/^[0-9]+$/.test(part)) value = parseInt(part, 10);
+    else return null;
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    values.push(value);
+  }
+  const nums = values as number[];
+  if (nums.length === 1) {
+    const v = nums[0]!;
+    if (v > 0xffffffff) return null;
+    return [(v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff];
+  }
+  if (nums.length === 2) {
+    const [a, b] = nums as [number, number];
+    if (a > 255 || b > 0xffffff) return null;
+    return [a, (b >>> 16) & 0xff, (b >>> 8) & 0xff, b & 0xff];
+  }
+  if (nums.length === 3) {
+    const [a, b, c] = nums as [number, number, number];
+    if (a > 255 || b > 255 || c > 0xffff) return null;
+    return [a, b, (c >>> 8) & 0xff, c & 0xff];
+  }
+  const [a, b, c, d] = nums as [number, number, number, number];
+  if (a > 255 || b > 255 || c > 255 || d > 255) return null;
+  return [a, b, c, d];
+}
+
+/**
+ * Expand an IPv6 literal (no brackets) to its 8 hextets: `::`
+ * compression, plus an embedded dotted-quad IPv4 tail (`::ffff:127.0.0.1`
+ * → `[0,0,0,0,0,0xffff,0x7f00,0x0001]`). Returns null when the host is
+ * not a valid IPv6 literal.
+ */
+export function parseIpv6Literal(host: string): number[] | null {
+  if (!host.includes(":")) return null;
+  let tail16: [number, number] | null = null;
+  let head = host;
+  const lastColon = host.lastIndexOf(":");
+  const afterLast = host.slice(lastColon + 1);
+  if (afterLast.includes(".")) {
+    const v4 = canonicalizeIpv4Literal(afterLast);
+    if (!v4) return null;
+    tail16 = [v4[0]! * 256 + v4[1]!, v4[2]! * 256 + v4[3]!];
+    head = host.slice(0, lastColon);
+  }
+  const parseGroup = (s: string): number[] | null => {
+    if (s === "") return [];
+    const out: number[] = [];
+    for (const g of s.split(":")) {
+      if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+      out.push(parseInt(g, 16));
+    }
+    return out;
+  };
+  const split = head.split("::");
+  if (split.length > 2) return null;
+  let groups: number[];
+  if (split.length === 2) {
+    const left = parseGroup(split[0]!);
+    const right = parseGroup(split[1]!);
+    if (!left || !right) return null;
+    const total = left.length + right.length + (tail16 ? 2 : 0);
+    if (total > 7) return null; // "::" must compress at least one group
+    groups = [...left, ...new Array<number>(8 - total).fill(0), ...right];
+  } else {
+    const g = parseGroup(split[0]!);
+    if (!g) return null;
+    groups = g;
+  }
+  if (tail16) groups.push(tail16[0], tail16[1]);
+  if (groups.length !== 8) return null;
+  return groups;
+}
+
+/** Shared IPv4 private / loopback / link-local / metadata / reserved rules. */
+function assertPublicIpv4Octets(octets: [number, number, number, number], host: string): void {
+  const [a, b] = octets;
+  const isPrivateOrReserved =
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 100 && b >= 64 && b <= 127) || // CGNAT 100.64.0.0/10
+    (a === 169 && b === 254) || // Link-local & cloud metadata 169.254.169.254
+    (a === 172 && b >= 16 && b <= 31) || // RFC 1918 172.16.0.0/12
+    (a === 192 && b === 168) || // RFC 1918 192.168.0.0/16
+    a >= 224; // Multicast / reserved
+  if (isPrivateOrReserved) {
+    throw new AppError(
+      "SSRF_BLOCKED",
+      `Private, loopback, or metadata IP '${host}' is blocked by SSRF policy.`,
+      400
+    );
+  }
+}
+
+/** Shared IPv6 loopback / unique-local / link-local rules, incl. IPv4 embedded in IPv6. */
+function assertPublicIpv6Hextets(groups: number[], host: string): void {
+  const blocked = (reason: string): never => {
+    throw new AppError(
+      "SSRF_BLOCKED",
+      `IPv6 ${reason} address '${host}' is blocked by SSRF policy.`,
+      400
+    );
+  };
+  const embeddedV4 = (hi: number, lo: number): [number, number, number, number] => [
+    (hi >>> 8) & 0xff,
+    hi & 0xff,
+    (lo >>> 8) & 0xff,
+    lo & 0xff,
+  ];
+  if (groups.every((g) => g === 0)) blocked("unspecified");
+  if (groups.slice(0, 7).every((g) => g === 0) && groups[7] === 1) blocked("loopback");
+  const g0 = groups[0]!;
+  if (g0 >= 0xfc00 && g0 <= 0xfdff) blocked("unique-local"); // fc00::/7
+  if (g0 >= 0xfe80 && g0 <= 0xfebf) blocked("link-local"); // fe80::/10
+  // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d): the
+  // embedded IPv4 decides. This catches the hex form the old string
+  // check missed (`::ffff:7f00:1` is `127.0.0.1`).
+  if (groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff) {
+    assertPublicIpv4Octets(embeddedV4(groups[6]!, groups[7]!), host);
+  } else if (groups.slice(0, 6).every((g) => g === 0)) {
+    assertPublicIpv4Octets(embeddedV4(groups[6]!, groups[7]!), host);
+  }
+  // 6to4 (2002::/16) embeds the IPv4 in hextets 2–3.
+  if (g0 === 0x2002) {
+    assertPublicIpv4Octets(embeddedV4(groups[1]!, groups[2]!), host);
+  }
+  // NOTE: Teredo (2001::/32) embeds its IPv4 XOR-obfuscated, so a plain
+  // hextet check cannot see it — the delivery-time re-check + DNS
+  // re-resolution is the backstop for that form.
+}
+
 export function validateSafeExternalUrl(rawUrl: string, allowHttpLocal = false): URL {
   let parsed: URL;
   try {
@@ -508,55 +766,101 @@ export function validateSafeExternalUrl(rawUrl: string, allowHttpLocal = false):
     throw new AppError("SSRF_BLOCKED", `Destination host '${host}' is prohibited by SSRF policy.`, 400);
   }
 
-  // IPv4 private / loopback / link-local / metadata CIDR check
-  const ipv4Match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
-  if (ipv4Match) {
-    const octets = [
-      Number(ipv4Match[1]),
-      Number(ipv4Match[2]),
-      Number(ipv4Match[3]),
-      Number(ipv4Match[4]),
-    ] as [number, number, number, number];
-    if (octets.some((o) => o < 0 || o > 255)) {
-      throw new AppError("SSRF_BLOCKED", "Invalid IPv4 destination address.", 400);
+  // IP literals are canonicalized first (inet_aton forms + IPv6
+  // expansion), then checked — never matched as raw strings. The
+  // `fc`/`fd` check applies ONLY to IPv6 literals (a hostname like
+  // `fc.example.com` is not a unique-local address).
+  const v4 = canonicalizeIpv4Literal(host);
+  if (v4) {
+    assertPublicIpv4Octets(v4, host);
+  } else if (host.includes(":")) {
+    const groups = parseIpv6Literal(host);
+    if (groups) {
+      assertPublicIpv6Hextets(groups, host);
+    } else {
+      throw new AppError("SSRF_BLOCKED", "Invalid IPv6 destination address.", 400);
     }
-    const [a, b] = octets;
-    const isPrivateOrReserved =
-      a === 0 ||
-      a === 10 ||
-      a === 127 ||
-      (a === 100 && b >= 64 && b <= 127) || // CGNAT 100.64.0.0/10
-      (a === 169 && b === 254) || // Link-local & cloud metadata 169.254.169.254
-      (a === 172 && b >= 16 && b <= 31) || // RFC 1918 172.16.0.0/12
-      (a === 192 && b === 168) || // RFC 1918 192.168.0.0/16
-      a >= 224; // Multicast / reserved
-    if (isPrivateOrReserved) {
-      throw new AppError(
-        "SSRF_BLOCKED",
-        `Private, loopback, or metadata IP '${host}' is blocked by SSRF policy.`,
-        400
-      );
-    }
-  }
-
-  // IPv6 loopback / unique-local / link-local check
-  if (
-    host === "::1" ||
-    host === "::" ||
-    host.startsWith("fc") ||
-    host.startsWith("fd") ||
-    host.startsWith("fe80:") ||
-    host.startsWith("::ffff:127.") ||
-    host.startsWith("::ffff:10.") ||
-    host.startsWith("::ffff:169.254.") ||
-    host.startsWith("::ffff:192.168.")
-  ) {
-    throw new AppError(
-      "SSRF_BLOCKED",
-      `IPv6 loopback or local address '${host}' is blocked by SSRF policy.`,
-      400
-    );
   }
 
   return parsed;
+}
+
+/**
+ * Async SSRF validation: the sync string-level checks above, PLUS DNS
+ * resolution of hostnames with a re-check of every resolved address
+ * (a name that resolves to a private IP is blocked even though the
+ * name itself looks public). IP literals skip DNS — they were already
+ * checked synchronously. With allowHttpLocal (local/test envs only)
+ * the DNS re-check is skipped — a local receiver is intentional
+ * there; the sync checks still apply.
+ *
+ * Resolution uses the system resolver under Node and DNS-over-HTTPS
+ * (Cloudflare DNS JSON API) as the fallback — the only resolver
+ * available on Workers. A host that cannot be resolved at all fails
+ * CLOSED: an unresolvable destination is never delivered to.
+ *
+ * Callers should use this at endpoint create/update time; the
+ * delivery-time redirect re-check in webhooks/service.ts is the second
+ * layer (it re-validates the final URL after redirects).
+ */
+export async function validateSafeExternalUrlAsync(
+  rawUrl: string,
+  allowHttpLocal = false
+): Promise<URL> {
+  const parsed = validateSafeExternalUrl(rawUrl, allowHttpLocal);
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (canonicalizeIpv4Literal(host) || host.includes(":")) return parsed;
+  // Local/test envs run local receivers on purpose: skip the DNS
+  // re-check there, exactly like assertHostnameResolvesToPublicIp
+  // does. The sync checks above (no credentials, protocol/port rules,
+  // blocked hostnames, private IP literals) still apply.
+  if (allowHttpLocal) return parsed;
+
+  const addresses = await resolveHostAddresses(host);
+  for (const address of addresses) {
+    const resolvedV4 = canonicalizeIpv4Literal(address);
+    if (resolvedV4) {
+      assertPublicIpv4Octets(resolvedV4, `${host} → ${address}`);
+      continue;
+    }
+    if (address.includes(":")) {
+      const groups = parseIpv6Literal(address);
+      if (groups) assertPublicIpv6Hextets(groups, `${host} → ${address}`);
+    }
+  }
+  return parsed;
+}
+
+async function resolveHostAddresses(host: string): Promise<string[]> {
+  try {
+    const dns = await import("node:dns/promises");
+    const found = await dns.lookup(host, { all: true });
+    const addresses = found.map((r) => r.address);
+    if (addresses.length > 0) return addresses;
+  } catch {
+    // No system resolver (Workers) or a resolver error — fall through
+    // to DNS-over-HTTPS below.
+  }
+  const out: string[] = [];
+  for (const type of ["A", "AAAA"] as const) {
+    try {
+      const res = await fetch(
+        `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(host)}&type=${type}`,
+        { headers: { Accept: "application/dns-json" } }
+      );
+      if (!res.ok) continue;
+      const body = (await res.json()) as { Answer?: Array<{ data: string }> };
+      for (const answer of body.Answer ?? []) out.push(answer.data);
+    } catch {
+      // A single DoH query failing must not mask the other type.
+    }
+  }
+  if (out.length === 0) {
+    throw new AppError(
+      "SSRF_BLOCKED",
+      `Destination host '${host}' could not be resolved.`,
+      400
+    );
+  }
+  return out;
 }

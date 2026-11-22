@@ -153,6 +153,7 @@ export function SubscriptionsSection() {
   const query = useAdminList<SubscriptionListItem>(
     "subscriptions",
     "/api/v1/admin/subscriptions",
+    { q: parsed.q, page, pageSize },
   );
 
   const updateSearch = (patch: {
@@ -274,6 +275,11 @@ export function SubscriptionsSection() {
       <ListTable
         columns={columns}
         data={filtered}
+        serverSearch
+        serverPagination
+        refreshSection="subscriptions"
+        filtersActive={statusFilter !== "all"}
+        total={query.total}
         search={parsed.q ?? ""}
         onSearchChange={(q) => updateSearch({ q, page: 1 })}
         page={page}
@@ -289,6 +295,8 @@ export function SubscriptionsSection() {
         emptyBody="Subscriptions appear here when a customer buys a recurring product."
         toolbar={
           <Select
+            id="subscriptions-status-filter"
+            name="status"
             aria-label="Filter by status"
             value={statusFilter}
             onChange={(e) => updateSearch({ status: e.target.value, page: 1 })}

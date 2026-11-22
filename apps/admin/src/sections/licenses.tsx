@@ -144,7 +144,11 @@ export function LicensesSection() {
     ? statusParam
     : "all";
 
-  const query = useAdminList<LicenseListItem>("licenses", "/api/v1/admin/licenses");
+  const query = useAdminList<LicenseListItem>("licenses", "/api/v1/admin/licenses", {
+    q: parsed.q,
+    page,
+    pageSize,
+  });
 
   const updateSearch = (patch: {
     q?: string;
@@ -254,6 +258,11 @@ export function LicensesSection() {
       <ListTable
         columns={columns}
         data={filtered}
+        serverSearch
+        serverPagination
+        refreshSection="licenses"
+        filtersActive={statusFilter !== "all"}
+        total={query.total}
         search={parsed.q ?? ""}
         onSearchChange={(q) => updateSearch({ q, page: 1 })}
         page={page}
@@ -269,6 +278,8 @@ export function LicensesSection() {
         emptyBody="Licenses appear here when an order or manual grant issues one."
         toolbar={
           <Select
+            id="licenses-status-filter"
+            name="status"
             aria-label="Filter by status"
             value={statusFilter}
             onChange={(e) => updateSearch({ status: e.target.value, page: 1 })}

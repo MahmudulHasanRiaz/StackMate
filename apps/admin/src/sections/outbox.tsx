@@ -29,7 +29,9 @@ import {
   Button,
   Chip,
   DateTimeCell,
+  Dialog,
   ErrorState,
+  Input,
   Pagination,
   StatusBadge,
   TableSkeleton,
@@ -79,10 +81,13 @@ function useOutboxEvents(filter: OutboxFilter) {
   return useQuery({
     queryKey: ["admin", "outbox-events", "list", filter],
     queryFn: async () => {
+      // The API defaults lists to 25 rows — ask for the max window
+      // (100). The endpoint has no ?q=, so search stays client-side
+      // over the loaded collection (see the M-05 note below).
       const path =
         filter === "all"
-          ? "/api/v1/admin/outbox-events"
-          : `/api/v1/admin/outbox-events?status=${filter}`;
+          ? "/api/v1/admin/outbox-events?limit=100"
+          : `/api/v1/admin/outbox-events?status=${filter}&limit=100`;
       const res = await apiRequest<{ items: OutboxEvent[] }>(path);
       return res.items;
     },
@@ -96,13 +101,36 @@ export function OutboxSection() {
   const [filter, setFilter] = useState<OutboxFilter>("all");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
+  const [search, setSearch] = useState("");
+  const [viewEvent, setViewEvent] = useState<OutboxEvent | null>(null);
   const query = useOutboxEvents(filter);
   const confirm = useConfirm();
   const rows = query.data ?? [];
+  const resourceMaps = useResourceMaps();
+  // M-05: search. The endpoint has no ?q= (it only reads ?status=),
+  // so this filters client-side over the loaded collection — the same
+  // established pattern as this page's client-side paging (F6). A
+  // server ?q= is the core API agent's follow-up if the outbox grows.
+  const needle = search.trim().toLowerCase();
+  const filteredRows =
+    needle.length === 0
+      ? rows
+      : rows.filter((e) => {
+          const hay = [
+            e.event_key,
+            e.event_type,
+            e.aggregate_type,
+            e.aggregate_id,
+            resolveResourceName(e.aggregate_type, e.aggregate_id, resourceMaps) ?? "",
+            e.last_error_code ?? "",
+          ]
+            .join(" ")
+            .toLowerCase();
+          return hay.includes(needle);
+        });
   /* F6 (2026-11-16): the outbox had no pagination — client-side paging
      over the loaded collection, like ListTable. */
-  const pageRows = rows.slice((page - 1) * pageSize, page * pageSize);
-  const resourceMaps = useResourceMaps();
+  const pageRows = filteredRows.slice((page - 1) * pageSize, page * pageSize);
 
   const replay = useAdminMutation<OutboxEvent, string>({
     mutationFn: (eventId) =>
@@ -135,6 +163,19 @@ export function OutboxSection() {
         help="Transactional outbox — every event the platform must deliver, and its retries"
       />
       <Toolbar>
+        <Input
+          id="outbox-search"
+          name="q"
+          type="search"
+          value={search}
+          onChange={(e) => {
+            setSearch(e.target.value);
+            setPage(1);
+          }}
+          placeholder="Search events…"
+          aria-label="Search outbox events"
+          autoComplete="off"
+        />
         {OUTBOX_FILTERS.map((f) => (
           <Chip
             key={f}
@@ -161,15 +202,17 @@ export function OutboxSection() {
             onRetry={() => void query.refetch()}
           />
         </div>
-      ) : rows.length === 0 ? (
+      ) : filteredRows.length === 0 ? (
         <div className="sm-table-flat">
           <div className="sm-empty">
             <Webhook size={18} strokeWidth={2} className="sm-empty-icon" />
             <div className="sm-empty-title">No outbox events</div>
             <p>
-              {filter === "all"
-                ? "No outbox events have been recorded yet."
-                : `No ${filter === "dead_letter" ? "dead-lettered" : filter} outbox events.`}
+              {rows.length === 0
+                ? filter === "all"
+                  ? "No outbox events have been recorded yet."
+                  : `No ${filter === "dead_letter" ? "dead-lettered" : filter} outbox events.`
+                : `No outbox events match “${search.trim()}”.`}
             </p>
           </div>
         </div>
@@ -220,38 +263,41 @@ export function OutboxSection() {
                     <DateTimeCell value={e.processed_at} />
                   </td>
                   <td>
-                    {e.status === "dead_letter" ? (
-                      <Button
-                        variant="secondary"
-                        size="sm"
-                        loading={replay.isPending && replay.variables === e.id}
-                        onClick={() =>
-                          void (async () => {
-                            const ok = await confirm({
-                              title: "Replay outbox event?",
-                              body: (
-                                <div>
-                                  <p>
-                                    {e.event_key} returns to pending with its
-                                    attempt count reset to 0 and will be
-                                    dispatched again.
-                                  </p>
-                                  <p>
-                                    Only dead-lettered events can be replayed.
-                                  </p>
-                                </div>
-                              ),
-                              confirmLabel: "Replay",
-                            });
-                            if (ok) replay.mutate(e.id);
-                          })()
-                        }
-                      >
-                        Replay
+                    <span style={{ display: "inline-flex", gap: 8 }}>
+                      <Button variant="ghost" size="sm" onClick={() => setViewEvent(e)}>
+                        View
                       </Button>
-                    ) : (
-                      "—"
-                    )}
+                      {e.status === "dead_letter" ? (
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          loading={replay.isPending && replay.variables === e.id}
+                          onClick={() =>
+                            void (async () => {
+                              const ok = await confirm({
+                                title: "Replay outbox event?",
+                                body: (
+                                  <div>
+                                    <p>
+                                      {e.event_key} returns to pending with its
+                                      attempt count reset to 0 and will be
+                                      dispatched again.
+                                    </p>
+                                    <p>
+                                      Only dead-lettered events can be replayed.
+                                    </p>
+                                  </div>
+                                ),
+                                confirmLabel: "Replay",
+                              });
+                              if (ok) replay.mutate(e.id);
+                            })()
+                          }
+                        >
+                          Replay
+                        </Button>
+                      ) : null}
+                    </span>
                   </td>
                 </tr>
               ))}
@@ -260,7 +306,7 @@ export function OutboxSection() {
           <Pagination
             page={page}
             pageSize={pageSize}
-            total={rows.length}
+            total={filteredRows.length}
             onPageChange={setPage}
             onPageSizeChange={(size) => {
               setPageSize(size);
@@ -269,6 +315,41 @@ export function OutboxSection() {
           />
         </div>
       )}
+      <Dialog
+        open={viewEvent !== null}
+        onClose={() => setViewEvent(null)}
+        title={viewEvent ? `Outbox event ${viewEvent.event_key}` : "Outbox event"}
+        footer={
+          <Button variant="secondary" onClick={() => setViewEvent(null)}>
+            Close
+          </Button>
+        }
+      >
+        {viewEvent ? (
+          <div>
+            <p className="sm-hint">
+              {viewEvent.event_type} · {humanizeType(viewEvent.aggregate_type)} ·{" "}
+              {viewEvent.status} · {viewEvent.attempt_count} attempt
+              {viewEvent.attempt_count === 1 ? "" : "s"}
+            </p>
+            <pre
+              className="sm-mono"
+              style={{
+                marginTop: 12,
+                padding: "var(--sm-space-3)",
+                background: "var(--sm-surface-muted)",
+                border: "1px solid var(--sm-border)",
+                borderRadius: 4,
+                overflow: "auto",
+                maxHeight: 320,
+                fontSize: 12,
+              }}
+            >
+              {JSON.stringify(viewEvent.payload, null, 2)}
+            </pre>
+          </div>
+        ) : null}
+      </Dialog>
     </section>
   );
 }

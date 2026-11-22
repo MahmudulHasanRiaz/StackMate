@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   pgTable,
   uuid,
@@ -10,6 +11,7 @@ import {
   timestamp,
   unique,
   index,
+  check,
 } from "drizzle-orm/pg-core";
 import { users } from "./auth.ts";
 import { customers } from "./customers.ts";
@@ -64,6 +66,9 @@ export const subscriptions = pgTable(
     index("idx_subscriptions_customer_created").on(table.customerId, table.createdAt.desc()),
     index("idx_subscriptions_product_status").on(table.productId, table.status),
     index("idx_subscriptions_status_next_renewal").on(table.status, table.nextRenewalAt),
+    check("subscriptions_status_check", sql`"status" IN ('trialing', 'pending', 'active', 'past_due', 'paused', 'cancelled', 'expired')`),
+    check("subscriptions_billing_kind_check", sql`"billing_kind" IN ('one_time', 'recurring', 'lifetime', 'custom')`),
+    check("subscriptions_unit_amount_minor_check", sql`"unit_amount_minor" >= 0`),
   ]
 );
 
@@ -93,6 +98,8 @@ export const subscriptionPeriods = pgTable(
       table.periodStart,
       table.periodEnd
     ),
+    check("subscription_periods_period_number_check", sql`"period_number" >= 1`),
+    check("subscription_periods_status_check", sql`"status" IN ('pending', 'active', 'completed', 'void', 'failed')`),
   ]
 );
 
@@ -112,4 +119,7 @@ export const subscriptionEvents = pgTable("subscription_events", {
   relatedInvoiceId: uuid("related_invoice_id"),
   metadata: jsonb("metadata").notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  check("subscription_events_actor_type_check", sql`"actor_type" IN ('system', 'staff', 'customer', 'provider')`),
+]);

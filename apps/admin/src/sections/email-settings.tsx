@@ -124,31 +124,38 @@ function SmtpForm({ smtp, onSaved }: { smtp: SmtpSettingsView; onSaved: () => vo
         checked={enabled}
         onChange={(e) => setEnabled(e.target.checked)}
       />
-      <Field label="SMTP host" required={enabled}>
+      <Field label="SMTP host" required={enabled} htmlFor="smtp-host">
         <Input
+          id="smtp-host"
+          name="smtp_host"
           value={host}
           onChange={(e) => setHost(e.target.value)}
           placeholder="smtp.example.com"
           autoComplete="off"
         />
       </Field>
-      <Field label="Port" required={enabled} hint="465 for implicit TLS, 587 for STARTTLS. Port 25 is blocked by Cloudflare Workers.">
+      <Field label="Port" required={enabled} htmlFor="smtp-port" hint="465 for implicit TLS, 587 for STARTTLS. Port 25 is blocked by Cloudflare Workers.">
         <Input
+          id="smtp-port"
+          name="smtp_port"
           value={port}
           onChange={(e) => setPort(e.target.value)}
           inputMode="numeric"
           autoComplete="off"
         />
       </Field>
-      <Field label="Username">
+      <Field label="Username" htmlFor="smtp-username">
         <Input
+          id="smtp-username"
+          name="smtp_username"
           value={username}
           onChange={(e) => setUsername(e.target.value)}
-          autoComplete="off"
+          autoComplete="username"
         />
       </Field>
       <Field
         label="Password"
+        htmlFor="smtp-password"
         hint={
           smtp.has_password
             ? "A password is stored (encrypted). Leave blank to keep it."
@@ -156,6 +163,8 @@ function SmtpForm({ smtp, onSaved }: { smtp: SmtpSettingsView; onSaved: () => vo
         }
       >
         <Input
+          id="smtp-password"
+          name="smtp_password"
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
@@ -163,15 +172,17 @@ function SmtpForm({ smtp, onSaved }: { smtp: SmtpSettingsView; onSaved: () => vo
           autoComplete="new-password"
         />
       </Field>
-      <Field label="TLS mode">
-        <Select value={tlsMode} onChange={(e) => setTlsMode(e.target.value as SmtpSettingsView["tls_mode"])}>
+      <Field label="TLS mode" htmlFor="smtp-tls-mode">
+        <Select id="smtp-tls-mode" name="tls_mode" value={tlsMode} onChange={(e) => setTlsMode(e.target.value as SmtpSettingsView["tls_mode"])}>
           <option value="starttls">STARTTLS (port 587)</option>
           <option value="ssl">SSL / implicit TLS (port 465)</option>
           <option value="none">None (plain, not recommended)</option>
         </Select>
       </Field>
-      <Field label="From address" required={enabled}>
+      <Field label="From address" required={enabled} htmlFor="smtp-from-address">
         <Input
+          id="smtp-from-address"
+          name="from_address"
           type="email"
           value={fromAddress}
           onChange={(e) => setFromAddress(e.target.value)}
@@ -179,8 +190,8 @@ function SmtpForm({ smtp, onSaved }: { smtp: SmtpSettingsView; onSaved: () => vo
           autoComplete="off"
         />
       </Field>
-      <Field label="From name">
-        <Input value={fromName} onChange={(e) => setFromName(e.target.value)} autoComplete="off" />
+      <Field label="From name" htmlFor="smtp-from-name">
+        <Input id="smtp-from-name" name="from_name" value={fromName} onChange={(e) => setFromName(e.target.value)} autoComplete="off" />
       </Field>
       {mutation.isError ? (
         <Alert variant="danger">
@@ -342,10 +353,13 @@ function RemindersForm() {
       </p>
       <Field
         label="Days before due"
+        htmlFor="reminders-due-offsets"
         hint="Comma-separated days, e.g. 7,1 sends a reminder 7 days and 1 day before the due date."
         error={errors.due_offsets_days ?? ""}
       >
         <Input
+          id="reminders-due-offsets"
+          name="due_offsets_days"
           value={dueOffsets}
           onChange={(e) => setDueOffsets(e.target.value)}
           inputMode="numeric"
@@ -360,10 +374,13 @@ function RemindersForm() {
       />
       <Field
         label="Days after due (overdue)"
+        htmlFor="reminders-overdue-offsets"
         hint="Comma-separated days after a missed due date, e.g. 1,3."
         error={errors.overdue_offsets_days ?? ""}
       >
         <Input
+          id="reminders-overdue-offsets"
+          name="overdue_offsets_days"
           value={overdueOffsets}
           onChange={(e) => setOverdueOffsets(e.target.value)}
           inputMode="numeric"

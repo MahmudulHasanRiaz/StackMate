@@ -77,15 +77,38 @@ export function validateStorageSettingsInput(input: SaveStorageSettingsInput): v
   }
   if (input.local_path !== undefined && input.local_path !== null) {
     const p = input.local_path.trim();
-    if (p.length === 0 || p.length > 500) {
+    // Empty ≡ absent: the driver falls back to the default root
+    // (and to STORAGE_LOCAL_PATH) for a blank value.
+    if (p.length === 0) return;
+    if (p.length > 500) {
       throw new AppError(
         "VALIDATION_ERROR",
-        "local_path must be 1–500 characters (or empty to use the default).",
+        "local_path must be at most 500 characters.",
         422,
       );
     }
-    if (p.includes("..")) {
-      throw new AppError("VALIDATION_ERROR", "local_path must not contain '..'.", 422);
+    // M-5: local_path is the Local driver's filesystem ROOT — an
+    // absolute path here is an arbitrary-directory write primitive
+    // reachable from the admin panel. Only RELATIVE paths are
+    // accepted (resolved under the process working directory, like
+    // the default "./data/media"). Absolute host paths are OPERATOR
+    // config, not admin-panel input: set STORAGE_LOCAL_PATH in the
+    // deployment environment instead.
+    if (
+      p.startsWith("/") ||
+      p.startsWith("\\") ||
+      /^[A-Za-z]:/.test(p) ||
+      p.includes("\\") ||
+      p.includes("..") ||
+      p.includes("\0") ||
+      // eslint-disable-next-line no-control-regex
+      /[\x00-\x1f\x7f]/.test(p)
+    ) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        "local_path must be a relative path under the working directory (e.g. 'data/media') — no absolute paths, '..', backslashes, or drive letters. Absolute host paths are set with STORAGE_LOCAL_PATH in the deployment environment.",
+        422,
+      );
     }
   }
 }

@@ -1,4 +1,5 @@
 import { sha256Hex } from "../common/sha256.ts";
+import { isValidIsoDateOnly } from "../common/dates.ts";
 import { v } from "../common/validator.ts";
 import { INTERVAL_UNITS, PRICE_KINDS } from "./catalog.ts";
 
@@ -35,6 +36,22 @@ export type OrderSource = (typeof ORDER_SOURCES)[number];
 // `null` — so every Add Customer submission 422'd live. Optional fields
 // here are therefore `.nullable().optional()`: JSON null ≡ absent. The
 // refine treats null exactly like empty.
+/** Billing/shipping address for a customer (table exists since 0000). */
+export const CreateCustomerAddressSchema = v.object({
+  address_type: v.enum(["billing", "shipping", "other"] as const).default("billing"),
+  // Null-tolerant (ADR-0009 decision 11): the admin UI sends JSON null
+  // for empty optional fields; null ≡ absent.
+  contact_name: v.string().trim().max(200).nullable().optional(),
+  phone: v.string().trim().min(6).max(40).nullable().optional(),
+  address_line_1: v.string().trim().max(250).nullable().optional(),
+  address_line_2: v.string().trim().max(250).nullable().optional(),
+  city: v.string().trim().max(120).nullable().optional(),
+  state_or_region: v.string().trim().max(120).nullable().optional(),
+  postal_code: v.string().trim().max(40).nullable().optional(),
+  country_code: v.string().trim().min(2).max(2).default("BD"),
+  is_default: v.boolean().default(false),
+});
+
 export const CreateCustomerSchema = v
   .object({
     customer_type: v.enum(["person", "business"] as const).default("person"),
@@ -49,6 +66,10 @@ export const CreateCustomerSchema = v
     website: v.string().trim().max(200).nullable().optional(),
     country_code: v.string().trim().min(2).max(2).default("BD"),
     notes: v.string().trim().max(2000).nullable().optional(),
+    // SPA H-02: one-request customer create — the body may carry an
+    // optional `address` object alongside the customer fields; the
+    // service validates it and creates it in the SAME transaction.
+    address: CreateCustomerAddressSchema.nullable().optional(),
   })
   .refine(
     (val) => Boolean(val.email?.trim() || val.phone?.trim()),
@@ -191,6 +212,24 @@ export const AdminCreateOrderSchema = v
     (val) =>
       val.activation_mode !== "on_date" || Boolean(val.activation_date?.trim()),
     "on_date activation needs activation_date."
+  )
+  .refine(
+    (val) => {
+      // F-05: on_date needs a REAL date, today-or-future. A past date
+      // would make the next sweep fulfill an unpaid order for ৳0; a
+      // DD/MM/YYYY value would silently never activate (lexicographic
+      // comparison). "Today" here is the UTC calendar date — the
+      // service check (commerce/service.ts) re-checks against today in
+      // the BUSINESS timezone (Asia/Dhaka) and is the authoritative
+      // boundary; this refine is deliberately no stricter than
+      // UTC-today, so it can never reject a date the service accepts.
+      if (val.activation_mode !== "on_date") return true;
+      const raw = val.activation_date?.trim() ?? "";
+      if (!isValidIsoDateOnly(raw)) return false;
+      const todayUtc = new Date().toISOString().slice(0, 10);
+      return raw >= todayUtc;
+    },
+    "on_date activation needs a valid activation_date (YYYY-MM-DD) that is today or in the future."
   );
 
 export interface SnapshotItemToHash {
@@ -214,22 +253,6 @@ export const UpdateCustomerSchema = v.object({
   country_code: v.string().trim().min(2).max(2).optional(),
   status: v.enum(CUSTOMER_STATUSES).optional(),
   notes: v.string().trim().max(2000).nullable().optional(),
-});
-
-/** Billing/shipping address for a customer (table exists since 0000). */
-export const CreateCustomerAddressSchema = v.object({
-  address_type: v.enum(["billing", "shipping", "other"] as const).default("billing"),
-  // Null-tolerant (ADR-0009 decision 11): the admin UI sends JSON null
-  // for empty optional fields; null ≡ absent.
-  contact_name: v.string().trim().max(200).nullable().optional(),
-  phone: v.string().trim().min(6).max(40).nullable().optional(),
-  address_line_1: v.string().trim().max(250).nullable().optional(),
-  address_line_2: v.string().trim().max(250).nullable().optional(),
-  city: v.string().trim().max(120).nullable().optional(),
-  state_or_region: v.string().trim().max(120).nullable().optional(),
-  postal_code: v.string().trim().max(40).nullable().optional(),
-  country_code: v.string().trim().min(2).max(2).default("BD"),
-  is_default: v.boolean().default(false),
 });
 
 export const UpdateCustomerAddressSchema = v.object({

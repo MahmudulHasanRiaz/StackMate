@@ -14,16 +14,26 @@
  *    money-safety warning; passing `help` suppresses `subtitle`.
  *  - useAdminList / useAdminDetail: TanStack Query over apiRequest.
  *  - useAdminMutation: mutation + toast + exact key invalidation.
- *  - ListTable: TanStack Table — client-side search/sort/pagination over
- *    the collection the API returns (the API has no server pagination).
- *    Search + page are URL-backed: the section owns them via its route's
- *    search params and passes them in.
+ *  - ListTable: TanStack Table — search/sort/pagination over the
+ *    collection the API returns. Search is server-driven where the
+ *    section opts in (`serverSearch` + `opts.q` on useAdminList):
+ *    the section threads its URL search into useAdminList's `q`
+ *    option (debounced, `?q=` on the request) and ListTable's client
+ *    filter is disabled — the rows it receives are already the
+ *    matches. Pagination is server-driven: when the section passes
+ *    `opts.page` / `opts.pageSize`, the hook sends `?page=` +
+ *    `?limit=` (the API slices the (page-1)*limit window and reports
+ *    the pre-limit `data.total`), and ListTable renders that page
+ *    as-is (`serverPagination`) — no row is unreachable. Without
+ *    page opts the hook keeps the old `?limit=100` window and
+ *    ListTable paginates client-side within it (option loads and
+ *    detail-tab lists, which have no server search).
  *  - DetailFacts: the 4–6 key facts row on detail pages.
  *
  * All five states (loading / empty / no-results / error / populated) are
  * handled here, so the silent-blank failure is impossible.
  */
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   flexRender,
   getCoreRowModel,
@@ -34,14 +44,15 @@ import {
   type ColumnDef,
   type SortingState,
 } from "@tanstack/react-table";
-import { useMutation, useQuery, type UseMutationOptions } from "@tanstack/react-query";
-import { ArrowDown, ArrowUp, ArrowUpDown, PackageSearch } from "lucide-react";
+import { keepPreviousData, useMutation, useQuery, type UseMutationOptions } from "@tanstack/react-query";
+import { ArrowDown, ArrowUp, ArrowUpDown, PackageSearch, RefreshCw } from "lucide-react";
 import { apiRequest, ApiClientError } from "./api-client";
 import { detailKey, listKey, queryClient } from "./query";
 import {
   Breadcrumb,
   EmptyState,
   ErrorState,
+  IconButton,
   InfoButton,
   Input,
   Pagination,
@@ -103,15 +114,111 @@ export function PageHeader({
 /* ------------------------------------------------------------------ */
 /* Data hooks                                                          */
 /* ------------------------------------------------------------------ */
-export function useAdminList<T>(section: string, path: string) {
+/* Audit H-01: the list search is server-driven. The section threads
+ *  its URL search value in as `opts.q` (the sections agent wires the
+ *  call sites); the hook debounces it 250ms (same as QuickNav) and
+ *  sends it as `?q=` on the request, so the server searches the FULL
+ *  dataset instead of the loaded page. The debounced value joins the
+ *  query key, so each distinct search caches separately — and
+ *  invalidation by listKey(section) still matches, because TanStack
+ *  Query matches invalidation keys by prefix. Without `opts.q` the
+ *  hook behaves exactly as before (no `?q=`, same key).
+ *
+ * Server pagination (audit follow-up): the API slices the
+ * (page-1)*limit window and reports the server `data.total`.
+ * When the section passes `opts.page` / `opts.pageSize`, the hook
+ * sends `?page=` + `?limit=<pageSize>` and joins both into the
+ * query key, so each page caches separately (invalidation by
+ * listKey(section) still matches by prefix). `keepPreviousData`
+ * keeps the old page visible while the next one loads, so paging
+ * never flashes the skeleton. Without page opts the hook keeps
+ * the old behaviour — always `?limit=100` (the API max) — and
+ * reports the server `data.total` alongside the items (`total`
+ * falls back to the loaded count when an endpoint does not return
+ * one). The return shape keeps `data` as the items array, so every
+ * existing call site reads `query.data` unchanged; pages pass
+ * `query.total` to ListTable, which paginates client-side within
+ * the loaded window when `serverPagination` is off, and renders
+ * the server page as-is when it is on.
+ *
+ * `opts.extra` threads server-side filter params the endpoint
+ * already supports (e.g. `{ payment_status: "paid" }`,
+ * `{ status: "active" }`) — the values join the query key, so each
+ * filter combination caches separately. Pages keep their
+ * client-side filter memo as well (same predicate); it is a no-op
+ * over the server-filtered rows. Only thread a param the endpoint
+ * actually reads — unknown params are ignored by the API, and a
+ * threaded param must never change what another part of the page
+ * derives from the same query (e.g. a header count). */
+export const LIST_FETCH_LIMIT = 100;
+
+export function useAdminList<T>(
+  section: string,
+  path: string,
+  // exactOptionalPropertyTypes is on: call sites pass `q: parsed.q`
+  // (string | undefined) and extra maps with undefined-valued keys
+  // for inactive filters, so both accept an explicit undefined here.
+  // Undefined extra values are dropped before the request is built.
+  // `page` / `pageSize` opt a list into true server pagination
+  // (see the hook comment above); omit both for the ?limit=100
+  // window used by option loads and detail-tab lists.
+  opts?: {
+    q?: string | undefined;
+    extra?: Record<string, string | undefined> | undefined;
+    page?: number | undefined;
+    pageSize?: number | undefined;
+  },
+) {
+  const q = opts?.q ?? "";
+  const extra = opts?.extra;
+  const page = opts?.page;
+  const pageSize = opts?.pageSize;
+  const [debouncedQ, setDebouncedQ] = useState(q);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedQ(q), 250);
+    return () => window.clearTimeout(timer);
+  }, [q]);
+  // Stable key for the extra params: call sites build the object
+  // inline each render, so the sorted-entries string is the key —
+  // never the object identity. Undefined-valued entries are dropped
+  // so `{ status: undefined }` and `{}` share one cache entry.
+  const extraEntries = extra
+    ? Object.entries(extra)
+        .filter(([, value]) => value !== undefined)
+        .sort(([a], [b]) => (a < b ? -1 : 1))
+    : [];
+  const extraKey = extraEntries.length > 0 ? JSON.stringify(extraEntries) : "";
   const query = useQuery({
-    queryKey: listKey(section),
+    queryKey: [
+      ...listKey(section),
+      ...(debouncedQ ? [{ q: debouncedQ }] : []),
+      ...(extraKey ? [{ extra: extraKey }] : []),
+      ...(page !== undefined ? [{ page, pageSize: pageSize ?? 25 }] : []),
+    ],
     queryFn: async () => {
-      const res = await apiRequest<{ items: T[] }>(path);
-      return res.items;
+      const params = new URLSearchParams();
+      for (const [key, value] of extraEntries) params.set(key, value as string);
+      if (page !== undefined) {
+        params.set("page", String(page));
+        params.set("limit", String(pageSize ?? 25));
+      } else {
+        params.set("limit", String(LIST_FETCH_LIMIT));
+      }
+      if (debouncedQ) params.set("q", debouncedQ);
+      const sep = path.includes("?") ? "&" : "?";
+      const res = await apiRequest<{ items: T[]; total?: number }>(`${path}${sep}${params}`);
+      return res;
     },
+    // Paging must not flash the skeleton: the previous page stays
+    // on screen while the next one loads (same pattern as the
+    // dashboard's keepPreviousData).
+    placeholderData: keepPreviousData,
   });
-  return query;
+  return {
+    ...query,
+    data: query.data?.items,
+    total: query.data?.total ?? query.data?.items?.length ?? 0,
+  };
 }
 
 export function useAdminDetail<T>(section: string, id: string, path: string) {
@@ -126,16 +233,43 @@ export function useAdminDetail<T>(section: string, id: string, path: string) {
 /* The query runs against the list endpoint's ?q= (server-side over    */
 /* the full dataset, first 25 matches) — never a filter over a loaded  */
 /* page. The caller's abort signal is combined with the 30s client     */
-/* bound, so a hung search still settles.                              */
+/* bound, so a hung search still settles. Audit H-03: the loader      */
+/* accepts server-side filter params (opts.extra, e.g.                */
+/* { status: "active" } / { is_enabled: "true" } — the API agent      */
+/* adds them) and forwards them on the request instead of filtering   */
+/* the loaded page client-side. This folds in the sections agent's     */
+/* local loadFilteredOptions copies (orders, payment-review, tickets,  */
+/* leads) — those call sites can now use this helper with { extra }   */
+/* and the copies can be deleted at integration. Audit L-01: with     */
+/* opts.withMeta the loader also reports whether the server capped    */
+/* the page (a full page means there may be more matches) —           */
+/* SearchableSelect renders the "Showing first N — refine your        */
+/* search" hint from it.                                               */
 /* ------------------------------------------------------------------ */
 export async function loadListOptions<T>(
   path: string,
   query: string,
   toOption: (item: T) => SearchableOption,
   signal?: AbortSignal,
-  opts?: { limit?: number },
-): Promise<SearchableOption[]> {
-  const params = new URLSearchParams({ limit: String(opts?.limit ?? 25) });
+  opts?: { limit?: number; extra?: Record<string, string>; withMeta?: false },
+): Promise<SearchableOption[]>;
+export async function loadListOptions<T>(
+  path: string,
+  query: string,
+  toOption: (item: T) => SearchableOption,
+  signal?: AbortSignal,
+  opts?: { limit?: number; extra?: Record<string, string>; withMeta: true },
+): Promise<{ options: SearchableOption[]; capped: boolean }>;
+export async function loadListOptions<T>(
+  path: string,
+  query: string,
+  toOption: (item: T) => SearchableOption,
+  signal?: AbortSignal,
+  opts?: { limit?: number; extra?: Record<string, string>; withMeta?: boolean },
+): Promise<SearchableOption[] | { options: SearchableOption[]; capped: boolean }> {
+  const limit = opts?.limit ?? 25;
+  const params = new URLSearchParams(opts?.extra ?? {});
+  params.set("limit", String(limit));
   const trimmed = query.trim();
   if (trimmed) params.set("q", trimmed);
   const controller = new AbortController();
@@ -146,7 +280,11 @@ export async function loadListOptions<T>(
     const res = await apiRequest<{ items: T[] }>(`${path}?${params}`, {
       signal: controller.signal,
     });
-    return res.items.map(toOption);
+    const options = res.items.map(toOption);
+    // A full page means the server may hold more matches than the
+    // cap returned; a short page proves the result set is complete.
+    const capped = res.items.length >= limit;
+    return opts?.withMeta ? { options, capped } : options;
   } finally {
     window.clearTimeout(timer);
     signal?.removeEventListener("abort", onAbort);
@@ -255,6 +393,11 @@ export function ListTable<T>({
   onEmptyAction,
   toolbar,
   getRowId,
+  serverSearch = false,
+  refreshSection,
+  filtersActive = false,
+  total,
+  serverPagination = false,
 }: {
   columns: ColumnDef<T, unknown>[];
   data: T[] | undefined;
@@ -275,9 +418,84 @@ export function ListTable<T>({
   onEmptyAction?: () => void;
   toolbar?: ReactNode;
   getRowId?: (row: T) => string;
+  /** Audit H-01: true when the section threads its search into
+   *  useAdminList's `q` option — the rows are already the server's
+   *  matches, so the client JSON filter is disabled. False keeps the
+   *  client filter for unmigrated pages. */
+  serverSearch?: boolean;
+  /** Audit L-04: the list section key (the same string passed to
+   *  useAdminList) — renders a Refresh button that invalidates the
+   *  list query, the manual counterpart to the 30s staleTime. */
+  refreshSection?: string;
+  /** Audit L-02: true when any toolbar filter is set to a non-default
+   *  value — the toolbar stays visible on an empty collection so the
+   *  user can see (and clear) what filtered everything out. The
+   *  section owns this; ListTable cannot introspect the toolbar. */
+  filtersActive?: boolean;
+  /** Server pagination (audit follow-up): the server `data.total`
+   *  for this list, from `useAdminList`'s `total` — the Pagination
+   *  footer shows it ("Showing 1–25 of 347"). Falls back to the
+   *  client-filtered count when the section does not pass one
+   *  (embedded tables with no list endpoint). */
+  total?: number;
+  /** True when the rows are exactly the server's page (the section
+   *  passed `page`/`pageSize` to useAdminList): the table must NOT
+   *  slice them client-side — TanStack's pagination row model would
+   *  empty page 2+ of a 25-row page — and the step-back below uses
+   *  the server total, not the loaded count. False keeps the old
+   *  ?limit=100 window behaviour (client-side paging within the
+   *  loaded rows). */
+  serverPagination?: boolean;
 }) {
   const [sorting, setSorting] = useState<SortingState>([]);
   const rows = useMemo(() => data ?? [], [data]);
+
+  // Server pagination: when `serverPagination` is on, the rows are
+  // exactly the server's page — the table renders them as-is and
+  // the step-back uses the SERVER total (a page past the last one,
+  // e.g. after a delete emptied it, steps back to the last page
+  // instead of rendering an empty one; Pagination's own clamp does
+  // the same on the populated branch). When it is off, the hook
+  // fetched the first 100 rows and the table paginates within that
+  // window — the "Next" button on the last loaded page still offers
+  // the next page, and it steps back here.
+  const serverTotalPages =
+    serverPagination && total !== undefined
+      ? Math.max(1, Math.ceil(total / pageSize))
+      : null;
+  const loadedPages =
+    serverTotalPages ?? Math.max(1, Math.ceil(rows.length / pageSize));
+  useEffect(() => {
+    if (!isLoading && page > loadedPages) {
+      onPageChange(loadedPages);
+    }
+  }, [isLoading, page, loadedPages, onPageChange]);
+
+  // Neon list pattern: the search is full-width, directly under the
+  // breadcrumb — the toolbar below it holds only filters/actions.
+  // The Refresh affordance (audit L-04) sits at the search row's
+  // right; the row is shared by the populated and the empty states.
+  const searchRow = (
+    <div className="sm-list-search">
+      <Input
+        className="sm-search-input"
+        type="search"
+        placeholder="Search…"
+        aria-label="Search"
+        value={search}
+        onChange={(e) => onSearchChange(e.target.value)}
+      />
+      {refreshSection ? (
+        <IconButton
+          label="Refresh list"
+          icon={RefreshCw}
+          onClick={() =>
+            void queryClient.invalidateQueries({ queryKey: listKey(refreshSection) })
+          }
+        />
+      ) : null}
+    </div>
+  );
 
   const table = useReactTable({
     data: rows,
@@ -295,11 +513,23 @@ export function ListTable<T>({
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
-    getPaginationRowModel: getPaginationRowModel(),
-    globalFilterFn: (row, _columnId, filterValue) => {
-      const needle = String(filterValue).toLowerCase();
-      return JSON.stringify(row.original).toLowerCase().includes(needle);
-    },
+    // Audit follow-up (server pagination): when the rows are the
+    // server's page, TanStack must NOT slice them — its pagination
+    // row model would take rows 25–50 of a 25-row page and render
+    // an empty tbody on every page past the first. The window mode
+    // keeps the row model (client-side paging within the 100 rows).
+    // (Spread, not `getPaginationRowModel: undefined` — the admin
+    // tsconfig has exactOptionalPropertyTypes on.)
+    ...(serverPagination ? {} : { getPaginationRowModel: getPaginationRowModel() }),
+    // Audit H-01: server-driven search passes every row — the server
+    // already filtered. The JSON-stringify filter stays for pages
+    // that have not migrated yet.
+    globalFilterFn: serverSearch
+      ? () => true
+      : (row, _columnId, filterValue) => {
+          const needle = String(filterValue).toLowerCase();
+          return JSON.stringify(row.original).toLowerCase().includes(needle);
+        },
     ...(getRowId ? { getRowId: (row: T) => getRowId(row) } : {}),
   });
 
@@ -312,16 +542,44 @@ export function ListTable<T>({
     );
   }
   if (rows.length === 0) {
+    // Audit L-02: an empty collection used to hide the whole
+    // search/filter toolbar — the user could not see what was
+    // filtering, or clear it. When a search is typed or any filter
+    // is active, keep the search row + toolbar above the empty state
+    // (with Clear search when a search is active). A genuinely empty
+    // collection with no search/filters keeps the plain empty state.
+    if (search === "" && !filtersActive) {
+      return (
+        <div className="sm-table-flat">
+          <EmptyState
+            icon={emptyIcon}
+            title={emptyTitle}
+            body={emptyBody}
+            {...(emptyActionLabel && onEmptyAction
+              ? { actionLabel: emptyActionLabel, onAction: onEmptyAction }
+              : {})}
+          />
+        </div>
+      );
+    }
     return (
-      <div className="sm-table-flat">
-        <EmptyState
-          icon={emptyIcon}
-          title={emptyTitle}
-          body={emptyBody}
-          {...(emptyActionLabel && onEmptyAction
-            ? { actionLabel: emptyActionLabel, onAction: onEmptyAction }
-            : {})}
-        />
+      <div>
+        {searchRow}
+        {toolbar ? <Toolbar>{toolbar}</Toolbar> : null}
+        <div className="sm-table-flat">
+          <EmptyState
+            icon={emptyIcon}
+            title="No results"
+            body={
+              search
+                ? `Nothing matches “${search}”. Try a different search.`
+                : "No records match the current filters. Try adjusting the filters."
+            }
+            {...(search
+              ? { actionLabel: "Clear search", onAction: () => onSearchChange("") }
+              : {})}
+          />
+        </div>
       </div>
     );
   }
@@ -329,18 +587,7 @@ export function ListTable<T>({
   const filteredCount = table.getFilteredRowModel().rows.length;
   return (
     <div>
-      {/* Neon list pattern: the search is full-width, directly under the
-          breadcrumb — the toolbar below it holds only filters/actions. */}
-      <div className="sm-list-search">
-        <Input
-          className="sm-search-input"
-          type="search"
-          placeholder="Search…"
-          aria-label="Search"
-          value={search}
-          onChange={(e) => onSearchChange(e.target.value)}
-        />
-      </div>
+      {searchRow}
       {toolbar ? <Toolbar>{toolbar}</Toolbar> : null}
       {filteredCount === 0 ? (
         <div className="sm-table-flat">
@@ -416,7 +663,7 @@ export function ListTable<T>({
           <Pagination
             page={page}
             pageSize={pageSize}
-            total={filteredCount}
+            total={total ?? filteredCount}
             onPageChange={onPageChange}
             onPageSizeChange={onPageSizeChange}
           />

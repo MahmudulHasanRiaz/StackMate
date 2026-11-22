@@ -198,7 +198,10 @@ const TEST_SETUP_TOKEN =
     ];
     for (const [type, id, actor] of rows) audit(type, id, actor);
 
-    const res = await apiRequest("/api/v1/admin/audit-logs", {}, cookie);
+    // ?limit=100: the list defaults to 25 rows (M-1) and audit rows
+    // are newest-first (appendAuditLog unshifts), so the oldest rows
+    // of this 27-row seed fall off page 1 without it.
+    const res = await apiRequest("/api/v1/admin/audit-logs?limit=100", {}, cookie);
     assert.equal(res.status, 200);
     const items = res.body.data.items as Array<{
       resource_type: string;
@@ -297,7 +300,7 @@ const TEST_SETUP_TOKEN =
       feature_keys: ["flow_test_a", "flow_test_b"],
     });
 
-    const res = await apiRequest("/api/v1/admin/audit-logs", {}, cookie);
+    const res = await apiRequest("/api/v1/admin/audit-logs?limit=100", {}, cookie);
     assert.equal(res.status, 200);
     const items = res.body.data.items as Array<{
       action: string;
@@ -330,7 +333,7 @@ const TEST_SETUP_TOKEN =
     const cookie = await bootstrapAndLoginSuperAdmin();
     audit("product", "00000000-0000-0000-0000-000000000000");
     audit("nonsense_type", "whatever-id");
-    const res = await apiRequest("/api/v1/admin/audit-logs", {}, cookie);
+    const res = await apiRequest("/api/v1/admin/audit-logs?limit=100", {}, cookie);
     assert.equal(res.status, 200);
     const items = res.body.data.items as Array<{
       resource_type: string;

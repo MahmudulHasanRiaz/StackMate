@@ -19,8 +19,8 @@
  *    (restructure batch, owner decision 2026-11-16).
  *
  * Topbar (both shells): ⌘K global search (server-side entity search +
- * quick navigation to pages) + ONE account button (avatar initials +
- * name + chevron) opening the account menu. The theme choice
+ * quick navigation to pages) + ONE account button (avatar photo or
+ * initials + name + chevron) opening the account menu. The theme choice
  * (System / Dark / Light) lives ONLY in the account menu — there is no
  * standalone topbar toggle. Theme choice persists in localStorage key
  * `sm-theme` (default dark); "system" follows prefers-color-scheme live.
@@ -78,6 +78,7 @@ import { queryClient } from "../lib/query";
 import { humanizeType } from "../lib/resolve-names";
 import { applyTheme, resolveThemeChoice, type ThemeChoice } from "../lib/theme";
 import { TwoFactorDisable, TwoFactorSetup } from "./two-factor-setup";
+import { MediaPicker } from "./media-picker";
 import {
   Alert,
   Avatar,
@@ -101,7 +102,15 @@ import { SETTINGS_CATEGORIES } from "../sections/settings";
 /* Auth context — principal is fetched once by the root route           */
 /* ------------------------------------------------------------------ */
 export interface StaffPrincipalDto {
-  user: { id: string; name: string; email: string; status: string };
+  user: {
+    id: string;
+    name: string;
+    email: string;
+    status: string;
+    /** Custom avatar URL (users.avatar_url, audit M-23) — null when
+     *  the user has none; Avatar falls back to Gravatar, then initials. */
+    avatar_url?: string | null;
+  };
   roles: string[];
   permissions: string[];
   two_factor_enabled: boolean;
@@ -525,7 +534,21 @@ function MainNav({
 /* quick navigation to pages stays as the "Pages" group below them.    */
 /* Keyboard: arrows move through the flat result list, Enter opens     */
 /* the active result, Esc closes.                                      */
+/* Audit L-03: each entity group maps to its list route — the "See     */
+/* all in X →" link under each group opens that list with ?q=          */
+/* prefilled (all nine routes validate q via parseListSearch).         */
 /* ------------------------------------------------------------------ */
+const GROUP_LIST_ROUTES: Record<string, string> = {
+  customers: "/customers",
+  orders: "/orders",
+  products: "/products",
+  licenses: "/licenses",
+  subscriptions: "/subscriptions",
+  tickets: "/tickets",
+  leads: "/leads",
+  staff: "/staff",
+  sites: "/settings/websites",
+};
 interface QuickNavItem {
   to: string;
   label: string;
@@ -630,27 +653,34 @@ function QuickNav() {
   }, []);
 
   // Flat keyboard order: entity results (group order) first, then pages.
+  // A group's "See all" entry follows its items, so arrows/Enter track
+  // the rendered order exactly (audit L-03).
   const flat = useMemo(() => {
-    const list: { to: string; key: string }[] = [];
+    const list: { to: string; key: string; search?: { q: string } }[] = [];
+    const q = query.trim();
     for (const group of searchGroups) {
       for (const item of group.items) {
         list.push({ to: item.to, key: `entity:${group.key}:${item.id}` });
+      }
+      const listRoute = GROUP_LIST_ROUTES[group.key];
+      if (listRoute && group.items.length > 0) {
+        list.push({ to: listRoute, key: `seeall:${group.key}`, search: { q } });
       }
     }
     for (const item of pageResults) {
       list.push({ to: item.to, key: `page:${item.to}:${item.label}` });
     }
     return list;
-  }, [searchGroups, pageResults]);
+  }, [searchGroups, pageResults, query]);
 
-  const go = (to: string) => {
+  const go = (to: string, search?: { q: string }) => {
     setOpen(false);
     setQuery("");
     setSearchGroups([]);
     // `to` is a runtime string (the item list is built dynamically);
     // the codebase's established pattern for this is a `never` cast
     // (see tracking.tsx useRouteNavigate).
-    void navigate({ to } as never);
+    void navigate({ to, ...(search ? { search } : {}) } as never);
   };
 
   const onListKeyDown = (e: React.KeyboardEvent) => {
@@ -662,7 +692,7 @@ function QuickNav() {
       setActive((a) => Math.max(a - 1, 0));
     } else if (e.key === "Enter") {
       const item = flat[active];
-      if (item) go(item.to);
+      if (item) go(item.to, item.search);
     }
   };
 
@@ -761,6 +791,31 @@ function QuickNav() {
                       </button>
                     );
                   })}
+                  {/* Audit L-03: the group is capped at 8 with no way
+                      to see the rest — this link opens the section
+                      list with the same query prefilled. It takes the
+                      next flat index so keyboard navigation tracks
+                      the rendered order. */}
+                  {group.items.length > 0
+                    ? (() => {
+                        const i = nextIndex();
+                        const listRoute = GROUP_LIST_ROUTES[group.key];
+                        return listRoute ? (
+                          <button
+                            key={`seeall:${group.key}`}
+                            type="button"
+                            role="option"
+                            aria-selected={i === active}
+                            data-active={i === active || undefined}
+                            className="sm-quicknav-item"
+                            onClick={() => go(listRoute, { q: query.trim() })}
+                            onMouseEnter={() => setActive(i)}
+                          >
+                            See all in {group.label} →
+                          </button>
+                        ) : null;
+                      })()
+                    : null}
                 </div>
               ))}
               {pageResults.length > 0 ? (
@@ -803,6 +858,16 @@ function QuickNav() {
 /* read-only. Change password uses POST /api/auth/change-password and  */
 /* revokes the user's other sessions.                                   */
 /* ------------------------------------------------------------------ */
+/**
+ * M-23: users.avatar_url stores an object KEY (an `avatars/` key or a
+ * media-library key), never a URL. The principal's avatar is served
+ * at GET /api/v1/admin/me/avatar; the key rides as a cache-buster so
+ * a changed avatar is never served stale from the 1h private cache.
+ */
+function ownAvatarSrc(key: string | null | undefined): string | null {
+  return key ? `/api/v1/admin/me/avatar?k=${encodeURIComponent(key)}` : null;
+}
+
 function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { principal } = useAuth();
   const { toast } = useToast();
@@ -812,6 +877,41 @@ function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }
   const [fieldError, setFieldError] = useState<string | undefined>(undefined);
   // Two-factor setup/disable opens as a second dialog from here.
   const [twoFactorMode, setTwoFactorMode] = useState<"none" | "setup" | "disable">("none");
+  // Avatar (audit M-23): the media picker opens as a sibling dialog.
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [avatarSaving, setAvatarSaving] = useState(false);
+
+  // Avatar updates PATCH immediately (separate from the Name save):
+  // the picker hands back a media asset; its content URL is sent and
+  // the API resolves it to the stored object key (image-only).
+  // Remove clears it back to Gravatar/initials. Rendering goes
+  // through GET /me/avatar (see ownAvatarSrc) — avatar_url itself
+  // is a key, never a URL.
+  const setAvatar = async (url: string | null) => {
+    setAvatarSaving(true);
+    setError(null);
+    try {
+      await apiRequest<StaffPrincipalDto>("/api/v1/admin/me", {
+        method: "PATCH",
+        body: JSON.stringify({ avatar_url: url }),
+      });
+      await queryClient.invalidateQueries({ queryKey: ["admin", "me"] });
+      toast({
+        title: url ? "Avatar updated" : "Avatar removed",
+        message: url
+          ? "Your new photo is showing."
+          : "Showing your Gravatar photo or initials instead.",
+      });
+    } catch (err) {
+      setError(
+        err instanceof ApiClientError
+          ? err.message
+          : "Could not update your avatar.",
+      );
+    } finally {
+      setAvatarSaving(false);
+    }
+  };
 
   useEffect(() => {
     if (open) {
@@ -874,6 +974,39 @@ function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }
     >
       <div className="sm-stack">
         {error ? <Alert variant="danger">{error}</Alert> : null}
+        {/* Audit M-23: the avatar control — pick from the media
+            library (or upload new from the same place) or remove the
+            custom photo. The media-picker pattern is used everywhere
+            an upload exists (ADR-0011). */}
+        <Field
+          label="Avatar"
+          hint="Your photo — shown in the account menu and search results. Without one, your Gravatar photo shows, or your initials."
+        >
+          <div className="sm-inline-row">
+            <Avatar
+              name={principal.user.name}
+              email={principal.user.email}
+              avatarUrl={ownAvatarSrc(principal.user.avatar_url)}
+              size="lg"
+            />
+            <Button
+              variant="secondary"
+              loading={avatarSaving}
+              onClick={() => setPickerOpen(true)}
+            >
+              Choose from library
+            </Button>
+            {principal.user.avatar_url ? (
+              <Button
+                variant="ghost"
+                disabled={avatarSaving}
+                onClick={() => void setAvatar(null)}
+              >
+                Remove
+              </Button>
+            ) : null}
+          </div>
+        </Field>
         <Field label="Name" required error={fieldError} htmlFor="profile-name">
           <Input
             id="profile-name"
@@ -950,6 +1083,16 @@ function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }
         />
       ) : null}
     </Dialog>
+    <MediaPicker
+      open={pickerOpen}
+      onClose={() => setPickerOpen(false)}
+      onSelect={(asset) => {
+        setPickerOpen(false);
+        void setAvatar(asset.content_url);
+      }}
+      kinds={["image"]}
+      title="Choose avatar from media library"
+    />
     </>
   );
 }
@@ -1115,8 +1258,9 @@ function useApiStatus(): ApiStatus {
 
 /* The account menu (Neon image-78): avatar + name + chevron opens a
    square dark menu with sections — header (avatar, name, email, roles),
-   "Manage" (Profile, Change password, Settings, Theme submenu), a live
-   API Status row (one GET /api/v1/health per session), then Sign out. */
+   "Manage" (Profile, Change password, Settings, Help, Theme submenu), a
+   live API Status row (one GET /api/v1/health per session), then Sign
+   out. */
 function AccountMenu() {
   const { principal, signOut } = useAuth();
   const navigate = useNavigate();
@@ -1139,14 +1283,23 @@ function AccountMenu() {
         triggerClassName="sm-account-btn"
         trigger={
           <>
-            <Avatar name={principal.user.name} email={principal.user.email} />
+            <Avatar
+              name={principal.user.name}
+              email={principal.user.email}
+              avatarUrl={ownAvatarSrc(principal.user.avatar_url)}
+            />
             <span className="sm-account-name">{principal.user.name}</span>
             <ChevronDown size={14} strokeWidth={2} className="sm-account-chevron" />
           </>
         }
       >
         <MenuHeader>
-          <Avatar name={principal.user.name} email={principal.user.email} size="lg" />
+          <Avatar
+            name={principal.user.name}
+            email={principal.user.email}
+            avatarUrl={ownAvatarSrc(principal.user.avatar_url)}
+            size="lg"
+          />
           <div className="sm-menu-header-body">
             <div className="sm-menu-header-name">{principal.user.name}</div>
             <div className="sm-menu-header-sub">{principal.user.email}</div>
@@ -1169,6 +1322,12 @@ function AccountMenu() {
         </MenuItem>
         <MenuItem icon={SettingsIcon} onClick={() => void navigate({ to: "/settings" })}>
           Settings
+        </MenuItem>
+        {/* Audit L-14 (decision D-7): the Help entry — a small Getting
+            Started page built only from the existing flows, plus the
+            in-app Integration Guide linked from it. */}
+        <MenuItem icon={LifeBuoy} onClick={() => void navigate({ to: "/getting-started" } as never)}>
+          Help
         </MenuItem>
         <MenuSub icon={SunMoon} label="Theme">
           {THEME_CHOICES.map((choice) => (

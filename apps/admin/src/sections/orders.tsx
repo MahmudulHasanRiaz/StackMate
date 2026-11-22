@@ -40,7 +40,12 @@ import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
 import { Plus, Receipt, ShoppingCart } from "lucide-react";
 import { apiRequest, formatMinorMoney } from "../lib/api-client";
-import { ddmmyyyyToIso, isoToDdmmyyyy } from "../lib/dates";
+import {
+  ddmmyyyyToIso,
+  isoToDdmmyyyy,
+  normalizeDateInput,
+  normalizePastedDate,
+} from "../lib/dates";
 import { detailKey, listKey, queryClient } from "../lib/query";
 import {
   DetailFacts,
@@ -75,6 +80,7 @@ import {
   TableSkeleton,
   Textarea,
   useConfirm,
+  type SearchableOption,
 } from "../components/primitives";
 import {
   CollapsibleSection,
@@ -265,7 +271,14 @@ export function OrdersSection() {
       : "";
   const updateSearch = useListSearchControls(parsed);
   const goTo = useGoTo();
-  const query = useAdminList<OrderListDto>("orders", "/api/v1/admin/orders");
+  const query = useAdminList<OrderListDto>("orders", "/api/v1/admin/orders", {
+    q: parsed.q,
+    page: parsed.page,
+    pageSize: parsed.pageSize,
+    // Server-side: ?payment_status= filters the full set; the
+    // client-side `filtered` memo below re-applies the same predicate.
+    extra: paymentFilter ? { payment_status: paymentFilter } : undefined,
+  });
   // Opened from a lead conversion (?new=1&customer=<id>&lead=<id>) or
   // the Create order button. The wizard reads the same search params
   // for its prefill.
@@ -274,9 +287,20 @@ export function OrdersSection() {
   );
   const wizardPrefill =
     typeof rawSearch.customer === "string" && typeof rawSearch.lead === "string"
-      ? { customerId: rawSearch.customer, leadId: rawSearch.lead }
+      ? {
+          customerId: rawSearch.customer,
+          leadId: rawSearch.lead,
+          productId:
+            typeof rawSearch.product === "string" && rawSearch.product !== ""
+              ? rawSearch.product
+              : null,
+          interest:
+            typeof rawSearch.interest === "string" && rawSearch.interest !== ""
+              ? rawSearch.interest
+              : null,
+        }
       : typeof rawSearch.customer === "string"
-        ? { customerId: rawSearch.customer, leadId: null }
+        ? { customerId: rawSearch.customer, leadId: null, productId: null, interest: null }
         : null;
 
   const columns: ColumnDef<OrderListDto, unknown>[] = [
@@ -395,6 +419,11 @@ export function OrdersSection() {
       <ListTable<OrderListDto>
         columns={columns}
         data={filtered}
+        serverSearch
+        serverPagination
+        refreshSection="orders"
+        filtersActive={paymentFilter !== ""}
+        total={query.total}
         search={parsed.q ?? ""}
         onSearchChange={(q) => updateSearch({ q: q === "" ? undefined : q, page: 1 })}
         page={parsed.page ?? 1}
@@ -410,6 +439,8 @@ export function OrdersSection() {
         emptyBody="Orders appear here once one is placed."
         toolbar={
           <Select
+            id="orders-payment-filter"
+            name="payment_status"
             value={paymentFilter}
             onChange={(e) =>
               updateSearch({
@@ -1166,22 +1197,32 @@ function EditInstallmentDialog({
               : "Could not save the installment."}
           </Alert>
         ) : null}
-        <Field label="Due date" required hint="DD/MM/YYYY." error={error ?? ""}>
+        <Field label="Due date" required htmlFor="inst-due-date" hint="DD/MM/YYYY." error={error ?? ""}>
           <Input
+            id="inst-due-date"
+            name="due_date"
             value={dueDate}
-            onChange={(e) => setDueDate(e.target.value)}
+            onChange={(e) => setDueDate(normalizeDateInput(e.target.value))}
+            onPaste={(e) => {
+              e.preventDefault();
+              setDueDate(normalizePastedDate(e.clipboardData.getData("text")));
+            }}
             placeholder="15/11/2026"
             maxLength={10}
           />
         </Field>
-        <Field label="Amount (read-only)">
+        <Field label="Amount (read-only)" htmlFor="inst-amount">
           <Input
+            id="inst-amount"
+            name="amount"
             value={formatMinorMoney(installment.amount_minor, currency)}
             disabled
           />
         </Field>
-        <Field label="Notes">
+        <Field label="Notes" htmlFor="inst-notes">
           <Textarea
+            id="inst-notes"
+            name="notes"
             value={notes}
             onChange={(e) => setNotes(e.target.value)}
             maxLength={1000}
@@ -1332,6 +1373,10 @@ interface WizardPaymentMethodDto {
 interface WizardPrefill {
   customerId: string | null;
   leadId: string | null;
+  /** Lead's product (if the lead was linked to one) — pre-selects the product picker. */
+  productId: string | null;
+  /** Lead's free-text interest — pre-fills the custom-offer label when there is no linked product. */
+  interest: string | null;
 }
 
 interface PlanPreviewRow {
@@ -1379,18 +1424,23 @@ function CreateOrderWizard({
   const [customerErrors, setCustomerErrors] = useState<Record<string, string>>({});
 
   /* Step 2 — item */
-  const [itemKind, setItemKind] = useState<"package" | "custom">("package");
-  const [productId, setProductId] = useState("");
+  const [itemKind, setItemKind] = useState<"package" | "custom">(
+    // Lead conversion prefill: a linked product keeps the package flow;
+    // interest text without a product becomes a custom offer labelled
+    // with that interest.
+    prefill?.productId ? "package" : prefill?.interest ? "custom" : "package",
+  );
+  const [productId, setProductId] = useState(prefill?.productId ?? "");
   const [packageId, setPackageId] = useState("");
   const [priceId, setPriceId] = useState("");
-  const [customLabel, setCustomLabel] = useState("");
+  const [customLabel, setCustomLabel] = useState(prefill?.interest ?? "");
   const [customPrice, setCustomPrice] = useState("");
   const [customPriceKind, setCustomPriceKind] = useState<
     "one_time" | "recurring" | "lifetime" | "free"
   >("one_time");
   const [customFeatures, setCustomFeatures] = useState<
-    { featureId: string; value: string }[]
-  >([{ featureId: "", value: "" }]);
+    { featureId: string; value: string; unlimited: boolean }[]
+  >([{ featureId: "", value: "", unlimited: false }]);
   const [quantity, setQuantity] = useState("1");
   const [discount, setDiscount] = useState("0");
   const [tax, setTax] = useState("0");
@@ -1544,6 +1594,34 @@ function CreateOrderWizard({
           next.customPrice = "Enter the price in minor units (0 or more).";
         if (customFeatures.filter((f) => f.featureId).length < 1)
           next.customFeatures = "Pick at least one feature for the custom offer.";
+        // Each entitlement value must match its feature's value_type
+        // (validateFeatureEntitlementValue, contracts catalog.ts) — the
+        // server rejects mismatches, so validate here with an inline
+        // error instead of a generic create-time failure. Skipped while
+        // the feature list is still loading (no value_type known yet).
+        if (!featuresQuery.isPending && (featuresQuery.data ?? []).length > 0) {
+          customFeatures.forEach((f, i) => {
+            if (!f.featureId) return;
+            const feat = (featuresQuery.data ?? []).find((x) => x.id === f.featureId);
+            if (!feat) {
+              next[`customFeature_${i}`] = "Choose a feature.";
+              return;
+            }
+            const raw = f.value.trim();
+            if (feat.value_type === "boolean") {
+              if (raw.toLowerCase() !== "true" && raw.toLowerCase() !== "false") {
+                next[`customFeature_${i}`] =
+                  `"${feat.name}" is a boolean feature — enter true or false.`;
+              }
+            } else if (f.unlimited) {
+              // Unlimited is valid for limit/quota/metered (sent as
+              // { value_type, value: null, unlimited: true }).
+            } else if (!/^\d+$/.test(raw)) {
+              next[`customFeature_${i}`] =
+                `"${feat.name}" is a ${feat.value_type} feature — enter a non-negative whole number, or tick Unlimited.`;
+            }
+          });
+        }
       }
       if (!Number.isInteger(qty) || qty < 1 || qty > 100)
         next.quantity = "Quantity must be 1–100.";
@@ -1662,6 +1740,16 @@ function CreateOrderWizard({
                     const feat = (featuresQuery.data ?? []).find(
                       (x) => x.id === f.featureId,
                     );
+                    if (feat && f.unlimited && feat.value_type !== "boolean") {
+                      return {
+                        product_feature_id: f.featureId,
+                        entitlement_value: {
+                          value_type: feat.value_type,
+                          value: null,
+                          unlimited: true,
+                        },
+                      };
+                    }
                     return {
                       product_feature_id: f.featureId,
                       entitlement_value: feat
@@ -1737,6 +1825,13 @@ function CreateOrderWizard({
         }
       }
       void queryClient.invalidateQueries({ queryKey: listKey("orders") });
+      // The first-payment claim (if any) lands in Payment Review, and the
+      // customer's profile tabs show the new order — invalidate those too
+      // instead of leaving them stale for 30s (audit M-07).
+      void queryClient.invalidateQueries({ queryKey: listKey("payment-submissions") });
+      void queryClient.invalidateQueries({
+        queryKey: detailKey("customers", createdOrder.customer_id),
+      });
       onCreated(createdOrder.id);
     } catch (err) {
       setFormError(err instanceof Error ? err.message : "Could not create the order.");
@@ -1787,7 +1882,7 @@ function CreateOrderWizard({
               Continue
             </Button>
           ) : (
-            <Button variant="primary" loading={creating} onClick={() => void create()}>
+            <Button variant="accent" loading={creating} onClick={() => void create()}>
               Create order
             </Button>
           )}
@@ -1815,8 +1910,10 @@ function CreateOrderWizard({
 
       {step === 1 ? (
         <div style={{ marginTop: 12 }}>
-          <Field label="Customer">
+          <Field label="Customer" htmlFor="wiz-customer-mode">
             <Select
+              id="wiz-customer-mode"
+              name="customer_mode"
               value={customerMode}
               onChange={(e) => setCustomerMode(e.target.value as "existing" | "new")}
             >
@@ -1829,6 +1926,7 @@ function CreateOrderWizard({
               <Field
                 label="Customer"
                 required
+                htmlFor="wiz-customer"
                 error={customerErrors.customer ?? ""}
               >
                 {/* One typable picker (PLAN §29): type a name, email or
@@ -1836,6 +1934,7 @@ function CreateOrderWizard({
                    customer set, so a customer beyond any loaded page
                    is still found. */}
                 <SearchableSelect
+                  id="wiz-customer"
                   value={customerId}
                   onChange={(v) => setCustomerId(v)}
                   loadOptions={(q, signal) =>
@@ -1877,8 +1976,10 @@ function CreateOrderWizard({
 
       {step === 2 ? (
         <div style={{ marginTop: 12 }}>
-          <Field label="Item type">
+          <Field label="Item type" htmlFor="wiz-item-kind">
             <Select
+              id="wiz-item-kind"
+              name="item_kind"
               value={itemKind}
               onChange={(e) => {
                 setItemKind(e.target.value as "package" | "custom");
@@ -1890,42 +1991,46 @@ function CreateOrderWizard({
               <option value="custom">Custom offer</option>
             </Select>
           </Field>
-          <Field label="Product" required error={itemErrors.product ?? ""}>
+          <Field label="Product" required htmlFor="wiz-product" error={itemErrors.product ?? ""}>
             {/* Searchable (PLAN §29): products are unbounded; only
-               active products are offered (the loader filters). */}
+               active products are offered (?status=active, server-side). */}
             <SearchableSelect
+              id="wiz-product"
               value={productId}
               onChange={(v) => {
                 setProductId(v);
                 setPackageId("");
                 setPriceId("");
-                setCustomFeatures([{ featureId: "", value: "" }]);
+                setCustomFeatures([{ featureId: "", value: "", unlimited: false }]);
                 clearItemError("product");
                 clearItemError("package");
                 clearItemError("price");
               }}
-              loadOptions={async (q, signal) => {
-                const all = await loadListOptions<WizardProductDto>(
+              loadOptions={async (q, signal) =>
+                loadListOptions<WizardProductDto>(
                   "/api/v1/admin/products",
                   q,
                   (p) => ({ value: p.id, label: p.name, data: p }),
                   signal,
-                );
-                return all.filter(
-                  (o) => (o.data as WizardProductDto | undefined)?.status === "active",
-                );
-              }}
+                  { extra: { status: "active" } },
+                )
+              }
+              resolveLabel={detailLabelResolver<WizardProductDto>(
+                (id) => `/api/v1/admin/products/${id}`,
+                (p) => p.name,
+              )}
               placeholder="Type a product name…"
               ariaLabel="Product"
             />
           </Field>
           {itemKind === "package" ? (
             <>
-              <Field label="Package" required error={itemErrors.package ?? ""}>
+              <Field label="Package" required htmlFor="wiz-package" error={itemErrors.package ?? ""}>
                 {/* Local mode: packages are this product's complete
                    subcollection (loaded whole), so client-side
                    filtering cannot miss one. */}
                 <SearchableSelect
+                  id="wiz-package"
                   value={packageId}
                   onChange={(v) => {
                     setPackageId(v);
@@ -1949,13 +2054,14 @@ function CreateOrderWizard({
                   ordering it.
                 </Alert>
               ) : null}
-              <Field label="Price" required error={itemErrors.price ?? ""}>
+              <Field label="Price" required htmlFor="wiz-price" error={itemErrors.price ?? ""}>
                 {/* SearchableSelect, local mode (PLAN §29): prices are
                    this version's complete set, so client-side filtering
                    cannot miss one. Typable, unlike the MenuSelect it
                    replaces (live defect 2026-11-17 — only type-ahead
                    worked on the native select). */}
                 <SearchableSelect
+                  id="wiz-price"
                   value={priceId}
                   onChange={(v) => {
                     setPriceId(v);
@@ -1981,8 +2087,10 @@ function CreateOrderWizard({
             </>
           ) : (
             <>
-              <Field label="Offer label" required error={itemErrors.customLabel ?? ""}>
+              <Field label="Offer label" required htmlFor="wiz-custom-label" error={itemErrors.customLabel ?? ""}>
                 <Input
+                  id="wiz-custom-label"
+                  name="custom_label"
                   value={customLabel}
                   onChange={(e) => {
                     setCustomLabel(e.target.value);
@@ -1992,8 +2100,10 @@ function CreateOrderWizard({
                   placeholder="e.g. Custom ERP setup"
                 />
               </Field>
-              <Field label="Price (minor units)" required error={itemErrors.customPrice ?? ""}>
+              <Field label="Price (minor units)" required htmlFor="wiz-custom-price" error={itemErrors.customPrice ?? ""}>
                 <Input
+                  id="wiz-custom-price"
+                  name="custom_price"
                   inputMode="numeric"
                   value={customPrice}
                   onChange={(e) => {
@@ -2003,8 +2113,10 @@ function CreateOrderWizard({
                   placeholder="500000"
                 />
               </Field>
-              <Field label="Billing kind">
+              <Field label="Billing kind" htmlFor="wiz-custom-price-kind">
                 <Select
+                  id="wiz-custom-price-kind"
+                  name="custom_price_kind"
                   value={customPriceKind}
                   onChange={(e) =>
                     setCustomPriceKind(
@@ -2020,53 +2132,104 @@ function CreateOrderWizard({
               </Field>
               <Field
                 label="Features"
-                hint="At least one feature from this product, with its entitlement value (true/false, a number, or text)."
+                hint="At least one feature from this product, with its entitlement value (true/false for boolean, a whole number for limit/quota/metered — or tick Unlimited)."
                 error={itemErrors.customFeatures ?? ""}
               >
                 <div>
-                  {customFeatures.map((f, i) => (
-                    <div key={i} className="sm-form-grid" style={{ marginTop: i > 0 ? 8 : 0 }}>
-                      {/* Local mode: features are this product's complete
-                         set, so client-side filtering cannot miss one. */}
-                      <SearchableSelect
-                        value={f.featureId}
-                        onChange={(v) =>
-                          setCustomFeatures((rows) =>
-                            rows.map((r, j) =>
-                              j === i ? { ...r, featureId: v } : r,
-                            ),
-                          )
-                        }
-                        options={(featuresQuery.data ?? [])
-                          .filter((feat) => feat.status === "active")
-                          .map((feat) => ({
-                            value: feat.id,
-                            label: `${feat.name} (${feat.value_type})`,
-                          }))}
-                        placeholder="Select a feature…"
-                        disabled={!productId || featuresQuery.isPending}
-                        ariaLabel="Feature"
-                      />
-                      <Input
-                        value={f.value}
-                        onChange={(e) =>
-                          setCustomFeatures((rows) =>
-                            rows.map((r, j) =>
-                              j === i ? { ...r, value: e.target.value } : r,
-                            ),
-                          )
-                        }
-                        placeholder="Value"
-                        aria-label="Entitlement value"
-                      />
-                    </div>
-                  ))}
+                  {customFeatures.map((f, i) => {
+                    const feat = (featuresQuery.data ?? []).find(
+                      (x) => x.id === f.featureId,
+                    );
+                    const canUnlimited =
+                      feat !== undefined && feat.value_type !== "boolean";
+                    return (
+                      <div key={i}>
+                        <div className="sm-form-grid" style={{ marginTop: i > 0 ? 8 : 0 }}>
+                          {/* Local mode: features are this product's complete
+                             set, so client-side filtering cannot miss one. */}
+                          <SearchableSelect
+                            id={`wiz-feature-${i}`}
+                            value={f.featureId}
+                            onChange={(v) =>
+                              setCustomFeatures((rows) =>
+                                rows.map((r, j) =>
+                                  j === i
+                                    ? { ...r, featureId: v, value: "", unlimited: false }
+                                    : r,
+                                ),
+                              )
+                            }
+                            options={(featuresQuery.data ?? [])
+                              .filter((feat) => feat.status === "active")
+                              .map((feat) => ({
+                                value: feat.id,
+                                label: `${feat.name} (${feat.value_type})`,
+                              }))}
+                            placeholder="Select a feature…"
+                            disabled={!productId || featuresQuery.isPending}
+                            ariaLabel="Feature"
+                          />
+                          <Input
+                            id={`wiz-feature-value-${i}`}
+                            name="entitlement_value"
+                            value={f.value}
+                            onChange={(e) =>
+                              setCustomFeatures((rows) =>
+                                rows.map((r, j) =>
+                                  j === i ? { ...r, value: e.target.value } : r,
+                                ),
+                              )
+                            }
+                            placeholder={
+                              feat?.value_type === "boolean"
+                                ? "true or false"
+                                : "Whole number"
+                            }
+                            disabled={f.unlimited}
+                            aria-label="Entitlement value"
+                          />
+                        </div>
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 12,
+                            marginTop: 4,
+                          }}
+                        >
+                          {canUnlimited ? (
+                            <Checkbox
+                              label="Unlimited"
+                              checked={f.unlimited}
+                              onChange={(e) =>
+                                setCustomFeatures((rows) =>
+                                  rows.map((r, j) =>
+                                    j === i
+                                      ? { ...r, unlimited: e.target.checked }
+                                      : r,
+                                  ),
+                                )
+                              }
+                            />
+                          ) : null}
+                          {itemErrors[`customFeature_${i}`] ? (
+                            <span className="sm-field-error" role="alert">
+                              {itemErrors[`customFeature_${i}`]}
+                            </span>
+                          ) : null}
+                        </div>
+                      </div>
+                    );
+                  })}
                   <div style={{ marginTop: 8 }}>
                     <Button
                       variant="secondary"
                       size="sm"
                       onClick={() =>
-                        setCustomFeatures((rows) => [...rows, { featureId: "", value: "" }])
+                        setCustomFeatures((rows) => [
+                          ...rows,
+                          { featureId: "", value: "", unlimited: false },
+                        ])
                       }
                     >
                       Add feature
@@ -2076,8 +2239,10 @@ function CreateOrderWizard({
               </Field>
             </>
           )}
-          <Field label="Quantity" required error={itemErrors.quantity ?? ""}>
+          <Field label="Quantity" required htmlFor="wiz-quantity" error={itemErrors.quantity ?? ""}>
             <Input
+              id="wiz-quantity"
+              name="quantity"
               inputMode="numeric"
               value={quantity}
               onChange={(e) => {
@@ -2086,8 +2251,10 @@ function CreateOrderWizard({
               }}
             />
           </Field>
-          <Field label="Discount (minor units)" error={itemErrors.discount ?? ""}>
+          <Field label="Discount (minor units)" htmlFor="wiz-discount" error={itemErrors.discount ?? ""}>
             <Input
+              id="wiz-discount"
+              name="discount_minor"
               inputMode="numeric"
               value={discount}
               onChange={(e) => {
@@ -2096,8 +2263,10 @@ function CreateOrderWizard({
               }}
             />
           </Field>
-          <Field label="Tax (minor units)" error={itemErrors.tax ?? ""}>
+          <Field label="Tax (minor units)" htmlFor="wiz-tax" error={itemErrors.tax ?? ""}>
             <Input
+              id="wiz-tax"
+              name="tax_minor"
               inputMode="numeric"
               value={tax}
               onChange={(e) => {
@@ -2106,8 +2275,10 @@ function CreateOrderWizard({
               }}
             />
           </Field>
-          <Field label="Internal notes">
+          <Field label="Internal notes" htmlFor="wiz-notes">
             <Textarea
+              id="wiz-notes"
+              name="internal_note"
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
               maxLength={2000}
@@ -2122,8 +2293,10 @@ function CreateOrderWizard({
             Estimated total {formatMinorMoney(estimatedTotal, "BDT")} — the plan
             below is built from it.
           </p>
-          <Field label="Payment plan">
+          <Field label="Payment plan" htmlFor="wiz-plan-kind">
             <Select
+              id="wiz-plan-kind"
+              name="plan_kind"
               value={planKind}
               onChange={(e) =>
                 setPlanKind(e.target.value as "full" | "advance_rest" | "equal_installments")
@@ -2135,10 +2308,16 @@ function CreateOrderWizard({
             </Select>
           </Field>
           {planKind === "full" ? (
-            <Field label="Due date" required hint="DD/MM/YYYY." error={planErrors.dueDate ?? ""}>
+            <Field label="Due date" required htmlFor="wiz-due-date" hint="DD/MM/YYYY." error={planErrors.dueDate ?? ""}>
               <Input
+                id="wiz-due-date"
+                name="due_date"
                 value={dueDate}
-                onChange={(e) => setDueDate(e.target.value)}
+                onChange={(e) => setDueDate(normalizeDateInput(e.target.value))}
+                onPaste={(e) => {
+                  e.preventDefault();
+                  setDueDate(normalizePastedDate(e.clipboardData.getData("text")));
+                }}
                 placeholder="15/11/2026"
                 maxLength={10}
               />
@@ -2148,10 +2327,13 @@ function CreateOrderWizard({
             <>
               <Field
                 label="Advance amount (minor units)"
+                htmlFor="wiz-advance-amount"
                 hint="Or a percent below — one of the two."
                 error={planErrors.advance ?? ""}
               >
                 <Input
+                  id="wiz-advance-amount"
+                  name="advance_amount"
                   inputMode="numeric"
                   value={advanceAmount}
                   onChange={(e) => setAdvanceAmount(e.target.value)}
@@ -2160,10 +2342,13 @@ function CreateOrderWizard({
               </Field>
               <Field
                 label="Advance percent"
+                htmlFor="wiz-advance-percent"
                 hint="1–99% of the total. Leave blank when an amount is given."
                 error={planErrors.advance ?? ""}
               >
                 <Input
+                  id="wiz-advance-percent"
+                  name="advance_percent"
                   inputMode="numeric"
                   value={advancePercent}
                   onChange={(e) => setAdvancePercent(e.target.value)}
@@ -2173,12 +2358,19 @@ function CreateOrderWizard({
               <Field
                 label="Rest due date"
                 required
+                htmlFor="wiz-rest-due-date"
                 hint="DD/MM/YYYY."
                 error={planErrors.restDueDate ?? ""}
               >
                 <Input
+                  id="wiz-rest-due-date"
+                  name="rest_due_date"
                   value={restDueDate}
-                  onChange={(e) => setRestDueDate(e.target.value)}
+                  onChange={(e) => setRestDueDate(normalizeDateInput(e.target.value))}
+                  onPaste={(e) => {
+                    e.preventDefault();
+                    setRestDueDate(normalizePastedDate(e.clipboardData.getData("text")));
+                  }}
                   placeholder="15/12/2026"
                   maxLength={10}
                 />
@@ -2190,9 +2382,12 @@ function CreateOrderWizard({
               <Field
                 label="Number of installments"
                 required
+                htmlFor="wiz-installment-count"
                 error={planErrors.installmentCount ?? ""}
               >
                 <Input
+                  id="wiz-installment-count"
+                  name="installment_count"
                   inputMode="numeric"
                   value={installmentCount}
                   onChange={(e) => setInstallmentCount(e.target.value)}
@@ -2201,9 +2396,12 @@ function CreateOrderWizard({
               <Field
                 label="Every X days"
                 required
+                htmlFor="wiz-interval-days"
                 error={planErrors.intervalDays ?? ""}
               >
                 <Input
+                  id="wiz-interval-days"
+                  name="interval_days"
                   inputMode="numeric"
                   value={intervalDays}
                   onChange={(e) => setIntervalDays(e.target.value)}
@@ -2212,12 +2410,19 @@ function CreateOrderWizard({
               <Field
                 label="Start date"
                 required
+                htmlFor="wiz-start-date"
                 hint="DD/MM/YYYY — the first installment is due on this date."
                 error={planErrors.startDate ?? ""}
               >
                 <Input
+                  id="wiz-start-date"
+                  name="start_date"
                   value={startDate}
-                  onChange={(e) => setStartDate(e.target.value)}
+                  onChange={(e) => setStartDate(normalizeDateInput(e.target.value))}
+                  onPaste={(e) => {
+                    e.preventDefault();
+                    setStartDate(normalizePastedDate(e.clipboardData.getData("text")));
+                  }}
                   placeholder="15/11/2026"
                   maxLength={10}
                 />
@@ -2253,8 +2458,10 @@ function CreateOrderWizard({
 
       {step === 4 ? (
         <div style={{ marginTop: 12 }}>
-          <Field label="License activation">
+          <Field label="License activation" htmlFor="wiz-activation-mode">
             <Select
+              id="wiz-activation-mode"
+              name="activation_mode"
               value={activationMode}
               onChange={(e) =>
                 setActivationMode(
@@ -2271,10 +2478,13 @@ function CreateOrderWizard({
             <Field
               label="Activation percent"
               required
+              htmlFor="wiz-activation-percent"
               hint="The license activates once this much of the total is paid."
               error={step4Errors.activationPercent ?? ""}
             >
               <Input
+                id="wiz-activation-percent"
+                name="activation_percent"
                 inputMode="numeric"
                 value={activationPercent}
                 onChange={(e) => setActivationPercent(e.target.value)}
@@ -2285,12 +2495,19 @@ function CreateOrderWizard({
             <Field
               label="Activation date"
               required
+              htmlFor="wiz-activation-date"
               hint="DD/MM/YYYY — activates on this date regardless of payment."
               error={step4Errors.activationDate ?? ""}
             >
               <Input
+                id="wiz-activation-date"
+                name="activation_date"
                 value={activationDate}
-                onChange={(e) => setActivationDate(e.target.value)}
+                onChange={(e) => setActivationDate(normalizeDateInput(e.target.value))}
+                onPaste={(e) => {
+                  e.preventDefault();
+                  setActivationDate(normalizePastedDate(e.clipboardData.getData("text")));
+                }}
                 placeholder="01/12/2026"
                 maxLength={10}
               />
@@ -2309,33 +2526,35 @@ function CreateOrderWizard({
           ) : null}
           <Field
             label="Subscription grace days"
+            htmlFor="wiz-grace-days"
             hint="After a renewal is missed, the license keeps working for this many days before it is suspended."
             error={step4Errors.graceDays ?? ""}
           >
             <Input
+              id="wiz-grace-days"
+              name="grace_days"
               inputMode="numeric"
               value={graceDays}
               onChange={(e) => setGraceDays(e.target.value)}
             />
           </Field>
           <CollapsibleSection title="Payment method & first payment (optional)">
-            <Field label="Payment method" error={step4Errors.paymentMethod ?? ""}>
+            <Field label="Payment method" htmlFor="wiz-payment-method" error={step4Errors.paymentMethod ?? ""}>
               {/* Searchable (PLAN §29): payment methods are unbounded;
-                 only enabled methods are offered (the loader filters). */}
+                 only enabled methods are offered (?is_enabled=true, server-side). */}
               <SearchableSelect
+                id="wiz-payment-method"
                 value={paymentMethodId}
                 onChange={(v) => setPaymentMethodId(v)}
-                loadOptions={async (q, signal) => {
-                  const all = await loadListOptions<WizardPaymentMethodDto>(
+                loadOptions={async (q, signal) =>
+                  loadListOptions<WizardPaymentMethodDto>(
                     "/api/v1/admin/payment-methods",
                     q,
                     (m) => ({ value: m.id, label: m.display_name, data: m }),
                     signal,
-                  );
-                  return all.filter(
-                    (o) => (o.data as WizardPaymentMethodDto | undefined)?.is_enabled,
-                  );
-                }}
+                    { extra: { is_enabled: "true" } },
+                  )
+                }
                 leadingOptions={[{ value: "", label: "No method yet" }]}
                 placeholder="No method yet"
                 ariaLabel="Payment method"
@@ -2343,39 +2562,56 @@ function CreateOrderWizard({
             </Field>
             <Field
               label="First payment amount (minor units)"
+              htmlFor="wiz-first-amount"
               hint="Recorded as a claim after the order is created — it still needs approval in Payment Review."
               error={step4Errors.firstPaymentAmount ?? ""}
             >
               <Input
+                id="wiz-first-amount"
+                name="first_payment_amount"
                 inputMode="numeric"
                 value={firstPaymentAmount}
                 onChange={(e) => setFirstPaymentAmount(e.target.value)}
                 placeholder="Leave blank for no first payment"
               />
             </Field>
-            <Field label="Sender name">
+            <Field label="Sender name" htmlFor="wiz-first-sender">
               <Input
+                id="wiz-first-sender"
+                name="sender_name"
+                autoComplete="name"
                 value={firstPaymentSender}
                 onChange={(e) => setFirstPaymentSender(e.target.value)}
               />
             </Field>
-            <Field label="Sender phone" error={step4Errors.firstPaymentPhone ?? ""}>
+            <Field label="Sender phone" htmlFor="wiz-first-phone" error={step4Errors.firstPaymentPhone ?? ""}>
               <Input
+                id="wiz-first-phone"
+                name="sender_phone"
+                autoComplete="tel"
                 value={firstPaymentPhone}
                 onChange={(e) => setFirstPaymentPhone(e.target.value)}
                 placeholder="01XXXXXXXXX"
               />
             </Field>
-            <Field label="Transaction reference">
+            <Field label="Transaction reference" htmlFor="wiz-first-ref">
               <Input
+                id="wiz-first-ref"
+                name="transaction_id"
                 value={firstPaymentRef}
                 onChange={(e) => setFirstPaymentRef(e.target.value)}
               />
             </Field>
-            <Field label="Payment date" hint="DD/MM/YYYY, if known." error={step4Errors.firstPaymentDate ?? ""}>
+            <Field label="Payment date" htmlFor="wiz-first-date" hint="DD/MM/YYYY, if known." error={step4Errors.firstPaymentDate ?? ""}>
               <Input
+                id="wiz-first-date"
+                name="payment_date"
                 value={firstPaymentDate}
-                onChange={(e) => setFirstPaymentDate(e.target.value)}
+                onChange={(e) => setFirstPaymentDate(normalizeDateInput(e.target.value))}
+                onPaste={(e) => {
+                  e.preventDefault();
+                  setFirstPaymentDate(normalizePastedDate(e.clipboardData.getData("text")));
+                }}
                 placeholder="15/11/2026"
                 maxLength={10}
               />

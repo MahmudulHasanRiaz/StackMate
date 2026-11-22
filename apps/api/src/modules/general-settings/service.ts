@@ -22,6 +22,7 @@ import * as schema from "../../../../../db/schema/index.ts";
 import { AppError } from "../../shared/errors.ts";
 import { sha256Hex } from "../../platform/crypto/index.ts";
 import { storeValidatedPrivateObject } from "../../platform/storage/driver.ts";
+import { sanitizeSvgText } from "../../platform/storage/media-validation.ts";
 import type { StorageDriver } from "../../platform/storage/driver.ts";
 
 export type GeneralSettingsDb = NodePgDatabase<typeof schema>;
@@ -205,10 +206,16 @@ export async function saveGeneralSettings(
 
 /**
  * Validate favicon bytes against the declared MIME type. PNG and ICO are
- * checked by magic bytes; SVG is XML text — it must start as SVG markup
- * and must not contain a script element (an SVG served as an image does
- * not execute scripts, but a stored `<script>` in a same-origin-served
- * file is not something we will ever store).
+ * checked by magic bytes; SVG is XML text — it must parse as a
+ * well-formed SVG document (parser-based `sanitizeSvgText`, full
+ * document, not a prefix scan) and must not contain active content.
+ *
+ * The sanitizer DROPS disallowed elements/attributes silently, so a
+ * document that needed dropping is rejected outright instead of stored
+ * as-is: the stored bytes are the original upload, and a `<script>`
+ * past byte 2048 (or an `onload` handler, or a `javascript:` link)
+ * must never reach R2. (Audit L-9: the old code decoded only the first
+ * 2048 bytes and checked only `<script>`.)
  */
 export function verifyFaviconBytes(bytes: Uint8Array, declaredMimeType: string): void {
   const mime = declaredMimeType.trim().toLowerCase();
@@ -240,17 +247,37 @@ export function verifyFaviconBytes(bytes: Uint8Array, declaredMimeType: string):
     }
     return;
   }
-  // image/svg+xml
+  // image/svg+xml — decode the FULL bytes and run the parser-based
+  // sanitizer: it throws (415) unless the document is well-formed XML
+  // with an <svg> root. The sanitizer drops disallowed content
+  // silently, so active content is rejected explicitly below — the
+  // stored bytes are the original upload, never the sanitized text.
+  //
+  // A leading XML declaration (`<?xml version="1.0" …?>`) is stripped
+  // first: the shared parser rejects EVERY declaration today
+  // (media-validation.ts checks `text.slice(pos, end).includes("<")`,
+  // which always includes the `<?xml` opener itself — the parent's
+  // remainder to fix there). The declaration carries no active content
+  // (version/encoding only); the rest of the document still goes
+  // through the full parser. A `<?xml-stylesheet …?>` processing
+  // instruction is NOT stripped (the regex requires whitespace or `?>`
+  // right after `<?xml`) and is still rejected by the parser.
   const text = new TextDecoder("utf-8", { fatal: false })
-    .decode(bytes.subarray(0, 2048))
-    .trimStart();
-  const isSvg =
-    text.startsWith("<svg") || text.startsWith("<?xml");
-  if (!isSvg || !text.includes("<svg")) {
-    throw new AppError("UNSUPPORTED_MEDIA_TYPE", "File does not look like SVG markup.", 415);
-  }
-  if (/<script[\s>]/i.test(text) || /<\/script>/i.test(text)) {
-    throw new AppError("UNSUPPORTED_MEDIA_TYPE", "SVG favicons must not contain scripts.", 415);
+    .decode(bytes)
+    .replace(/^\uFEFF?<\?xml(?:\s[^>]*)?\?>\s*/, "");
+  sanitizeSvgText(text);
+  if (
+    /<script[\s>]/i.test(text) ||
+    /<\/script>/i.test(text) ||
+    /<foreignObject[\s>]/i.test(text) ||
+    /\son[a-z]+\s*=/i.test(text) ||
+    /javascript\s*:/i.test(text)
+  ) {
+    throw new AppError(
+      "UNSUPPORTED_MEDIA_TYPE",
+      "SVG favicons must not contain scripts, event handlers, or script URLs.",
+      415
+    );
   }
 }
 

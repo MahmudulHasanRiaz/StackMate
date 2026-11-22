@@ -122,8 +122,10 @@ function OAuthProviderCard({ provider, onSaved }: { provider: OAuthProviderView;
           checked={enabled}
           onChange={(e) => setEnabled(e.target.checked)}
         />
-        <Field label="Client ID" required={enabled}>
+        <Field label="Client ID" required={enabled} htmlFor={`oauth-client-id-${provider.provider}`}>
           <Input
+            id={`oauth-client-id-${provider.provider}`}
+            name="client_id"
             value={clientId}
             onChange={(e) => setClientId(e.target.value)}
             placeholder="OAuth client ID"
@@ -132,6 +134,7 @@ function OAuthProviderCard({ provider, onSaved }: { provider: OAuthProviderView;
         </Field>
         <Field
           label="Client secret"
+          htmlFor={`oauth-client-secret-${provider.provider}`}
           hint={
             provider.has_client_secret
               ? "A secret is stored (encrypted). Leave blank to keep it."
@@ -139,6 +142,8 @@ function OAuthProviderCard({ provider, onSaved }: { provider: OAuthProviderView;
           }
         >
           <Input
+            id={`oauth-client-secret-${provider.provider}`}
+            name="client_secret"
             type="password"
             value={clientSecret}
             onChange={(e) => setClientSecret(e.target.value)}
@@ -186,6 +191,8 @@ function TwoFactorPolicyRow({
     <div className="sm-policy-row">
       <span className="sm-policy-label">{label}</span>
       <Select
+        id={`2fa-policy-${scope}`}
+        name="two_factor_mode"
         value={value}
         onChange={(e) => setValue(e.target.value as TwoFactorMode)}
         aria-label={`Two-factor policy for ${label}`}
@@ -240,7 +247,7 @@ export function AuthSettingsSection() {
       <PageHeader
         breadcrumb={[{ label: "Settings" }, { label: "Authentication" }]}
         title="Authentication"
-        help="OAuth providers shown on the sign-in page and the two-factor policy. Email (SMTP) settings live under Settings → Email."
+        help="OAuth providers shown on the sign-in page and the two-factor policy. Two-factor is off by default; Required forces staff with that role to set up two-factor at sign-in before they can use the admin. Email (SMTP) settings live under Settings → Email."
       />
       <h2 className="sm-section-title">OAuth providers</h2>
       <div className="sm-grid-2">
@@ -249,10 +256,6 @@ export function AuthSettingsSection() {
         ))}
       </div>
       <h2 className="sm-section-title">Two-factor authentication policy</h2>
-      <p className="sm-muted">
-        Default is off. <strong>Required</strong> forces staff with that role to set up two-factor
-        authentication at sign-in before they can use the admin.
-      </p>
       <div className="sm-card">
         <TwoFactorPolicyRow
           scope="global"
