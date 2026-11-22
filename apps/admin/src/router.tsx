@@ -34,8 +34,9 @@ import {
   useParams,
 } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
-import { apiRequest } from "./lib/api-client";
+import { ApiClientError, apiRequest, onApiUnauthorized } from "./lib/api-client";
 import { queryClient } from "./lib/query";
+import { isChunkLoadError, maybeReloadForStaleChunk } from "./lib/chunk-retry";
 import { parseListSearch, type ListSearch } from "./lib/section-kit";
 import {
   AuthProvider,
@@ -51,7 +52,7 @@ import {
   TwoFactorRecoveryPage,
 } from "./components/public-pages";
 import { DashboardSection } from "./sections/dashboard";
-import { Skeleton, TableSkeleton } from "./components/primitives";
+import { Button, ErrorState, Skeleton, TableSkeleton } from "./components/primitives";
 
 /**
  * Route-level code splitting (design spec §5.6): every section loads on
@@ -199,12 +200,39 @@ function RootComponent() {
   const session = useQuery({
     queryKey: ["admin", "me"],
     queryFn: () => apiRequest<StaffPrincipalDto>("/api/v1/admin/me"),
-    retry: false,
+    // Session-check retries (live bug 2026-11-22): the previous
+    // `retry: false` made ANY transient /me failure (network blip,
+    // 500, cold Worker) render the sign-in screen, so the owner
+    // perceived a sign-out after reload and had to sign in again.
+    // A 401 means definitively no session — retrying is pointless.
+    // Anything else is retried twice with backoff, and if it still
+    // fails the connection-error screen below renders instead of
+    // the sign-in screen (the API answers 500, not 401, for backend
+    // failures — see resolveStaffPrincipal).
+    retry: (failureCount, error) => {
+      if (error instanceof ApiClientError && error.statusCode === 401) return false;
+      return failureCount < 2;
+    },
+    retryDelay: (attemptIndex) => Math.min(1000 * 2 ** attemptIndex, 5000),
   });
 
   useEffect(() => {
     if (session.data) setPrincipal(session.data);
   }, [session.data]);
+
+  // Mid-session expiry (live bug 2026-11-22): when a signed-in tab's
+  // session dies (12h expiry, suspension), every section query 401s
+  // and each section shows "Something went wrong" instead of the
+  // sign-in screen. While a principal is held, a 401 from any admin
+  // endpoint drops straight to the sign-in screen. The handler is
+  // only registered while signed in, so sign-in's own 401s (wrong
+  // password) never trigger it, and it is scoped to /api/v1/admin/*
+  // inside api-client.
+  useEffect(() => {
+    if (!principal) return;
+    onApiUnauthorized(() => setPrincipal(null));
+    return () => onApiUnauthorized(null);
+  }, [principal]);
 
   // Public pages (Auth + Email batch): /reset-password, /accept-invitation
   // and /two-factor-recovery render OUTSIDE the principal gate — they are
@@ -226,6 +254,39 @@ function RootComponent() {
             <Skeleton height={32} width="40%" />
           </div>
         </div>
+      </main>
+    );
+  }
+
+  // Session check failed (live bug 2026-11-22): only a 401 means
+  // "no session" and shows the sign-in screen. Any other failure —
+  // network, 500, timeout — means the check itself failed, not that
+  // the user is signed out, so it renders a retry screen instead:
+  // the session cookie is untouched and Retry re-runs the check.
+  if (session.isError && !principal) {
+    const err = session.error;
+    if (err instanceof ApiClientError && err.statusCode === 401) {
+      return <AuthScreen onSignedIn={setPrincipal} />;
+    }
+    return (
+      <main className="sm-auth">
+        <section className="sm-auth-card" aria-labelledby="session-check-heading">
+          <h1 id="session-check-heading" className="sm-page-title">
+            Couldn&apos;t reach the server
+          </h1>
+          <p className="sm-hint" style={{ marginTop: 12 }}>
+            Your sign-in could not be checked — the server did not answer. You have not
+            been signed out. Try again.
+          </p>
+          <p style={{ marginTop: 8 }}>
+            {err instanceof Error ? err.message : "Request failed"}
+          </p>
+          <div style={{ marginTop: 16 }}>
+            <Button variant="primary" onClick={() => void session.refetch()}>
+              Retry
+            </Button>
+          </div>
+        </section>
       </main>
     );
   }
@@ -524,7 +585,43 @@ const routeTree = rootRoute.addChildren([
   ]),
 ]);
 
-export const router = createRouter({ routeTree });
+/**
+ * Router-level error screen (live bug 2026-11-22): every route uses
+ * TanStack Router's default error component unless it defines its
+ * own, so a failed lazy import rendered the bare "Something went
+ * wrong!" with no recovery. This replaces it app-wide:
+ *  - a chunk-load failure reloads once (fresh index.html carries the
+ *    current chunk hashes after a deploy); if the reload already
+ *    happened recently, or the error is not a chunk failure, the
+ *    screen below renders instead of reload-looping.
+ *  - other render errors get the app's ErrorState with a Retry that
+ *    resets the boundary; a chunk failure's Retry reloads the page
+ *    instead, because React.lazy caches a rejected import and reset()
+ *    alone cannot re-fetch it.
+ */
+function RouteErrorComponent({ error, reset }: { error: unknown; reset: () => void }) {
+  const chunkError = isChunkLoadError(error);
+  useEffect(() => {
+    if (chunkError) maybeReloadForStaleChunk(error);
+    // Reload exactly once per mount for a chunk failure; the
+    // timestamp guard inside maybeReloadForStaleChunk is what
+    // stops a loop, so this effect intentionally runs once.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  const message = chunkError
+    ? "The app was updated and this page failed to load. It should reload once on its own — if it is still showing this, use the button below."
+    : error instanceof Error
+      ? error.message
+      : "An unexpected error occurred.";
+  return (
+    <ErrorState
+      message={message}
+      onRetry={chunkError ? () => window.location.reload() : reset}
+    />
+  );
+}
+
+export const router = createRouter({ routeTree, defaultErrorComponent: RouteErrorComponent });
 
 declare module "@tanstack/react-router" {
   interface Register {

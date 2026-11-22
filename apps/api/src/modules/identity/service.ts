@@ -820,8 +820,18 @@ export async function resolveStaffPrincipal(
           }
           return null;
         }
-      } catch {
-        return null;
+      } catch (err) {
+        // Better Auth's getSession returns null for a missing/expired
+        // session and throws UNAUTHORIZED (401) only when the session's
+        // user is gone; anything else it throws is an infrastructure
+        // failure (DB/Hyperdrive). Swallowing that as "no session"
+        // turned every transient backend blip into a 401, and the SPA
+        // rendered the sign-in screen — the owner perceived a sign-out
+        // after reload and had to sign in again, though the session
+        // was never dead (live bug 2026-11-22). Rethrow non-401 so the
+        // dispatcher answers 500 and the SPA shows its retry state.
+        if ((err as { status?: unknown } | null)?.status === 401) return null;
+        throw err;
       }
     }
   }
@@ -830,9 +840,13 @@ export async function resolveStaffPrincipal(
   if (!rawToken) return null;
 
   if (auth && storeSupportsBetterAuth(store)) {
-    const row = await findBetterAuthSessionByToken(store, rawToken).catch(() => null);
+    // Same rule as the cookie path above: a DB failure here must
+    // propagate as a 500, never masquerade as "no session" (live bug
+    // 2026-11-22). These lookups return null when the row is absent;
+    // they only throw when the database itself fails.
+    const row = await findBetterAuthSessionByToken(store, rawToken);
     if (!row || row.expiresAt.getTime() <= nowMs) return null;
-    const email = await findBetterAuthUserEmail(store, row.userId).catch(() => null);
+    const email = await findBetterAuthUserEmail(store, row.userId);
     if (!email) return null;
     await reloadStateIfPossible(store);
     const user = store.state.users.find((u) => u.email === email.trim().toLowerCase());
