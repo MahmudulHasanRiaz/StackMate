@@ -113,6 +113,15 @@ export interface StaffPrincipal {
     name: string;
     email: string;
     status: "active" | "suspended";
+    /**
+     * Custom avatar (audit M-23): the R2 object key stored in
+     * users.avatar_url, or null for Gravatar/initials. The shell
+     * renders it through GET /api/v1/admin/me/avatar — a principal
+     * without this field can never show the custom photo, no matter
+     * what PATCH /me persisted (live bug 2026-11-22: picker toasted
+     * success but Gravatar stayed after save + reload).
+     */
+    avatar_url: string | null;
   };
   session_id: string;
   roles: string[];
@@ -467,7 +476,13 @@ async function findBetterAuthUserEmail(
 function buildPrincipal(state: DatabaseState, user: UserRecord): StaffPrincipal {
   const { roles, permissions } = resolveEffectivePermissions(state, user.id);
   return {
-    user: { id: user.id, name: user.name, email: user.email, status: user.status },
+    user: {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      status: user.status,
+      avatar_url: user.avatar_url ?? null,
+    },
     session_id: "",
     roles,
     permissions,

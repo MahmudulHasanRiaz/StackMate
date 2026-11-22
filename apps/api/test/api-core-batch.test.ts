@@ -678,6 +678,13 @@ describe("API-core batch", () => {
     });
     assert.equal(set.status, 200, JSON.stringify(set.body));
     assert.equal(set.body.data.avatar_url, key);
+    // Regression (live bug 2026-11-22): GET /me is the principal the
+    // shell renders — it must carry avatar_url, or the custom photo
+    // never shows (PATCH alone is not enough: the SPA ignores the
+    // PATCH body and re-reads the principal).
+    const meAfterSet = await apiRequest("/api/v1/admin/me", { cookie: superCookie });
+    assert.equal(meAfterSet.status, 200, JSON.stringify(meAfterSet.body));
+    assert.equal(meAfterSet.body.data.user.avatar_url, key);
     const cleared = await apiRequest("/api/v1/admin/me", {
       method: "PATCH",
       cookie: superCookie,
@@ -685,6 +692,9 @@ describe("API-core batch", () => {
     });
     assert.equal(cleared.status, 200, JSON.stringify(cleared.body));
     assert.equal(cleared.body.data.avatar_url, null);
+    const meAfterClear = await apiRequest("/api/v1/admin/me", { cookie: superCookie });
+    assert.equal(meAfterClear.status, 200, JSON.stringify(meAfterClear.body));
+    assert.equal(meAfterClear.body.data.user.avatar_url, null);
     const gone = await apiRequest("/api/v1/admin/me/avatar", { cookie: superCookie });
     assert.equal(gone.status, 404, JSON.stringify(gone.body));
   });

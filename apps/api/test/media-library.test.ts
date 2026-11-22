@@ -726,6 +726,13 @@ describe.skipIf(!DATABASE_URL)("media library — upload, search, drivers", () =
     assert.equal(served.status, 200, JSON.stringify(served.body));
     assert.equal(served.headers.get("Content-Type"), "image/png");
 
+    // Regression (live bug 2026-11-22): GET /me is the principal the
+    // shell renders — it must carry the resolved key, or the custom
+    // photo never shows (the picker PATCH alone is not enough).
+    const meAfterSet = await authed("/api/v1/admin/me");
+    assert.equal(meAfterSet.status, 200, JSON.stringify(meAfterSet.body));
+    assert.equal(meAfterSet.body.data.user.avatar_url, key);
+
     // A non-image library asset is rejected, and an unknown media id 404s.
     const txtUploaded = await uploadFile(
       "notes.txt",
