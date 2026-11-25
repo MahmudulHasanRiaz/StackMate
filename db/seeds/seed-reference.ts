@@ -45,6 +45,9 @@ export const SEED_PERMISSIONS = [
   { id: "00000000-0000-4000-8000-000000000131", key: "media.manage", description: "Upload, rename, move, and delete media files" },
   { id: "00000000-0000-4000-8000-000000000132", key: "integrations.read", description: "View external website integrations, webhooks, and delivery records" },
   { id: "00000000-0000-4000-8000-000000000133", key: "tracking.read", description: "View Meta Pixel and Conversions API tracking events" },
+  { id: "00000000-0000-4000-8000-000000000134", key: "expenses.read", description: "View expenses and profit & loss analytics" },
+  { id: "00000000-0000-4000-8000-000000000135", key: "expenses.manage", description: "Create, edit, and delete expenses" },
+  { id: "00000000-0000-4000-8000-000000000136", key: "expense_categories.manage", description: "Create, edit, and delete expense categories" },
 ] as const;
 
 export const SEED_ROLES: ReadonlyArray<{
@@ -95,6 +98,10 @@ export const SEED_ROLES: ReadonlyArray<{
       "subscriptions.read",
       "subscriptions.manage",
       "licenses.read",
+      // Expense module (migration 0019): finance owns expense recording.
+      "expenses.read",
+      "expenses.manage",
+      "expense_categories.manage",
     ],
   },
   {
@@ -148,6 +155,8 @@ export const SEED_ROLES: ReadonlyArray<{
       "leads.manage",
       "media.view",
       "media.manage",
+      // Expense module (migration 0019): read-only view of expenses.
+      "expenses.read",
     ],
   },
   {
@@ -187,6 +196,8 @@ export const SEED_ROLES: ReadonlyArray<{
       // (webhooks/deliveries/outbox) and tracking events.
       "integrations.read",
       "tracking.read",
+      // Expense module (migration 0019): read-only view of expenses + P&L.
+      "expenses.read",
     ],
   },
 ];

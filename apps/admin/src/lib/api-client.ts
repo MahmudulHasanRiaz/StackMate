@@ -200,3 +200,411 @@ export async function rawApiRequest<T>(
 
   return json as T;
 }
+
+/* ------------------------------------------------------------------ */
+/* Expense module (admin UI, 2026-11-25).                              */
+/*                                                                     */
+/* Contract (API worker builds the endpoints in parallel):             */
+/*  - GET/POST /api/v1/admin/expense-categories[?q=&is_active=&page=   */
+/*    &pageSize=], PATCH/DELETE /expense-categories/:id (409 when      */
+/*    expenses exist); rows carry an expense count.                    */
+/*  - GET/POST /api/v1/admin/expenses[?q=&categoryId=&productId=       */
+/*    &from=&to=&page=&pageSize=], PATCH/DELETE /expenses/:id.         */
+/*  - GET /api/v1/admin/analytics/profit-loss[?from=&to=&productId=].  */
+/*                                                                     */
+/* CASING SHIM — verified 2026-11-25 against the API worker's code
+ * (packages/contracts/src/domains/expenses.ts,
+ * apps/api/src/modules/expenses/service.ts,
+ * apps/api/src/modules/analytics/pnl.ts, app.ts routes): the expense
+ * write schemas are camelCase (amountMinor, expenseDate, categoryId),
+ * categories use snake_case is_active, category rows carry a camelCase
+ * expenseCount, expense rows are snake_case records with NO embedded
+ * names (the UI resolves names via the category/product lists), and
+ * the P&L result is camelCase throughout. List params accept both
+ * `pageSize` and `limit`; from/to are both-or-neither (400 otherwise).
+ * The normalizers below accept either casing on read and the writes
+ * send both casings where they differ — the API's validator strips
+ * unknown keys, so the extra keys are harmless. Once the module is
+ * live-verified, the losing casing can be deleted here — the sections
+ * only ever see the camelCase types below. */
+
+export interface ExpenseCategory {
+  id: string;
+  name: string;
+  description: string | null;
+  color: string | null;
+  icon: string | null;
+  isActive: boolean;
+  expenseCount: number;
+  createdAt: string | null;
+}
+
+export interface Expense {
+  id: string;
+  amountMinor: number;
+  expenseDate: string;
+  categoryId: string;
+  categoryName: string | null;
+  categoryColor: string | null;
+  productId: string | null;
+  productName: string | null;
+  paymentMethodId: string | null;
+  vendor: string | null;
+  notes: string | null;
+  receiptMediaId: string | null;
+  receiptUrl: string | null;
+  createdAt: string | null;
+}
+
+export interface ProfitLossByCategory {
+  categoryId: string;
+  categoryName: string;
+  color: string | null;
+  totalMinor: number;
+  count: number;
+}
+
+export interface ProfitLossByProduct {
+  productId: string;
+  productName: string;
+  salesMinor: number;
+  expensesMinor: number;
+  netMinor: number;
+  orderCount: number;
+  expenseCount: number;
+}
+
+export interface ProfitLossTrendPoint {
+  date: string;
+  salesMinor: number;
+  expensesMinor: number;
+  netMinor: number;
+}
+
+export interface ProfitLossReport {
+  from: string | null;
+  to: string | null;
+  productId: string | null;
+  sales: { totalMinor: number; orderCount: number };
+  expenses: { totalMinor: number; count: number };
+  netMinor: number;
+  byCategory: ProfitLossByCategory[];
+  byProduct: ProfitLossByProduct[];
+  trend: ProfitLossTrendPoint[];
+}
+
+export interface ExpenseCategoryInput {
+  name: string;
+  description?: string | null | undefined;
+  color?: string | null | undefined;
+  icon?: string | null | undefined;
+  isActive?: boolean | undefined;
+}
+
+export interface ExpenseInput {
+  amountMinor: number;
+  expenseDate: string;
+  categoryId: string;
+  productId?: string | null | undefined;
+  paymentMethodId?: string | null | undefined;
+  vendor?: string | null | undefined;
+  notes?: string | null | undefined;
+  receiptMediaId?: string | null | undefined;
+}
+
+type UnknownRecord = Record<string, unknown>;
+
+function asRecord(value: unknown): UnknownRecord {
+  return typeof value === "object" && value !== null ? (value as UnknownRecord) : {};
+}
+
+/** First defined value under the camelCase key, else the snake_case key. */
+function pick(record: UnknownRecord, camel: string, snake: string): unknown {
+  const camelValue = record[camel];
+  if (camelValue !== undefined && camelValue !== null) return camelValue;
+  return record[snake];
+}
+
+function pickString(record: UnknownRecord, camel: string, snake: string): string | null {
+  const value = pick(record, camel, snake);
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function pickNumber(record: UnknownRecord, camel: string, snake: string): number {
+  const value = pick(record, camel, snake);
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function pickBoolean(record: UnknownRecord, camel: string, snake: string, fallback: boolean): boolean {
+  const value = pick(record, camel, snake);
+  return typeof value === "boolean" ? value : fallback;
+}
+
+function normalizeExpenseCategory(raw: unknown): ExpenseCategory {
+  const r = asRecord(raw);
+  return {
+    id: String(r.id ?? ""),
+    name: String(r.name ?? ""),
+    description: pickString(r, "description", "description"),
+    color: pickString(r, "color", "color"),
+    icon: pickString(r, "icon", "icon"),
+    isActive: pickBoolean(r, "isActive", "is_active", true),
+    expenseCount: pickNumber(r, "expenseCount", "expense_count"),
+    createdAt: pickString(r, "createdAt", "created_at"),
+  };
+}
+
+function normalizeExpense(raw: unknown): Expense {
+  const r = asRecord(raw);
+  const category = asRecord(r.category);
+  const product = asRecord(r.product);
+  return {
+    id: String(r.id ?? ""),
+    amountMinor: pickNumber(r, "amountMinor", "amount_minor"),
+    expenseDate: pickString(r, "expenseDate", "expense_date") ?? "",
+    categoryId: pickString(r, "categoryId", "category_id") ?? "",
+    categoryName:
+      pickString(r, "categoryName", "category_name") ??
+      (typeof category.name === "string" ? category.name : null),
+    categoryColor:
+      pickString(r, "categoryColor", "category_color") ??
+      (typeof category.color === "string" ? category.color : null),
+    productId: pickString(r, "productId", "product_id"),
+    productName:
+      pickString(r, "productName", "product_name") ??
+      (typeof product.name === "string" ? product.name : null),
+    paymentMethodId: pickString(r, "paymentMethodId", "payment_method_id"),
+    vendor: pickString(r, "vendor", "vendor"),
+    notes: pickString(r, "notes", "notes"),
+    receiptMediaId: pickString(r, "receiptMediaId", "receipt_media_id"),
+    receiptUrl: pickString(r, "receiptUrl", "receipt_url"),
+    createdAt: pickString(r, "createdAt", "created_at"),
+  };
+}
+
+function normalizeProfitLoss(raw: unknown): ProfitLossReport {
+  const r = asRecord(raw);
+  const range = asRecord(r.range);
+  const sales = asRecord(r.sales);
+  const expenses = asRecord(r.expenses);
+  const byCategory = Array.isArray(r.byCategory)
+    ? r.byCategory
+    : Array.isArray(r.by_category)
+      ? r.by_category
+      : [];
+  const byProduct = Array.isArray(r.byProduct)
+    ? r.byProduct
+    : Array.isArray(r.by_product)
+      ? r.by_product
+      : [];
+  const trend = Array.isArray(r.trend) ? r.trend : [];
+  return {
+    from: pickString(range, "from", "from") ?? pickString(r, "from", "from"),
+    to: pickString(range, "to", "to") ?? pickString(r, "to", "to"),
+    productId: pickString(r, "productId", "product_id"),
+    sales: {
+      totalMinor: pickNumber(sales, "totalMinor", "total_minor"),
+      orderCount: pickNumber(sales, "orderCount", "order_count"),
+    },
+    expenses: {
+      totalMinor: pickNumber(expenses, "totalMinor", "total_minor"),
+      count: pickNumber(expenses, "count", "count"),
+    },
+    netMinor: pickNumber(r, "netMinor", "net_minor"),
+    byCategory: (byCategory as unknown[]).map((item) => {
+      const row = asRecord(item);
+      return {
+        categoryId: pickString(row, "categoryId", "category_id") ?? "",
+        categoryName: pickString(row, "categoryName", "category_name") ?? "—",
+        color: pickString(row, "color", "color"),
+        totalMinor: pickNumber(row, "totalMinor", "total_minor"),
+        count: pickNumber(row, "count", "count"),
+      };
+    }),
+    byProduct: (byProduct as unknown[]).map((item) => {
+      const row = asRecord(item);
+      return {
+        productId: pickString(row, "productId", "product_id") ?? "",
+        productName: pickString(row, "productName", "product_name") ?? "—",
+        salesMinor: pickNumber(row, "salesMinor", "sales_minor"),
+        expensesMinor: pickNumber(row, "expensesMinor", "expenses_minor"),
+        netMinor: pickNumber(row, "netMinor", "net_minor"),
+        orderCount: pickNumber(row, "orderCount", "order_count"),
+        expenseCount: pickNumber(row, "expenseCount", "expense_count"),
+      };
+    }),
+    trend: (trend as unknown[]).map((item) => {
+      const row = asRecord(item);
+      return {
+        date: String(row.date ?? ""),
+        salesMinor: pickNumber(row, "salesMinor", "sales_minor"),
+        expensesMinor: pickNumber(row, "expensesMinor", "expenses_minor"),
+        netMinor: pickNumber(row, "netMinor", "net_minor"),
+      };
+    }),
+  };
+}
+
+export interface ExpenseCategoryListParams {
+  q?: string | undefined;
+  isActive?: boolean | undefined;
+  page?: number | undefined;
+  pageSize?: number | undefined;
+}
+
+export async function fetchExpenseCategories(
+  params: ExpenseCategoryListParams,
+): Promise<{ items: ExpenseCategory[]; total: number }> {
+  const query = new URLSearchParams();
+  if (params.q) query.set("q", params.q);
+  if (params.isActive !== undefined) query.set("is_active", String(params.isActive));
+  if (params.page !== undefined) query.set("page", String(params.page));
+  if (params.pageSize !== undefined) {
+    query.set("pageSize", String(params.pageSize));
+    query.set("limit", String(params.pageSize));
+  }
+  const res = await apiRequest<{ items: unknown[]; total?: number }>(
+    `/api/v1/admin/expense-categories?${query}`,
+  );
+  return {
+    items: res.items.map(normalizeExpenseCategory),
+    total: res.total ?? res.items.length,
+  };
+}
+
+export async function createExpenseCategory(
+  body: ExpenseCategoryInput,
+): Promise<ExpenseCategory> {
+  const res = await apiRequest<unknown>("/api/v1/admin/expense-categories", {
+    method: "POST",
+    body: JSON.stringify({
+      name: body.name,
+      description: body.description ?? null,
+      color: body.color ?? null,
+      icon: body.icon ?? null,
+      is_active: body.isActive ?? true,
+      isActive: body.isActive ?? true,
+    }),
+  });
+  return normalizeExpenseCategory(res);
+}
+
+export async function updateExpenseCategory(
+  id: string,
+  body: Partial<ExpenseCategoryInput>,
+): Promise<ExpenseCategory> {
+  const payload: Record<string, unknown> = {};
+  if (body.name !== undefined) payload.name = body.name;
+  if (body.description !== undefined) payload.description = body.description;
+  if (body.color !== undefined) payload.color = body.color;
+  if (body.icon !== undefined) payload.icon = body.icon;
+  if (body.isActive !== undefined) {
+    payload.is_active = body.isActive;
+    payload.isActive = body.isActive;
+  }
+  const res = await apiRequest<unknown>(`/api/v1/admin/expense-categories/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+  return normalizeExpenseCategory(res);
+}
+
+export async function deleteExpenseCategory(id: string): Promise<void> {
+  await apiRequest<void>(`/api/v1/admin/expense-categories/${id}`, { method: "DELETE" });
+}
+
+export interface ExpenseListParams {
+  q?: string | undefined;
+  categoryId?: string | undefined;
+  productId?: string | undefined;
+  from?: string | undefined;
+  to?: string | undefined;
+  page?: number | undefined;
+  pageSize?: number | undefined;
+}
+
+export async function fetchExpenses(
+  params: ExpenseListParams,
+): Promise<{ items: Expense[]; total: number }> {
+  const query = new URLSearchParams();
+  if (params.q) query.set("q", params.q);
+  if (params.categoryId) {
+    query.set("categoryId", params.categoryId);
+    query.set("category_id", params.categoryId);
+  }
+  if (params.productId) {
+    query.set("productId", params.productId);
+    query.set("product_id", params.productId);
+  }
+  if (params.from) query.set("from", params.from);
+  if (params.to) query.set("to", params.to);
+  if (params.page !== undefined) query.set("page", String(params.page));
+  if (params.pageSize !== undefined) {
+    query.set("pageSize", String(params.pageSize));
+    query.set("limit", String(params.pageSize));
+  }
+  const res = await apiRequest<{ items: unknown[]; total?: number }>(
+    `/api/v1/admin/expenses?${query}`,
+  );
+  return { items: res.items.map(normalizeExpense), total: res.total ?? res.items.length };
+}
+
+function expenseWriteBody(body: ExpenseInput): Record<string, unknown> {
+  return {
+    amountMinor: body.amountMinor,
+    amount_minor: body.amountMinor,
+    expenseDate: body.expenseDate,
+    expense_date: body.expenseDate,
+    categoryId: body.categoryId,
+    category_id: body.categoryId,
+    ...(body.productId ? { productId: body.productId, product_id: body.productId } : { productId: null, product_id: null }),
+    ...(body.paymentMethodId
+      ? { paymentMethodId: body.paymentMethodId, payment_method_id: body.paymentMethodId }
+      : { paymentMethodId: null, payment_method_id: null }),
+    ...(body.vendor !== undefined ? { vendor: body.vendor } : {}),
+    ...(body.notes !== undefined ? { notes: body.notes } : {}),
+    ...(body.receiptMediaId
+      ? { receiptMediaId: body.receiptMediaId, receipt_media_id: body.receiptMediaId }
+      : { receiptMediaId: null, receipt_media_id: null }),
+  };
+}
+
+export async function createExpense(body: ExpenseInput): Promise<Expense> {
+  const res = await apiRequest<unknown>("/api/v1/admin/expenses", {
+    method: "POST",
+    body: JSON.stringify(expenseWriteBody(body)),
+  });
+  return normalizeExpense(res);
+}
+
+export async function updateExpense(id: string, body: ExpenseInput): Promise<Expense> {
+  const res = await apiRequest<unknown>(`/api/v1/admin/expenses/${id}`, {
+    method: "PATCH",
+    body: JSON.stringify(expenseWriteBody(body)),
+  });
+  return normalizeExpense(res);
+}
+
+export async function deleteExpense(id: string): Promise<void> {
+  await apiRequest<void>(`/api/v1/admin/expenses/${id}`, { method: "DELETE" });
+}
+
+export interface ProfitLossParams {
+  from?: string | undefined;
+  to?: string | undefined;
+  productId?: string | undefined;
+}
+
+export async function fetchProfitLoss(params: ProfitLossParams): Promise<ProfitLossReport> {
+  const query = new URLSearchParams();
+  if (params.from) query.set("from", params.from);
+  if (params.to) query.set("to", params.to);
+  if (params.productId) {
+    query.set("productId", params.productId);
+    query.set("product_id", params.productId);
+  }
+  const res = await apiRequest<unknown>(
+    `/api/v1/admin/analytics/profit-loss?${query}`,
+  );
+  return normalizeProfitLoss(res);
+}

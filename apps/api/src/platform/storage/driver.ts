@@ -66,8 +66,14 @@ export interface StorageDriver {
 
 export class R2StorageDriver implements StorageDriver {
   readonly name: StorageDriverName = "r2";
+  private readonly bucket: R2BucketBinding;
 
-  constructor(private readonly bucket: R2BucketBinding) {}
+  // No parameter property: `node scripts/smoke-check.mjs` runs the TS
+  // source through Node's strip-only type stripping, which rejects
+  // parameter properties (ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX).
+  constructor(bucket: R2BucketBinding) {
+    this.bucket = bucket;
+  }
 
   async put(key: string, bytes: Uint8Array, contentType: string): Promise<{ size: number }> {
     await this.bucket.put(key, bytes, {

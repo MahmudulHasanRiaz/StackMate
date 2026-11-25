@@ -165,6 +165,8 @@ import {
   type CustomerRecord,
   type CustomerReportRecord,
   type DatabaseState,
+  type ExpenseCategoryRecord,
+  type ExpenseRecord,
   type IdempotencyRecord,
   type IntegratedSiteRecord,
   type InvoiceRecord,
@@ -1959,6 +1961,13 @@ function buildLoadStateQuery(caps: StoreCapabilities): string {
             reason, provider_refund_id, requested_by_user_id, processed_by_user_id,
             created_at, updated_at
        FROM payment_refunds` },
+    { key: "expenseCategories", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, name, description, color, icon, is_active,
+            created_at, updated_at
+       FROM expense_categories` },
+    { key: "expenses", orderBy: "t.expense_date ASC, t.created_at ASC, t.id ASC", sql: `SELECT id, amount_minor, currency, expense_date, category_id, product_id,
+            payment_method_id, vendor, notes, receipt_media_id, recorded_by,
+            created_at, updated_at
+       FROM expenses` },
     { key: "licenseSnapshotItems", orderBy: "t.snapshot_id, t.feature_key_snapshot", sql: `SELECT id, snapshot_id, feature_key_snapshot, value_type_snapshot,
             entitlement_value, unit_snapshot
        FROM license_entitlement_snapshot_items` },
@@ -2963,6 +2972,39 @@ async function loadStateInternalImpl(
     updated_at: reqIso(row, "updated_at", "payment_refunds"),
   }));
 
+  // -- Expense categories + expenses (migration 0018) -----------------------
+  const expenseCategoryRows = loadRows(combined, "expenseCategories");
+  const expense_categories: ExpenseCategoryRecord[] = expenseCategoryRows.map((row) => ({
+    id: reqStr(row, "id", "expense_categories"),
+    name: reqStr(row, "name", "expense_categories"),
+    description: str(row, "description"),
+    color: reqStr(row, "color", "expense_categories"),
+    icon: str(row, "icon"),
+    is_active: bool(row, "is_active"),
+    created_at: reqIso(row, "created_at", "expense_categories"),
+    updated_at: reqIso(row, "updated_at", "expense_categories"),
+  }));
+
+  const expenseRows = loadRows(combined, "expenses");
+  const expenses: ExpenseRecord[] = expenseRows.map((row) => ({
+    id: reqStr(row, "id", "expenses"),
+    amount_minor: reqNum(row, "amount_minor", "expenses"),
+    // BDT-only by contract (the service never writes another currency);
+    // a hand-edited row with another currency falls back to BDT, the
+    // same asEnum fallback pattern used for status columns above.
+    currency: asEnum(str(row, "currency"), ["BDT"] as const, "BDT"),
+    expense_date: dateOnly(row, "expense_date") ?? "",
+    category_id: reqStr(row, "category_id", "expenses"),
+    product_id: str(row, "product_id"),
+    payment_method_id: str(row, "payment_method_id"),
+    vendor: str(row, "vendor"),
+    notes: str(row, "notes"),
+    receipt_media_id: str(row, "receipt_media_id"),
+    recorded_by: str(row, "recorded_by"),
+    created_at: reqIso(row, "created_at", "expenses"),
+    updated_at: reqIso(row, "updated_at", "expenses"),
+  }));
+
   // -- Licenses (snapshots + items + activations) -----------------------------
   const licenseSnapshotItemRows = loadRows(combined, "licenseSnapshotItems");
   const licenseSnapshotItemsBySnapshot = groupBy(licenseSnapshotItemRows, (r) =>
@@ -3425,6 +3467,8 @@ async function loadStateInternalImpl(
     payment_transactions,
     payment_verification_logs,
     payment_refunds,
+    expense_categories,
+    expenses,
     subscriptions,
     licenses,
     license_events,
@@ -6147,7 +6191,6 @@ async function persistStateDiff(
         "provider_refund_id",
         "requested_by_user_id",
         "processed_by_user_id",
-        "updated_at",
       ];
       await upd(
         "payment_refunds",
@@ -6161,7 +6204,6 @@ async function persistStateDiff(
           r.provider_refund_id,
           r.requested_by_user_id,
           r.processed_by_user_id,
-          r.updated_at,
           r.id,
         ],
         idWhere(cols.length + 1),
@@ -6170,6 +6212,150 @@ async function persistStateDiff(
     },
     remove: async (c, r) => {
       await del("payment_refunds", idWhere(1), [r.id]);
+    },
+  };
+
+  // Expense module (migration 0018) — same SyncSpec shape as refunds.
+  // Categories are parents (expenses.category_id RESTRICT), expenses
+  // are children: deletes run expenses-first, upserts categories-first
+  // (see the sync passes below).
+  const expenseCategorySpec: SyncSpec<ExpenseCategoryRecord> = {
+    keyOf: (r) => r.id,
+    scalarOf: (r) => r,
+    insert: async (c, r) => {
+      await ins(
+        "expense_categories",
+        [
+          "id",
+          "name",
+          "description",
+          "color",
+          "icon",
+          "is_active",
+          "created_at",
+          "updated_at",
+        ],
+        [
+          r.id,
+          r.name,
+          r.description,
+          r.color,
+          r.icon,
+          r.is_active,
+          r.created_at,
+          r.updated_at,
+        ]
+      );
+    },
+    update: async (c, _b, r) => {
+      // NOTE: "updated_at" is NOT in cols — upd(..., touch=true) appends
+      // `"updated_at" = now()`. Listing it in cols as well makes Postgres
+      // reject the UPDATE ("multiple assignments to same column
+      // updated_at") — the refundSpec had exactly that latent bug until
+      // the expense update test caught the same shape here (refunds are
+      // insert-only in practice, so it never fired).
+      const cols = [
+        "name",
+        "description",
+        "color",
+        "icon",
+        "is_active",
+      ];
+      await upd(
+        "expense_categories",
+        cols,
+        [
+          r.name,
+          r.description,
+          r.color,
+          r.icon,
+          r.is_active,
+          r.id,
+        ],
+        idWhere(cols.length + 1),
+        true
+      );
+    },
+    remove: async (c, r) => {
+      await del("expense_categories", idWhere(1), [r.id]);
+    },
+  };
+
+  const expenseSpec: SyncSpec<ExpenseRecord> = {
+    keyOf: (r) => r.id,
+    scalarOf: (r) => r,
+    insert: async (c, r) => {
+      await ins(
+        "expenses",
+        [
+          "id",
+          "amount_minor",
+          "currency",
+          "expense_date",
+          "category_id",
+          "product_id",
+          "payment_method_id",
+          "vendor",
+          "notes",
+          "receipt_media_id",
+          "recorded_by",
+          "created_at",
+          "updated_at",
+        ],
+        [
+          r.id,
+          r.amount_minor,
+          r.currency,
+          r.expense_date,
+          r.category_id,
+          r.product_id,
+          r.payment_method_id,
+          r.vendor,
+          r.notes,
+          r.receipt_media_id,
+          r.recorded_by,
+          r.created_at,
+          r.updated_at,
+        ]
+      );
+    },
+    update: async (c, _b, r) => {
+      // Same "updated_at" note as expenseCategorySpec: touch=true sets
+      // it, so it must not also be in cols.
+      const cols = [
+        "amount_minor",
+        "currency",
+        "expense_date",
+        "category_id",
+        "product_id",
+        "payment_method_id",
+        "vendor",
+        "notes",
+        "receipt_media_id",
+        "recorded_by",
+      ];
+      await upd(
+        "expenses",
+        cols,
+        [
+          r.amount_minor,
+          r.currency,
+          r.expense_date,
+          r.category_id,
+          r.product_id,
+          r.payment_method_id,
+          r.vendor,
+          r.notes,
+          r.receipt_media_id,
+          r.recorded_by,
+          r.id,
+        ],
+        idWhere(cols.length + 1),
+        true
+      );
+    },
+    remove: async (c, r) => {
+      await del("expenses", idWhere(1), [r.id]);
     },
   };
 
@@ -6962,6 +7148,8 @@ async function persistStateDiff(
   await syncDeletes(client, before.sent_reminders, after.sent_reminders, sentReminderSpec, "sent_reminders");
   await syncDeletes(client, before.payment_verification_logs, after.payment_verification_logs, verificationLogSpec, "payment_verification_logs");
   await syncDeletes(client, before.payment_refunds, after.payment_refunds, refundSpec, "payment_refunds");
+  await syncDeletes(client, before.expenses, after.expenses, expenseSpec, "expenses");
+  await syncDeletes(client, before.expense_categories, after.expense_categories, expenseCategorySpec, "expense_categories");
   await syncDeletes(client, fb.licenseSnapshotItems, fa.licenseSnapshotItems, licenseSnapshotItemSpec, "license_entitlement_snapshot_items");
   await syncDeletes(client, fb.licenseSnapshots, fa.licenseSnapshots, licenseSnapshotSpec, "license_entitlement_snapshots");
   await syncDeletes(client, fb.licenseActivations, fa.licenseActivations, licenseActivationSpec, "license_activations");
@@ -7050,6 +7238,8 @@ async function persistStateDiff(
   await syncUpserts(client, before.payment_transactions, after.payment_transactions, transactionSpec, "payment_transactions");
   await syncUpserts(client, before.payment_verification_logs, after.payment_verification_logs, verificationLogSpec, "payment_verification_logs");
   await syncUpserts(client, before.payment_refunds, after.payment_refunds, refundSpec, "payment_refunds");
+  await syncUpserts(client, before.expense_categories, after.expense_categories, expenseCategorySpec, "expense_categories");
+  await syncUpserts(client, before.expenses, after.expenses, expenseSpec, "expenses");
   await syncUpserts(client, before.licenses, after.licenses, licenseSpec, "licenses");
   await syncUpserts(client, fb.licenseSnapshots, fa.licenseSnapshots, licenseSnapshotSpec, "license_entitlement_snapshots");
   await syncUpserts(client, fb.licenseSnapshotItems, fa.licenseSnapshotItems, licenseSnapshotItemSpec, "license_entitlement_snapshot_items");

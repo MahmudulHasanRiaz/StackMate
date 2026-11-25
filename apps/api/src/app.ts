@@ -83,6 +83,19 @@ import {
   isTimestampInOverviewRange,
   parseOverviewRange,
 } from "./modules/analytics/overview-range.ts";
+import { computeProfitLoss } from "./modules/analytics/pnl.ts";
+import {
+  createExpense,
+  createExpenseCategory,
+  deleteExpense,
+  deleteExpenseCategory,
+  getExpense,
+  getExpenseCategory,
+  listExpenseCategories,
+  listExpenses,
+  updateExpense,
+  updateExpenseCategory,
+} from "./modules/expenses/service.ts";
 import {
   acceptStaffInvitation,
   assertStaffPermission,
@@ -6058,6 +6071,180 @@ export function createStackMateApp(
             ).length,
             range,
           });
+        }
+
+        // Expense module — categories + expenses + P&L analytics.
+        // `?pageSize=` is accepted as an alias for the standard
+        // `?limit=` (M-1: 1..100, default 25); `?page=` as usual.
+        // `?from=&to=` follow parseOverviewRange semantics (both or
+        // neither, YYYY-MM-DD, max 366 days, 400 otherwise).
+        const parseExpenseListQuery = () => {
+          const { q, limit, page } = parseListQuery(url.searchParams);
+          const rawPageSize = Number(url.searchParams.get("pageSize"));
+          const effectiveLimit =
+            Number.isFinite(rawPageSize) && rawPageSize >= 1
+              ? Math.min(Math.floor(rawPageSize), 100)
+              : limit;
+          return { q, limit: effectiveLimit, page };
+        };
+
+        if (method === "GET" && pathname === "/api/v1/admin/expense-categories") {
+          assertStaffPermission(principal, "expenses.read");
+          const { q, limit, page } = parseExpenseListQuery();
+          const isActiveRaw = url.searchParams.get("is_active");
+          const isActive =
+            isActiveRaw === "true" ? true : isActiveRaw === "false" ? false : null;
+          const items = await listExpenseCategories(store, principal, {
+            q,
+            isActive,
+          });
+          return pagedCollectionResponse(items, limit, page);
+        }
+
+        if (method === "POST" && pathname === "/api/v1/admin/expense-categories") {
+          await assertStaffPermissionAudited(
+            store,
+            principal,
+            "expense_categories.manage",
+            requestId,
+          );
+          const body = await readJsonBody(request);
+          const created = await createExpenseCategory(store, principal, body, requestId);
+          return jsonResponse(created, 201);
+        }
+
+        const mExpenseCategoryDetail = matchPath(
+          "/api/v1/admin/expense-categories/:categoryId",
+          pathname,
+        );
+        if (method === "GET" && mExpenseCategoryDetail) {
+          assertStaffPermission(principal, "expenses.read");
+          const category = await getExpenseCategory(
+            store,
+            principal,
+            mExpenseCategoryDetail.params.categoryId!,
+          );
+          return jsonResponse(category);
+        }
+
+        if (method === "PATCH" && mExpenseCategoryDetail) {
+          await assertStaffPermissionAudited(
+            store,
+            principal,
+            "expense_categories.manage",
+            requestId,
+          );
+          const body = await readJsonBody(request);
+          const updated = await updateExpenseCategory(
+            store,
+            principal,
+            mExpenseCategoryDetail.params.categoryId!,
+            body,
+            requestId,
+          );
+          return jsonResponse(updated);
+        }
+
+        if (method === "DELETE" && mExpenseCategoryDetail) {
+          await assertStaffPermissionAudited(
+            store,
+            principal,
+            "expense_categories.manage",
+            requestId,
+          );
+          const deleted = await deleteExpenseCategory(
+            store,
+            principal,
+            mExpenseCategoryDetail.params.categoryId!,
+            requestId,
+          );
+          return jsonResponse(deleted);
+        }
+
+        if (method === "GET" && pathname === "/api/v1/admin/expenses") {
+          assertStaffPermission(principal, "expenses.read");
+          const { q, limit, page } = parseExpenseListQuery();
+          const range = parseOverviewRange(url.searchParams);
+          const items = await listExpenses(store, principal, {
+            q,
+            categoryId: url.searchParams.get("categoryId"),
+            productId: url.searchParams.get("productId"),
+            from: range?.from ?? null,
+            to: range?.to ?? null,
+          });
+          return pagedCollectionResponse(items, limit, page);
+        }
+
+        if (method === "POST" && pathname === "/api/v1/admin/expenses") {
+          await assertStaffPermissionAudited(
+            store,
+            principal,
+            "expenses.manage",
+            requestId,
+          );
+          const body = await readJsonBody(request);
+          const created = await createExpense(store, principal, body, requestId);
+          return jsonResponse(created, 201);
+        }
+
+        const mExpenseDetail = matchPath("/api/v1/admin/expenses/:expenseId", pathname);
+        if (method === "GET" && mExpenseDetail) {
+          assertStaffPermission(principal, "expenses.read");
+          const expense = await getExpense(
+            store,
+            principal,
+            mExpenseDetail.params.expenseId!,
+          );
+          return jsonResponse(expense);
+        }
+
+        if (method === "PATCH" && mExpenseDetail) {
+          await assertStaffPermissionAudited(
+            store,
+            principal,
+            "expenses.manage",
+            requestId,
+          );
+          const body = await readJsonBody(request);
+          const updated = await updateExpense(
+            store,
+            principal,
+            mExpenseDetail.params.expenseId!,
+            body,
+            requestId,
+          );
+          return jsonResponse(updated);
+        }
+
+        if (method === "DELETE" && mExpenseDetail) {
+          await assertStaffPermissionAudited(
+            store,
+            principal,
+            "expenses.manage",
+            requestId,
+          );
+          const deleted = await deleteExpense(
+            store,
+            principal,
+            mExpenseDetail.params.expenseId!,
+            requestId,
+          );
+          return jsonResponse(deleted);
+        }
+
+        // Profit & Loss — sales are the dashboard verified-revenue
+        // definition (paid + completed in range, order totals) minus
+        // succeeded refunds recorded in range; see pnl.ts header.
+        if (method === "GET" && pathname === "/api/v1/admin/analytics/profit-loss") {
+          assertStaffPermission(principal, "expenses.read");
+          const range = parseOverviewRange(url.searchParams);
+          const productId = url.searchParams.get("productId");
+          const result = computeProfitLoss(store.state, {
+            range,
+            productId,
+            timeZone: env.DEFAULT_TIMEZONE,
+          });
+          return jsonResponse(result);
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/audit-logs") {

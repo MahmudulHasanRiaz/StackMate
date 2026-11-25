@@ -56,8 +56,13 @@ function assertSafeKey(key: string): void {
 
 export class LocalStorageDriver implements StorageDriver {
   readonly name: StorageDriverName = "local";
+  private readonly root: string;
 
-  constructor(private readonly root: string) {}
+  // No parameter property: see R2StorageDriver (driver.ts) — Node's
+  // strip-only type stripping rejects them in scripts/smoke-check.mjs.
+  constructor(root: string) {
+    this.root = root;
+  }
 
   private filePath(key: string): string {
     assertSafeKey(key);
