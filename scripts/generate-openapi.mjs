@@ -2,20 +2,24 @@
 /**
  * OpenAPI generator — E-23 (PRD §21; TAD §18.1 + §18.4; API spec §24.1).
  *
- * Generates `docs/openapi.json` (OpenAPI 3.1) from the REAL route table
- * in `apps/api/src/app.ts` — the single request dispatcher. The API has
- * no framework router to introspect (routes are `method === ... &&
- * pathname === ...` / `matchPath(...)` conditionals), so this script
- * extracts them with anchored regexes:
+ * Generates `docs/openapi.json` (OpenAPI 3.1) from the REAL route table.
+ * Route source, in order (Hono migration, plan §4):
  *
- *   1. `method === "GET" && pathname === "/api/..."` (exact routes).
- *   2. `method === "GET" && mVar` where `const mVar = matchPath("...", ...)`
- *      (parameterized routes, incl. multi-line conditions).
- *   3. Fallback: any `pathname === "/api/..."` literal, paired with the
- *      nearest preceding `method === "..."` within 300 chars.
- *   4. Orphans: a `matchPath` variable whose methods were not caught by
- *      (2) — its declaration span is scanned for `method === "..."`
- *      occurrences that mention the variable (nested `if (mVar)` blocks).
+ *   1. HONO (preferred): the Hono app's `app.routes` — `createHonoApp()`
+ *      from `apps/api/src/hono-app.ts`, loaded with Node's native
+ *      type-stripping import. No regex, no guessing: the routes the app
+ *      actually registers are the routes documented. The app is built
+ *      with `resolveRuntimeConfig()` + an in-memory store factory, so
+ *      generation touches no DB.
+ *   2. LEGACY fallback: regex extraction from `apps/api/src/app.ts`
+ *      (the hand-rolled dispatcher) — used ONLY while the Hono app
+ *      cannot be loaded yet (Worker 1/2/2b/3/4 still landing). A loud
+ *      warning names the failure. The conformance test
+ *      (`apps/api/test/hono-routes.conformance.test.ts`) has NO such
+ *      fallback — it fails until the Hono app loads — so a stuck
+ *      fallback cannot hide silently. Once the Hono app is complete,
+ *      remove the legacy path (`extractRoutes` + the fallback in
+ *      `loadRoutes`) and the `source` option.
  *
  * Every extracted operation gets a stable operationId, its path
  * parameters, a security requirement derived from the path prefix, and
@@ -32,16 +36,18 @@
  * Run: `node scripts/generate-openapi.mjs` (writes docs/openapi.json).
  * Gate: `node scripts/check-openapi.mjs` regenerates in memory and
  * fails on any drift, so CI can verify contracts can be generated and
- * validated (TAD §18.4). Routes wired later (e.g. the Batch E admin
- * routes Worker A2 adds) appear automatically on the next run.
+ * validated (TAD §18.4).
  */
 import { readFile, writeFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(SCRIPT_DIR, "..");
 const APP_TS = join(REPO_ROOT, "apps/api/src/app.ts");
+const HONO_APP_URL = pathToFileURL(
+  join(REPO_ROOT, "apps/api/src/hono-app.ts")
+).href;
 const OUT_PATH = join(REPO_ROOT, "docs/openapi.json");
 
 const METHODS = ["GET", "POST", "PATCH", "PUT", "DELETE"];
@@ -133,8 +139,118 @@ export function extractRoutes(source) {
   );
 }
 
-export function buildOpenApi(source) {
-  const routes = extractRoutes(source);
+function sortRoutes(routes) {
+  return [...routes].sort((a, b) =>
+    a.pattern === b.pattern
+      ? METHODS.indexOf(a.method) - METHODS.indexOf(b.method)
+      : a.pattern.localeCompare(b.pattern),
+  );
+}
+
+/**
+ * Extract the (method, pattern) route table from a Hono app's
+ * `app.routes` — the preferred source (Hono migration, plan §4).
+ * Hono registers `app.use()` middleware as ALL-method routes; those
+ * are pipeline, not routes, so they are skipped. `POST /api/v1/graphql`
+ * (the additive GraphQL endpoint, plan §3.2) IS a real route and is
+ * kept here — `buildOpenApi` documents REST only, so callers that
+ * need a pure-REST table filter it out (see `loadRoutes`).
+ */
+export function extractRoutesFromHono(app) {
+  const routes = new Map(); // "METHOD path" -> { method, pattern, how }
+  for (const entry of app.routes ?? []) {
+    if (!entry || typeof entry.method !== "string" || typeof entry.path !== "string") {
+      continue;
+    }
+    const method = entry.method.toUpperCase();
+    if (!METHODS.includes(method) || !entry.path.startsWith("/api/")) continue;
+    const key = `${method} ${entry.path}`;
+    if (!routes.has(key)) {
+      routes.set(key, { method, pattern: entry.path, how: "hono" });
+    }
+  }
+  return sortRoutes([...routes.values()]);
+}
+
+/**
+ * Build the Hono app and extract its routes. The app is constructed
+ * with resolved local env + an in-memory store factory — route
+ * registration touches no DB. Throws on any failure; `loadRoutes`
+ * decides whether to fall back to the legacy source.
+ */
+export async function loadHonoRoutes() {
+  const mod = await import(HONO_APP_URL);
+  const factory = mod.createHonoApp ?? mod.default ?? mod.app;
+  if (typeof factory !== "function") {
+    if (factory && Array.isArray(factory.routes)) {
+      return extractRoutesFromHono(factory);
+    }
+    throw new Error(
+      `apps/api/src/hono-app.ts exports no createHonoApp() factory ` +
+        `(exports: ${Object.keys(mod).join(", ") || "(none)"}).`
+    );
+  }
+  const { resolveRuntimeConfig } = await import(
+    pathToFileURL(join(REPO_ROOT, "apps/api/src/env.ts")).href
+  );
+  const { StackMateDataStore } = await import(
+    pathToFileURL(join(REPO_ROOT, "apps/api/src/platform/db/store.ts")).href
+  );
+  const store = new StackMateDataStore();
+  const app = await factory({
+    env: resolveRuntimeConfig(),
+    storeFactory: async () => store,
+  });
+  if (!app || !Array.isArray(app.routes)) {
+    throw new Error("createHonoApp() did not return a Hono app with a `routes` array.");
+  }
+  return extractRoutesFromHono(app);
+}
+
+/**
+ * Resolve the route table for generation.
+ * Returns `{ routes, source }` where `source` is `"hono"` (preferred)
+ * or `"legacy-app.ts"` (regex fallback while the Hono app cannot be
+ * loaded yet — loud warning, see the header comment). The GraphQL
+ * endpoint is REST-external, so it is excluded from the OpenAPI table
+ * either way (it is allow-listed, not documented, in the conformance
+ * test).
+ */
+export async function loadRoutes() {
+  try {
+    const routes = await loadHonoRoutes();
+    return {
+      routes: routes.filter(
+        (r) => !(r.method === "POST" && r.pattern === "/api/v1/graphql")
+      ),
+      source: "hono",
+    };
+  } catch (err) {
+    console.warn(
+      "WARNING: Hono route source unavailable — falling back to legacy " +
+        `regex extraction from apps/api/src/app.ts (${err.message}). ` +
+        "The route-conformance test has no such fallback and stays RED " +
+        "until the Hono app loads."
+    );
+    const source = await readFile(APP_TS, "utf8");
+    return { routes: extractRoutes(source), source: "legacy-app.ts" };
+  }
+}
+
+export function buildOpenApi(routesOrSource, options = {}) {
+  const routes = Array.isArray(routesOrSource)
+    ? sortRoutes(routesOrSource)
+    : extractRoutes(routesOrSource);
+  const source = options.source ?? (Array.isArray(routesOrSource) ? "hono" : "legacy-app.ts");
+  const routeSourceNote =
+    source === "hono"
+      ? "generated from the Hono route table in " +
+        "apps/api/src/hono-app.ts (`app.routes`; run " +
+        "`node scripts/generate-openapi.mjs` to regenerate; " +
+        "`node scripts/check-openapi.mjs` is the CI gate). "
+      : "generated from the route table in " +
+        "apps/api/src/app.ts (run `node scripts/generate-openapi.mjs` to " +
+        "regenerate; `node scripts/check-openapi.mjs` is the CI gate). ";
   const paths = {};
   const seenOperationIds = new Set();
   for (const { method, pattern } of routes) {
@@ -209,9 +325,8 @@ export function buildOpenApi(source) {
       title: "StackMate API",
       version: "v1",
       description:
-        "StackMate v1 API — generated from the route table in " +
-        "apps/api/src/app.ts (run `node scripts/generate-openapi.mjs` to " +
-        "regenerate; `node scripts/check-openapi.mjs` is the CI gate). " +
+        "StackMate v1 API — " +
+        routeSourceNote +
         "Endpoints under /api/auth/* that are not listed here are served " +
         "by the Better Auth handler (sign-up, social sign-in, two-factor " +
         "enable/disable) — see apps/api/src/modules/identity/better-auth.ts. " +
@@ -314,15 +429,15 @@ export function buildOpenApi(source) {
 }
 
 export async function main() {
-  const source = await readFile(APP_TS, "utf8");
-  const doc = buildOpenApi(source);
+  const { routes, source } = await loadRoutes();
+  const doc = buildOpenApi(routes, { source });
   const operationCount = Object.values(doc.paths).reduce(
     (n, ops) => n + Object.keys(ops).length,
     0
   );
   await writeFile(OUT_PATH, `${JSON.stringify(doc, null, 2)}\n`, "utf8");
   console.log(
-    `OpenAPI written to docs/openapi.json: ${Object.keys(doc.paths).length} paths, ${operationCount} operations.`
+    `OpenAPI written to docs/openapi.json: ${Object.keys(doc.paths).length} paths, ${operationCount} operations (source: ${source}).`
   );
 }
 
