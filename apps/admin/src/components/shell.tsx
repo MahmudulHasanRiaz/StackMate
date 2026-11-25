@@ -58,6 +58,7 @@ import {
   LogOut,
   Menu as MenuIcon,
   Package,
+  Receipt,
   RefreshCw,
   ScrollText,
   Search,
@@ -67,6 +68,7 @@ import {
   ShoppingCart,
   SunMoon,
   Tags,
+  TrendingUp,
   Undo2,
   User,
   UserPlus,
@@ -201,6 +203,16 @@ export const NAVIGATION_GROUPS: ReadonlyArray<{
       { to: "/payment-review", label: "Payment Review", icon: ClipboardCheck, permission: "payments.read" },
       { to: "/refunds", label: "Refunds", icon: Undo2, permission: "payments.read" },
       { to: "/leads", label: "Leads", icon: UserPlus, permission: "leads.view" },
+    ],
+  },
+  {
+    group: "Finance",
+    items: [
+      // Expense Module (2026-11-25): operational finance pages.
+      // Expense categories are config, so they live in Settings
+      // (/settings/expense-categories), not here.
+      { to: "/expenses", label: "Expenses", icon: Receipt, permission: "expenses.read" },
+      { to: "/analytics/profit-loss", label: "Profit & Loss", icon: TrendingUp, permission: "expenses.read" },
     ],
   },
   {

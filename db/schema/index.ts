@@ -22,3 +22,4 @@ export * from "./reminders.ts";
 export * from "./tickets.ts";
 export * from "./leads.ts";
 export * from "./media.ts";
+export * from "./expenses.ts";

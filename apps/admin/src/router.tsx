@@ -132,6 +132,19 @@ const PaymentSubmissionDetailSection = lazy(() =>
 const RefundsSection = lazy(() =>
   import("./sections/refunds").then((m) => ({ default: m.RefundsSection })),
 );
+// Expense Module (2026-11-25): Finance pages in the main menu and
+// the category config page under Settings.
+const ExpensesSection = lazy(() =>
+  import("./sections/expenses").then((m) => ({ default: m.ExpensesSection })),
+);
+const ProfitLossSection = lazy(() =>
+  import("./sections/profit-loss").then((m) => ({ default: m.ProfitLossSection })),
+);
+const ExpenseCategoriesSection = lazy(() =>
+  import("./sections/expense-categories").then((m) => ({
+    default: m.ExpenseCategoriesSection,
+  })),
+);
 const ProductsSection = lazy(() =>
   import("./sections/products").then((m) => ({ default: m.ProductsSection })),
 );
@@ -434,6 +447,11 @@ const paymentSubmissionDetailRoute = makeDetailRoute("/payment-review/$submissio
 // Refunds standalone list — same list as the Payment Review Refunds tab
 // (D-4), on its own Commerce nav entry.
 const refundsRoute = makeListRoute("/refunds", RefundsSection);
+// Expense Module (2026-11-25): Finance group — operational expense
+// list + P&L analytics. Categories are config, so they live under
+// /settings/* (see the settings routes below).
+const expensesRoute = makeListRoute("/expenses", ExpensesSection);
+const profitLossRoute = makeListRoute("/analytics/profit-loss", ProfitLossSection);
 const subscriptionsRoute = makeListRoute("/subscriptions", SubscriptionsSection);
 const subscriptionDetailRoute = makeDetailRoute("/subscriptions/$subscriptionId", "subscriptionId", SubscriptionDetailSection);
 const licensesRoute = makeListRoute("/licenses", LicensesSection);
@@ -516,6 +534,10 @@ const settingsPaymentMethodsRoute = makeSettingsListRoute(
   "/payment-methods",
   PaymentMethodsSection,
 );
+const settingsExpenseCategoriesRoute = makeSettingsListRoute(
+  "/expense-categories",
+  ExpenseCategoriesSection,
+);
 const settingsPaymentMethodDetailRoute = makeSettingsDetailRoute(
   "/payment-methods/$methodId",
   "methodId",
@@ -559,6 +581,8 @@ const routeTree = rootRoute.addChildren([
     paymentReviewRoute,
     paymentSubmissionDetailRoute,
     refundsRoute,
+    expensesRoute,
+    profitLossRoute,
     subscriptionsRoute,
     subscriptionDetailRoute,
     licensesRoute,
@@ -581,6 +605,7 @@ const routeTree = rootRoute.addChildren([
     settingsWebsiteDetailRoute,
     settingsPaymentMethodsRoute,
     settingsPaymentMethodDetailRoute,
+    settingsExpenseCategoriesRoute,
     settingsWebhooksRoute,
     settingsWebhookDetailRoute,
     settingsTrackingRoute,

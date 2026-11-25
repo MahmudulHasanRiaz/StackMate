@@ -502,6 +502,38 @@ export interface PaymentRefundRecord {
   updated_at: string;
 }
 
+// Expense module (migration 0018, SyncSpec in drizzle-store.ts).
+// currency is BDT-only by contract (expenses are BDT-only); expense_date
+// is a YYYY-MM-DD date; recorded_by is a plain nullable uuid with NO
+// foreign key (see migration 0018 — no recorded_by column exists
+// anywhere else to copy an FK pattern from).
+export interface ExpenseCategoryRecord {
+  id: string;
+  name: string;
+  description: string | null;
+  color: string;
+  icon: string | null;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ExpenseRecord {
+  id: string;
+  amount_minor: number;
+  currency: "BDT";
+  expense_date: string;
+  category_id: string;
+  product_id: string | null;
+  payment_method_id: string | null;
+  vendor: string | null;
+  notes: string | null;
+  receipt_media_id: string | null;
+  recorded_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface SubscriptionPeriodRecord {
   id: string;
   subscription_id: string;
@@ -854,6 +886,8 @@ export interface DatabaseState {
   payment_transactions: PaymentTransactionRecord[];
   payment_verification_logs: PaymentVerificationLogRecord[];
   payment_refunds: PaymentRefundRecord[];
+  expense_categories: ExpenseCategoryRecord[];
+  expenses: ExpenseRecord[];
   subscriptions: SubscriptionRecord[];
   licenses: LicenseRecord[];
   license_events: LicenseEventRecord[];
@@ -967,6 +1001,8 @@ export class StackMateDataStore {
       payment_transactions: [],
       payment_verification_logs: [],
       payment_refunds: [],
+      expense_categories: [],
+      expenses: [],
       subscriptions: [],
       licenses: [],
       license_events: [],

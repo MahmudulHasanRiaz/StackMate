@@ -320,34 +320,37 @@ describe.skipIf(!DATABASE_URL)("DrizzleStore (Postgres) integration", () => {
     const byRole = new Map<string, number>(
       grants.rows.map((row) => [row.role_key as string, row.n as number])
     );
-    // seed-reference.ts matrix: super_admin 33, admin 33, finance_manager 13,
-    // license_manager 7, product_manager 6, support_staff 13, marketing_manager 5,
-    // read_only 12 = 122 total. Before migration 0003 only super_admin had any.
+    // seed-reference.ts matrix: super_admin 36, admin 36, finance_manager 16,
+    // license_manager 7, product_manager 6, support_staff 14, marketing_manager 5,
+    // read_only 13 = 133 total. Before migration 0003 only super_admin had any.
     // (ADR-0009 added 4 permissions — tickets.view/manage, leads.view/manage:
     // super_admin +4, admin +4, support_staff +4, read_only +2 = +14 total.
     // Migration 0012 added 2 — media.view/manage: super_admin +2, admin +2,
     // support_staff +2, read_only +1 = +7 total. Migration 0014 (D-1) granted
     // admin users.manage: admin +1. Migration 0016 added 2 read permissions —
     // integrations.read, tracking.read: super_admin +2, admin +2,
-    // marketing_manager +1 (tracking.read only), read_only +2 = +7 total.)
-    assert.equal(byRole.get("super_admin"), 33);
-    assert.equal(byRole.get("admin"), 33);
-    assert.equal(byRole.get("finance_manager"), 13);
+    // marketing_manager +1 (tracking.read only), read_only +2 = +7 total.
+    // Migration 0019 added 3 expense permissions — expenses.read,
+    // expenses.manage, expense_categories.manage: super_admin +3, admin +3,
+    // finance_manager +3, support_staff +1 (read only), read_only +1 = +11 total.)
+    assert.equal(byRole.get("super_admin"), 36);
+    assert.equal(byRole.get("admin"), 36);
+    assert.equal(byRole.get("finance_manager"), 16);
     assert.equal(byRole.get("license_manager"), 7);
     assert.equal(byRole.get("product_manager"), 6);
-    assert.equal(byRole.get("support_staff"), 13);
+    assert.equal(byRole.get("support_staff"), 14);
     assert.equal(byRole.get("marketing_manager"), 5);
-    assert.equal(byRole.get("read_only"), 12);
+    assert.equal(byRole.get("read_only"), 13);
     const total = [...byRole.values()].reduce((a, b) => a + b, 0);
-    assert.equal(total, 122);
+    assert.equal(total, 133);
 
     // The grants must also be visible through the store's loaded roles.
     const reloaded = await store.loadState();
     const admin = reloaded.roles.find((r) => r.key === "admin");
     assert.ok(admin, "admin role missing from loadState");
-    assert.equal(admin?.permission_keys.length, 33); // ADR-0009: +4 tickets/leads grants; 0012: +2 media grants; 0014 (D-1): +1 users.manage; 0016: +2 read grants
+    assert.equal(admin?.permission_keys.length, 36); // ADR-0009: +4 tickets/leads grants; 0012: +2 media grants; 0014 (D-1): +1 users.manage; 0016: +2 read grants; 0019: +3 expense grants
     assert.ok(admin?.permission_keys.includes("users.manage")); // D-1 (0014): admin manages staff
     const readOnly = reloaded.roles.find((r) => r.key === "read_only");
-    assert.equal(readOnly?.permission_keys.length, 12); // ADR-0009: +2 tickets/leads view grants; 0012: +1 media.view; 0016: +2 read grants
+    assert.equal(readOnly?.permission_keys.length, 13); // ADR-0009: +2 tickets/leads view grants; 0012: +1 media.view; 0016: +2 read grants; 0019: +1 expenses.read
   });
 });

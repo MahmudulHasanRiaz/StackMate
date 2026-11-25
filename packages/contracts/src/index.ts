@@ -13,3 +13,4 @@ export * from "./domains/leads.ts";
 export * from "./domains/reminders.ts";
 export * from "./domains/search.ts";
 export * from "./domains/media.ts";
+export * from "./domains/expenses.ts";
