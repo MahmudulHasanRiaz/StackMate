@@ -4,8 +4,10 @@
  *
  * CI gate: the generated contract must be valid and must match the
  * current route table. It
- *   1. regenerates the document in memory from `apps/api/src/app.ts`
- *      (same builder as `scripts/generate-openapi.mjs`),
+ *   1. regenerates the document in memory from the Hono app's
+ *      `app.routes` (same builder as `scripts/generate-openapi.mjs`;
+ *      legacy regex fallback from `apps/api/src/app.ts` only while the
+ *      Hono app cannot be loaded yet — see that script's header),
  *   2. fails if `docs/openapi.json` differs (drift — re-run the
  *      generator and commit the result),
  *   3. validates structure: OpenAPI 3.1, info, non-empty paths, every
@@ -22,11 +24,10 @@
 import { readFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildOpenApi } from "./generate-openapi.mjs";
+import { buildOpenApi, loadRoutes } from "./generate-openapi.mjs";
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(SCRIPT_DIR, "..");
-const APP_TS = join(REPO_ROOT, "apps/api/src/app.ts");
 const DOC_PATH = join(REPO_ROOT, "docs/openapi.json");
 
 const failures = [];
@@ -55,8 +56,8 @@ function collectRefs(node, out = []) {
   return out;
 }
 
-const source = await readFile(APP_TS, "utf8");
-const regenerated = buildOpenApi(source);
+const { routes, source } = await loadRoutes();
+const regenerated = buildOpenApi(routes, { source });
 
 let storedRaw;
 try {
@@ -76,8 +77,9 @@ if (storedRaw !== undefined) {
 if (stored) {
   if (JSON.stringify(stored) !== JSON.stringify(regenerated)) {
     fail(
-      "docs/openapi.json is stale — it does not match a fresh generation from " +
-        "apps/api/src/app.ts. Run `node scripts/generate-openapi.mjs` and commit the result."
+      "docs/openapi.json is stale — it does not match a fresh generation " +
+        `from the ${source === "hono" ? "Hono app (apps/api/src/hono-app.ts)" : "legacy route table (apps/api/src/app.ts)"}. ` +
+        "Run `node scripts/generate-openapi.mjs` and commit the result."
     );
   }
 }

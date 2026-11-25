@@ -521,15 +521,34 @@ describe("Audit Batch A1 — Auth + Security (in-memory)", () => {
     assert.equal(typeof res.body.error.message, "string");
   });
 
-  // -- F-09: no Hono remnant --------------------------------------------
-  it("F-09: package.json has no hono dependency and app.ts claims no Hono", () => {
+  // -- F-09: Hono IS the foundation (reverted 2026-11-25) --------------
+  // Audit #2's F-09 removed Hono as a dead dependency. The owner then
+  // ordered a full Hono migration (2026-11-25), so the removal was
+  // reverted and Hono is now the backend foundation. This test guards
+  // the new state: Hono must be a declared dependency AND the Hono app
+  // composition must exist. (The old "no Hono" assertion is the exact
+  // opposite of the current architecture — do not restore it.)
+  it("F-09: package.json declares hono and the Hono app composition exists", () => {
     const pkg = JSON.parse(
       readFileSync(path.join(repoRoot, "apps/api/package.json"), "utf8")
     ) as { dependencies?: Record<string, string> };
-    assert.ok(!("hono" in (pkg.dependencies ?? {})), "hono must not be a dependency");
-    const appSrc = readFileSync(path.join(repoRoot, "apps/api/src/app.ts"), "utf8");
-    const header = appSrc.slice(0, 1200);
-    assert.ok(!/Hono/.test(header), "app.ts header must not claim Hono");
+    assert.equal(
+      pkg.dependencies?.hono,
+      "4.13.18",
+      "hono must be a pinned dependency (Hono migration)"
+    );
+    const honoAppSrc = readFileSync(
+      path.join(repoRoot, "apps/api/src/hono-app.ts"),
+      "utf8"
+    );
+    assert.ok(
+      /export function createHonoApp/.test(honoAppSrc),
+      "hono-app.ts must export createHonoApp"
+    );
+    assert.ok(
+      /registerAllRoutes/.test(honoAppSrc),
+      "hono-app.ts must register all routes"
+    );
   });
 
   // -- F-10: store-creation failure logs the message only ---------------

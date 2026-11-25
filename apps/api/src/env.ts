@@ -90,6 +90,14 @@ export interface StackMateBindings {
    * resolveRuntimeConfig throws otherwise (fail-closed at boot).
    */
   SETUP_TOKEN?: string | undefined;
+  /**
+   * Hono wiring rollback flag (temporary, Hono migration).
+   * When explicitly "0" or "false" the Worker entrypoint falls back to
+   * the pre-Hono handler (apps/api/src/app-legacy.ts). Default (unset
+   * or any other value) is Hono ON. Delete with app-legacy.ts after
+   * the Hono path is live-verified.
+   */
+  HONO_ENABLED?: string | undefined;
   LICENSE_SIGNING_PRIVATE_JWK?: string | undefined;
   LICENSE_SIGNING_PUBLIC_JWK?: string | undefined;
   LICENSE_SIGNING_KEY_ID: string;
@@ -222,6 +230,7 @@ export function resolveRuntimeConfig(rawEnv: Partial<StackMateBindings> = {}): S
     LICENSE_VERIFIER_SECRET: licenseVerifierSecret,
     CHECKOUT_TOKEN_SECRET: checkoutTokenSecret,
     SETUP_TOKEN: setupToken || undefined,
+    HONO_ENABLED: rawEnv.HONO_ENABLED ?? process.env.HONO_ENABLED,
     LICENSE_SIGNING_PRIVATE_JWK:
       rawEnv.LICENSE_SIGNING_PRIVATE_JWK ?? process.env.LICENSE_SIGNING_PRIVATE_JWK,
     LICENSE_SIGNING_PUBLIC_JWK:
@@ -237,4 +246,15 @@ export function resolveRuntimeConfig(rawEnv: Partial<StackMateBindings> = {}): S
       rawEnv.HYPERDRIVE_CACHED ?? rawEnv.HYPERDRIVE_NO_CACHE ?? { connectionString: fallbackDbUrl },
     R2_BUCKET: rawEnv.R2_BUCKET,
   };
+}
+
+/**
+ * True unless HONO_ENABLED is explicitly "0" or "false".
+ * Default is Hono ON. Temporary rollback switch for the Hono
+ * migration (see apps/api/src/app.ts) — delete with app-legacy.ts
+ * after the Hono path is live-verified.
+ */
+export function isHonoEnabled(env: StackMateBindings): boolean {
+  const v = env.HONO_ENABLED?.trim().toLowerCase();
+  return v !== "0" && v !== "false";
 }
