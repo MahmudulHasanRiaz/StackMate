@@ -30,6 +30,7 @@ import {
   Input,
   Select,
   TableSkeleton,
+  GroupField,
 } from "../components/primitives";
 import {
   fetchStorageSettings,
@@ -97,12 +98,12 @@ function StorageSettingsForm({ initial }: { initial: StorageSettingsView }) {
           </Select>
         </Field>
         {driver === "r2" ? (
-          <Field label="R2 bucket">
+          <GroupField label="R2 bucket">
             <span className="sm-cell-line">
               <span className="sm-mono sm-cell-text">{initial.r2_bucket}</span>
               <CopyButton value={initial.r2_bucket} label="Copy bucket name" />
             </span>
-          </Field>
+          </GroupField>
         ) : null}
         {driver === "local" ? (
           <Field

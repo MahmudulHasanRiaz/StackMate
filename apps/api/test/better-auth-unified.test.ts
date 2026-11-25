@@ -102,9 +102,16 @@ describe.skipIf(!DATABASE_URL)("Better Auth unified staff auth (Postgres)", () =
       body: { email, password },
     });
     assert.equal(res.status, 200, `sign-in failed for ${email}: ${JSON.stringify(res.body)}`);
-    const token = res.body.data.session_token as string;
-    assert.ok(token, "sign-in must return a session_token");
-    return { token, cookie: extractSessionCookie(res.headers), principal: res.body.data.principal };
+    assert.ok(
+      !("session_token" in (res.body.data ?? {})),
+      "A-01: sign-in JSON must not carry session_token (cookie-only)"
+    );
+    const cookie = extractSessionCookie(res.headers);
+    // Better Auth signs the session cookie: value is "<raw token>.<signature>".
+    // The raw token is what the sessions table stores (Bearer path + row checks).
+    const token = cookie.split("=")[1]!.split(".")[0]!;
+    assert.ok(token, "sign-in cookie must carry a session token");
+    return { token, cookie, principal: res.body.data.principal };
   }
 
   async function countRows(sql: string, params: unknown[] = []): Promise<number> {

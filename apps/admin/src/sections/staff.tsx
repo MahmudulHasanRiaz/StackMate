@@ -61,6 +61,7 @@ import {
   Tabs,
   Textarea,
   useConfirm,
+  GroupField,
 } from "../components/primitives";
 import {
   DetailFacts,
@@ -72,6 +73,7 @@ import {
   useAdminDetail,
   useAdminList,
   useAdminMutation,
+  useIdempotencyKey,
 } from "../lib/section-kit";
 import { humanizeType } from "../lib/resolve-names";
 
@@ -254,10 +256,11 @@ export function StaffSection() {
     setRoleDialog({ mode: "edit", role });
   };
 
-  const createRole = useAdminMutation<Role, { key: string; name: string; description?: string; permissions: string[] }>({
+    const createRoleKey = useIdempotencyKey();
+const createRole = useAdminMutation<Role, { key: string; name: string; description?: string; permissions: string[] }>({
     mutationFn: (body) =>
       apiRequest<Role>("/api/v1/admin/roles", {
-        method: "POST",
+        method: "POST", idempotencyKey: createRoleKey,
         body: JSON.stringify(body),
       }),
     invalidateKeys: [listKey("staff-roles")],
@@ -354,13 +357,14 @@ export function StaffSection() {
     setInviteDialog(true);
   };
 
-  const createInvitation = useAdminMutation<
+    const createInvitationKey = useIdempotencyKey();
+const createInvitation = useAdminMutation<
     CreateInvitationResult,
     { name: string; email: string; role_keys: string[] }
   >({
     mutationFn: (body) =>
       apiRequest<CreateInvitationResult>("/api/v1/admin/users/invitations", {
-        method: "POST",
+        method: "POST", idempotencyKey: createInvitationKey,
         body: JSON.stringify(body),
       }),
     invalidateKeys: [listKey("staff-invitations")],
@@ -394,14 +398,15 @@ export function StaffSection() {
     });
   };
 
-  const revokeInvitation = useAdminMutation<
+    const revokeInvitationKey = useIdempotencyKey();
+const revokeInvitation = useAdminMutation<
     StaffInvitation,
     { id: string; name: string; email: string }
   >({
     mutationFn: (body) =>
       apiRequest<StaffInvitation>(
         `/api/v1/admin/users/invitations/${body.id}/revoke`,
-        { method: "POST" },
+        { method: "POST", idempotencyKey: revokeInvitationKey },
       ),
     invalidateKeys: [listKey("staff-invitations")],
     successTitle: "Invitation revoked",
@@ -945,7 +950,7 @@ export function StaffSection() {
             placeholder="What this role is for"
           />
         </Field>
-        <Field
+        <GroupField
           label="Permissions"
           hint={
             rolePermissionsLocked
@@ -989,7 +994,7 @@ export function StaffSection() {
               })}
             </div>
           )}
-        </Field>
+        </GroupField>
       </Dialog>
 
       {/* ---- Invite staff dialog ---- */}
@@ -1048,7 +1053,7 @@ export function StaffSection() {
             placeholder="name@example.com"
           />
         </Field>
-        <Field
+        <GroupField
           label="Roles"
           required
           hint="Only a Super Admin can invite someone as super_admin."
@@ -1082,7 +1087,7 @@ export function StaffSection() {
               ))}
             </div>
           )}
-        </Field>
+        </GroupField>
         {createInvitation.isError ? (
           <Alert variant="danger">
             {apiErrorMessage(createInvitation.error)}

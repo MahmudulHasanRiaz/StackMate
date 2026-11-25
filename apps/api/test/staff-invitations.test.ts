@@ -54,13 +54,13 @@ describe("Staff invitations (Batch 1, in-memory)", () => {
       body: { email: "invite-admin@stackmate.local", password: "InviteSuperPass123!" },
     });
     assert.equal(signIn.status, 200, JSON.stringify(signIn.body));
-    superCookie = `stackmate_session=${signIn.body.data.session_token}`;
+    superCookie = sessionCookieFromHeaders(signIn.headers);
   });
 
   async function apiRequest(
     path: string,
     options: { method?: string; body?: unknown; cookie?: string } = {}
-  ): Promise<{ status: number; body: any }> {
+  ): Promise<{ status: number; body: any; headers: Headers }> {
     const headers = new Headers({ "Content-Type": "application/json" });
     if (options.cookie) headers.set("Cookie", options.cookie);
     const init: RequestInit = { method: options.method ?? "GET", headers };
@@ -69,7 +69,17 @@ describe("Staff invitations (Batch 1, in-memory)", () => {
       new Request(`http://localhost:8787${path}`, init),
       env
     );
-    return { status: res.status, body: await res.json() };
+    return { status: res.status, body: await res.json(), headers: res.headers };
+  }
+
+  // A-01: the session token is cookie-only — sign-in JSON no longer
+  // carries session_token, so the cookie comes from Set-Cookie.
+  function sessionCookieFromHeaders(resHeaders: Headers): string {
+    const setCookies =
+      typeof resHeaders.getSetCookie === "function" ? resHeaders.getSetCookie() : [];
+    const pair = setCookies.find((c) => c.startsWith("stackmate_session="));
+    assert.ok(pair, "sign-in must set a stackmate_session cookie");
+    return pair!.split(";")[0]!;
   }
 
   async function createSupportRole(): Promise<string> {
@@ -226,7 +236,7 @@ describe("Staff invitations (Batch 1, in-memory)", () => {
       body: { email: "support@stackmate.local", password: "SupportPass123!" },
     });
     assert.equal(staffSignIn.status, 200, JSON.stringify(staffSignIn.body));
-    const staffCookie = `stackmate_session=${staffSignIn.body.data.session_token}`;
+    const staffCookie = sessionCookieFromHeaders(staffSignIn.headers);
 
     const attempt = await apiRequest("/api/v1/admin/users/invitations", {
       method: "POST",

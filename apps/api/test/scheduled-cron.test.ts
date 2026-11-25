@@ -184,7 +184,20 @@ describe.skipIf(!DATABASE_URL)("scheduled (cron) handler — live-path repro", (
 
   it("empty outbox: scheduled resolves (no throw) and claims nothing", async () => {
     const result = await app.scheduled({}, envStaging, { waitUntil: () => {} });
-    assert.deepEqual(result, { claimed: 0, delivered: 0, simulated: 0, skipped: 0, retrying: 0, dead_lettered: 0 });
+    assert.deepEqual(
+      {
+        claimed: result.claimed,
+        delivered: result.delivered,
+        simulated: result.simulated,
+        skipped: result.skipped,
+        retrying: result.retrying,
+        dead_lettered: result.dead_lettered,
+      },
+      { claimed: 0, delivered: 0, simulated: 0, skipped: 0, retrying: 0, dead_lettered: 0 }
+    );
+    // B-02: the drain result carries its wall time (the drain ran —
+    // the zeroed fallback for a skipped drain has no duration_ms).
+    assert.equal(typeof (result as { duration_ms?: unknown }).duration_ms, "number");
   }, 60_000);
 
   it("webhook event with no subscribed endpoints: skipped, no throw", async () => {

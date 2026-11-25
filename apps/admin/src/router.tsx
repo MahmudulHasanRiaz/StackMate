@@ -45,7 +45,6 @@ import {
   type StaffPrincipalDto,
 } from "./components/shell";
 import { AuthScreen } from "./components/auth";
-import { TwoFactorSetup } from "./components/two-factor-setup";
 import {
   AcceptInvitationPage,
   ResetPasswordPage,
@@ -59,6 +58,11 @@ import { Button, ErrorState, Skeleton, TableSkeleton } from "./components/primit
  * demand; the dashboard (index) and auth stay in the initial bundle.
  * Sections export named components, so each lazy() maps to a default.
  */
+// D-16: TwoFactorSetup pulls in qrcode-generator — lazy so the QR
+// library is downloaded only on the forced-2FA screen / 2FA dialogs.
+const TwoFactorSetup = lazy(() =>
+  import("./components/two-factor-setup").then((m) => ({ default: m.TwoFactorSetup })),
+);
 const GeneralSettingsSection = lazy(() =>
   import("./sections/general-settings").then((m) => ({ default: m.GeneralSettingsSection })),
 );
@@ -207,6 +211,18 @@ const WebhooksSection = lazy(() =>
 const WebhookDetailSection = lazy(() =>
   import("./sections/webhooks").then((m) => ({ default: m.WebhookDetailSection })),
 );
+// E-21: Jobs/Runs view (scheduled jobs + sweep runs).
+const JobsSection = lazy(() =>
+  import("./sections/jobs").then((m) => ({ default: m.JobsSection })),
+);
+// E-09: Renewals view (upcoming/due/overdue/failed/cancelled buckets).
+const RenewalsSection = lazy(() =>
+  import("./sections/renewals").then((m) => ({ default: m.RenewalsSection })),
+);
+// E-05: Signing-key lifecycle surface (Settings/Licenses).
+const SigningKeysSection = lazy(() =>
+  import("./sections/signing-keys").then((m) => ({ default: m.SigningKeysSection })),
+);
 const GettingStartedPage = lazy(() =>
   import("./components/getting-started").then((m) => ({ default: m.GettingStartedPage })),
 );
@@ -324,12 +340,20 @@ function RootComponent() {
           <h1 id="forced-2fa-heading" className="sm-page-title">
             Set up two-factor authentication
           </h1>
-          <TwoFactorSetup
-            forced
-            onDone={() => {
-              void queryClient.invalidateQueries({ queryKey: ["admin", "me"] });
-            }}
-          />
+          <Suspense
+            fallback={
+              <div style={{ marginTop: 16 }}>
+                <Skeleton height={120} />
+              </div>
+            }
+          >
+            <TwoFactorSetup
+              forced
+              onDone={() => {
+                void queryClient.invalidateQueries({ queryKey: ["admin", "me"] });
+              }}
+            />
+          </Suspense>
         </section>
       </main>
     );
@@ -460,6 +484,8 @@ const licenseDetailRoute = makeDetailRoute("/licenses/$licenseId", "licenseId", 
 // The config pages (websites, payment methods, webhooks, tracking
 // pixel-groups) live under /settings/* — see the settings routes below.
 const trackingEventsRoute = makeListRoute("/tracking-events", TrackingSection);
+const jobsRoute = makeListRoute("/jobs", JobsSection);
+const renewalsRoute = makeListRoute("/renewals", RenewalsSection);
 const outboxRoute = makeListRoute("/outbox", OutboxSection);
 const staffRoute = makeListRoute("/staff", StaffSection);
 const staffUserDetailRoute = makeDetailRoute("/staff/$userId", "userId", StaffUserDetailSection);
@@ -551,6 +577,10 @@ const settingsWebhookDetailRoute = makeSettingsDetailRoute(
 );
 const settingsTrackingRoute = makeSettingsListRoute("/tracking", TrackingConfigSection);
 const settingsAuthRoute = makeSettingsListRoute("/authentication", AuthSettingsSection);
+const settingsSigningKeysRoute = makeSettingsListRoute(
+  "/signing-keys",
+  SigningKeysSection,
+);
 const settingsEmailRoute = makeSettingsListRoute("/email", EmailSettingsSection);
 const settingsGeneralRoute = makeSettingsListRoute("/general", GeneralSettingsSection);
 const settingsStorageRoute = makeSettingsListRoute("/storage", StorageSettingsSection);
@@ -589,6 +619,8 @@ const routeTree = rootRoute.addChildren([
     licenseDetailRoute,
     trackingEventsRoute,
     outboxRoute,
+    jobsRoute,
+    renewalsRoute,
     staffRoute,
     staffUserDetailRoute,
     auditLogsRoute,
@@ -610,6 +642,7 @@ const routeTree = rootRoute.addChildren([
     settingsWebhookDetailRoute,
     settingsTrackingRoute,
     settingsAuthRoute,
+    settingsSigningKeysRoute,
     settingsEmailRoute,
     settingsGeneralRoute,
     settingsStorageRoute,

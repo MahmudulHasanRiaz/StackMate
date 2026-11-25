@@ -709,13 +709,6 @@ function fingerprintSigningKeyRows(rows: Array<Record<string, unknown>>): string
     .join("|");
 }
 
-/**
- * C-1: warned once when the DB-backed rate-limit table is missing,
- * so the in-memory fallback (and the migration still owed) is visible
- * in the logs instead of silent.
- */
-let rateLimitTableMissingWarned = false;
-
 async function detectCapabilitiesCached(
   connectionString: string,
   client: Client
@@ -953,6 +946,68 @@ export class DrizzleStore extends StackMateDataStore {
         store.usesInMemoryBucket = false;
       } else {
         // Keep the inherited InMemoryR2Bucket and flag it (header note 5).
+        store.usesInMemoryBucket = true;
+      }
+    } catch (error) {
+      await pgClient.end().catch(() => {});
+      throw error;
+    }
+    return store;
+  }
+
+  /**
+   * B-01 (phased fast path): connect WITHOUT the combined full-state
+   * load. The returned store's `state` holds only the in-memory seed
+   * rows — services must NOT read `store.state` from it. Use the
+   * targeted lookup methods instead (`findStaffPrincipalByEmail`,
+   * `findLicenseForValidation`, `findIntegratedSiteByKey`,
+   * `loadPublicCatalog`, `claimOutboxEvents`); each runs 1–6 targeted
+   * SQL queries and never touches the other ~60 tables. The FULL LOAD
+   * REMAINS the fallback: plain `create()` and `withTransaction`
+   * (which reloads inside the transaction) are unchanged, so any route
+   * not yet migrated keeps working exactly as before.
+   *
+   * No store/client is shared across requests (OD-03): like
+   * `create()`, this opens a fresh request-scoped client owned by the
+   * returned store — `close()` ends it. Signing keys are loaded only
+   * when `loadSigningKey` is set (license validation needs them to
+   * sign entitlement tokens; a principal lookup does not).
+   */
+  public static async createTargeted(
+    opts: DrizzleStoreCreateOptions & { loadSigningKey?: boolean }
+  ): Promise<DrizzleStore> {
+    if (!opts.connectionString || opts.connectionString.trim().length === 0) {
+      throw new Error(
+        "DrizzleStore.createTargeted: connectionString is empty. Pass the PostgreSQL connection string (in production, HYPERDRIVE_NO_CACHE.connectionString)."
+      );
+    }
+    let pgClient: Client;
+    try {
+      pgClient = await DrizzleStore.connectWithRetry(opts.connectionString);
+    } catch (error) {
+      const wrapped = new Error(
+        `DrizzleStore.createTargeted: could not connect to PostgreSQL: ${(error as Error).message}`
+      );
+      (wrapped as { code?: unknown }).code = (
+        error as { code?: unknown }
+      )?.code;
+      throw wrapped;
+    }
+    const drizzleDb = drizzle(pgClient, { schema });
+    const store = new DrizzleStore(pgClient, drizzleDb);
+    try {
+      store.capabilities = await detectCapabilitiesCached(
+        opts.connectionString,
+        pgClient
+      );
+      await assertRequiredTablesCached(opts.connectionString, pgClient);
+      if (opts.loadSigningKey) {
+        await store.resolveSigningKey(opts);
+      }
+      if (opts.r2Bucket !== undefined && opts.r2Bucket !== null) {
+        store.r2Bucket = opts.r2Bucket;
+        store.usesInMemoryBucket = false;
+      } else {
         store.usesInMemoryBucket = true;
       }
     } catch (error) {
@@ -1525,17 +1580,47 @@ export class DrizzleStore extends StackMateDataStore {
    * C-1: DB-backed rate limiting (table `rate_limit_buckets`,
    * migration 0016 — the DB agent's part). One atomic upsert: the
    * count increments and the window resets iff expired, so concurrent
-   * requests cannot both slip under the limit. Until migration 0016
-   * lands the table is missing (42P01) — fall back to the in-memory
-   * Map (best-effort, same as the pre-fix behaviour) so auth never
-   * 500s on a missing table; warn once so the gap is visible.
+   * requests cannot both slip under the limit.
+   *
+   * B-09: `options.skipWhenLimitedBy` names a more specific bucket
+   * (e.g. the per-account sign-in lockout). When that bucket is
+   * already limited, the generic bucket is skipped entirely — no
+   * increment and no upsert round-trip on the hot path; the caller
+   * 429s on the specific bucket anyway. The call-site wiring lives in
+   * app.ts (sign-in: skip the generic `auth:` bucket when the
+   * lockout bucket already applies).
+   *
+   * A-07: until migration 0016 lands the table is missing (42P01) —
+   * the in-memory fallback is KEPT (LV-01 unconfirmed: staging may
+   * not have 0016 yet), but every fallback occurrence is now logged
+   * LOUDLY (console.error per occurrence, not warn-once) so a dead
+   * limiter can never go unnoticed again. See also
+   * `rateLimitTableExists()` for the boot/readiness probe.
    */
   public override async checkRateLimit(
     bucketKey: string,
     maxRequests: number,
-    windowMs = 60_000
+    windowMs = 60_000,
+    options?: {
+      skipWhenLimitedBy?: {
+        bucketKey: string;
+        maxRequests: number;
+        windowMs?: number;
+      };
+    }
   ): Promise<void> {
     this.assertOpen();
+    const skip = options?.skipWhenLimitedBy;
+    if (skip) {
+      // Non-incrementing probe (1 SELECT): if the specific bucket is
+      // already limited, the generic bucket must not also be burned.
+      const alreadyLimited = await this.isRateLimited(
+        skip.bucketKey,
+        skip.maxRequests,
+        skip.windowMs ?? 60_000
+      );
+      if (alreadyLimited) return;
+    }
     try {
       const res = await this.pgClient.query(
         `INSERT INTO rate_limit_buckets ("key", "count", "reset_at")
@@ -1557,12 +1642,15 @@ export class DrizzleStore extends StackMateDataStore {
     } catch (error) {
       if (error instanceof AppError) throw error;
       if ((error as { code?: string })?.code === "42P01") {
-        if (!rateLimitTableMissingWarned) {
-          rateLimitTableMissingWarned = true;
-          console.warn(
-            "[stackmate] rate_limit_buckets table is missing (migration 0016 not applied) — rate limiting falls back to the per-isolate in-memory map until it lands."
-          );
-        }
+        // A-07: LOUD, per occurrence — the DB-backed limiter is down
+        // and auth is running on the per-isolate in-memory map (which
+        // is effectively empty per request on Workers). Apply
+        // migration 0016; see rateLimitTableExists().
+        console.error(
+          "[stackmate] RATE LIMIT DEGRADED: rate_limit_buckets table is missing " +
+            "(migration 0016 not applied) — rate limiting fell back to the per-isolate " +
+            `in-memory map for bucket '${bucketKey}'. This fallback is fail-open on Workers.`
+        );
         return super.checkRateLimit(bucketKey, maxRequests, windowMs);
       }
       throw error;
@@ -1621,8 +1709,702 @@ export class DrizzleStore extends StackMateDataStore {
     }
   }
 
+  // -- B-01 targeted reads (fast paths) --------------------------------------
+  // Each method below runs 1–7 targeted SQL queries for ONE route's
+  // data and never runs the combined full-state load. They are safe on
+  // a `createTargeted()` store (whose `state` is empty) AND on a
+  // regular `create()` store. All mappings mirror
+  // loadStateInternalImpl / buildLoadStateQuery column-for-column —
+  // if a column list changes there, change it here too. Serialized
+  // through the instance lock like every other client use.
+
+  private async targetedRows(text: string, values: unknown[] = []): Promise<Row[]> {
+    this.assertOpen();
+    const release = await this.acquireStoreLock();
+    try {
+      this.queryMetrics.uncachedQueries += 1;
+      return await queryRows(this.pgClient, text, values);
+    } finally {
+      release();
+    }
+  }
+
+  private mapUserRow(row: Row): UserRecord {
+    return {
+      id: reqStr(row, "id", "users"),
+      name: reqStr(row, "name", "users"),
+      email: reqStr(row, "email", "users"),
+      email_verified: bool(row, "email_verified"),
+      password_hash: this.capabilities.usersPasswordHash
+        ? (str(row, "password_hash") ?? "")
+        : "",
+      two_factor_enabled: bool(row, "two_factor_enabled"),
+      avatar_url: this.capabilities.usersAvatarUrl
+        ? (str(row, "avatar_url") ?? null)
+        : null,
+      status: asEnum(
+        str(row, "staff_status"),
+        ["active", "suspended"] as const,
+        "active"
+      ),
+      created_at: reqIso(row, "created_at", "users"),
+      updated_at: reqIso(row, "updated_at", "users"),
+    };
+  }
+
+  private static readonly USER_COLUMNS = `u.id, u.name, u.email, u.email_verified, u.created_at, u.updated_at,
+            sp.status AS staff_status`;
+
+  /** One staff user by email (session/principal lookup hot path). */
+  public async findUserByEmail(email: string): Promise<UserRecord | null> {
+    const rows = await this.targetedRows(
+      `SELECT ${DrizzleStore.USER_COLUMNS}
+            ${this.capabilities.usersPasswordHash ? ", u.password_hash" : ""}
+            ${this.capabilities.usersTwoFactorEnabled ? ", u.two_factor_enabled" : ""}
+            ${this.capabilities.usersAvatarUrl ? ", u.avatar_url" : ""}
+         FROM users u
+         LEFT JOIN staff_profiles sp ON sp.user_id = u.id
+        WHERE lower(u.email) = lower($1)
+        LIMIT 1`,
+      [email.trim()]
+    );
+    const row = rows[0];
+    return row ? this.mapUserRow(row) : null;
+  }
+
+  /**
+   * Staff principal data for one email: the user row + role keys +
+   * permission keys + the 2FA policy rows (3 queries). This is what
+   * resolveStaffPrincipal needs after Better Auth has already verified
+   * the session — it replaces the create-load + principal reload pair
+   * on every admin request (A-11). The policy rows are NOT optional:
+   * `two_factor_setup_required` is computed from them, and a fast
+   * path that skipped them would silently grant a full session to a
+   * user under a `required` policy who has not set 2FA up yet. On a
+   * pre-0007 database (no auth_two_factor_policy table) the policy
+   * list is empty, exactly like the combined load.
+   */
+  public async findStaffPrincipalByEmail(
+    email: string
+  ): Promise<{
+    user: UserRecord;
+    roles: string[];
+    permissions: string[];
+    twoFactorPolicy: TwoFactorPolicyRecord[];
+  } | null> {
+    const user = await this.findUserByEmail(email);
+    if (!user) return null;
+    const rows = await this.targetedRows(
+      `SELECT r."key" AS role_key, p."key" AS permission_key
+         FROM user_roles ur
+         JOIN roles r ON r.id = ur.role_id
+         LEFT JOIN role_permissions rp ON rp.role_id = r.id
+         LEFT JOIN permissions p ON p.id = rp.permission_id
+        WHERE ur.user_id = $1`,
+      [user.id]
+    );
+    const roles = [...new Set(rows.map((r) => String(r["role_key"])))];
+    const permissions = [
+      ...new Set(
+        rows
+          .map((r) => r["permission_key"])
+          .filter((k): k is string => typeof k === "string")
+      ),
+    ];
+    const policyRows = this.capabilities.authEmailTables
+      ? await this.targetedRows(
+          `SELECT id, scope, mode, updated_at FROM auth_two_factor_policy ORDER BY scope ASC`
+        )
+      : [];
+    const twoFactorPolicy: TwoFactorPolicyRecord[] = policyRows.map((row) => ({
+      id: reqStr(row, "id", "auth_two_factor_policy"),
+      scope: reqStr(row, "scope", "auth_two_factor_policy"),
+      mode: asEnum(
+        str(row, "mode"),
+        ["off", "optional", "required"] as const,
+        "off"
+      ),
+      updated_at: reqIso(row, "updated_at", "auth_two_factor_policy"),
+    }));
+    return { user, roles, permissions, twoFactorPolicy };
+  }
+
+  /**
+   * License validation hot path: the license row by key hash + its
+   * entitlement snapshots (+ items), activations, product code, and
+   * underlying subscription status (6 queries). Mirrors the license
+   * mapping in loadStateInternalImpl. The mutation half of
+   * validate/activate (last_seen_at, seat changes) still goes through
+   * withTransaction — this read fast path is for the lookup + checks.
+   */
+  public async findLicenseForValidation(keyHash: string): Promise<{
+    license: LicenseRecord;
+    productCode: string;
+    subscriptionStatus: string | null;
+  } | null> {
+    const licenseRows = await this.targetedRows(
+      `SELECT id, license_number, product_id, customer_id, source_order_item_id,
+              subscription_id, license_key_hash, license_key_hint, status,
+              activation_limit, valid_from, expires_at, grace_until,
+              current_entitlement_snapshot_id, issued_at, created_at, updated_at
+         FROM licenses WHERE license_key_hash = $1 LIMIT 1`,
+      [keyHash]
+    );
+    const licenseRow = licenseRows[0];
+    if (!licenseRow) return null;
+    const licenseId = reqStr(licenseRow, "id", "licenses");
+
+    const [snapshotRows, snapshotItemRows, activationRows, productRows, subscriptionRows] =
+      await Promise.all([
+        this.targetedRows(
+          `SELECT id, license_id, version_number, source_type, effective_at,
+                  reason, snapshot_hash, created_by_user_id, created_at
+             FROM license_entitlement_snapshots
+            WHERE license_id = $1 ORDER BY version_number ASC`,
+          [licenseId]
+        ),
+        this.targetedRows(
+          `SELECT id, snapshot_id, feature_key_snapshot, value_type_snapshot,
+                  entitlement_value, unit_snapshot
+             FROM license_entitlement_snapshot_items
+            WHERE snapshot_id IN (SELECT id FROM license_entitlement_snapshots WHERE license_id = $1)
+            ORDER BY snapshot_id, feature_key_snapshot`,
+          [licenseId]
+        ),
+        this.targetedRows(
+          `SELECT id, license_id, installation_id_hash, domain_normalized,
+                  environment, status, activated_at, last_seen_at, deactivated_at,
+                  metadata, created_at
+             FROM license_activations
+            WHERE license_id = $1 ORDER BY activated_at ASC, id ASC`,
+          [licenseId]
+        ),
+        this.targetedRows(`SELECT code FROM products WHERE id = $1 LIMIT 1`, [
+          reqStr(licenseRow, "product_id", "licenses"),
+        ]),
+        this.targetedRows(`SELECT status FROM subscriptions WHERE id = $1 LIMIT 1`, [
+          str(licenseRow, "subscription_id"),
+        ]),
+      ]);
+
+    const itemsBySnapshot = groupBy(snapshotItemRows, (r) => String(r["snapshot_id"]));
+    const snapshots: LicenseEntitlementSnapshotRecord[] = snapshotRows.map((s) => {
+      const snapId = reqStr(s, "id", "license_entitlement_snapshots");
+      return {
+        id: snapId,
+        license_id: licenseId,
+        version_number: reqNum(s, "version_number", "license_entitlement_snapshots"),
+        source_type: asEnum(
+          str(s, "source_type"),
+          ["order_item", "subscription_period", "manual_grant", "admin_adjustment"] as const,
+          "manual_grant"
+        ),
+        effective_at: reqIso(s, "effective_at", "license_entitlement_snapshots"),
+        reason: str(s, "reason"),
+        snapshot_hash: reqStr(s, "snapshot_hash", "license_entitlement_snapshots"),
+        items: (itemsBySnapshot.get(snapId) ?? []).map((it) => ({
+          feature_key_snapshot: reqStr(
+            it,
+            "feature_key_snapshot",
+            "license_entitlement_snapshot_items"
+          ),
+          value_type_snapshot: asEnum(
+            str(it, "value_type_snapshot"),
+            ["boolean", "limit", "quota", "metered"] as const,
+            "boolean"
+          ),
+          entitlement_value: it["entitlement_value"] ?? null,
+          unit_snapshot: str(it, "unit_snapshot"),
+        })),
+        created_by_user_id: str(s, "created_by_user_id"),
+        created_at: reqIso(s, "created_at", "license_entitlement_snapshots"),
+      };
+    });
+    const activations: LicenseActivationRecord[] = activationRows.map((a) => ({
+      id: reqStr(a, "id", "license_activations"),
+      license_id: licenseId,
+      installation_id_hash: reqStr(a, "installation_id_hash", "license_activations"),
+      domain_normalized: str(a, "domain_normalized"),
+      environment: asEnum(
+        str(a, "environment"),
+        ["production", "staging", "development", "other"] as const,
+        "production"
+      ),
+      status: asEnum(
+        str(a, "status"),
+        ["active", "deactivated", "blocked"] as const,
+        "active"
+      ),
+      activated_at: reqIso(a, "activated_at", "license_activations"),
+      last_seen_at: iso(a, "last_seen_at") ?? reqIso(a, "activated_at", "license_activations"),
+      deactivated_at: iso(a, "deactivated_at"),
+      metadata: asJsonObject(a, "metadata"),
+      created_at: reqIso(a, "created_at", "license_activations"),
+    }));
+    const license: LicenseRecord = {
+      id: licenseId,
+      license_number: reqStr(licenseRow, "license_number", "licenses"),
+      product_id: reqStr(licenseRow, "product_id", "licenses"),
+      customer_id: reqStr(licenseRow, "customer_id", "licenses"),
+      source_order_item_id: str(licenseRow, "source_order_item_id"),
+      subscription_id: str(licenseRow, "subscription_id"),
+      license_key_hash: reqStr(licenseRow, "license_key_hash", "licenses"),
+      license_key_hint: reqStr(licenseRow, "license_key_hint", "licenses"),
+      status: asEnum(
+        str(licenseRow, "status"),
+        ["pending", "active", "expired", "suspended", "revoked"] as const,
+        "pending"
+      ),
+      activation_limit: reqNum(licenseRow, "activation_limit", "licenses"),
+      valid_from: reqIso(licenseRow, "valid_from", "licenses"),
+      expires_at: iso(licenseRow, "expires_at"),
+      grace_until: iso(licenseRow, "grace_until"),
+      current_entitlement_snapshot_id:
+        str(licenseRow, "current_entitlement_snapshot_id") ?? snapshots[0]?.id ?? "",
+      snapshots,
+      activations,
+      issued_at:
+        iso(licenseRow, "issued_at") ?? reqIso(licenseRow, "created_at", "licenses"),
+      created_at: reqIso(licenseRow, "created_at", "licenses"),
+      updated_at: reqIso(licenseRow, "updated_at", "licenses"),
+    };
+    return {
+      license,
+      productCode: productRows[0] ? reqStr(productRows[0], "code", "products") : "",
+      subscriptionStatus: subscriptionRows[0]
+        ? str(subscriptionRows[0], "status")
+        : null,
+    };
+  }
+
+  /** One integrated site by site key, with domains + product ids (3 queries). */
+  public async findIntegratedSiteByKey(siteKey: string): Promise<IntegratedSiteRecord | null> {
+    const siteRows = await this.targetedRows(
+      `SELECT id, site_key, name, environment, status, api_version,
+              allowed_capabilities, created_at, updated_at
+         FROM integrated_sites WHERE site_key = $1 LIMIT 1`,
+      [siteKey]
+    );
+    const siteRow = siteRows[0];
+    if (!siteRow) return null;
+    const siteId = reqStr(siteRow, "id", "integrated_sites");
+    const [productRows, domainRows] = await Promise.all([
+      this.targetedRows(
+        `SELECT product_id FROM site_products WHERE integrated_site_id = $1`,
+        [siteId]
+      ),
+      this.targetedRows(
+        `SELECT id, integrated_site_id, domain, verification_method,
+                verification_challenge, verification_status, verified_at, is_primary, created_at
+           FROM site_domains WHERE integrated_site_id = $1 ORDER BY created_at ASC, id ASC`,
+        [siteId]
+      ),
+    ]);
+    return {
+      id: siteId,
+      site_key: reqStr(siteRow, "site_key", "integrated_sites"),
+      name: reqStr(siteRow, "name", "integrated_sites"),
+      environment: asEnum(
+        str(siteRow, "environment"),
+        ["production", "staging", "development"] as const,
+        "production"
+      ),
+      status: asEnum(
+        str(siteRow, "status"),
+        ["pending_verification", "active", "suspended", "revoked"] as const,
+        "pending_verification"
+      ),
+      api_version: reqStr(siteRow, "api_version", "integrated_sites"),
+      allowed_capabilities: asJsonArray<string>(siteRow, "allowed_capabilities"),
+      product_ids: productRows.map((r) => String(r["product_id"])),
+      domains: domainRows.map((d) => ({
+        id: reqStr(d, "id", "site_domains"),
+        domain: reqStr(d, "domain", "site_domains"),
+        verification_method: asEnum(
+          str(d, "verification_method"),
+          ["dns_txt", "http_file", "manual_review"] as const,
+          "dns_txt"
+        ),
+        verification_challenge: reqStr(d, "verification_challenge", "site_domains"),
+        verification_status: asEnum(
+          str(d, "verification_status"),
+          ["pending", "verified", "failed"] as const,
+          "pending"
+        ),
+        verified_at: iso(d, "verified_at"),
+        is_primary: bool(d, "is_primary"),
+      })),
+      created_at: reqIso(siteRow, "created_at", "integrated_sites"),
+      updated_at: reqIso(siteRow, "updated_at", "integrated_sites"),
+    };
+  }
+
+  /**
+   * Public catalog hot path: active products (+ channels), product
+   * features, active packages, published versions (+ feature grants),
+   * active prices (7 queries). Only the rows a public catalog /
+   * checkout read ever needs — no orders, customers, audit, outbox,
+   * sessions, or any other table. Route wiring (app.ts) is a follow-up;
+   * until then the full load remains the fallback.
+   */
+  public async loadPublicCatalog(): Promise<{
+    products: ProductRecord[];
+    product_features: ProductFeatureRecord[];
+    product_packages: ProductPackageRecord[];
+    package_versions: PackageVersionRecord[];
+    package_prices: PackagePriceRecord[];
+  }> {
+    const [channelRows, productRows, featureRows, packageRows, versionRows, grantRows, priceRows] =
+      await Promise.all([
+        this.targetedRows(`SELECT product_id, channel_key FROM product_distribution_channels`),
+        this.targetedRows(
+          `SELECT id, code, slug, name, description, product_type, fulfillment_type,
+                  status, website_url, documentation_url, logo_asset_id, created_by_user_id,
+                  created_at, updated_at
+                  ${this.capabilities.productsDefaults ? ", default_activation_limit, offline_grace_hours" : ""}
+             FROM products WHERE status = 'active' ORDER BY created_at ASC, id ASC`
+        ),
+        this.targetedRows(
+          `SELECT id, product_id, feature_key, name, description, value_type, unit,
+                  default_value, status, created_at, updated_at
+             FROM product_features ORDER BY created_at ASC, id ASC`
+        ),
+        this.targetedRows(
+          `SELECT id, product_id, package_key, name, description, status,
+                  created_at, updated_at
+                  ${this.capabilities.packagesCurrentVersion ? ", current_version_id" : ""}
+             FROM product_packages WHERE status = 'active' ORDER BY created_at ASC, id ASC`
+        ),
+        this.targetedRows(
+          `SELECT id, package_id, product_id, version_number, status,
+                  change_summary, published_at, created_at
+             FROM package_versions WHERE status = 'published' ORDER BY created_at ASC, id ASC`
+        ),
+        this.targetedRows(
+          `SELECT id, package_version_id, product_id, product_feature_id,
+                  feature_key_snapshot, value_type_snapshot, entitlement_value
+                  ${this.capabilities.packageVersionFeaturesUnit ? ", unit_snapshot" : ""}
+             FROM package_version_features ORDER BY package_version_id, feature_key_snapshot`
+        ),
+        this.targetedRows(
+          `SELECT id, package_version_id, price_key, price_kind, amount_minor,
+                  currency_code, interval_unit, interval_count, trial_days,
+                  setup_fee_minor, status, created_at
+                  ${this.capabilities.packagePricesUsedInOrders ? ", used_in_orders" : ""}
+             FROM package_prices WHERE status = 'active' ORDER BY created_at ASC, id ASC`
+        ),
+      ]);
+    const channelsByProduct = groupBy(channelRows, (r) => String(r["product_id"]));
+    const products: ProductRecord[] = productRows.map((row) => {
+      const id = reqStr(row, "id", "products");
+      return {
+        id,
+        code: reqStr(row, "code", "products"),
+        slug: reqStr(row, "slug", "products"),
+        name: reqStr(row, "name", "products"),
+        description: str(row, "description"),
+        product_type: reqStr(row, "product_type", "products"),
+        fulfillment_type: reqStr(row, "fulfillment_type", "products"),
+        distribution_channels: (channelsByProduct.get(id) ?? []).map((r) =>
+          String(r["channel_key"])
+        ),
+        default_activation_limit: this.capabilities.productsDefaults
+          ? reqNum(row, "default_activation_limit", "products")
+          : 1,
+        offline_grace_hours: this.capabilities.productsDefaults
+          ? reqNum(row, "offline_grace_hours", "products")
+          : 72,
+        status: asEnum(
+          str(row, "status"),
+          ["draft", "active", "archived"] as const,
+          "draft"
+        ),
+        website_url: str(row, "website_url"),
+        documentation_url: str(row, "documentation_url"),
+        // E-13: same gap as the full load — the public-catalog fast
+        // path must mirror the load mapping column-for-column.
+        logo_asset_id: str(row, "logo_asset_id"),
+        created_by_user_id: str(row, "created_by_user_id"),
+        created_at: reqIso(row, "created_at", "products"),
+        updated_at: reqIso(row, "updated_at", "products"),
+      };
+    });
+    const product_features: ProductFeatureRecord[] = featureRows.map((row) => ({
+      id: reqStr(row, "id", "product_features"),
+      product_id: reqStr(row, "product_id", "product_features"),
+      feature_key: reqStr(row, "feature_key", "product_features"),
+      name: reqStr(row, "name", "product_features"),
+      description: str(row, "description"),
+      value_type: asEnum(
+        str(row, "value_type"),
+        ["boolean", "limit", "quota", "metered"] as const,
+        "boolean"
+      ),
+      unit: str(row, "unit"),
+      default_value: row["default_value"] ?? null,
+      status: asEnum(str(row, "status"), ["active", "archived"] as const, "active"),
+      created_at: reqIso(row, "created_at", "product_features"),
+      updated_at: reqIso(row, "updated_at", "product_features"),
+    }));
+    const product_packages: ProductPackageRecord[] = packageRows.map((row) => ({
+      id: reqStr(row, "id", "product_packages"),
+      product_id: reqStr(row, "product_id", "product_packages"),
+      package_key: reqStr(row, "package_key", "product_packages"),
+      name: reqStr(row, "name", "product_packages"),
+      description: str(row, "description"),
+      status: asEnum(
+        str(row, "status"),
+        ["draft", "active", "archived"] as const,
+        "draft"
+      ),
+      current_version_id: this.capabilities.packagesCurrentVersion
+        ? str(row, "current_version_id")
+        : null,
+      created_at: reqIso(row, "created_at", "product_packages"),
+      updated_at: reqIso(row, "updated_at", "product_packages"),
+    }));
+    const grantsByVersion = groupBy(grantRows, (r) =>
+      String(r["package_version_id"])
+    );
+    const package_versions: PackageVersionRecord[] = versionRows.map((row) => {
+      const id = reqStr(row, "id", "package_versions");
+      const features: PackageVersionFeatureGrant[] = (
+        grantsByVersion.get(id) ?? []
+      ).map((g) => ({
+        id: reqStr(g, "id", "package_version_features"),
+        package_version_id: id,
+        product_id: reqStr(g, "product_id", "package_version_features"),
+        product_feature_id: reqStr(g, "product_feature_id", "package_version_features"),
+        feature_key_snapshot: reqStr(g, "feature_key_snapshot", "package_version_features"),
+        value_type_snapshot: asEnum(
+          str(g, "value_type_snapshot"),
+          ["boolean", "limit", "quota", "metered"] as const,
+          "boolean"
+        ),
+        entitlement_value: g["entitlement_value"] ?? null,
+        unit_snapshot: this.capabilities.packageVersionFeaturesUnit
+          ? str(g, "unit_snapshot")
+          : null,
+      }));
+      return {
+        id,
+        package_id: reqStr(row, "package_id", "package_versions"),
+        product_id: reqStr(row, "product_id", "package_versions"),
+        version_number: reqNum(row, "version_number", "package_versions"),
+        status: asEnum(
+          str(row, "status"),
+          ["draft", "published", "retired"] as const,
+          "draft"
+        ),
+        change_summary: str(row, "change_summary"),
+        features,
+        published_at: iso(row, "published_at"),
+        created_at: reqIso(row, "created_at", "package_versions"),
+      };
+    });
+    const package_prices: PackagePriceRecord[] = priceRows.map((row) => ({
+      id: reqStr(row, "id", "package_prices"),
+      package_version_id: reqStr(row, "package_version_id", "package_prices"),
+      price_key: reqStr(row, "price_key", "package_prices"),
+      price_kind: asEnum(
+        str(row, "price_kind"),
+        ["free", "one_time", "recurring", "lifetime"] as const,
+        "one_time"
+      ),
+      amount_minor: reqNum(row, "amount_minor", "package_prices"),
+      currency_code: reqStr(row, "currency_code", "package_prices"),
+      interval_unit: asEnumOrNull(str(row, "interval_unit"), [
+        "day",
+        "week",
+        "month",
+        "year",
+      ] as const),
+      interval_count: num(row, "interval_count"),
+      trial_days: reqNum(row, "trial_days", "package_prices"),
+      setup_fee_minor: reqNum(row, "setup_fee_minor", "package_prices"),
+      status: asEnum(
+        str(row, "status"),
+        ["active", "inactive", "retired"] as const,
+        "active"
+      ),
+      used_in_orders: this.capabilities.packagePricesUsedInOrders
+        ? bool(row, "used_in_orders")
+        : false,
+      created_at: reqIso(row, "created_at", "package_prices"),
+    }));
+    return { products, product_features, product_packages, package_versions, package_prices };
+  }
+
+  private mapOutboxRow(row: Row): OutboxEventRecord {
+    return {
+      id: reqStr(row, "id", "outbox_events"),
+      event_key: reqStr(row, "event_key", "outbox_events"),
+      aggregate_type: reqStr(row, "aggregate_type", "outbox_events"),
+      aggregate_id: reqStr(row, "aggregate_id", "outbox_events"),
+      event_type: reqStr(row, "event_type", "outbox_events"),
+      payload: asJsonObject(row, "payload"),
+      status: asEnum(
+        str(row, "status"),
+        ["pending", "processing", "delivered", "dead_letter", "simulated", "skipped"] as const,
+        "pending"
+      ),
+      attempt_count: reqNum(row, "attempt_count", "outbox_events"),
+      available_at: reqIso(row, "available_at", "outbox_events"),
+      locked_until: iso(row, "locked_until"),
+      locked_by: str(row, "locked_by"),
+      last_error_code: str(row, "last_error_code"),
+      created_at: reqIso(row, "created_at", "outbox_events"),
+      processed_at: iso(row, "processed_at"),
+    };
+  }
+
+  /**
+   * C-05 (real SQL claim): lease a batch of due outbox events with
+   * row-level locking — ONE statement, no full-state load, no
+   * advisory-lock serialisation of the whole drain. `FOR UPDATE SKIP
+   * LOCKED` lets two concurrent drains split the batch instead of
+   * contending on the global writer lock; the eligible set is ordered
+   * explicitly by `available_at, created_at` (the old in-memory claim
+   * relied on the load query's ordering). Claimed rows come back as
+   * `processing` with the attempt count already incremented.
+   */
+  public async claimOutboxEvents(
+    batchSize: number,
+    workerId: string,
+    leaseMs = 60_000
+  ): Promise<OutboxEventRecord[]> {
+    this.assertOpen();
+    const release = await this.acquireStoreLock();
+    try {
+      this.queryMetrics.uncachedQueries += 1;
+      const res = await this.pgClient.query(
+        `UPDATE outbox_events SET status = 'processing',
+               locked_by = $2,
+               locked_until = NOW() + ($3 * INTERVAL '1 millisecond'),
+               attempt_count = attempt_count + 1
+          WHERE id IN (
+            SELECT id FROM outbox_events
+             WHERE (status = 'pending' AND available_at <= NOW())
+                OR (status = 'processing' AND locked_until IS NOT NULL AND locked_until <= NOW())
+             ORDER BY available_at ASC, created_at ASC
+             LIMIT $1
+             FOR UPDATE SKIP LOCKED
+          )
+          RETURNING id, event_key, aggregate_type, aggregate_id, event_type, payload,
+            status, attempt_count, available_at, locked_until, locked_by,
+            last_error_code, created_at, processed_at`,
+        [batchSize, workerId, leaseMs]
+      );
+      const claimed = (res.rows as unknown as Row[]).map((r) => this.mapOutboxRow(r));
+      // UPDATE ... RETURNING has no defined row order — the subquery
+      // picks the right SET, but the drain must process in claim
+      // order (available_at, created_at), so sort here (batch ≤ 25).
+      claimed.sort(
+        (a, b) =>
+          new Date(a.available_at).getTime() - new Date(b.available_at).getTime() ||
+          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+      );
+      return claimed;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * B-12: delete ONLY expiry-defined rows — idempotency records past
+   * their 24h `expires_at`, expired rate-limit buckets, expired
+   * sessions, expired request nonces. Audit / tracking / outbox /
+   * financial rows are NEVER touched here (OD-01 retention decision
+   * pending). Each table deletes at most `limitPerTable` rows per
+   * call, so a cron tick stays cheap. Returns the per-table counts.
+   */
+  public async cleanupExpiredRows(
+    limitPerTable = 1000
+  ): Promise<Record<string, number>> {
+    this.assertOpen();
+    const release = await this.acquireStoreLock();
+    try {
+      const counts: Record<string, number> = {};
+      const prune = async (table: string, where: string): Promise<number> => {
+        const res = await this.pgClient.query(
+          `DELETE FROM "${table}" WHERE id IN (
+             SELECT id FROM "${table}" WHERE ${where} LIMIT $1
+           )`,
+          [limitPerTable]
+        );
+        this.queryMetrics.uncachedQueries += 1;
+        return res.rowCount ?? 0;
+      };
+      // rate_limit_buckets has no `id` column — delete by its natural
+      // key instead.
+      const pruneByKey = async (
+        table: string,
+        keyColumn: string,
+        where: string
+      ): Promise<number> => {
+        const res = await this.pgClient.query(
+          `DELETE FROM "${table}" WHERE "${keyColumn}" IN (
+             SELECT "${keyColumn}" FROM "${table}" WHERE ${where} LIMIT $1
+           )`,
+          [limitPerTable]
+        );
+        this.queryMetrics.uncachedQueries += 1;
+        return res.rowCount ?? 0;
+      };
+      counts["idempotency_records"] = await prune(
+        "idempotency_records",
+        "expires_at < NOW()"
+      );
+      counts["rate_limit_buckets"] = await pruneByKey(
+        "rate_limit_buckets",
+        "key",
+        "reset_at <= NOW()"
+      );
+      counts["sessions"] = await prune("sessions", "expires_at < NOW()");
+      // request_nonces: `nonce` alone is not unique across
+      // credentials — delete by the composite key.
+      const nonceRes = await this.pgClient.query(
+        `DELETE FROM "request_nonces" WHERE (credential_id, nonce) IN (
+           SELECT credential_id, nonce FROM "request_nonces"
+            WHERE expires_at < NOW() LIMIT $1
+         )`,
+        [limitPerTable]
+      );
+      this.queryMetrics.uncachedQueries += 1;
+      counts["request_nonces"] = nonceRes.rowCount ?? 0;
+      return counts;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * A-07: readiness probe for the DB-backed rate limiter — true when
+   * the `rate_limit_buckets` table (migration 0016) exists. The cron /
+   * boot path can call this and fail loudly instead of silently
+   * running on the in-memory fallback.
+   */
+  public async rateLimitTableExists(): Promise<boolean> {
+    this.assertOpen();
+    const release = await this.acquireStoreLock();
+    try {
+      const rows = await queryRows(
+        this.pgClient,
+        `SELECT 1 FROM information_schema.tables
+          WHERE table_schema = current_schema() AND table_name = 'rate_limit_buckets'
+          LIMIT 1`
+      );
+      return rows.length > 0;
+    } finally {
+      release();
+    }
+  }
+
   private async loadStateInternal(client: Client): Promise<void> {
     this.state = await loadStateInternalImpl(client, this.capabilities);
+    // A-11: the state is fresh as of this load — a principal lookup
+    // in the same request must not pay for a second full load.
+    this.loadedAtMs = Date.now();
   }
 
   /**
@@ -1642,16 +2424,19 @@ export class DrizzleStore extends StackMateDataStore {
     const release = await this.acquireStoreLock();
     const client = this.pgClient;
     let begun = false;
-    let snapshotJson: string | null = null;
+    // B-04: ONE parse of the snapshot. The parsed `before` object is
+    // the rollback target too — the old code stringified once, parsed
+    // for the diff, and parsed AGAIN on rollback, so every transaction
+    // paid two whole-state JSON parses (CPU + memory ∝ total DB size).
+    let before: DatabaseState | null = null;
     try {
       this.queryMetrics.uncachedQueries += 1;
       await client.query("BEGIN");
       begun = true;
       await client.query("SELECT pg_advisory_xact_lock($1)", [WRITER_ADVISORY_LOCK_KEY]);
       await this.loadStateInternal(client);
-      snapshotJson = JSON.stringify(this.state);
+      before = JSON.parse(JSON.stringify(this.state)) as DatabaseState;
       const result = await fn(this.state);
-      const before = JSON.parse(snapshotJson) as DatabaseState;
       await persistStateDiff(client, this.capabilities, before, this.state);
       await client.query("COMMIT");
       begun = false;
@@ -1662,8 +2447,8 @@ export class DrizzleStore extends StackMateDataStore {
         await client.query("ROLLBACK").catch(() => {});
         this.queryMetrics.transactionsRolledBack += 1;
       }
-      if (snapshotJson !== null) {
-        this.state = JSON.parse(snapshotJson) as DatabaseState;
+      if (before !== null) {
+        this.state = before;
       }
       throw error;
     } finally {
@@ -1850,7 +2635,7 @@ function buildLoadStateQuery(caps: StoreCapabilities): string {
        FROM customer_reports` },
     { key: "channels", orderBy: "t.product_id, t.channel_key", sql: `SELECT product_id, channel_key FROM product_distribution_channels` },
     { key: "products", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, code, slug, name, description, product_type, fulfillment_type,
-            status, website_url, documentation_url, created_by_user_id,
+            status, website_url, documentation_url, logo_asset_id, created_by_user_id,
             created_at, updated_at
             ${caps.productsDefaults ? ", default_activation_limit, offline_grace_hours" : ""}
        FROM products` },
@@ -2300,6 +3085,10 @@ async function loadStateInternalImpl(
       ),
       website_url: str(row, "website_url"),
       documentation_url: str(row, "documentation_url"),
+      // E-13: logo_asset_id (uuid → uploaded_assets, migration 0000)
+      // was missing from the load mapping, so a logo set via the
+      // catalog service vanished on the next DB reload.
+      logo_asset_id: str(row, "logo_asset_id"),
       created_by_user_id: str(row, "created_by_user_id"),
       created_at: reqIso(row, "created_at", "products"),
       updated_at: reqIso(row, "updated_at", "products"),
@@ -3534,6 +4323,14 @@ interface SyncSpec<T> {
   remove: (client: Client, row: T) => Promise<void>;
   /** Append-only tables (migration 0000 immutability triggers). */
   immutable?: boolean;
+  /**
+   * B-04: optional multi-row batch insert. When present, syncUpserts
+   * inserts ALL new rows of this table in ONE statement
+   * (`INSERT ... VALUES (...), (...)`) instead of one round-trip per
+   * row. Must insert exactly the rows `insert` would (same columns
+   * and values); updates still go one row at a time.
+   */
+  insertMany?: (client: Client, rows: T[]) => Promise<void>;
 }
 
 function immutableError(table: string, key: string, op: string): Error {
@@ -3567,11 +4364,16 @@ async function syncUpserts<T>(
 ): Promise<Set<string>> {
   const touched = new Set<string>();
   const beforeByKey = new Map(before.map((r) => [spec.keyOf(r), r]));
+  // B-04: collect new rows first — updates run one row at a time (as
+  // before), but inserts go through `insertMany` in ONE multi-row
+  // statement when the spec provides it, instead of N sequential
+  // round-trips on the single pinned client.
+  const newRows: T[] = [];
   for (const row of after) {
     const key = spec.keyOf(row);
     const prev = beforeByKey.get(key);
     if (prev === undefined) {
-      await spec.insert(client, row);
+      newRows.push(row);
       touched.add(key);
     } else if (
       JSON.stringify(spec.scalarOf(prev)) !== JSON.stringify(spec.scalarOf(row))
@@ -3581,6 +4383,15 @@ async function syncUpserts<T>(
       touched.add(key);
     }
   }
+  if (newRows.length > 0) {
+    if (spec.insertMany) {
+      await spec.insertMany(client, newRows);
+    } else {
+      for (const row of newRows) {
+        await spec.insert(client, row);
+      }
+    }
+  }
   return touched;
 }
 
@@ -3588,6 +4399,28 @@ function insertSql(table: string, columns: string[]): string {
   const cols = columns.map((c) => `"${c}"`).join(", ");
   const params = columns.map((_, i) => `$${i + 1}`).join(", ");
   return `INSERT INTO "${table}" (${cols}) VALUES (${params})`;
+}
+
+/**
+ * B-04: one multi-row INSERT statement for a batch of rows
+ * (`INSERT ... VALUES (...), (...)`). Returns the SQL text + the
+ * flattened parameter values in row order.
+ */
+function insertManySql(
+  table: string,
+  columns: string[],
+  rowsValues: unknown[][]
+): { text: string; values: unknown[] } {
+  const cols = columns.map((c) => `"${c}"`).join(", ");
+  const values: unknown[] = [];
+  const groups = rowsValues.map((rowVals) => {
+    const params = rowVals.map((v) => {
+      values.push(v);
+      return `$${values.length}`;
+    });
+    return `(${params.join(", ")})`;
+  });
+  return { text: `INSERT INTO "${table}" (${cols}) VALUES ${groups.join(", ")}`, values };
 }
 
 function updateSql(
@@ -4248,6 +5081,7 @@ async function persistStateDiff(
         "status",
         "website_url",
         "documentation_url",
+        "logo_asset_id",
         "created_by_user_id",
         "created_at",
         "updated_at",
@@ -4263,6 +5097,7 @@ async function persistStateDiff(
         r.status,
         r.website_url,
         r.documentation_url,
+        r.logo_asset_id ?? null,
         r.created_by_user_id,
         r.created_at,
         r.updated_at,
@@ -4284,6 +5119,7 @@ async function persistStateDiff(
         "status",
         "website_url",
         "documentation_url",
+        "logo_asset_id",
         "created_by_user_id",
         "updated_at",
       ];
@@ -4297,6 +5133,7 @@ async function persistStateDiff(
         r.status,
         r.website_url,
         r.documentation_url,
+        r.logo_asset_id ?? null,
         r.created_by_user_id,
         r.updated_at,
       ];
@@ -6854,6 +7691,37 @@ async function persistStateDiff(
         ]
       );
     },
+    // B-04: batch insert for the cron drain (one delivery row per
+    // endpoint per event — N rows in one statement).
+    insertMany: async (c, rows) => {
+      const cols = [
+        "id",
+        "webhook_endpoint_id",
+        "event_id",
+        "delivery_id",
+        "status",
+        "attempt_count",
+        "last_http_status",
+        "delivered_at",
+        "created_at",
+      ];
+      const { text, values } = insertManySql(
+        "webhook_deliveries",
+        cols,
+        rows.map((r) => [
+          r.id,
+          r.webhook_endpoint_id,
+          r.event_id,
+          r.delivery_id,
+          r.status,
+          r.attempt_count,
+          r.last_http_status,
+          r.delivered_at,
+          new Date().toISOString(),
+        ])
+      );
+      await execSql(c, text, values);
+    },
     update: async (c, _b, r) => {
       const cols = [
         "webhook_endpoint_id",
@@ -6925,6 +7793,47 @@ async function persistStateDiff(
           r.processed_at,
         ]
       );
+    },
+    // B-04: batch insert (outbox rows are created in bursts — one per
+    // order/payment/tracking event — so N rows go in one statement).
+    insertMany: async (c, rows) => {
+      const cols = [
+        "id",
+        "event_key",
+        "aggregate_type",
+        "aggregate_id",
+        "event_type",
+        "payload",
+        "status",
+        "attempt_count",
+        "available_at",
+        "locked_until",
+        "locked_by",
+        "last_error_code",
+        "created_at",
+        "processed_at",
+      ];
+      const { text, values } = insertManySql(
+        "outbox_events",
+        cols,
+        rows.map((r) => [
+          r.id,
+          r.event_key,
+          r.aggregate_type,
+          r.aggregate_id,
+          r.event_type,
+          json(r.payload),
+          r.status,
+          r.attempt_count,
+          r.available_at,
+          r.locked_until,
+          r.locked_by,
+          r.last_error_code,
+          r.created_at,
+          r.processed_at,
+        ])
+      );
+      await execSql(c, text, values);
     },
     update: async (c, _b, r) => {
       const cols = [
@@ -7120,6 +8029,40 @@ async function persistStateDiff(
         ]
       );
     },
+    // B-04: batch insert (nearly every transaction appends audit rows).
+    insertMany: async (c, rows) => {
+      const cols = [
+        "id",
+        "actor_type",
+        "actor_user_id",
+        "integrated_site_id",
+        "action",
+        "resource_type",
+        "resource_id",
+        "outcome",
+        "request_id",
+        "changes",
+        "created_at",
+      ];
+      const { text, values } = insertManySql(
+        "audit_logs",
+        cols,
+        rows.map((r) => [
+          r.id,
+          r.actor_type,
+          r.actor_user_id,
+          r.integrated_site_id,
+          r.action,
+          r.resource_type,
+          r.resource_id,
+          r.outcome,
+          r.request_id,
+          json(r.changes),
+          r.created_at,
+        ])
+      );
+      await execSql(c, text, values);
+    },
     update: immutableStub(),
     remove: immutableStub(),
   };
@@ -7229,13 +8172,19 @@ async function persistStateDiff(
   await syncUpserts(client, fb.orderSnapshotItems, fa.orderSnapshotItems, orderSnapshotItemSpec, "order_item_entitlement_snapshot_items");
   await syncUpserts(client, before.order_installments, after.order_installments, orderInstallmentSpec, "order_installments");
   await syncUpserts(client, before.subscriptions, after.subscriptions, subscriptionSpec, "subscriptions");
-  await syncUpserts(client, fb.periods, fa.periods, periodSpec, "subscription_periods");
   await syncUpserts(client, before.invoices, after.invoices, invoiceSpec, "invoices");
   await syncUpserts(client, fb.invoiceItems, fa.invoiceItems, invoiceItemSpec, "invoice_items");
   await syncUpserts(client, before.payment_providers, after.payment_providers, providerSpec, "payment_providers");
   await syncUpserts(client, before.payment_methods, after.payment_methods, methodSpec, "payment_methods");
   await syncUpserts(client, before.payment_submissions, after.payment_submissions, submissionSpec, "payment_submissions");
   await syncUpserts(client, before.payment_transactions, after.payment_transactions, transactionSpec, "payment_transactions");
+  // C-04/0023 follow-up: subscription_periods references invoices(id)
+  // AND payment_transactions(id) (FKs added by migration 0023), so
+  // periods MUST sync after both — syncing them before invoices (the
+  // old order) made every renewal-invoice sweep fail with
+  // subscription_periods_invoice_id_fkey. Delete order already
+  // handles this (ON DELETE SET NULL), only the insert order broke.
+  await syncUpserts(client, fb.periods, fa.periods, periodSpec, "subscription_periods");
   await syncUpserts(client, before.payment_verification_logs, after.payment_verification_logs, verificationLogSpec, "payment_verification_logs");
   await syncUpserts(client, before.payment_refunds, after.payment_refunds, refundSpec, "payment_refunds");
   await syncUpserts(client, before.expense_categories, after.expense_categories, expenseCategorySpec, "expense_categories");

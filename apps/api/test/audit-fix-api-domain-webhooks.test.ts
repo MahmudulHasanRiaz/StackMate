@@ -94,14 +94,20 @@ describe("webhooks/outbox — audit fixes (C-2, M-3, M-14e)", () => {
       encryptionKey: ENCRYPTION_KEY,
     });
 
-    assert.deepEqual(result, {
-      claimed: 1,
-      delivered: 0,
-      simulated: 1,
-      skipped: 0,
-      retrying: 0,
-      dead_lettered: 0,
-    });
+    assert.deepEqual(
+      (({ duration_ms, ...counts }) => counts)(result),
+      {
+        claimed: 1,
+        delivered: 0,
+        simulated: 1,
+        skipped: 0,
+        retrying: 0,
+        dead_lettered: 0,
+      }
+    );
+    // B-02: the drain result carries its wall time.
+    assert.equal(typeof result.duration_ms, "number");
+    assert.ok(result.duration_ms >= 0);
     const outbox = store.state.outbox_events.find((e) => e.id === ev.id)!;
     assert.equal(outbox.status as string, "simulated");
     assert.ok(outbox.processed_at);
@@ -195,14 +201,19 @@ describe("webhooks/outbox — audit fixes (C-2, M-3, M-14e)", () => {
       transport: async () => ({ status: 200 }),
     });
 
-    assert.deepEqual(result, {
-      claimed: 1,
-      delivered: 0,
-      simulated: 0,
-      skipped: 1,
-      retrying: 0,
-      dead_lettered: 0,
-    });
+    assert.deepEqual(
+      (({ duration_ms, ...counts }) => counts)(result),
+      {
+        claimed: 1,
+        delivered: 0,
+        simulated: 0,
+        skipped: 1,
+        retrying: 0,
+        dead_lettered: 0,
+      }
+    );
+    assert.equal(typeof result.duration_ms, "number");
+    assert.ok(result.duration_ms >= 0);
     const outbox = store.state.outbox_events.find((e) => e.id === ev.id)!;
     assert.equal(outbox.status as string, "skipped");
     assert.ok(outbox.processed_at);

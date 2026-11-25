@@ -119,6 +119,15 @@ export async function apiRequest<T>(
     headers,
   });
 
+  // D-12: a 204 No Content (or empty-200) success has no JSON body —
+  // return early instead of throwing "Request failed with status 204".
+  // No current admin endpoint returns 204 (the only 204 in the API is
+  // the CORS preflight, which never goes through apiRequest), so this
+  // is latent robustness, not a live bug.
+  if (res.status === 204 || res.headers.get("Content-Length") === "0") {
+    return undefined as unknown as T;
+  }
+
   const json = (await res.json().catch(() => null)) as
     | { data?: T; error?: { code: string; message: string; details: Record<string, unknown> | null; request_id: string } }
     | null;
@@ -167,6 +176,11 @@ export async function rawApiRequest<T>(
     credentials: "include",
     headers,
   });
+
+  // D-12 (same as apiRequest): a 204 / empty success has no JSON body.
+  if (res.status === 204 || res.headers.get("Content-Length") === "0") {
+    return undefined as unknown as T;
+  }
 
   const json = (await res.json().catch(() => null)) as
     | { error?: { code: string; message: string; details: Record<string, unknown> | null; request_id: string }; code?: string; message?: string }

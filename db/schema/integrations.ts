@@ -51,6 +51,9 @@ export const siteDomains = pgTable("site_domains", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 },
 (table) => [
+  // Migration 0021 (audit C-02): domains are listed per site; site
+  // deletes scan the child table.
+  index("idx_site_domains_site_id").on(table.integratedSiteId),
   check("site_domains_verification_method_check", sql`"verification_method" IN ('dns_txt', 'http_file', 'manual_review')`),
   check("site_domains_verification_status_check", sql`"verification_status" IN ('pending', 'verified', 'failed')`),
 ]);
@@ -92,6 +95,9 @@ export const siteCredentials = pgTable("site_credentials", {
   lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
 },
 (table) => [
+  // Migration 0021 (audit C-02): credentials are listed per site;
+  // site deletes scan the child table.
+  index("idx_site_credentials_site_id").on(table.integratedSiteId),
   check("site_credentials_credential_type_check", sql`"credential_type" IN ('public_key', 'bearer_secret', 'hmac_shared_secret', 'public_signing_key')`),
   check("site_credentials_status_check", sql`"status" IN ('active', 'rotated', 'revoked', 'expired')`),
 ]);

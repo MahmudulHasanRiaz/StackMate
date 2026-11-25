@@ -105,6 +105,9 @@ export const passwordResetTokens = pgTable("password_reset_tokens", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 },
 (table) => [
+  // Migration 0021 (audit C-02): the auth service looks a token row
+  // up by user (reset / 2FA-recovery invalidation on password change).
+  index("idx_password_reset_tokens_user_id").on(table.userId),
   // Index exists in SQL (migration 0007) — declared here so
   // drizzle-kit generate reproduces it (found during the 0014
   // generate verification; previously the only index generate missed).

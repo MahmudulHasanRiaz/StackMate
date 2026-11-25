@@ -149,6 +149,11 @@ export const CreateProductSchema = v.object({
   distribution_channels: v.array(v.enum(DISTRIBUTION_CHANNELS), { min: 1 }).optional(),
   website_url: v.string().url().optional(),
   documentation_url: v.string().url().optional(),
+  // E-13 (PRD §5.1): logo is an R2 object reference — the id of an
+  // uploaded asset (FK products.logo_asset_id → uploaded_assets.id).
+  // Validated against the asset table in the catalog service; the SPA
+  // picks it with the media picker.
+  logo_asset_id: v.string().uuid().optional(),
   default_activation_limit: v.number().int().min(1).max(10000).default(1),
   offline_grace_hours: v.number().int().min(0).max(720).default(72),
 });
@@ -158,6 +163,8 @@ export const UpdateProductSchema = v.object({
   description: v.string().trim().max(4000).nullable().optional(),
   website_url: v.string().url().nullable().optional(),
   documentation_url: v.string().url().nullable().optional(),
+  // E-13: nullable — an explicit null clears the logo.
+  logo_asset_id: v.string().uuid().nullable().optional(),
 });
 
 export const CreateProductFeatureSchema = v.object({

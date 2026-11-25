@@ -35,7 +35,7 @@
  * It is shown ONCE in a warning banner with a copy button and is never
  * stored, never rendered from a list response, and never reconstructed.
  */
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, useMemo} from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
 import { Ban, Eye, Globe, KeyRound, Plus, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
@@ -51,6 +51,7 @@ import {
   useAdminDetail,
   useAdminList,
   useAdminMutation,
+  useIdempotencyKey,
 } from "../lib/section-kit";
 import {
   Alert,
@@ -72,6 +73,7 @@ import {
   Textarea,
   Toolbar,
   useConfirm,
+  GroupField,
 } from "../components/primitives";
 
 /* ------------------------------------------------------------------ */
@@ -238,77 +240,80 @@ export function IntegrationsSection() {
     navigate({ to: "/settings/websites", search: next });
   };
 
-  const columns: ColumnDef<IntegratedSite, unknown>[] = [
-    {
-      header: "Site",
-      accessorKey: "name",
-      cell: ({ row }) => <strong>{row.original.name}</strong>,
-    },
-    {
-      header: "Site key",
-      accessorKey: "site_key",
-      enableSorting: false,
-      cell: ({ row }) => (
-        <span className="sm-mono">
-          {row.original.site_key}
-          <CopyButton value={row.original.site_key} label="Copy site key" />
-        </span>
-      ),
-    },
-    {
-      header: "Environment",
-      accessorKey: "environment",
-      cell: ({ row }) => row.original.environment,
-    },
-    {
-      header: "Status",
-      accessorKey: "status",
-      cell: ({ row }) => <StatusBadge status={row.original.status} />,
-    },
-    {
-      header: "Primary domain",
-      accessorKey: "domains",
-      enableSorting: false,
-      cell: ({ row }) => {
-        const primary =
-          row.original.domains.find((d) => d.is_primary) ?? row.original.domains[0];
-        return primary ? primary.domain : "—";
+  const columns: ColumnDef<IntegratedSite, unknown>[] = useMemo(
+    () => [
+      {
+        header: "Site",
+        accessorKey: "name",
+        cell: ({ row }) => <strong>{row.original.name}</strong>,
       },
-    },
-    {
-      header: "Products",
-      accessorKey: "product_ids",
-      enableSorting: false,
-      cell: ({ row }) => (
-        <span className="sm-tabular">{row.original.product_ids.length}</span>
-      ),
-    },
-    {
-      header: "Created",
-      accessorKey: "created_at",
-      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
-    },
-    {
-      header: "Actions",
-      id: "actions",
-      enableSorting: false,
-      cell: ({ row }) => (
-        <Button
-          variant="ghost"
-          size="sm"
-          icon={Eye}
-          onClick={() =>
-            navigate({
-              to: "/settings/websites/$siteId",
-              params: { siteId: row.original.id },
-            })
-          }
-        >
-          View
-        </Button>
-      ),
-    },
-  ];
+      {
+        header: "Site key",
+        accessorKey: "site_key",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <span className="sm-mono">
+            {row.original.site_key}
+            <CopyButton value={row.original.site_key} label="Copy site key" />
+          </span>
+        ),
+      },
+      {
+        header: "Environment",
+        accessorKey: "environment",
+        cell: ({ row }) => row.original.environment,
+      },
+      {
+        header: "Status",
+        accessorKey: "status",
+        cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      },
+      {
+        header: "Primary domain",
+        accessorKey: "domains",
+        enableSorting: false,
+        cell: ({ row }) => {
+          const primary =
+            row.original.domains.find((d) => d.is_primary) ?? row.original.domains[0];
+          return primary ? primary.domain : "—";
+        },
+      },
+      {
+        header: "Products",
+        accessorKey: "product_ids",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <span className="sm-tabular">{row.original.product_ids.length}</span>
+        ),
+      },
+      {
+        header: "Created",
+        accessorKey: "created_at",
+        cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
+      },
+      {
+        header: "Actions",
+        id: "actions",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <Button
+            variant="ghost"
+            size="sm"
+            icon={Eye}
+            onClick={() =>
+              navigate({
+                to: "/settings/websites/$siteId",
+                params: { siteId: row.original.id },
+              })
+            }
+          >
+            View
+          </Button>
+        ),
+      },
+  ],
+    [navigate],
+  )
 
   return (
     <section aria-labelledby="integrations-heading">
@@ -392,10 +397,11 @@ function RegisterSiteDialog({
 
   const productsQuery = useAdminList<Product>("products", "/api/v1/admin/products");
 
-  const create = useAdminMutation<RegisteredSite, Record<string, unknown>>({
+    const createKey = useIdempotencyKey();
+const create = useAdminMutation<RegisteredSite, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<RegisteredSite>("/api/v1/admin/integrated-sites", {
-        method: "POST",
+        method: "POST", idempotencyKey: createKey,
         body: JSON.stringify(body),
       }),
     invalidateKeys: [listKey("integrated-sites")],
@@ -518,7 +524,7 @@ function RegisterSiteDialog({
             </div>
           )}
         </Field>
-        <Field
+        <GroupField
           label="Capabilities"
           required
           error={errors.capabilities ?? ""}
@@ -533,7 +539,7 @@ function RegisterSiteDialog({
               />
             ))}
           </div>
-        </Field>
+        </GroupField>
       </form>
     </Dialog>
   );
@@ -556,19 +562,21 @@ export function IntegratedSiteDetailSection({ id }: { id: string }) {
   );
   const site = query.data;
 
-  const suspend = useAdminMutation<IntegratedSite, void>({
+    const suspendKey = useIdempotencyKey();
+const suspend = useAdminMutation<IntegratedSite, void>({
     mutationFn: () =>
       apiRequest<IntegratedSite>(`/api/v1/admin/integrated-sites/${id}/suspend`, {
-        method: "POST",
+        method: "POST", idempotencyKey: suspendKey,
       }),
     invalidateKeys: [detailKey("integrated-sites", id), listKey("integrated-sites")],
     successTitle: "Site suspended",
   });
 
-  const revoke = useAdminMutation<IntegratedSite, void>({
+    const revokeKey = useIdempotencyKey();
+const revoke = useAdminMutation<IntegratedSite, void>({
     mutationFn: () =>
       apiRequest<IntegratedSite>(`/api/v1/admin/integrated-sites/${id}/revoke`, {
-        method: "POST",
+        method: "POST", idempotencyKey: revokeKey,
       }),
     invalidateKeys: [detailKey("integrated-sites", id), listKey("integrated-sites")],
     successTitle: "Site revoked",
@@ -850,7 +858,7 @@ function EditSiteDialog({
             />
           </Field>
         </div>
-        <Field label="Capabilities">
+        <GroupField label="Capabilities">
           <div className="sm-form-grid">
             {SITE_CAPABILITIES.map((cap) => (
               <Checkbox
@@ -867,7 +875,7 @@ function EditSiteDialog({
               />
             ))}
           </div>
-        </Field>
+        </GroupField>
       </form>
     </Dialog>
   );
@@ -1008,11 +1016,12 @@ function AssignProductDialog({
   const [productId, setProductId] = useState("");
   const [error, setError] = useState("");
 
-  const assign = useAdminMutation<IntegratedSite, string>({
+    const assignKey = useIdempotencyKey();
+const assign = useAdminMutation<IntegratedSite, string>({
     mutationFn: (pid) =>
       apiRequest<IntegratedSite>(
         `/api/v1/admin/integrated-sites/${site.id}/products`,
-        { method: "POST", body: JSON.stringify({ product_id: pid }) },
+        { method: "POST", idempotencyKey: assignKey, body: JSON.stringify({ product_id: pid }) },
       ),
     invalidateKeys: [
       detailKey("integrated-sites", site.id),
@@ -1101,11 +1110,12 @@ function SiteCredentialsTab({ siteId }: { siteId: string }) {
     { q: search, page, pageSize },
   );
 
-  const revoke = useAdminMutation<SiteCredential, string>({
+    const revokeKey = useIdempotencyKey();
+const revoke = useAdminMutation<SiteCredential, string>({
     mutationFn: (credId) =>
       apiRequest<SiteCredential>(
         `/api/v1/admin/integrated-sites/${siteId}/credentials/${credId}/revoke`,
-        { method: "POST" },
+        { method: "POST", idempotencyKey: revokeKey },
       ),
     invalidateKeys: [
       listKey("site-credentials"),
@@ -1115,11 +1125,12 @@ function SiteCredentialsTab({ siteId }: { siteId: string }) {
     successTitle: "Credential revoked",
   });
 
-  const rotate = useAdminMutation<RotatedCredential, string>({
+    const rotateKey = useIdempotencyKey();
+const rotate = useAdminMutation<RotatedCredential, string>({
     mutationFn: (credId) =>
       apiRequest<RotatedCredential>(
         `/api/v1/admin/integrated-sites/${siteId}/credentials/${credId}/rotate`,
-        { method: "POST" },
+        { method: "POST", idempotencyKey: rotateKey },
       ),
     invalidateKeys: [
       listKey("site-credentials"),
@@ -1135,111 +1146,114 @@ function SiteCredentialsTab({ siteId }: { siteId: string }) {
       }),
   });
 
-  const columns: ColumnDef<SiteCredential, unknown>[] = [
-    {
-      header: "Key ID",
-      accessorKey: "key_id",
-      cell: ({ row }) => (
-        <span className="sm-mono">
-          {row.original.key_id}
-          <CopyButton value={row.original.key_id} label="Copy key ID" />
-        </span>
-      ),
-    },
-    {
-      header: "Type",
-      accessorKey: "credential_type",
-      cell: ({ row }) => row.original.credential_type,
-    },
-    {
-      header: "Scopes",
-      accessorKey: "scopes",
-      enableSorting: false,
-      cell: ({ row }) => row.original.scopes.join(", "),
-    },
-    {
-      header: "Status",
-      accessorKey: "status",
-      cell: ({ row }) => <StatusBadge status={row.original.status} />,
-    },
-    {
-      header: "Last used",
-      accessorKey: "last_used_at",
-      cell: ({ row }) => <DateTimeCell value={row.original.last_used_at} />,
-    },
-    {
-      header: "Created",
-      accessorKey: "created_at",
-      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
-    },
-    {
-      header: "Actions",
-      id: "actions",
-      enableSorting: false,
-      cell: ({ row }) => {
-        const cred = row.original;
-        const active = cred.status === "active";
-        // 2 row actions → one "…" menu (Neon Branches pattern). The
-        // confirm dialogs still gate both actions; the mutation toasts
-        // ("Credential rotated"/"Credential revoked") + the one-time
-        // secret panel report the outcome, so no inline spinner is lost.
-        return (
-          <RowMenu
-            items={[
-              {
-                icon: RefreshCw,
-                label: "Rotate credential",
-                disabled: !active,
-                onSelect: () =>
-                  void (async () => {
-                    const ok = await confirm({
-                      title: "Rotate credential?",
-                      body: (
-                        <div>
-                          <p>
-                            {cred.key_id} is revoked and a new credential of
-                            the same type is issued. The old secret stops
-                            working immediately.
-                          </p>
-                          <p>The new secret is shown once — copy it now.</p>
-                        </div>
-                      ),
-                      confirmLabel: "Rotate",
-                      danger: true,
-                      warning: `${cred.key_id} is revoked and a new credential of the same type is issued.`,
-                    });
-                    if (ok) rotate.mutate(cred.id);
-                  })(),
-              },
-              {
-                icon: Ban,
-                label: "Revoke credential",
-                danger: true,
-                disabled: !active,
-                onSelect: () =>
-                  void (async () => {
-                    const ok = await confirm({
-                      title: "Revoke credential?",
-                      body: (
-                        <p>
-                          {cred.key_id} stops authenticating permanently. This
-                          cannot be undone — any integration using it will fail
-                          until it switches to another credential.
-                        </p>
-                      ),
-                      confirmLabel: "Revoke",
-                      danger: true,
-                      warning: `${cred.key_id} stops authenticating permanently.`,
-                    });
-                    if (ok) revoke.mutate(cred.id);
-                  })(),
-              },
-            ]}
-          />
-        );
+  const columns: ColumnDef<SiteCredential, unknown>[] = useMemo(
+    () => [
+      {
+        header: "Key ID",
+        accessorKey: "key_id",
+        cell: ({ row }) => (
+          <span className="sm-mono">
+            {row.original.key_id}
+            <CopyButton value={row.original.key_id} label="Copy key ID" />
+          </span>
+        ),
       },
-    },
-  ];
+      {
+        header: "Type",
+        accessorKey: "credential_type",
+        cell: ({ row }) => row.original.credential_type,
+      },
+      {
+        header: "Scopes",
+        accessorKey: "scopes",
+        enableSorting: false,
+        cell: ({ row }) => row.original.scopes.join(", "),
+      },
+      {
+        header: "Status",
+        accessorKey: "status",
+        cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      },
+      {
+        header: "Last used",
+        accessorKey: "last_used_at",
+        cell: ({ row }) => <DateTimeCell value={row.original.last_used_at} />,
+      },
+      {
+        header: "Created",
+        accessorKey: "created_at",
+        cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
+      },
+      {
+        header: "Actions",
+        id: "actions",
+        enableSorting: false,
+        cell: ({ row }) => {
+          const cred = row.original;
+          const active = cred.status === "active";
+          // 2 row actions → one "…" menu (Neon Branches pattern). The
+          // confirm dialogs still gate both actions; the mutation toasts
+          // ("Credential rotated"/"Credential revoked") + the one-time
+          // secret panel report the outcome, so no inline spinner is lost.
+          return (
+            <RowMenu
+              items={[
+                {
+                  icon: RefreshCw,
+                  label: "Rotate credential",
+                  disabled: !active,
+                  onSelect: () =>
+                    void (async () => {
+                      const ok = await confirm({
+                        title: "Rotate credential?",
+                        body: (
+                          <div>
+                            <p>
+                              {cred.key_id} is revoked and a new credential of
+                              the same type is issued. The old secret stops
+                              working immediately.
+                            </p>
+                            <p>The new secret is shown once — copy it now.</p>
+                          </div>
+                        ),
+                        confirmLabel: "Rotate",
+                        danger: true,
+                        warning: `${cred.key_id} is revoked and a new credential of the same type is issued.`,
+                      });
+                      if (ok) rotate.mutate(cred.id);
+                    })(),
+                },
+                {
+                  icon: Ban,
+                  label: "Revoke credential",
+                  danger: true,
+                  disabled: !active,
+                  onSelect: () =>
+                    void (async () => {
+                      const ok = await confirm({
+                        title: "Revoke credential?",
+                        body: (
+                          <p>
+                            {cred.key_id} stops authenticating permanently. This
+                            cannot be undone — any integration using it will fail
+                            until it switches to another credential.
+                          </p>
+                        ),
+                        confirmLabel: "Revoke",
+                        danger: true,
+                        warning: `${cred.key_id} stops authenticating permanently.`,
+                      });
+                      if (ok) revoke.mutate(cred.id);
+                    })(),
+                },
+              ]}
+            />
+          );
+        },
+      },
+  ],
+    [confirm, rotate, revoke],
+  )
 
   return (
     <div>
@@ -1326,11 +1340,12 @@ function CreateCredentialDialog({
   const [scopes, setScopes] = useState("catalog.read, checkout.create");
   const [error, setError] = useState("");
 
-  const create = useAdminMutation<CreatedCredential, Record<string, unknown>>({
+    const createKey = useIdempotencyKey();
+const create = useAdminMutation<CreatedCredential, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<CreatedCredential>(
         `/api/v1/admin/integrated-sites/${siteId}/credentials`,
-        { method: "POST", body: JSON.stringify(body) },
+        { method: "POST", idempotencyKey: createKey, body: JSON.stringify(body) },
       ),
     invalidateKeys: [
       listKey("site-credentials"),
@@ -1421,11 +1436,12 @@ function SiteDomainsTab({ site }: { site: IntegratedSite }) {
   const [verifyTarget, setVerifyTarget] = useState<SiteDomain | null>(null);
   const confirm = useConfirm();
 
-  const challenge = useAdminMutation<IntegratedSite, string>({
+    const challengeKey = useIdempotencyKey();
+const challenge = useAdminMutation<IntegratedSite, string>({
     mutationFn: (domainId) =>
       apiRequest<IntegratedSite>(
         `/api/v1/admin/integrated-sites/${site.id}/domains/${domainId}/verification-challenge`,
-        { method: "POST" },
+        { method: "POST", idempotencyKey: challengeKey },
       ),
     invalidateKeys: [
       detailKey("integrated-sites", site.id),
@@ -1447,109 +1463,112 @@ function SiteDomainsTab({ site }: { site: IntegratedSite }) {
     successTitle: "Domain deleted",
   });
 
-  const columns: ColumnDef<SiteDomain, unknown>[] = [
-    {
-      header: "Domain",
-      accessorKey: "domain",
-      cell: ({ row }) => (
-        <span>
-          {row.original.domain}
-          {row.original.is_primary ? " (primary)" : ""}
-        </span>
-      ),
-    },
-    {
-      header: "Method",
-      accessorKey: "verification_method",
-      cell: ({ row }) => row.original.verification_method,
-    },
-    {
-      header: "Status",
-      accessorKey: "verification_status",
-      cell: ({ row }) => (
-        <StatusBadge status={row.original.verification_status} />
-      ),
-    },
-    {
-      header: "Verified at",
-      accessorKey: "verified_at",
-      cell: ({ row }) => <DateTimeCell value={row.original.verified_at} />,
-    },
-    {
-      header: "Challenge",
-      accessorKey: "verification_challenge",
-      enableSorting: false,
-      cell: ({ row }) => (
-        <span className="sm-mono sm-break">
-          {row.original.verification_challenge}
-          <CopyButton
-            value={row.original.verification_challenge}
-            label="Copy verification challenge"
-          />
-        </span>
-      ),
-    },
-    {
-      header: "Actions",
-      id: "actions",
-      enableSorting: false,
-      cell: ({ row }) => {
-        const domain = row.original;
-        const verified = domain.verification_status === "verified";
-        // 3 row actions → one "…" menu (Neon Branches pattern). The
-        // confirm dialog still gates Delete; the mutation toasts
-        // ("Challenge regenerated"/"Domain deleted") + the verify dialog
-        // report the outcome, so no inline spinner is lost.
-        return (
-          <RowMenu
-            items={[
-              {
-                icon: RefreshCw,
-                label: "New challenge",
-                onSelect: () => challenge.mutate(domain.id),
-              },
-              {
-                icon: ShieldCheck,
-                label: "Verify",
-                disabled: verified,
-                onSelect: () => setVerifyTarget(domain),
-              },
-              {
-                icon: Trash2,
-                label: "Delete",
-                danger: true,
-                disabled: site.domains.length <= 1,
-                onSelect: () =>
-                  void (async () => {
-                    const ok = await confirm({
-                      title: "Delete domain?",
-                      body: (
-                        <div>
-                          <p>
-                            {domain.domain} will be permanently removed from{" "}
-                            {site.name}.
-                          </p>
-                          {domain.is_primary ? (
-                            <p>
-                              It is the primary domain — the first remaining
-                              domain becomes primary.
-                            </p>
-                          ) : null}
-                        </div>
-                      ),
-                      confirmLabel: "Delete",
-                      danger: true,
-                      warning: `${domain.domain} will be permanently removed from ${site.name}.`,
-                    });
-                    if (ok) remove.mutate(domain.id);
-                  })(),
-              },
-            ]}
-          />
-        );
+  const columns: ColumnDef<SiteDomain, unknown>[] = useMemo(
+    () => [
+      {
+        header: "Domain",
+        accessorKey: "domain",
+        cell: ({ row }) => (
+          <span>
+            {row.original.domain}
+            {row.original.is_primary ? " (primary)" : ""}
+          </span>
+        ),
       },
-    },
-  ];
+      {
+        header: "Method",
+        accessorKey: "verification_method",
+        cell: ({ row }) => row.original.verification_method,
+      },
+      {
+        header: "Status",
+        accessorKey: "verification_status",
+        cell: ({ row }) => (
+          <StatusBadge status={row.original.verification_status} />
+        ),
+      },
+      {
+        header: "Verified at",
+        accessorKey: "verified_at",
+        cell: ({ row }) => <DateTimeCell value={row.original.verified_at} />,
+      },
+      {
+        header: "Challenge",
+        accessorKey: "verification_challenge",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <span className="sm-mono sm-break">
+            {row.original.verification_challenge}
+            <CopyButton
+              value={row.original.verification_challenge}
+              label="Copy verification challenge"
+            />
+          </span>
+        ),
+      },
+      {
+        header: "Actions",
+        id: "actions",
+        enableSorting: false,
+        cell: ({ row }) => {
+          const domain = row.original;
+          const verified = domain.verification_status === "verified";
+          // 3 row actions → one "…" menu (Neon Branches pattern). The
+          // confirm dialog still gates Delete; the mutation toasts
+          // ("Challenge regenerated"/"Domain deleted") + the verify dialog
+          // report the outcome, so no inline spinner is lost.
+          return (
+            <RowMenu
+              items={[
+                {
+                  icon: RefreshCw,
+                  label: "New challenge",
+                  onSelect: () => challenge.mutate(domain.id),
+                },
+                {
+                  icon: ShieldCheck,
+                  label: "Verify",
+                  disabled: verified,
+                  onSelect: () => setVerifyTarget(domain),
+                },
+                {
+                  icon: Trash2,
+                  label: "Delete",
+                  danger: true,
+                  disabled: site.domains.length <= 1,
+                  onSelect: () =>
+                    void (async () => {
+                      const ok = await confirm({
+                        title: "Delete domain?",
+                        body: (
+                          <div>
+                            <p>
+                              {domain.domain} will be permanently removed from{" "}
+                              {site.name}.
+                            </p>
+                            {domain.is_primary ? (
+                              <p>
+                                It is the primary domain — the first remaining
+                                domain becomes primary.
+                              </p>
+                            ) : null}
+                          </div>
+                        ),
+                        confirmLabel: "Delete",
+                        danger: true,
+                        warning: `${domain.domain} will be permanently removed from ${site.name}.`,
+                      });
+                      if (ok) remove.mutate(domain.id);
+                    })(),
+                },
+              ]}
+            />
+          );
+        },
+      },
+  ],
+    [confirm, setVerifyTarget, site],
+  )
 
   return (
     <div>
@@ -1560,6 +1579,11 @@ function SiteDomainsTab({ site }: { site: IntegratedSite }) {
       <ListTable<SiteDomain>
         columns={columns}
         data={site.domains}
+        // D-10: the sibling tables refresh their section; the domains
+        // table did not — its Refresh button was missing. Domains come
+        // from the site DETAIL query (no list key exists), so the
+        // button invalidates that exact key instead.
+        refreshQueryKey={detailKey("integrated-sites", site.id)}
         search={search}
         onSearchChange={(q) => {
           setSearch(q);
@@ -1618,11 +1642,12 @@ function AddDomainDialog({
   const [isPrimary, setIsPrimary] = useState(false);
   const [error, setError] = useState("");
 
-  const add = useAdminMutation<IntegratedSite, Record<string, unknown>>({
+    const addKey = useIdempotencyKey();
+const add = useAdminMutation<IntegratedSite, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<IntegratedSite>(
         `/api/v1/admin/integrated-sites/${site.id}/domains`,
-        { method: "POST", body: JSON.stringify(body) },
+        { method: "POST", idempotencyKey: addKey, body: JSON.stringify(body) },
       ),
     invalidateKeys: [
       detailKey("integrated-sites", site.id),
@@ -1718,11 +1743,12 @@ function VerifyDomainDialog({
   const [note, setNote] = useState("");
   const [error, setError] = useState("");
 
-  const verify = useAdminMutation<IntegratedSite, Record<string, unknown>>({
+    const verifyKey = useIdempotencyKey();
+const verify = useAdminMutation<IntegratedSite, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<IntegratedSite>(
         `/api/v1/admin/integrated-sites/${siteId}/domains/${domain?.id}/verify`,
-        { method: "POST", body: JSON.stringify(body) },
+        { method: "POST", idempotencyKey: verifyKey, body: JSON.stringify(body) },
       ),
     invalidateKeys: [
       detailKey("integrated-sites", siteId),

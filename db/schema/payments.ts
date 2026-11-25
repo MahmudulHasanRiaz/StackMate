@@ -215,6 +215,9 @@ export const paymentVerificationLogs = pgTable("payment_verification_logs", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 },
 (table) => [
+  // Migration 0021 (audit C-02): verification history is read per
+  // payment submission.
+  index("idx_payment_verification_logs_submission_id").on(table.paymentSubmissionId),
   check("payment_verification_logs_decision_check", sql`"decision" IN ('approved', 'rejected', 'requested_information', 'reopened')`),
 ]);
 
@@ -240,6 +243,9 @@ export const paymentRefunds = pgTable("payment_refunds", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 },
 (table) => [
+  // Migration 0021 (audit C-02): refunds are read per payment
+  // transaction (order detail, P&L); transaction deletes scan here.
+  index("idx_payment_refunds_transaction_id").on(table.paymentTransactionId),
   check("payment_refunds_amount_minor_check", sql`"amount_minor" > 0`),
   check("payment_refunds_status_check", sql`"status" IN ('requested', 'pending', 'succeeded', 'failed', 'cancelled')`),
 ]);

@@ -102,13 +102,23 @@ describe("API-core batch", () => {
     return { status: res.status, body, headers: res.headers };
   }
 
+  // A-01: the session token is cookie-only — sign-in JSON no longer
+  // carries session_token, so the cookie comes from Set-Cookie.
+  function sessionCookieFromHeaders(resHeaders: Headers): string {
+    const setCookies =
+      typeof resHeaders.getSetCookie === "function" ? resHeaders.getSetCookie() : [];
+    const pair = setCookies.find((c) => c.startsWith("stackmate_session="));
+    assert.ok(pair, "sign-in must set a stackmate_session cookie");
+    return pair!.split(";")[0]!;
+  }
+
   async function signIn(email: string, password: string): Promise<string> {
     const res = await apiRequest("/api/auth/sign-in", {
       method: "POST",
       body: { email, password },
     });
     assert.equal(res.status, 200, `sign-in ${email}: ${JSON.stringify(res.body)}`);
-    return `stackmate_session=${res.body.data.session_token}`;
+    return sessionCookieFromHeaders(res.headers);
   }
 
   async function createUser(
@@ -372,22 +382,41 @@ describe("API-core batch", () => {
         connectionString: "postgresql://postgres:postgres@127.0.0.1:5432/stackmate_test",
       },
     };
-    const stagingEnv = resolveRuntimeConfig({
-      APP_ENV: "staging",
-      ...stagingSecrets,
-      APP_URL: "http://localhost:5173",
-      API_URL: "http://localhost:8787",
-      BETTER_AUTH_URL: "http://localhost:8787",
-      TRUSTED_ORIGINS: "http://localhost:5173,http://localhost:8787",
-    });
-    const stagingApp = createStackMateApp(store);
-    const bad = await stagingApp.fetch(
-      new Request("http://localhost:8787/api/v1/health"),
-      stagingEnv
+    // A-09: the fail-fast moved from per-request (500) to boot time —
+    // resolveRuntimeConfig itself throws on localhost URL vars in
+    // staging/production, so the app never starts misconfigured.
+    assert.throws(
+      () =>
+        resolveRuntimeConfig({
+          APP_ENV: "staging",
+          ...stagingSecrets,
+          APP_URL: "http://localhost:5173",
+          API_URL: "http://localhost:8787",
+          BETTER_AUTH_URL: "http://localhost:8787",
+          TRUSTED_ORIGINS: "http://localhost:5173,http://localhost:8787",
+        }),
+      /points at localhost/
     );
-    const badText = await bad.text();
-    assert.equal(bad.status, 500, badText);
-    assert.equal(JSON.parse(badText).error.code, "INTERNAL_ERROR");
+    // A-09: omitting the vars entirely must fail too — the resolved
+    // localhost defaults are validated, not just explicitly-set values.
+    assert.throws(
+      () => resolveRuntimeConfig({ APP_ENV: "staging", ...stagingSecrets }),
+      /points at localhost/
+    );
+    // An unparseable URL var also fails at boot.
+    assert.throws(
+      () =>
+        resolveRuntimeConfig({
+          APP_ENV: "staging",
+          ...stagingSecrets,
+          APP_URL: "https://admin.staging.example.com",
+          API_URL: "https://api.staging.example.com",
+          BETTER_AUTH_URL: "ht!tp://bad url",
+          TRUSTED_ORIGINS: "https://admin.staging.example.com",
+        }),
+      /not a parseable URL/
+    );
+    const stagingApp = createStackMateApp(store);
 
     const goodEnv = resolveRuntimeConfig({
       APP_ENV: "staging",

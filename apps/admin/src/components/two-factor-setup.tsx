@@ -21,6 +21,7 @@
 import { useMemo, useState, type FormEvent } from "react";
 import qrcode from "qrcode-generator";
 import { rawApiRequest, ApiClientError } from "../lib/api-client";
+import { useIdempotencyKey } from "../lib/section-kit";
 import { Alert, Button, Field, Input } from "./primitives";
 
 function qrSvg(totpUri: string): string {
@@ -59,6 +60,10 @@ export function TwoFactorSetup({
   const svg = useMemo(() => (totpUri ? qrSvg(totpUri) : ""), [totpUri]);
   const secret = useMemo(() => secretFromUri(totpUri), [totpUri]);
 
+  // A-04: one key per setup instance — a retried enable replays the
+  // same TOTP secret + backup codes instead of generating new ones
+  // the user never sees.
+  const enableKey = useIdempotencyKey();
   const enable = async (e: FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -66,7 +71,7 @@ export function TwoFactorSetup({
     try {
       const res = await rawApiRequest<{ totpURI: string; backupCodes: string[] }>(
         "/api/auth/two-factor/enable",
-        { method: "POST", body: JSON.stringify({ password }) }
+        { method: "POST", body: JSON.stringify({ password }), idempotencyKey: enableKey }
       );
       setTotpUri(res.totpURI);
       setBackupCodes(res.backupCodes ?? []);
@@ -220,6 +225,8 @@ export function TwoFactorDisable({
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // A-04: one key per dialog instance — a retried disable replays.
+  const disableKey = useIdempotencyKey();
   const disable = async (e: FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -228,6 +235,7 @@ export function TwoFactorDisable({
       await rawApiRequest("/api/auth/two-factor/disable", {
         method: "POST",
         body: JSON.stringify({ password }),
+        idempotencyKey: disableKey,
       });
       onDone();
     } catch (err) {

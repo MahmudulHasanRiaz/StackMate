@@ -42,7 +42,7 @@ async function apiRequest(
   env: ReturnType<typeof resolveRuntimeConfig>,
   path: string,
   options: { method?: string; body?: unknown; cookie?: string } = {}
-): Promise<{ status: number; body: any }> {
+): Promise<{ status: number; body: any; headers: Headers }> {
   const headers = new Headers({ "Content-Type": "application/json" });
   if (options.cookie) headers.set("Cookie", options.cookie);
   const init: RequestInit = { method: options.method ?? "GET", headers };
@@ -50,10 +50,20 @@ async function apiRequest(
   const res = await app.fetch(new Request(`http://localhost:8787${path}`, init), env);
   const text = await res.text();
   try {
-    return { status: res.status, body: JSON.parse(text) };
+    return { status: res.status, body: JSON.parse(text), headers: res.headers };
   } catch {
-    return { status: res.status, body: text };
+    return { status: res.status, body: text, headers: res.headers };
   }
+}
+
+// A-01: the session token is cookie-only — sign-in JSON no longer
+// carries session_token, so the cookie comes from Set-Cookie.
+function sessionCookieFromHeaders(resHeaders: Headers): string {
+  const setCookies =
+    typeof resHeaders.getSetCookie === "function" ? resHeaders.getSetCookie() : [];
+  const pair = setCookies.find((c) => c.startsWith("stackmate_session="));
+  assert.ok(pair, "sign-in must set a stackmate_session cookie");
+  return pair!.split(";")[0]!;
 }
 
 describe("Audit identity/auth fixes (in-memory)", () => {
@@ -82,7 +92,7 @@ describe("Audit identity/auth fixes (in-memory)", () => {
       body: { email: "fix-admin@stackmate.local", password: "FixSuperPass123!" },
     });
     assert.equal(signIn.status, 200, JSON.stringify(signIn.body));
-    superCookie = `stackmate_session=${signIn.body.data.session_token}`;
+    superCookie = sessionCookieFromHeaders(signIn.headers);
     superPrincipal = signIn.body.data.principal as StaffPrincipal;
     assert.ok(superPrincipal.roles.includes("super_admin"));
   });
@@ -177,7 +187,7 @@ describe("Audit identity/auth fixes (in-memory)", () => {
     assert.equal(signIn.status, 200, JSON.stringify(signIn.body));
     return {
       id: created.body.data.user.id as string,
-      cookie: `stackmate_session=${signIn.body.data.session_token}`,
+      cookie: sessionCookieFromHeaders(signIn.headers),
       principal: signIn.body.data.principal as StaffPrincipal,
     };
   }

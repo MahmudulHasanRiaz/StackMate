@@ -15,14 +15,21 @@ import {
   AcceptStaffInvitationSchema,
   CreateRoleSchema,
   CreateStaffInvitationSchema,
+  isCommonPassword,
   UpdateRoleSchema,
 } from "../../../../../packages/contracts/src/index.ts";
-import { randomOpaqueToken, sha256Hex } from "../../platform/crypto/index.ts";
+import {
+  hashTokenPeppered,
+  randomOpaqueToken,
+  sha256Hex,
+  verifyTokenHash,
+} from "../../platform/crypto/index.ts";
 import type {
   DatabaseState,
   RoleRecord,
   StaffInvitationRecord,
   StackMateDataStore,
+  TwoFactorPolicyRecord,
   UserRecord,
 } from "../../platform/db/store.ts";
 import { AppError } from "../../shared/errors.ts";
@@ -84,14 +91,55 @@ export type BetterAuthInstance = ReturnType<typeof createBetterAuth>;
  * changed, so they stay in sync; the legacy hash is never used to
  * authorize a production request.
  *
- * PASSWORD POLICY (audit API L-22, accepted as-is 2026-11-19): length
- * only — every password in the product must be at least 10 characters
- * (bootstrap, staff creation, invite accept, reset, change-password).
- * No strength meter, no breach-list check, no character-class rules.
- * That is a deliberate, recorded decision, not an oversight: keep it
- * length-only until the owner asks for more. Do not "improve" this
- * silently in a fix batch.
+ * PASSWORD POLICY (audit API L-22, F-05 2026-11-25): length ≥10
+ * everywhere (bootstrap, staff creation, invite accept, reset,
+ * change-password) PLUS a common/breached-password check
+ * (isCommonPassword, same offline list as the contracts schema) at
+ * set/change time. No character-class rules. A password that is only
+ * long ("Password1234") is now rejected on every password-setting
+ * path; the length floor is unchanged.
  */
+
+/**
+ * Server-side pepper for one-time token hashes (audit F-04): the
+ * existing ENCRYPTION_KEY_V1 master secret, reused — no new secret.
+ * Resolution order: explicit argument (the app.ts wiring passes
+ * env.ENCRYPTION_KEY_V1) → the store's own encryption secret
+ * (DrizzleStore holds it after create(); the field is TS-private but
+ * present at runtime) → process.env.ENCRYPTION_KEY_V1 (local/test).
+ * Returns undefined when no pepper is available — hashing then falls
+ * back to the legacy bare SHA-256 form and old rows still verify.
+ */
+export function resolveTokenPepper(
+  store: StackMateDataStore,
+  explicitPepper?: string | null
+): string | undefined {
+  const explicit = explicitPepper?.trim() ?? "";
+  if (explicit.length > 0) return explicit;
+  const fromStore = (
+    store as unknown as { encryptionSecret?: unknown }
+  ).encryptionSecret;
+  if (typeof fromStore === "string" && fromStore.trim().length > 0) {
+    return fromStore.trim();
+  }
+  const fromEnv = process.env.ENCRYPTION_KEY_V1?.trim() ?? "";
+  return fromEnv.length > 0 ? fromEnv : undefined;
+}
+
+/**
+ * F-05: reject a common / breached password at set/change time.
+ * Length is checked by the caller (messages stay path-specific);
+ * this only adds the common-password rejection.
+ */
+export function assertPasswordNotCommon(password: string): void {
+  if (isCommonPassword(password)) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "This password is too common or has appeared in data breaches. Choose a different password.",
+      422
+    );
+  }
+}
 export function storeSupportsBetterAuth(store: StackMateDataStore): boolean {
   return (store as unknown as { drizzleDb?: unknown }).drizzleDb !== undefined;
 }
@@ -101,6 +149,10 @@ function drizzleDbOf(store: StackMateDataStore): NodePgDatabase<typeof schema> {
 }
 
 async function reloadStateIfPossible(store: StackMateDataStore): Promise<void> {
+  // A-11: a store created in this request already holds fresh state
+  // (loadedAtMs is set at construction) — reloading it is a second
+  // full combined load for nothing. Older stores reload as before.
+  if (store.isStateFresh()) return;
   const maybe = store as unknown as { loadState?: () => Promise<unknown> };
   if (typeof maybe.loadState === "function") {
     await maybe.loadState();
@@ -208,6 +260,7 @@ export async function bootstrapInitialSuperAdmin(
         422
       );
     }
+    assertPasswordNotCommon(input.password);
 
     const now = new Date().toISOString();
     const user: UserRecord = {
@@ -304,6 +357,7 @@ function validateCreateStaffUserInput(input: {
       422
     );
   }
+  assertPasswordNotCommon(input.password);
   if (!Array.isArray(input.role_keys) || input.role_keys.some((rk) => typeof rk !== "string" || rk.trim().length === 0)) {
     throw new AppError(
       "VALIDATION_ERROR",
@@ -689,7 +743,10 @@ async function signInStaffSessionViaBetterAuth(
       actor_user_id: user!.id,
       action: "identity.auth.signed_in",
       resource_type: "session",
-      resource_id: token.slice(0, 12),
+      // A-13: the session ROW id, never a prefix of the raw token —
+      // a token prefix in the audit log (readable via the audit-logs
+      // API) hands out searchable token material.
+      resource_id: sessionRow?.id ?? emailNormalized,
       outcome: "success",
       request_id: input.requestId,
     });
@@ -789,6 +846,59 @@ async function signInStaffSessionTestAdapter(
  * Returns null when there is no valid session. The test adapter (no
  * Better Auth) resolves against its in-memory `sessions` state instead.
  */
+/**
+ * A-11 fast path for resolveStaffPrincipal: after Better Auth has
+ * already verified the session, the principal needs only the user row
+ * + roles + permissions + 2FA policy — 3 targeted queries via
+ * DrizzleStore.findStaffPrincipalByEmail, no full-state load. Returns
+ * null when the store has no targeted lookup (in-memory/test stores)
+ * or the user is not found, so the caller falls through to the
+ * reload + state-lookup path exactly as before. A found-but-suspended
+ * user returns null directly (the slow path would too).
+ */
+async function findStaffPrincipalFast(
+  store: StackMateDataStore,
+  email: string,
+  sessionId: string
+): Promise<StaffPrincipal | null> {
+  const storeWithLookup = store as unknown as {
+    findStaffPrincipalByEmail?: (
+      email: string
+    ) => Promise<{
+      user: UserRecord;
+      roles: string[];
+      permissions: string[];
+      twoFactorPolicy: TwoFactorPolicyRecord[];
+    } | null>;
+  };
+  if (typeof storeWithLookup.findStaffPrincipalByEmail !== "function") return null;
+  const found = await storeWithLookup.findStaffPrincipalByEmail(
+    email.trim().toLowerCase()
+  );
+  if (!found) return null;
+  if (found.user.status !== "active") return null;
+  return {
+    user: {
+      id: found.user.id,
+      name: found.user.name,
+      email: found.user.email,
+      status: found.user.status,
+      avatar_url: found.user.avatar_url ?? null,
+    },
+    session_id: sessionId,
+    roles: found.roles,
+    permissions: found.permissions,
+    two_factor_enabled: found.user.two_factor_enabled,
+    // The policy rows come from the same targeted lookup, so the
+    // setup-required flag matches buildPrincipal exactly.
+    two_factor_setup_required: resolveTwoFactorSetupRequired(
+      { two_factor_policy: found.twoFactorPolicy } as DatabaseState,
+      found.user,
+      found.roles
+    ),
+  };
+}
+
 export async function resolveStaffPrincipal(
   store: StackMateDataStore,
   input: {
@@ -809,6 +919,16 @@ export async function resolveStaffPrincipal(
           headers: new Headers({ cookie: input.cookieHeader }),
         })) as { session?: { id?: string; expiresAt?: string | Date }; user?: { email?: string } } | null;
         if (session?.user?.email) {
+          // A-11: targeted principal lookup — no full-state reload
+          // when the store already has the session's user (the common
+          // case). Falls through to the reload path when the lookup
+          // finds nothing.
+          const fast = await findStaffPrincipalFast(
+            store,
+            session.user.email,
+            session.session?.id ?? ""
+          );
+          if (fast) return fast;
           await reloadStateIfPossible(store);
           const user = store.state.users.find(
             (u) => u.email === session.user!.email!.trim().toLowerCase()
@@ -848,6 +968,9 @@ export async function resolveStaffPrincipal(
     if (!row || row.expiresAt.getTime() <= nowMs) return null;
     const email = await findBetterAuthUserEmail(store, row.userId);
     if (!email) return null;
+    // A-11: same targeted fast path as the cookie branch above.
+    const fast = await findStaffPrincipalFast(store, email, row.id);
+    if (fast) return fast;
     await reloadStateIfPossible(store);
     const user = store.state.users.find((u) => u.email === email.trim().toLowerCase());
     if (!user || user.status !== "active") return null;
@@ -1069,6 +1192,7 @@ export async function changeStaffPassword(
   if (input.newPassword.length < 10) {
     throw new AppError("VALIDATION_ERROR", "New password must be at least 10 characters.", 422);
   }
+  assertPasswordNotCommon(input.newPassword);
   const auth = input.auth ?? null;
   if (auth && storeSupportsBetterAuth(store)) {
     // Without `asResponse`, better-call THROWS Better Auth's APIError on
@@ -1120,6 +1244,31 @@ export async function changeStaffPassword(
         request_id: input.requestId,
       });
     });
+    // A-12: a password change ends the whole reset-token family —
+    // a reset token minted BEFORE the change must not stay valid for
+    // its full 1h TTL (same rule as reset/recovery, which call
+    // invalidateSiblingResetTokens inside their own transactions).
+    // The password is already changed by Better Auth at this point,
+    // so a failed invalidation is reported honestly instead of
+    // pretending the change failed: the caller must know the old
+    // reset links may still work. The guard is load-bearing: callers
+    // may run this branch with a stubbed drizzleDb (no .transaction
+    // — see the M-13 tests), in which case there is no reset-token
+    // table to invalidate and the step is skipped, not failed.
+    const db = drizzleDbOf(store);
+    if (typeof (db as unknown as { transaction?: unknown } | null)?.transaction === "function") {
+      try {
+        await db.transaction(async (tx) => {
+          await invalidateSiblingResetTokens(tx, principal.user.id);
+        });
+      } catch {
+        throw new AppError(
+          "INTERNAL_ERROR",
+          "Password was changed, but outstanding password-reset links could not be revoked. Ask an admin to check the reset tokens for this account.",
+          500
+        );
+      }
+    }
     // Revoke every session except the one that made this request
     // (dist/api/routes/session.mjs: revokeOtherSessions filters out
     // ctx.context.session.session.token). Identified via the same
@@ -1145,7 +1294,11 @@ export async function changeStaffPassword(
     // real count.
     return { changed: true, revoked_other_sessions: null };
   }
-  // Test adapter only (see module header).
+  // Test adapter only (see module header). There is no reset-token
+  // table in the in-memory adapter (reset/recovery tokens live only
+  // in the Drizzle password_reset_tokens table), so a password change
+  // here has no sibling tokens to invalidate — A-12 is a no-op on
+  // this path by construction.
   return store.withTransaction((state) => {
     const user = state.users.find((u) => u.id === principal.user.id);
     if (!user) throw new AppError("NOT_FOUND", "Staff user not found.", 404);
@@ -1664,7 +1817,8 @@ export async function createStaffInvitationByAdmin(
   store: StackMateDataStore,
   actor: StaffPrincipal,
   rawInput: unknown,
-  requestId: string
+  requestId: string,
+  pepper?: string | null
 ): Promise<{
   invitation: Omit<StaffInvitationRecord, "token_hash">;
   token_once: string;
@@ -1710,7 +1864,9 @@ export async function createStaffInvitationByAdmin(
       email,
       name: input.name.trim(),
       role_keys: [...input.role_keys],
-      token_hash: sha256Hex(rawToken),
+      // F-04: HMAC-peppered hash for newly minted tokens; old
+      // bare-SHA-256 rows keep verifying via verifyTokenHash below.
+      token_hash: hashTokenPeppered(rawToken, resolveTokenPepper(store, pepper)),
       status: "pending",
       expires_at: new Date(now.getTime() + STAFF_INVITATION_TTL_MS).toISOString(),
       invited_by_user_id: actor.user.id,
@@ -1774,18 +1930,29 @@ export async function revokeStaffInvitationByAdmin(
 export async function acceptStaffInvitation(
   store: StackMateDataStore,
   rawInput: unknown,
-  requestId: string
+  requestId: string,
+  pepper?: string | null
 ): Promise<{ user: Omit<UserRecord, "password_hash">; roles: string[] }> {
   const input = AcceptStaffInvitationSchema.parse(rawInput);
   assertInvitationPersistence(store);
-  const tokenHash = sha256Hex(input.token);
+  // F-04: match by verification, not by hash equality — a stored hash
+  // may be peppered (`peppered:<hmac>`, new) or bare SHA-256 (old);
+  // verifyTokenHash accepts both, so old invitations keep working
+  // until they expire or are accepted.
+  const pepperValue = resolveTokenPepper(store, pepper);
+  const findInvitation = (
+    state: DatabaseState
+  ): StaffInvitationRecord | undefined =>
+    (state.staff_invitations ?? []).find((i) =>
+      verifyTokenHash(input.token, i.token_hash, pepperValue)
+    );
 
   // Expire a stale pending invitation in its OWN transaction first: a
   // flip followed by a throw in the same transaction would be rolled
   // back and the row would stay 'pending' forever (same trap as the
   // license-expiry flip in STATUS.md gap #2).
   await store.withTransaction((state) => {
-    const stale = (state.staff_invitations ?? []).find((i) => i.token_hash === tokenHash);
+    const stale = findInvitation(state);
     if (
       stale &&
       stale.status === "pending" &&
@@ -1806,7 +1973,7 @@ export async function acceptStaffInvitation(
   });
 
   return store.withTransaction((state) => {
-    const invitation = (state.staff_invitations ?? []).find((i) => i.token_hash === tokenHash);
+    const invitation = findInvitation(state);
     if (!invitation) {
       throw new AppError("UNAUTHORIZED", "Invitation token is invalid.", 401);
     }
@@ -1895,12 +2062,15 @@ const RESET_TOKEN_TTL_MS = 60 * 60 * 1000;
 export function createPasswordResetToken(
   store: StackMateDataStore,
   userId: string,
-  purpose: PasswordResetPurpose
+  purpose: PasswordResetPurpose,
+  pepper?: string | null
 ): { rawToken: string; tokenHash: string; expiresAt: Date } {
   const rawToken = randomOpaqueToken("smreset", 24);
   return {
     rawToken,
-    tokenHash: sha256Hex(rawToken),
+    // F-04: HMAC-peppered hash for newly minted tokens; old
+    // bare-SHA-256 rows keep verifying via findValidResetToken below.
+    tokenHash: hashTokenPeppered(rawToken, resolveTokenPepper(store, pepper)),
     expiresAt: new Date(Date.now() + RESET_TOKEN_TTL_MS),
   };
 }
@@ -1988,25 +2158,36 @@ async function invalidateSiblingResetTokens(
 async function findValidResetToken(
   store: StackMateDataStore,
   rawToken: string,
-  purpose: PasswordResetPurpose
+  purpose: PasswordResetPurpose,
+  pepper?: string | null
 ): Promise<{ id: string; userId: string } | null> {
   const db = drizzleDbOf(store);
-  const tokenHash = sha256Hex(rawToken);
-  const rows = await db
-    .select()
-    .from(baPasswordResetTokens)
-    .where(
-      and(
-        eq(baPasswordResetTokens.tokenHash, tokenHash),
-        eq(baPasswordResetTokens.purpose, purpose)
+  const pepperValue = resolveTokenPepper(store, pepper);
+  // F-04: try the peppered hash first, then the legacy bare SHA-256
+  // hash — two indexed equality lookups, so old rows minted before
+  // peppering keep verifying until they expire or are consumed.
+  const candidateHashes = [
+    hashTokenPeppered(rawToken, pepperValue),
+    ...(pepperValue ? [sha256Hex(rawToken)] : []),
+  ];
+  for (const tokenHash of candidateHashes) {
+    const rows = await db
+      .select()
+      .from(baPasswordResetTokens)
+      .where(
+        and(
+          eq(baPasswordResetTokens.tokenHash, tokenHash),
+          eq(baPasswordResetTokens.purpose, purpose)
+        )
       )
-    )
-    .limit(1);
-  const row = rows[0];
-  if (!row) return null;
-  if (row.usedAt) return null;
-  if (row.expiresAt.getTime() < Date.now()) return null;
-  return { id: row.id, userId: row.userId };
+      .limit(1);
+    const row = rows[0];
+    if (!row) continue;
+    if (row.usedAt) return null;
+    if (row.expiresAt.getTime() < Date.now()) return null;
+    return { id: row.id, userId: row.userId };
+  }
+  return null;
 }
 
 /**
@@ -2019,7 +2200,7 @@ async function findValidResetToken(
  */
 export async function resetStaffPasswordByToken(
   store: StackMateDataStore,
-  input: { token: string; newPassword: string; requestId: string }
+  input: { token: string; newPassword: string; requestId: string; pepper?: string | null }
 ): Promise<{ user_id: string; email: string }> {
   if (!input.newPassword || input.newPassword.length < 10) {
     throw new AppError(
@@ -2028,7 +2209,8 @@ export async function resetStaffPasswordByToken(
       422
     );
   }
-  const found = await findValidResetToken(store, input.token, "password_reset").catch(
+  assertPasswordNotCommon(input.newPassword);
+  const found = await findValidResetToken(store, input.token, "password_reset", input.pepper).catch(
     () => null
   );
   if (!found) {
@@ -2122,10 +2304,10 @@ export async function resetStaffPasswordByToken(
  */
 export async function recoverTwoFactorByToken(
   store: StackMateDataStore,
-  input: { token: string; password: string; requestId: string },
+  input: { token: string; password: string; requestId: string; pepper?: string | null },
   auth?: BetterAuthInstance | null
 ): Promise<{ user_id: string; email: string }> {
-  const found = await findValidResetToken(store, input.token, "two_factor_recovery").catch(
+  const found = await findValidResetToken(store, input.token, "two_factor_recovery", input.pepper).catch(
     () => null
   );
   if (!found) {

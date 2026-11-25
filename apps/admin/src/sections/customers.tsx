@@ -36,7 +36,7 @@
  * and written with navigate({ search }) cast to never — both resolve
  * by path at runtime (see the same note in orders.tsx).
  */
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, useMemo} from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
@@ -63,6 +63,7 @@ import {
   useAdminList,
   useAdminMutation,
   type ListSearch,
+  useIdempotencyKey,
 } from "../lib/section-kit";
 import {
   Alert,
@@ -732,23 +733,26 @@ export function CustomersSection() {
   // The name cell renders the customer name as text; the row action opens
   // the detail page. (ListTable columns are module-level so they cannot
   // close over goTo — the View button column is added here.)
-  const columns: ColumnDef<CustomerDto, unknown>[] = [
-    ...customerColumns,
-    {
-      id: "actions",
-      header: "",
-      enableSorting: false,
-      cell: ({ row }) => (
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={() => goTo(`/customers/${row.original.id}`)}
-        >
-          View
-        </Button>
-      ),
-    },
-  ];
+  const columns: ColumnDef<CustomerDto, unknown>[] = useMemo(
+    () => [
+      ...customerColumns,
+      {
+        id: "actions",
+        header: "",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => goTo(`/customers/${row.original.id}`)}
+          >
+            View
+          </Button>
+        ),
+      },
+  ],
+    [goTo],
+  )
 
   return (
     <section aria-labelledby="customers-heading">
@@ -812,10 +816,11 @@ function AddCustomerDialog({
   const [formError, setFormError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
-  const mutation = useAdminMutation<CustomerDto, Record<string, unknown>>({
+    const mutationKey = useIdempotencyKey();
+const mutation = useAdminMutation<CustomerDto, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<CustomerDto>("/api/v1/admin/customers", {
-        method: "POST",
+        method: "POST", idempotencyKey: mutationKey,
         body: JSON.stringify(body),
       }),
     invalidateKeys: [listKey("customers")],
@@ -893,6 +898,8 @@ function AddCustomerDialog({
 // page. They keep the ?limit=100 window instead: the whole window is
 // searchable and pageable client-side, and the old API-default cap of
 // 25 rows (which silently truncated a customer's orders at 25) is gone.
+// D-04: RelatedList states the cap when the window is full, so the
+// list never silently ends at 100 rows.
 function useCustomerCollection<T>(customerId: string, key: string, path: string) {
   return useQuery({
     queryKey: ["admin", "customers", "detail", customerId, key],
@@ -930,31 +937,44 @@ function RelatedList<T>({
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
+  // D-04: these detail endpoints have no server search (?q= is not
+  // threaded here), so server paging would shrink the client-side
+  // search to one page. They keep the ?limit=100 window instead — and
+  // when the window is full the cap is now stated, instead of the
+  // list silently ending at 100 rows.
+  const windowFull = (data?.length ?? 0) >= 100;
   return (
-    <ListTable<T>
-      columns={columns}
-      data={data}
-      search={search}
-      onSearchChange={(q) => {
-        setSearch(q);
-        setPage(1);
-      }}
-      page={page}
-      onPageChange={setPage}
-      pageSize={pageSize}
-      onPageSizeChange={(size) => {
-        setPageSize(size);
-        setPage(1);
-      }}
-      isLoading={isLoading}
-      isError={isError}
-      error={error}
-      onRetry={onRetry}
-      emptyIcon={UserRound}
-      emptyTitle={emptyTitle}
-      emptyBody={emptyBody}
-      getRowId={getRowId}
-    />
+    <>
+      {windowFull ? (
+        <p className="sm-hint" style={{ margin: "0 0 8px" }}>
+          Showing the first 100 records — use search to narrow down.
+        </p>
+      ) : null}
+      <ListTable<T>
+        columns={columns}
+        data={data}
+        search={search}
+        onSearchChange={(q) => {
+          setSearch(q);
+          setPage(1);
+        }}
+        page={page}
+        onPageChange={setPage}
+        pageSize={pageSize}
+        onPageSizeChange={(size) => {
+          setPageSize(size);
+          setPage(1);
+        }}
+        isLoading={isLoading}
+        isError={isError}
+        error={error}
+        onRetry={onRetry}
+        emptyIcon={UserRound}
+        emptyTitle={emptyTitle}
+        emptyBody={emptyBody}
+        getRowId={getRowId}
+      />
+    </>
   );
 }
 
@@ -1008,7 +1028,7 @@ export function CustomerDetailSection({ id }: { id: string }) {
     queryKey: ["admin", "customers", "detail", id, "issues"],
     queryFn: async () => {
       const res = await apiRequest<{ items: CustomerTicketDto[] }>(
-        `/api/v1/admin/tickets?customer_id=${id}`,
+        `/api/v1/admin/tickets?customer_id=${id}&limit=100`,
       );
       return res.items;
     },
@@ -2005,7 +2025,8 @@ function AddressDialog({
   const [isDefault, setIsDefault] = useState(address?.is_default ?? false);
   const [errors, setErrors] = useState<Record<string, string>>({});
 
-  const mutation = useAdminMutation<CustomerAddressDto, Record<string, unknown>>({
+    const mutationKey = useIdempotencyKey();
+const mutation = useAdminMutation<CustomerAddressDto, Record<string, unknown>>({
     mutationFn: (body) =>
       address
         ? apiRequest<CustomerAddressDto>(
@@ -2014,7 +2035,7 @@ function AddressDialog({
           )
         : apiRequest<CustomerAddressDto>(
             `/api/v1/admin/customers/${customerId}/addresses`,
-            { method: "POST", body: JSON.stringify(body) },
+            { method: "POST", idempotencyKey: mutationKey, body: JSON.stringify(body) },
           ),
     invalidateKeys: [detailKey("customers", customerId)],
     successTitle: address ? "Address updated" : "Address added",
@@ -2170,10 +2191,11 @@ function ReportDialog({
   const [detail, setDetail] = useState("");
   const [error, setError] = useState<string | null>(null);
 
-  const mutation = useAdminMutation<CustomerReportDto, Record<string, unknown>>({
+    const mutationKey = useIdempotencyKey();
+const mutation = useAdminMutation<CustomerReportDto, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<CustomerReportDto>(`/api/v1/admin/customers/${customerId}/reports`, {
-        method: "POST",
+        method: "POST", idempotencyKey: mutationKey,
         body: JSON.stringify(body),
       }),
     invalidateKeys: [listKey("customers"), detailKey("customers", customerId)],
@@ -2280,14 +2302,15 @@ function SplitContactDialog({
   );
   const [error, setError] = useState<string | null>(null);
 
-  const mutation = useAdminMutation<
+    const mutationKey = useIdempotencyKey();
+const mutation = useAdminMutation<
     { source_customer: CustomerDto; new_customer: CustomerDto },
     Record<string, unknown>
   >({
     mutationFn: (body) =>
       apiRequest<{ source_customer: CustomerDto; new_customer: CustomerDto }>(
         `/api/v1/admin/customers/${customer.id}/split-contact`,
-        { method: "POST", body: JSON.stringify(body) },
+        { method: "POST", idempotencyKey: mutationKey, body: JSON.stringify(body) },
       ),
     invalidateKeys: [listKey("customers"), detailKey("customers", customer.id)],
     successTitle: "Contact split",

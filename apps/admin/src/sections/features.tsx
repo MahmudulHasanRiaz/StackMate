@@ -22,7 +22,7 @@
  * Archive is refused with 409 while a published package version
  * references the feature (service message is surfaced verbatim).
  */
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent, useMemo} from "react";
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
@@ -40,6 +40,7 @@ import {
   parseListSearch,
   useAdminList,
   useAdminMutation,
+  useIdempotencyKey,
 } from "../lib/section-kit";
 import {
   Alert,
@@ -61,6 +62,7 @@ import {
   Textarea,
   useConfirm,
   useToast,
+  GroupField,
 } from "../components/primitives";
 import type { ProductListItem } from "./products";
 
@@ -341,10 +343,11 @@ function CreateFeatureDialog({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
 
-  const create = useAdminMutation({
+    const createKey = useIdempotencyKey();
+const create = useAdminMutation({
     mutationFn: (body: Record<string, unknown>) =>
       apiRequest<FeatureDto>(`/api/v1/admin/products/${productId}/features`, {
-        method: "POST",
+        method: "POST", idempotencyKey: createKey,
         body: JSON.stringify(body),
       }),
     invalidateKeys: [
@@ -405,11 +408,14 @@ function CreateFeatureDialog({
    * attached — nothing is ever silent. An all-failed bulk arrives as
    * a 422 whose per-row errors live in error.details.errors.
    */
+  // A-04: one key per dialog instance — a retried bulk create replays
+  // instead of creating the rows a second time.
+  const bulkKey = useIdempotencyKey();
   const bulkCreate = useMutation({
     mutationFn: (body: Record<string, unknown>) =>
       apiRequest<BulkCreateResponse>(
         `/api/v1/admin/products/${productId}/features/bulk`,
-        { method: "POST", body: JSON.stringify(body) },
+        { method: "POST", body: JSON.stringify(body), idempotencyKey: bulkKey },
       ),
     onSuccess: (result) => {
       void queryClient.invalidateQueries({
@@ -605,7 +611,7 @@ function CreateFeatureDialog({
           </Field>
         </div>
         <div style={{ marginTop: 16 }}>
-          <Field
+          <GroupField
             label="Default value"
             hint="Used when a package does not set its own value"
             {...(errors.entitlement ? { error: errors.entitlement } : {})}
@@ -617,7 +623,7 @@ function CreateFeatureDialog({
               {...(errors.entitlement ? { error: errors.entitlement } : {})}
               idPrefix="cf-default"
             />
-          </Field>
+          </GroupField>
         </div>
         <div style={{ marginTop: 16 }}>
           <Field label="Description" htmlFor="cf-description">
@@ -739,7 +745,7 @@ function CreateFeatureDialog({
                   placeholder="seats"
                 />
               </Field>
-              <Field
+              <GroupField
                 label="Default value"
                 hint="Used when a package does not set its own value"
                 {...(row.errors.entitlement ? { error: row.errors.entitlement } : {})}
@@ -757,7 +763,7 @@ function CreateFeatureDialog({
                   {...(row.errors.entitlement ? { error: row.errors.entitlement } : {})}
                   idPrefix={`bf-default-${row.localId}`}
                 />
-              </Field>
+              </GroupField>
               <Field label="Description" htmlFor={`bf-description-${row.localId}`}>
                 <Input
                   id={`bf-description-${row.localId}`}
@@ -856,6 +862,13 @@ export function FeaturesSection() {
     const timer = window.setTimeout(() => setDebouncedFeatureSearch(search), 250);
     return () => window.clearTimeout(timer);
   }, [search]);
+  // D-01: the status filter is read before the query so it can be
+  // threaded server-side (?status=) instead of filtering one page.
+  const statusFilter =
+    typeof raw.status === "string" &&
+    (STATUS_FILTERS as readonly string[]).includes(raw.status)
+      ? raw.status
+      : "all";
   const featuresQuery = useQuery({
     queryKey: [
       "admin",
@@ -863,6 +876,7 @@ export function FeaturesSection() {
       "list",
       productId ?? "none",
       debouncedFeatureSearch,
+      statusFilter,
       list.page ?? 1,
       list.pageSize ?? 25,
     ],
@@ -871,6 +885,7 @@ export function FeaturesSection() {
         limit: String(list.pageSize ?? 25),
         page: String(list.page ?? 1),
       });
+      if (statusFilter !== "all") params.set("status", statusFilter);
       if (debouncedFeatureSearch.trim()) params.set("q", debouncedFeatureSearch.trim());
       const res = await apiRequest<{ items: FeatureDto[]; total?: number }>(
         `/api/v1/admin/products/${productId}/features?${params}`,
@@ -880,11 +895,12 @@ export function FeaturesSection() {
     enabled: Boolean(productId),
   });
 
-  const archive = useAdminMutation({
+    const archiveKey = useIdempotencyKey();
+const archive = useAdminMutation({
     mutationFn: (feature: FeatureDto) =>
       apiRequest<FeatureDto>(
         `/api/v1/admin/products/${feature.product_id}/features/${feature.id}/archive`,
-        { method: "POST" },
+        { method: "POST", idempotencyKey: archiveKey },
       ),
     invalidateKeys: [
       ["admin", "features", "list", productId ?? "none"],
@@ -894,11 +910,7 @@ export function FeaturesSection() {
     successTitle: "Feature archived",
   });
 
-  const statusFilter =
-    typeof raw.status === "string" &&
-    (STATUS_FILTERS as readonly string[]).includes(raw.status)
-      ? raw.status
-      : "all";
+  // Client filter stays as the fallback until the API reads ?status=.
   const rows = (featuresQuery.data?.items ?? []).filter((f) =>
     statusFilter === "all" ? true : f.status === statusFilter,
   );
@@ -925,93 +937,96 @@ export function FeaturesSection() {
     if (ok) archive.mutate(feature);
   }
 
-  const columns: ColumnDef<FeatureDto, unknown>[] = [
-    {
-      accessorKey: "feature_key",
-      header: "Key",
-      cell: ({ row }) => (
-        <span
-          style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
-        >
-          <span className="sm-mono">{row.original.feature_key}</span>
-          <CopyButton
-            value={row.original.feature_key}
-            label={`Copy key ${row.original.feature_key}`}
-          />
-        </span>
-      ),
-    },
-    {
-      accessorKey: "name",
-      header: "Name",
-      cell: ({ row }) => (
-        <a
-          href={`/features/${row.original.id}?product=${row.original.product_id}`}
-        >
-          {row.original.name}
-        </a>
-      ),
-    },
-    {
-      accessorKey: "value_type",
-      header: "Value type",
-      cell: ({ row }) => row.original.value_type,
-    },
-    {
-      accessorKey: "unit",
-      header: "Unit",
-      cell: ({ row }) => row.original.unit ?? "—",
-    },
-    {
-      accessorKey: "default_value",
-      header: "Default",
-      cell: ({ row }) => formatEntitlement(row.original.default_value),
-    },
-    {
-      accessorKey: "used_by_packages",
-      header: "Used by",
-      cell: ({ row }) => {
-        const used = row.original.used_by_packages ?? [];
-        if (used.length === 0) return "Not used in any package";
-        return (
-          <span>
-            {used.map((u, i) => (
-              <span key={u.package_id}>
-                {i > 0 ? ", " : null}
-                <a href={`/packages/${u.package_id}`}>{u.package_name}</a>
-                {` v${u.version_number} · ${u.version_status}`}
-              </span>
-            ))}
-          </span>
-        );
-      },
-    },
-    {
-      accessorKey: "status",
-      header: "Status",
-      cell: ({ row }) => <StatusBadge status={row.original.status} />,
-    },
-    {
-      accessorKey: "created_at",
-      header: "Created",
-      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
-    },
-    {
-      id: "actions",
-      header: "Actions",
-      cell: ({ row }) =>
-        row.original.status === "active" ? (
-          <Button
-            variant="danger-ghost"
-            size="sm"
-            loading={archive.isPending}
-            onClick={() => void onArchive(row.original)}
+  const columns: ColumnDef<FeatureDto, unknown>[] = useMemo(
+    () => [
+      {
+        accessorKey: "feature_key",
+        header: "Key",
+        cell: ({ row }) => (
+          <span
+            style={{ display: "inline-flex", alignItems: "center", gap: 4 }}
           >
-            Archive
-          </Button>
-        ) : null,
-    },
-  ];
+            <span className="sm-mono">{row.original.feature_key}</span>
+            <CopyButton
+              value={row.original.feature_key}
+              label={`Copy key ${row.original.feature_key}`}
+            />
+          </span>
+        ),
+      },
+      {
+        accessorKey: "name",
+        header: "Name",
+        cell: ({ row }) => (
+          <a
+            href={`/features/${row.original.id}?product=${row.original.product_id}`}
+          >
+            {row.original.name}
+          </a>
+        ),
+      },
+      {
+        accessorKey: "value_type",
+        header: "Value type",
+        cell: ({ row }) => row.original.value_type,
+      },
+      {
+        accessorKey: "unit",
+        header: "Unit",
+        cell: ({ row }) => row.original.unit ?? "—",
+      },
+      {
+        accessorKey: "default_value",
+        header: "Default",
+        cell: ({ row }) => formatEntitlement(row.original.default_value),
+      },
+      {
+        accessorKey: "used_by_packages",
+        header: "Used by",
+        cell: ({ row }) => {
+          const used = row.original.used_by_packages ?? [];
+          if (used.length === 0) return "Not used in any package";
+          return (
+            <span>
+              {used.map((u, i) => (
+                <span key={u.package_id}>
+                  {i > 0 ? ", " : null}
+                  <a href={`/packages/${u.package_id}`}>{u.package_name}</a>
+                  {` v${u.version_number} · ${u.version_status}`}
+                </span>
+              ))}
+            </span>
+          );
+        },
+      },
+      {
+        accessorKey: "status",
+        header: "Status",
+        cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      },
+      {
+        accessorKey: "created_at",
+        header: "Created",
+        cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
+      },
+      {
+        id: "actions",
+        header: "Actions",
+        cell: ({ row }) =>
+          row.original.status === "active" ? (
+            <Button
+              variant="danger-ghost"
+              size="sm"
+              loading={archive.isPending}
+              onClick={() => void onArchive(row.original)}
+            >
+              Archive
+            </Button>
+          ) : null,
+      },
+  ],
+    [onArchive],
+  )
 
   return (
     <section aria-labelledby="features-heading">
@@ -1125,6 +1140,7 @@ export function FeaturesSection() {
           data={rows}
           serverSearch
           serverPagination
+          disableSorting
           refreshSection="features"
           filtersActive={statusFilter !== "all"}
           total={featuresQuery.data?.total ?? 0}
@@ -1299,7 +1315,7 @@ function EditFeatureDialog({
           </Field>
         </div>
         <div style={{ marginTop: 16 }}>
-          <Field
+          <GroupField
             label="Default value"
             hint="Key and value type cannot be changed"
             {...(errors.entitlement ? { error: errors.entitlement } : {})}
@@ -1311,7 +1327,7 @@ function EditFeatureDialog({
               {...(errors.entitlement ? { error: errors.entitlement } : {})}
               idPrefix="ef-default"
             />
-          </Field>
+          </GroupField>
         </div>
         <div style={{ marginTop: 16 }}>
           <Field label="Description" htmlFor="ef-description">
@@ -1369,11 +1385,12 @@ export function FeatureDetailSection({ id }: { id: string }) {
     enabled: Boolean(productId),
   });
 
-  const archive = useAdminMutation({
+    const archiveKey = useIdempotencyKey();
+const archive = useAdminMutation({
     mutationFn: (_: void) =>
       apiRequest<FeatureDto>(
         `/api/v1/admin/products/${productId}/features/${id}/archive`,
-        { method: "POST" },
+        { method: "POST", idempotencyKey: archiveKey },
       ),
     invalidateKeys: [
       detailKey("features", id),

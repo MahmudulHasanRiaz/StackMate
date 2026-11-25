@@ -71,6 +71,10 @@ export interface ApiSuccessEnvelope<T> {
 export interface ApiCollectionData<T> {
   items: T[];
   next_cursor: string | null;
+  // B-05: `total` is the pre-limit count (the full filtered set), so
+  // clients can paginate. Optional — callers that do not pass a total
+  // get no `total` key (same wire shape as before).
+  total?: number;
 }
 
 export type ApiCollectionEnvelope<T> = ApiSuccessEnvelope<ApiCollectionData<T>>;
@@ -97,12 +101,14 @@ export function createSuccessEnvelope<T>(data: T, requestId: string): ApiSuccess
 export function createCollectionEnvelope<T>(
   items: T[],
   nextCursor: string | null,
-  requestId: string
+  requestId: string,
+  total?: number
 ): ApiCollectionEnvelope<T> {
   return {
     data: {
       items,
       next_cursor: nextCursor,
+      ...(total !== undefined ? { total } : {}),
     },
     meta: {
       request_id: requestId,

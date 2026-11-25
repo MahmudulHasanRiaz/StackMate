@@ -35,6 +35,7 @@ import {
   useAdminDetail,
   useAdminList,
   useAdminMutation,
+  useIdempotencyKey,
 } from "../lib/section-kit";
 import {
   Button,
@@ -153,7 +154,15 @@ export function SubscriptionsSection() {
   const query = useAdminList<SubscriptionListItem>(
     "subscriptions",
     "/api/v1/admin/subscriptions",
-    { q: parsed.q, page, pageSize },
+    {
+      q: parsed.q,
+      page,
+      pageSize,
+      // D-01: thread the status filter server-side (the API reads
+      // ?status= once the B-05 half lands; the client filter below
+      // stays as the fallback until then).
+      extra: statusFilter !== "all" ? { status: statusFilter } : undefined,
+    },
   );
 
   const updateSearch = (patch: {
@@ -277,6 +286,7 @@ export function SubscriptionsSection() {
         data={filtered}
         serverSearch
         serverPagination
+        disableSorting
         refreshSection="subscriptions"
         filtersActive={statusFilter !== "all"}
         total={query.total}
@@ -320,15 +330,19 @@ export function SubscriptionsSection() {
 /* ------------------------------------------------------------------ */
 export function SubscriptionDetailSection({ id }: { id: string }) {
   const confirm = useConfirm();
+  // A-04: one idempotency key per detail-page instance — a retried
+  // manual renewal replays instead of creating a second invoice.
+  const renewalKey = useIdempotencyKey();
   const query = useAdminDetail<SubscriptionDetail>(
     "subscriptions",
     id,
     `/api/v1/admin/subscriptions/${id}`,
   );
 
-  const lifecycle = useAdminMutation<unknown, string>({
+    const lifecycleKey = useIdempotencyKey();
+const lifecycle = useAdminMutation<unknown, string>({
     mutationFn: (action) =>
-      apiRequest(`/api/v1/admin/subscriptions/${id}/${action}`, { method: "POST" }),
+      apiRequest(`/api/v1/admin/subscriptions/${id}/${action}`, { method: "POST", idempotencyKey: lifecycleKey }),
     invalidateKeys: [detailKey("subscriptions", id), listKey("subscriptions")],
     successTitle: "Subscription updated",
   });
@@ -337,7 +351,7 @@ export function SubscriptionDetailSection({ id }: { id: string }) {
     mutationFn: () =>
       apiRequest(`/api/v1/admin/subscriptions/${id}/renewal-invoices`, {
         method: "POST",
-        idempotencyKey: crypto.randomUUID(),
+        idempotencyKey: renewalKey,
       }),
     invalidateKeys: [detailKey("subscriptions", id), listKey("subscriptions")],
     successTitle: "Renewal invoice created",

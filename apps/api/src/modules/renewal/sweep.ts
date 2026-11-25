@@ -26,6 +26,7 @@
 import { randomUUID } from "node:crypto";
 import type {
   DatabaseState,
+  OrderRecord,
   StackMateDataStore,
   SentReminderKind,
 } from "../../platform/db/store.ts";
@@ -37,10 +38,8 @@ import {
   suspendLicensesForSubscriptionInTx,
 } from "../activation/service.ts";
 import { appendAuditLog } from "../audit/service.ts";
-import { computeOrderRemaining } from "../customers/service.ts";
 import {
   getReminderSettings,
-  hasSentReminder,
   markReminderSentInTx,
 } from "../reminders/service.ts";
 import { generateRenewalInvoiceInTx } from "../subscriptions/service.ts";
@@ -67,8 +66,17 @@ export interface SweepReport {
   installments_marked_overdue: number;
   reminders_due: SweepReminder[];
   reminders_skipped_no_email: number;
+  /**
+   * A-05: reminders are capped per run (SWEEP_REMINDERS_PER_RUN_CAP).
+   * Reminders past the cap are NOT planned this run — they are
+   * counted here and picked up by the next minute's run.
+   */
+  reminders_capped: number;
   errors: string[];
 }
+
+/** A-05: at most this many reminders are planned (and sent) per run. */
+export const SWEEP_REMINDERS_PER_RUN_CAP = 25;
 
 export function formatMinorBDT(minor: number): string {
   return `৳${(minor / 100).toLocaleString("en-BD", {
@@ -89,13 +97,54 @@ function addDays(dateIso: string, days: number): string {
   return d.toISOString().slice(0, 10);
 }
 
-function customerEmail(state: DatabaseState, customerId: string): string | null {
-  const customer = state.customers.find((c) => c.id === customerId);
-  return customer?.email?.trim() ? customer.email.trim() : null;
+/**
+ * B-03: per-tick indexes, built ONCE per sweep instead of `.find`
+ * per row. The old code did `state.customers.find(...)` per reminder
+ * candidate and `state.orders.find(...)` per installment, and
+ * `hasSentReminder` scanned all of `sent_reminders` per candidate —
+ * O(n·m) in JS every minute. The maps/set below make every lookup
+ * O(1); the reminder loops then iterate only pre-filtered due rows.
+ */
+export interface SweepIndexes {
+  customersById: Map<string, string>;
+  ordersById: Map<string, OrderRecord>;
+  paidByOrderId: Map<string, number>;
+  sentReminderKeys: Set<string>;
+}
+
+function buildSweepIndexes(state: DatabaseState): SweepIndexes {
+  const customersById = new Map<string, string>();
+  for (const c of state.customers) {
+    if (c.email?.trim()) customersById.set(c.id, c.email.trim());
+  }
+  const ordersById = new Map(state.orders.map((o) => [o.id, o]));
+  const paidByOrderId = new Map<string, number>();
+  for (const inst of state.order_installments) {
+    paidByOrderId.set(
+      inst.order_id,
+      (paidByOrderId.get(inst.order_id) ?? 0) + inst.paid_amount_minor
+    );
+  }
+  const sentReminderKeys = new Set(
+    state.sent_reminders.map(
+      (r) => `${r.kind}:${r.reference_id}:${r.offset_days}`
+    )
+  );
+  return { customersById, ordersById, paidByOrderId, sentReminderKeys };
+}
+
+function customerEmailFromIndex(
+  customersById: Map<string, string>,
+  customerId: string
+): string | null {
+  return customersById.get(customerId) ?? null;
 }
 
 function reminderFor(
-  state: DatabaseState,
+  indexes: {
+    customersById: Map<string, string>;
+    sentReminderKeys: Set<string>;
+  },
   kind: SentReminderKind,
   referenceId: string,
   offsetDays: number,
@@ -103,8 +152,10 @@ function reminderFor(
   subject: string,
   text: string
 ): SweepReminder | null {
-  if (hasSentReminder(state, kind, referenceId, offsetDays)) return null;
-  const to = customerEmail(state, customerId);
+  if (indexes.sentReminderKeys.has(`${kind}:${referenceId}:${offsetDays}`)) {
+    return null;
+  }
+  const to = customerEmailFromIndex(indexes.customersById, customerId);
   if (!to) return null;
   return { kind, reference_id: referenceId, offset_days: offsetDays, to_email: to, subject, text };
 }
@@ -141,10 +192,25 @@ export function planSweepInTx(
     installments_marked_overdue: 0,
     reminders_due: [],
     reminders_skipped_no_email: 0,
+    reminders_capped: 0,
     errors: [],
   };
   const fail = (step: string, err: unknown) => {
     report.errors.push(`${step}: ${err instanceof Error ? err.message : String(err)}`);
+  };
+
+  // B-03: indexes built ONCE per tick; every lookup below is O(1).
+  const indexes = buildSweepIndexes(state);
+  // A-05: cap helper — past the cap the reminder is counted, not
+  // planned; the next minute's run picks it up (it was never marked
+  // sent, so nothing is lost).
+  const planReminder = (r: SweepReminder | null): void => {
+    if (!r) return;
+    if (report.reminders_due.length >= SWEEP_REMINDERS_PER_RUN_CAP) {
+      report.reminders_capped += 1;
+      return;
+    }
+    report.reminders_due.push(r);
   };
 
   // (c) Installments past due → overdue (before reminders, so the overdue
@@ -271,10 +337,13 @@ export function planSweepInTx(
     }
   }
 
-  // (f) Reminders.
+  // (f) Reminders — single pass over unpaid installments; the order
+  // lookup is O(1) via the per-tick index (was state.orders.find per
+  // installment) and the paid-so-far figure comes from the pre-built
+  // paidByOrderId map (was computeOrderRemaining's full scan).
   for (const inst of state.order_installments) {
     if (inst.paid_amount_minor >= inst.amount_minor) continue;
-    const order = state.orders.find((o) => o.id === inst.order_id);
+    const order = indexes.ordersById.get(inst.order_id);
     if (!order || order.status === "cancelled") continue;
     const remaining = inst.amount_minor - inst.paid_amount_minor;
     try {
@@ -283,16 +352,16 @@ export function planSweepInTx(
         for (const offset of settings.due_offsets_days) {
           if (daysBetween(today, inst.due_date) === offset) {
             const r = reminderFor(
-              state,
+              indexes,
               "installment_due",
               inst.id,
               offset,
               order.customer_id,
               `Payment due ${offset === 0 ? "today" : `in ${offset} day${offset === 1 ? "" : "s"}`} — Order ${order.order_number}`,
-              `Hi,\n\nA payment of ${formatMinorBDT(remaining)} for order ${order.order_number} (installment #${inst.installment_number}) is due on ${inst.due_date}.\n\nTotal order: ${formatMinorBDT(order.total_minor)} · Paid so far: ${formatMinorBDT(order.total_minor - computeOrderRemaining(state, order))}.\n\n— StackMate`
+              `Hi,\n\nA payment of ${formatMinorBDT(remaining)} for order ${order.order_number} (installment #${inst.installment_number}) is due on ${inst.due_date}.\n\nTotal order: ${formatMinorBDT(order.total_minor)} · Paid so far: ${formatMinorBDT(indexes.paidByOrderId.get(order.id) ?? 0)}.\n\n— StackMate`
             );
-            if (r) report.reminders_due.push(r);
-            else if (!hasSentReminder(state, "installment_due", inst.id, offset) && !customerEmail(state, order.customer_id)) report.reminders_skipped_no_email += 1;
+            if (r) planReminder(r);
+            else if (!indexes.sentReminderKeys.has(`installment_due:${inst.id}:${offset}`) && !indexes.customersById.has(order.customer_id)) report.reminders_skipped_no_email += 1;
           }
         }
       } else if (settings.overdue_enabled) {
@@ -300,7 +369,7 @@ export function planSweepInTx(
         for (const offset of settings.overdue_offsets_days) {
           if (daysBetween(inst.due_date, today) === offset) {
             const r = reminderFor(
-              state,
+              indexes,
               "installment_overdue",
               inst.id,
               offset,
@@ -308,8 +377,8 @@ export function planSweepInTx(
               `Payment overdue — Order ${order.order_number}`,
               `Hi,\n\nA payment of ${formatMinorBDT(remaining)} for order ${order.order_number} (installment #${inst.installment_number}) was due on ${inst.due_date} and is now ${offset} day${offset === 1 ? "" : "s"} overdue. Please pay at your earliest convenience.\n\n— StackMate`
             );
-            if (r) report.reminders_due.push(r);
-            else if (!hasSentReminder(state, "installment_overdue", inst.id, offset) && !customerEmail(state, order.customer_id)) report.reminders_skipped_no_email += 1;
+            if (r) planReminder(r);
+            else if (!indexes.sentReminderKeys.has(`installment_overdue:${inst.id}:${offset}`) && !indexes.customersById.has(order.customer_id)) report.reminders_skipped_no_email += 1;
           }
         }
       }
@@ -326,7 +395,7 @@ export function planSweepInTx(
       for (const offset of settings.due_offsets_days) {
         if (daysBetween(today, periodEnd) === offset) {
           const r = reminderFor(
-            state,
+            indexes,
             "subscription_renewal",
             sub.id,
             offset,
@@ -334,8 +403,8 @@ export function planSweepInTx(
             `Renewal due ${offset === 0 ? "today" : `in ${offset} day${offset === 1 ? "" : "s"}`} — Subscription ${sub.subscription_number}`,
             `Hi,\n\nYour subscription ${sub.subscription_number} renews on ${periodEnd}. Your renewal invoice is ready — please pay before the renewal date to keep your license active without interruption.\n\n— StackMate`
           );
-          if (r) report.reminders_due.push(r);
-          else if (!hasSentReminder(state, "subscription_renewal", sub.id, offset) && !customerEmail(state, sub.customer_id)) report.reminders_skipped_no_email += 1;
+          if (r) planReminder(r);
+          else if (!indexes.sentReminderKeys.has(`subscription_renewal:${sub.id}:${offset}`) && !indexes.customersById.has(sub.customer_id)) report.reminders_skipped_no_email += 1;
         }
       }
     } catch (err) {
@@ -384,6 +453,7 @@ export async function runRenewalExpirySweep(
       installments_marked_overdue: 0,
       reminders_due: [],
       reminders_skipped_no_email: 0,
+      reminders_capped: 0,
       errors: [`sweep-transaction: ${err instanceof Error ? err.message : String(err)}`],
     };
   }

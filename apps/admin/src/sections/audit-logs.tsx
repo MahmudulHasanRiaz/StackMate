@@ -2,9 +2,11 @@
  * Audit Log — read-only record of staff, system, and integration actions.
  *
  * GET /api/v1/admin/audit-logs (audit_logs.read). Server-side search
- * (?q=) and filters (?action=, ?resource=, ?outcome=) over the full
- * history; the actor-type filter stays client-side (the API's ?actor=
- * filters by actor user id, not by type). Search, page, and pageSize
+ * (?q=) and filters (?action=, ?resource=, ?outcome=, ?actor_type=)
+ * over the full history — ?actor_type= is threaded forward-compatible
+ * (the API reads it once the B-05 half lands; the client filter stays
+ * as fallback). The API's ?actor= filters by actor user id, not by
+ * type, so it is never threaded. Search, page, and pageSize
  * are URL-backed via the route search params; filters are URL-backed
  * the same way. There are no mutation endpoints for audit logs
  * (read-only by design) — this section creates nothing.
@@ -25,11 +27,13 @@ import {
   SearchableSelect,
   Select,
   StatusBadge,
+  useToast,
 } from "../components/primitives";
 import {
   DetailFacts,
   ListTable,
   PageHeader,
+  downloadCsv,
   parseListSearch,
   useAdminList,
 } from "../lib/section-kit";
@@ -119,6 +123,7 @@ export function AuditLogsSection() {
     search: AuditLogSearch;
   }) => void;
   const [selected, setSelected] = useState<AuditLogRecord | null>(null);
+  const { toast } = useToast();
 
   const query = useAdminList<AuditLogRecord>(
     "audit-logs",
@@ -127,27 +132,27 @@ export function AuditLogsSection() {
       q: search.q,
       page: search.page,
       pageSize: search.pageSize,
-      // Server-side: ?action=, ?resource=, ?outcome= filter the full
-      // history. ?actor= is NOT threaded — it filters by actor user
-      // id, while this page's actor filter is the actor TYPE, so it
-      // stays client-side in the `filtered` memo below.
+      // Server-side: ?action=, ?resource=, ?outcome=, ?actor_type=
+      // filter the full history (the API reads ?actor_type= once the
+      // B-05 half lands; unknown params are ignored until then and
+      // the client filter in the `filtered` memo stays as fallback).
+      // ?actor= is NOT threaded — it filters by actor user id, while
+      // this page's actor filter is the actor TYPE.
       extra: {
         ...(search.action ? { action: search.action } : {}),
         ...(search.resource_type ? { resource: search.resource_type } : {}),
         ...(search.outcome ? { outcome: search.outcome } : {}),
+        ...(search.actor_type ? { actor_type: search.actor_type } : {}),
       },
     },
   );
 
-  // Filter-dropdown options come from a separate UNFILTERED load:
-  // deriving them from the filtered rows would narrow the dropdowns
-  // to the current filter (pick action=X and the action list would
-  // show only X). When no filter/search is active this shares the
-  // main query's key, so TanStack dedupes it into one fetch.
-  const optionsQuery = useAdminList<AuditLogRecord>(
-    "audit-logs",
-    "/api/v1/admin/audit-logs",
-  );
+  // D-05: the duplicate unfiltered options fetch is gone — dropdown
+  // options derive from the main query's rows. Trade-off, stated
+  // honestly: with a filter active the option lists narrow to the
+  // filtered page (a URL-restored value still shows via
+  // selectedLabel). A server distinct-values endpoint would remove
+  // this; until it exists, one fetch beats two.
 
   /* F3 (2026-11-16, follow-up): the API returns a server-resolved
      `resource_display_name` for every resource type (see
@@ -160,16 +165,16 @@ export function AuditLogsSection() {
   const resourceMaps = useResourceMaps();
 
   const actions = useMemo(
-    () => distinctSorted((optionsQuery.data ?? []).map((e) => e.action)),
-    [optionsQuery.data],
+    () => distinctSorted((query.data ?? []).map((e) => e.action)),
+    [query.data],
   );
   const resourceTypes = useMemo(
-    () => distinctSorted((optionsQuery.data ?? []).map((e) => e.resource_type)),
-    [optionsQuery.data],
+    () => distinctSorted((query.data ?? []).map((e) => e.resource_type)),
+    [query.data],
   );
   const actorTypes = useMemo(
-    () => distinctSorted((optionsQuery.data ?? []).map((e) => e.actor_type)),
-    [optionsQuery.data],
+    () => distinctSorted((query.data ?? []).map((e) => e.actor_type)),
+    [query.data],
   );
 
   const filtersActive = Boolean(
@@ -325,6 +330,29 @@ export function AuditLogsSection() {
         data={filtered}
         serverSearch
         serverPagination
+        disableSorting
+        enableRowSelection
+        bulkActions={[
+          {
+            label: "Export selected (CSV)",
+            onSelect: (rows) => {
+              downloadCsv(
+                "audit-logs.csv",
+                ["Timestamp", "Actor type", "Actor", "Action", "Resource", "Outcome", "Request ID"],
+                rows.map((r) => [
+                  r.created_at,
+                  r.actor_type,
+                  r.actor_user_id ?? "",
+                  r.action,
+                  r.resource_display_name ?? `${r.resource_type}:${r.resource_id}`,
+                  r.outcome,
+                  r.request_id,
+                ]),
+              );
+              toast({ title: "Exported", message: `${rows.length} audit event(s) downloaded as CSV.`, variant: "success" });
+            },
+          },
+        ]}
         refreshSection="audit-logs"
         filtersActive={filtersActive}
         total={query.total}
@@ -358,9 +386,9 @@ export function AuditLogsSection() {
             {/* Searchable, local mode (PLAN §29): the action vocabulary
                grows with the product (100+ event names), so a plain
                dropdown is unusable. The options are the distinct set
-               from the UNFILTERED collection (optionsQuery) — deriving
-               them from the filtered rows would narrow the dropdown to
-               the current filter. A URL-restored value shows itself
+               from the loaded page (D-05: the duplicate unfiltered
+               fetch is gone) — with a filter active the lists narrow
+               to the filtered page. A URL-restored value shows itself
                (selectedLabel) even before its rows load. */}
             <SearchableSelect
               id="audit-action-filter"

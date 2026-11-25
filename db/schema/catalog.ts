@@ -126,7 +126,11 @@ export const productReleases = pgTable(
     metadata: jsonb("metadata").notNull().default({}),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [unique("uq_product_release_version").on(table.productId, table.version, table.channel)]
+  (table) => [
+    unique("uq_product_release_version").on(table.productId, table.version, table.channel),
+    // Migration 0021 (audit C-02): releases are listed per product.
+    index("idx_product_releases_product_id").on(table.productId),
+  ]
 );
 
 export const productFeatures = pgTable(

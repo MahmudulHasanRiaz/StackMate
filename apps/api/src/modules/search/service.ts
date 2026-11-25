@@ -71,6 +71,24 @@ export function searchGlobal(
   const cap = <T>(items: T[]): T[] => items.slice(0, GLOBAL_SEARCH_MAX_PER_GROUP);
   const groups: GlobalSearchGroup[] = [];
 
+  // B-13: lookups built ONCE per search instead of `.find`/`.filter`
+  // per row — orders/licenses/subscriptions did a customers.find per
+  // row, licenses a products.find per row, and staff a
+  // user_roles.filter + roles.filter per user.
+  const customersById = new Map(state.customers.map((c) => [c.id, c]));
+  const productsById = new Map(state.products.map((p) => [p.id, p]));
+  const rolesByUserId = new Map<string, string[]>();
+  {
+    const rolesById = new Map(state.roles.map((r) => [r.id, humanizeRoleKey(r.key)]));
+    for (const ur of state.user_roles) {
+      const label = rolesById.get(ur.role_id);
+      if (!label) continue;
+      const list = rolesByUserId.get(ur.user_id);
+      if (list) list.push(label);
+      else rolesByUserId.set(ur.user_id, [label]);
+    }
+  }
+
   if (can("customers")) {
     const items: GlobalSearchItem[] = cap(
       state.customers.filter(
@@ -101,10 +119,10 @@ export function searchGlobal(
         (o) =>
           includes(o.order_number, q) ||
           includes(o.public_reference, q) ||
-          includes(state.customers.find((c) => c.id === o.customer_id)?.name, q),
+          includes(customersById.get(o.customer_id)?.name, q),
       ),
     ).map((o) => {
-      const customer = state.customers.find((c) => c.id === o.customer_id);
+      const customer = customersById.get(o.customer_id);
       return {
         type: "orders" as const,
         id: o.id,
@@ -134,12 +152,12 @@ export function searchGlobal(
       state.licenses.filter(
         (l) =>
           includes(l.license_number, q) ||
-          includes(state.customers.find((c) => c.id === l.customer_id)?.name, q) ||
-          includes(state.products.find((p) => p.id === l.product_id)?.code, q),
+          includes(customersById.get(l.customer_id)?.name, q) ||
+          includes(productsById.get(l.product_id)?.code, q),
       ),
     ).map((l) => {
-      const customer = state.customers.find((c) => c.id === l.customer_id);
-      const product = state.products.find((p) => p.id === l.product_id);
+      const customer = customersById.get(l.customer_id);
+      const product = productsById.get(l.product_id);
       return {
         type: "licenses" as const,
         id: l.id,
@@ -156,10 +174,10 @@ export function searchGlobal(
       state.subscriptions.filter(
         (s) =>
           includes(s.subscription_number, q) ||
-          includes(state.customers.find((c) => c.id === s.customer_id)?.name, q),
+          includes(customersById.get(s.customer_id)?.name, q),
       ),
     ).map((s) => {
-      const customer = state.customers.find((c) => c.id === s.customer_id);
+      const customer = customersById.get(s.customer_id);
       return {
         type: "subscriptions" as const,
         id: s.id,
@@ -210,12 +228,7 @@ export function searchGlobal(
     const items: GlobalSearchItem[] = cap(
       state.users.filter((u) => includes(u.name, q) || includes(u.email, q)),
     ).map((u) => {
-      const roleIds = new Set(
-        state.user_roles.filter((ur) => ur.user_id === u.id).map((ur) => ur.role_id),
-      );
-      const roles = state.roles
-        .filter((r) => roleIds.has(r.id))
-        .map((r) => humanizeRoleKey(r.key));
+      const roles = rolesByUserId.get(u.id) ?? [];
       return {
         type: "staff" as const,
         id: u.id,

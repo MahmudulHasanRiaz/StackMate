@@ -21,7 +21,7 @@
  *  POST   /api/v1/admin/products/:id/publish     products.update
  *  POST   /api/v1/admin/products/:id/archive     products.update
  */
-import { useState, type FormEvent } from "react";
+import { useMemo, useState, type FormEvent } from "react";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
 import { Package, Pencil, Plus } from "lucide-react";
@@ -31,6 +31,8 @@ import {
   DISTRIBUTION_CHANNELS,
 } from "../../../../packages/contracts/src/index.ts";
 import { apiRequest } from "../lib/api-client";
+import { MediaPicker } from "../components/media-picker";
+import type { MediaAssetView } from "../lib/media";
 import { detailKey, listKey } from "../lib/query";
 import {
   apiErrorMessage,
@@ -41,6 +43,7 @@ import {
   useAdminDetail,
   useAdminList,
   useAdminMutation,
+  useIdempotencyKey,
 } from "../lib/section-kit";
 import {
   Alert,
@@ -76,6 +79,10 @@ export interface ProductListItem {
   default_activation_limit: number;
   offline_grace_hours: number;
   status: "draft" | "active" | "archived";
+  /** E-13: product logo (media asset id + preview URL, when the API
+   *  returns them — absent on older API builds, rendered as "—"). */
+  logo_asset_id?: string | null;
+  logo_url?: string | null;
   website_url: string | null;
   documentation_url: string | null;
   created_at: string;
@@ -165,13 +172,17 @@ function CreateProductDialog({
   const [documentationUrl, setDocumentationUrl] = useState("");
   const [activationLimit, setActivationLimit] = useState("1");
   const [graceHours, setGraceHours] = useState("72");
+  // E-13: logo picked from the media library (ADR-0011 picker).
+  const [logo, setLogo] = useState<{ id: string; name: string; url: string } | null>(null);
+  const [logoPickerOpen, setLogoPickerOpen] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
 
-  const create = useAdminMutation({
+    const createKey = useIdempotencyKey();
+const create = useAdminMutation({
     mutationFn: (body: Record<string, unknown>) =>
       apiRequest<ProductListItem>("/api/v1/admin/products", {
-        method: "POST",
+        method: "POST", idempotencyKey: createKey,
         body: JSON.stringify(body),
       }),
     invalidateKeys: [listKey("products")],
@@ -234,6 +245,7 @@ function CreateProductDialog({
       offline_grace_hours: Number(graceHours),
     };
     if (description.trim()) body.description = description.trim();
+    if (logo) body.logo_asset_id = logo.id;
     if (channels.length > 0) body.distribution_channels = channels;
     if (websiteUrl.trim()) body.website_url = websiteUrl.trim();
     if (documentationUrl.trim()) body.documentation_url = documentationUrl.trim();
@@ -391,6 +403,44 @@ function CreateProductDialog({
           </Field>
         </div>
         <div style={{ marginTop: 16 }}>
+          <Field label="Logo" htmlFor="cp-logo" hint="Picked from the media library.">
+            <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+              {logo ? (
+                <img
+                  src={logo.url}
+                  alt={logo.name}
+                  width={40}
+                  height={40}
+                  style={{ borderRadius: 4, objectFit: "contain", background: "var(--sm-surface)" }}
+                />
+              ) : (
+                <span className="sm-muted">No logo</span>
+              )}
+              <Button
+                variant="secondary"
+                size="sm"
+                type="button"
+                onClick={() => setLogoPickerOpen(true)}
+              >
+                {logo ? "Change logo" : "Choose logo"}
+              </Button>
+              {logo ? (
+                <Button variant="ghost" size="sm" type="button" onClick={() => setLogo(null)}>
+                  Remove
+                </Button>
+              ) : null}
+            </div>
+          </Field>
+          <MediaPicker
+            open={logoPickerOpen}
+            onClose={() => setLogoPickerOpen(false)}
+            onSelect={(asset: MediaAssetView) => {
+              setLogo({ id: asset.id, name: asset.original_filename, url: asset.content_url });
+              setLogoPickerOpen(false);
+            }}
+            kinds={["image"]}
+            title="Choose product logo"
+          />
           <Field label="Description" htmlFor="cp-description">
             <Textarea
               id="cp-description"
@@ -442,22 +492,27 @@ export function ProductsSection() {
   const updateSearch = useSearchUpdater();
   const [createOpen, setCreateOpen] = useState(false);
   const search = list.q ?? "";
-  const query = useAdminList<ProductListItem>("products", "/api/v1/admin/products", {
-    q: search,
-    page: list.page,
-    pageSize: list.pageSize,
-  });
-
   const statusFilter =
     typeof raw.status === "string" &&
     (STATUS_FILTERS as readonly string[]).includes(raw.status)
       ? raw.status
       : "all";
+  const query = useAdminList<ProductListItem>("products", "/api/v1/admin/products", {
+    q: search,
+    page: list.page,
+    pageSize: list.pageSize,
+    // D-01: thread the status filter server-side (the API reads
+    // ?status= once the B-05 half lands; unknown params are ignored
+    // until then and the client filter below stays as the fallback).
+    extra: statusFilter !== "all" ? { status: statusFilter } : undefined,
+  });
   const rows = (query.data ?? []).filter((p) =>
     statusFilter === "all" ? true : p.status === statusFilter,
   );
 
-  const columns: ColumnDef<ProductListItem, unknown>[] = [
+  // D-15: memoized — every search keystroke used to rebuild the table.
+  const columns: ColumnDef<ProductListItem, unknown>[] = useMemo(
+    () => [
     {
       accessorKey: "code",
       header: "Code",
@@ -502,11 +557,49 @@ export function ProductsSection() {
       ),
     },
     {
+      // E-13: logo column (thumbnail when the API returns a URL).
+      accessorKey: "logo_url",
+      header: "Logo",
+      enableSorting: false,
+      cell: ({ row }) =>
+        row.original.logo_url ? (
+          <img
+            src={row.original.logo_url}
+            alt=""
+            width={28}
+            height={28}
+            style={{ objectFit: "contain", borderRadius: 4 }}
+          />
+        ) : (
+          "—"
+        ),
+    },
+    {
+      // E-14: distribution channels (PRD §5.2).
+      accessorKey: "distribution_channels",
+      header: "Channels",
+      enableSorting: false,
+      cell: ({ row }) =>
+        row.original.distribution_channels.length > 0 ? (
+          <span style={{ display: "inline-flex", flexWrap: "wrap", gap: 4 }}>
+            {row.original.distribution_channels.map((c) => (
+              <span key={c} className="sm-chip">
+                {sentenceCase(c)}
+              </span>
+            ))}
+          </span>
+        ) : (
+          <span className="sm-hint">Default</span>
+        ),
+    },
+    {
       accessorKey: "created_at",
       header: "Created",
       cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
     },
-  ];
+    ],
+    [],
+  );
 
   return (
     <section aria-labelledby="products-heading">
@@ -525,6 +618,7 @@ export function ProductsSection() {
         data={rows}
         serverSearch
         serverPagination
+        disableSorting
         refreshSection="products"
         filtersActive={statusFilter !== "all"}
         total={query.total}
@@ -583,6 +677,18 @@ function EditProductDialog({
   const [documentationUrl, setDocumentationUrl] = useState(
     product.documentation_url ?? "",
   );
+  // E-13: logo (media asset). The preview URL is kept when the API
+  // sent one; otherwise the picker re-resolves it on change.
+  const [logo, setLogo] = useState<{ id: string; name: string; url: string } | null>(
+    product.logo_asset_id
+      ? {
+          id: product.logo_asset_id,
+          name: "Current logo",
+          url: product.logo_url ?? "",
+        }
+      : null,
+  );
+  const [logoPickerOpen, setLogoPickerOpen] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
 
@@ -626,6 +732,7 @@ function EditProductDialog({
         description: description.trim() ? description.trim() : null,
         website_url: websiteUrl.trim() ? websiteUrl.trim() : null,
         documentation_url: documentationUrl.trim() ? documentationUrl.trim() : null,
+        logo_asset_id: logo ? logo.id : null,
       },
       { onError: (err) => setSubmitError(apiErrorMessage(err)) },
     );
@@ -694,6 +801,46 @@ function EditProductDialog({
           </Field>
         </div>
         <div style={{ marginTop: 16 }}>
+          <Field label="Logo" htmlFor="ep-logo" hint="Picked from the media library.">
+            <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+              {logo && logo.url ? (
+                <img
+                  src={logo.url}
+                  alt={logo.name}
+                  width={40}
+                  height={40}
+                  style={{ borderRadius: 4, objectFit: "contain", background: "var(--sm-surface)" }}
+                />
+              ) : logo ? (
+                <span className="sm-mono">{logo.id.slice(0, 8)}…</span>
+              ) : (
+                <span className="sm-muted">No logo</span>
+              )}
+              <Button
+                variant="secondary"
+                size="sm"
+                type="button"
+                onClick={() => setLogoPickerOpen(true)}
+              >
+                {logo ? "Change logo" : "Choose logo"}
+              </Button>
+              {logo ? (
+                <Button variant="ghost" size="sm" type="button" onClick={() => setLogo(null)}>
+                  Remove
+                </Button>
+              ) : null}
+            </div>
+          </Field>
+          <MediaPicker
+            open={logoPickerOpen}
+            onClose={() => setLogoPickerOpen(false)}
+            onSelect={(asset: MediaAssetView) => {
+              setLogo({ id: asset.id, name: asset.original_filename, url: asset.content_url });
+              setLogoPickerOpen(false);
+            }}
+            kinds={["image"]}
+            title="Choose product logo"
+          />
           <Field label="Description" htmlFor="ep-description">
             <Textarea
               id="ep-description"
@@ -720,10 +867,11 @@ export function ProductDetailSection({ id }: { id: string }) {
     `/api/v1/admin/products/${id}`,
   );
 
-  const setStatus = useAdminMutation({
+    const setStatusKey = useIdempotencyKey();
+const setStatus = useAdminMutation({
     mutationFn: (action: "publish" | "archive") =>
       apiRequest<ProductDetailDto>(`/api/v1/admin/products/${id}/${action}`, {
-        method: "POST",
+        method: "POST", idempotencyKey: setStatusKey,
       }),
     invalidateKeys: [detailKey("products", id), listKey("products")],
     successTitle: "Product updated",

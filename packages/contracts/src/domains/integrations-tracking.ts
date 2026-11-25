@@ -184,5 +184,50 @@ export const CreateStaffInvitationSchema = v.object({
 export const AcceptStaffInvitationSchema = v.object({
   token: v.string().trim().min(32).max(200),
   name: v.string().trim().min(2).max(200),
-  password: v.string().min(10).max(200),
+  // F-05: length-only is no longer the whole policy — a common /
+  // breached password is rejected here too (same check as the
+  // server-side assertPasswordNotCommon in identity/service.ts).
+  password: v
+    .string()
+    .min(10)
+    .max(200)
+    .refine(
+      (pw) => !isCommonPassword(pw),
+      "This password is too common or has appeared in data breaches. Choose a different password."
+    ),
 });
+
+/**
+ * Common / breached passwords (audit F-05, offline list — no new
+ * dependency, no network call). The ≥10 length floor is unchanged and
+ * no character-class rules are added; this only rejects passwords
+ * that appear in well-known breach corpora (RockYou / HaveIBeenPwned
+ * top entries) or are a listed base word with trailing digits
+ * ("Password1234", "admin2024"). Matching is case-insensitive.
+ * The identity service reuses this exact list server-side so the
+ * schema and the service can never drift apart.
+ */
+export const COMMON_PASSWORDS: ReadonlySet<string> = new Set([
+  "password", "password1", "password123", "password1234", "password12345",
+  "passw0rd", "passwd", "pass123", "pass1234",
+  "123456", "12345678", "123456789", "1234567890", "12345", "1234567",
+  "123123", "123321", "111111", "11111111", "000000", "00000000",
+  "qwerty", "qwerty123", "qwertyuiop", "asdfgh", "asdfghjkl", "zxcvbnm",
+  "abc123", "abc1234", "abcd1234", "1qaz2wsx", "1q2w3e4r", "qazwsx",
+  "letmein", "welcome", "welcome1", "welcome123", "login", "admin",
+  "admin123", "admin1234", "administrator", "root", "toor",
+  "monkey", "dragon", "master", "sunshine", "princess", "football",
+  "shadow", "superman", "michael", "charlie", "jordan", "tigger",
+  "secret", "changeme", "change-me", "default", "test", "test123",
+  "test1234", "demo", "demo123", "user", "user123",
+  "stackmate", "stackmate123", "riaz", "mahmudul",
+  "iloveyou", "trustno1", "hello123", "freedom", "whatever",
+]);
+
+export function isCommonPassword(password: string): boolean {
+  const normalized = password.trim().toLowerCase();
+  if (COMMON_PASSWORDS.has(normalized)) return true;
+  // Listed base word + trailing digits ("password2024", "admin99").
+  const base = normalized.replace(/\d+$/, "");
+  return base.length >= 3 && base !== normalized && COMMON_PASSWORDS.has(base);
+}

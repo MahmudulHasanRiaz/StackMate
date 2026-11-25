@@ -141,6 +141,48 @@
       "when": 1795615885883,
       "tag": "0019_expense_permissions",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "8",
+      "when": 1795621800000,
+      "tag": "0020_audit_c01_skipped_constraints_reattempt",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "8",
+      "when": 1795621801000,
+      "tag": "0021_fk_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "8",
+      "when": 1795621802000,
+      "tag": "0022_media_search_trgm",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "8",
+      "when": 1795621803000,
+      "tag": "0023_subscription_invoice_payment_fks",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "8",
+      "when": 1795621804000,
+      "tag": "0024_scheduled_job_runs",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "8",
+      "when": 1795621805000,
+      "tag": "0025_sent_reminders_reference_index",
+      "breakpoints": true
     }
   ]
 }

@@ -143,6 +143,8 @@ export interface ProductRecord {
   status: "draft" | "active" | "archived";
   website_url: string | null;
   documentation_url: string | null;
+  /** E-13 (PRD §5.1): R2 object reference — uploaded_assets.id, or null. */
+  logo_asset_id?: string | null;
   created_by_user_id: string | null;
   created_at: string;
   updated_at: string;
@@ -933,8 +935,60 @@ export interface DatabaseState {
   };
 }
 
+/**
+ * F-12: canonical JSON serialisation — object keys sorted recursively,
+ * so the same logical payload hashes identically regardless of key
+ * order. The old `JSON.stringify(requestPayload)` preserved insertion
+ * order, so a legitimate retry serialised with different key order
+ * hashed differently and got a false 409 IDEMPOTENCY_KEY_REUSED.
+ */
+export function canonicalStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value) ?? "null";
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => canonicalStringify(v)).join(",")}]`;
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys
+    .map((k) => `${JSON.stringify(k)}:${canonicalStringify(obj[k])}`)
+    .join(",")}}`;
+}
+
+/**
+ * Options for executeIdempotent. `sanitizeStoredBody` strips secrets
+ * from the body before it is persisted (A-03: the checkout response
+ * carries a 2h bearer token that must never land in
+ * idempotency_records.response_body); the fresh caller still receives
+ * the real body. `reissueBody` rebuilds the live body from the stored
+ * (sanitized) record on replay — e.g. re-issuing the checkout token
+ * deterministically from its stored payload.
+ */
+export interface IdempotentCommandOptions<T> {
+  sanitizeStoredBody?: (body: T) => unknown;
+  reissueBody?: (stored: unknown) => T;
+}
+
 export class StackMateDataStore {
   public state: DatabaseState;
+  /**
+   * Audit Batch B (A-11): when this store's state was last loaded from
+   * the database (DrizzleStore sets it in loadStateInternal; the
+   * in-memory store's state IS the source of truth, so it is set at
+   * construction). `isStateFresh()` lets callers skip a redundant
+   * reload when the store was created in this request — every admin
+   * request used to pay create-load + principal reload + (for writes)
+   * a third load inside withTransaction.
+   */
+  public loadedAtMs: number | null = null;
+
+  /** True when the state was loaded recently (default: within 30s). */
+  public isStateFresh(maxAgeMs = 30_000): boolean {
+    const at = this.loadedAtMs;
+    if (at === null) return false;
+    return Date.now() - at <= maxAgeMs;
+  }
   /**
    * Object-storage bucket for private payment evidence. Typed as the
    * R2BucketBinding interface (not the in-memory implementation) so a real
@@ -966,6 +1020,9 @@ export class StackMateDataStore {
     const keyMat = generateEd25519KeyMaterial(initialSigningKeyId);
     this.signingKeys.set(initialSigningKeyId, keyMat);
     this.activeSigningKeyId = initialSigningKeyId;
+    // A-11: the in-memory state is the source of truth — it is
+    // "loaded" at construction and never goes stale.
+    this.loadedAtMs = Date.now();
 
     this.state = {
       users: [],
@@ -1141,13 +1198,17 @@ export class StackMateDataStore {
 
     await prevMutex;
     this.queryMetrics.uncachedQueries += 1;
-    const snapshotJson = JSON.stringify(this.state);
+    // B-04: ONE parse of the snapshot. The parsed `before` object is
+    // the rollback target too — the old code stringified once, parsed
+    // for the diff, and parsed AGAIN on rollback, so every transaction
+    // paid two whole-state JSON parses (CPU + memory ∝ total DB size).
+    const before = JSON.parse(JSON.stringify(this.state)) as DatabaseState;
     try {
       const result = await fn(this.state);
       this.queryMetrics.transactionsCommitted += 1;
       return result;
     } catch (error) {
-      this.state = JSON.parse(snapshotJson) as DatabaseState;
+      this.state = before;
       this.queryMetrics.transactionsRolledBack += 1;
       throw error;
     } finally {
@@ -1169,12 +1230,32 @@ export class StackMateDataStore {
    * upsert on `rate_limit_buckets`, which is what makes the limit
    * survive across requests on Workers (the pre-fix in-app Map was
    * recreated on every fetch() and never tripped).
+   *
+   * B-09: `options.skipWhenLimitedBy` names a more specific bucket
+   * (e.g. the per-account sign-in lockout). When that bucket is
+   * already limited, the generic bucket is skipped entirely.
    */
   public async checkRateLimit(
     bucketKey: string,
     maxRequests: number,
-    windowMs = 60_000
+    windowMs = 60_000,
+    options?: {
+      skipWhenLimitedBy?: {
+        bucketKey: string;
+        maxRequests: number;
+        windowMs?: number;
+      };
+    }
   ): Promise<void> {
+    const skip = options?.skipWhenLimitedBy;
+    if (skip) {
+      const alreadyLimited = await this.isRateLimited(
+        skip.bucketKey,
+        skip.maxRequests,
+        skip.windowMs ?? 60_000
+      );
+      if (alreadyLimited) return;
+    }
     const now = Date.now();
     const entry = this.rateLimitBuckets.get(bucketKey);
     if (!entry || now >= entry.resetAtMs) {
@@ -1239,13 +1320,27 @@ export class StackMateDataStore {
 
   /**
    * Executes a deterministic idempotent command (Database Design §18.5, API Spec §20).
+   *
+   * F-12: the request hash is canonical (recursively sorted keys).
+   * F-13: `expires_at` is enforced — an expired record is treated as
+   * absent (deleted in the same transaction) and the command runs
+   * fresh; a replay after expiry never returns the stored body.
+   * F-14: a `processing` record is inserted BEFORE `fn` runs, so a
+   * concurrent duplicate sees IDEMPOTENCY_IN_PROGRESS (409) instead
+   * of waiting blindly; on `fn` failure the marker is removed, so a
+   * retry is allowed (and the enclosing transaction's rollback removes
+   * it anyway on the Drizzle path).
+   * A-03: when `options.sanitizeStoredBody` is given, only the
+   * sanitized body is persisted; replays rebuild the live body via
+   * `options.reissueBody`.
    */
   public async executeIdempotent<T>(
     scopeKey: string,
     idempotencyKey: string,
     requestPayload: unknown,
     statusCode: number,
-    fn: (state: DatabaseState) => Promise<T> | T
+    fn: (state: DatabaseState) => Promise<T> | T,
+    options?: IdempotentCommandOptions<T>
   ): Promise<{ status: number; body: T; replayed: boolean }> {
     const trimmedKey = idempotencyKey.trim();
     if (trimmedKey.length < 8 || trimmedKey.length > 128) {
@@ -1255,12 +1350,15 @@ export class StackMateDataStore {
         400
       );
     }
-    const requestHash = sha256Hex(JSON.stringify(requestPayload ?? {}));
+    const requestHash = sha256Hex(canonicalStringify(requestPayload ?? {}));
 
     return this.withTransaction(async (state) => {
-      const existing = state.idempotency_records.find(
+      const nowMs = Date.now();
+      const existingIdx = state.idempotency_records.findIndex(
         (r) => r.scope_key === scopeKey && r.idempotency_key === trimmedKey
       );
+      const existing =
+        existingIdx >= 0 ? state.idempotency_records[existingIdx] : undefined;
       if (existing) {
         if (existing.request_hash !== requestHash) {
           throw new AppError(
@@ -1269,32 +1367,60 @@ export class StackMateDataStore {
             409
           );
         }
-        if (existing.status === "processing") {
-          throw new AppError(
-            "IDEMPOTENCY_IN_PROGRESS",
-            "A request with this Idempotency-Key is currently processing.",
-            409
-          );
+        // F-13: expired records are absent, not replayable — delete
+        // and fall through to a fresh execution.
+        if (new Date(existing.expires_at).getTime() <= nowMs) {
+          state.idempotency_records.splice(existingIdx, 1);
+        } else {
+          if (existing.status === "processing") {
+            throw new AppError(
+              "IDEMPOTENCY_IN_PROGRESS",
+              "A request with this Idempotency-Key is currently processing.",
+              409
+            );
+          }
+          return {
+            status: existing.response_status,
+            body: options?.reissueBody
+              ? options.reissueBody(existing.response_body)
+              : (existing.response_body as T),
+            replayed: true,
+          };
         }
-        return {
-          status: existing.response_status,
-          body: existing.response_body as T,
-          replayed: true,
-        };
       }
 
-      const body = await fn(state);
-      state.idempotency_records.push({
+      // F-14: claim the key BEFORE running fn.
+      const record: IdempotencyRecord = {
         id: randomUUID(),
         scope_key: scopeKey,
         idempotency_key: trimmedKey,
         request_hash: requestHash,
-        status: "completed",
+        status: "processing",
         response_status: statusCode,
-        response_body: body,
-        expires_at: new Date(Date.now() + 24 * 3600 * 1000).toISOString(),
-        created_at: new Date().toISOString(),
-      });
+        response_body: null,
+        expires_at: new Date(nowMs + 24 * 3600 * 1000).toISOString(),
+        created_at: new Date(nowMs).toISOString(),
+      };
+      state.idempotency_records.push(record);
+
+      let body: T;
+      try {
+        body = await fn(state);
+      } catch (err) {
+        // F-14: a failed command must not leave a processing marker
+        // behind — remove it so the next retry runs fn again. (The
+        // enclosing transaction's rollback removes it as well on the
+        // Drizzle path; this covers the in-memory path explicitly.)
+        const markerIdx = state.idempotency_records.indexOf(record);
+        if (markerIdx >= 0) state.idempotency_records.splice(markerIdx, 1);
+        throw err;
+      }
+
+      record.status = "completed";
+      // A-03: persist only the sanitized body — never a live token.
+      record.response_body = options?.sanitizeStoredBody
+        ? options.sanitizeStoredBody(body)
+        : body;
 
       return { status: statusCode, body, replayed: false };
     });

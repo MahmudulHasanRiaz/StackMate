@@ -28,23 +28,25 @@
  * picked file's bytes are fetched back and sent through the unchanged
  * base64 evidence endpoint.
  */
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import type { ColumnDef } from "@tanstack/react-table";
 import { AlertTriangle, ClipboardCheck, Plus } from "lucide-react";
 import { ApiClientError, apiRequest, formatMinorMoney } from "../lib/api-client";
-import { detailKey, listKey } from "../lib/query";
+import { detailKey, listKey, queryClient } from "../lib/query";
 import {
   DetailFacts,
   DetailLayout,
   ListTable,
   PageHeader,
+  downloadCsv,
   loadListOptions,
   parseListSearch,
   useAdminDetail,
   useAdminList,
   useAdminMutation,
+  useIdempotencyKey,
   type ListSearch,
 } from "../lib/section-kit";
 import { MediaPicker } from "../components/media-picker";
@@ -70,10 +72,11 @@ import {
   StatusBadge,
   Tabs,
   Textarea,
+  useToast,
 } from "../components/primitives";
 import { shortId } from "../lib/resolve-names";
 import type { PaymentMethod } from "./payment-methods";
-import { normalizeDateInput, normalizePastedDate } from "../lib/dates";
+import { ddmmyyyyToIso, normalizeDateInput, normalizePastedDate } from "../lib/dates";
 
 /* ------------------------------------------------------------------ */
 /* Types (mirror apps/api/src/platform/db/store.ts + contracts)        */
@@ -119,6 +122,10 @@ export interface PaymentSubmission {
   customer_credit_balance_minor?: number | null;
   customer_name?: string | null;
   payment_method_name?: string | null;
+  /** E-15: Product + Gateway columns (PRD §11.6) — sent by the API
+   *  once the list DTO carries them; "—" on older API builds. */
+  product_name?: string | null;
+  gateway_name?: string | null;
   submitted_date_display?: string | null;
   verification_logs?: PaymentVerificationLog[];
 }
@@ -203,12 +210,17 @@ function useListSearch() {
 
 function useGoDetail(base: string, param: string) {
   const navigate = useNavigate();
-  return (id: string) =>
-    (navigate as unknown as (opts: { to: string; params: Record<string, string> }) => void)({
-      to: `${base}/$${param}`,
-      params: { [param]: id },
-    });
+  return useCallback(
+    (id: string) =>
+      (navigate as unknown as (opts: { to: string; params: Record<string, string> }) => void)({
+        to: `${base}/$${param}`,
+        params: { [param]: id },
+      }),
+    [navigate, base, param],
+  );
 }
+
+
 
 /* ------------------------------------------------------------------ */
 /* Payment Review — queue list                                         */
@@ -221,36 +233,52 @@ export function PaymentReviewSection() {
   const [tab, setTab] = useState<"submissions" | "refunds">("submissions");
   const [refundOpen, setRefundOpen] = useState(false);
 
+  // D-01: thread ?status= server-side, together with two separate
+  // unfiltered count queries (pageSize 1 — only their `total` is
+  // read) so the header's pending count stays the TRUE pending total
+  // even when the chip filter is not "all". The client filter below
+  // stays as the fallback until the API reads ?status=.
+  const [sort, setSort] = useState<string | undefined>(undefined);
   const submissions = useAdminList<PaymentSubmission>(
     "payment-submissions",
     "/api/v1/admin/payment-submissions",
-    // No `extra` here on purpose: the header's pendingCount is
-    // derived from this same query, so a server-side ?status= would
-    // zero it whenever the chip filter is not "all". The status
-    // filter stays client-side over the loaded page; thread
-    // ?status= only together with a separate unfiltered count query.
-    { q: parsed.q, page: parsed.page, pageSize: parsed.pageSize },
+    {
+      q: parsed.q,
+      page: parsed.page,
+      pageSize: parsed.pageSize,
+      extra: {
+        ...(statusFilter !== "all" ? { status: statusFilter } : {}),
+        ...(sort ? { sort } : {}),
+      },
+    },
   );
-  // SPA M-22: default newest-first by submitted_at (the server ORDER
-  // BY is the core API agent's job; this keeps the list stable until
-  // then and guards the transient inconsistency the audit saw).
-  const filtered = useMemo(
-    () =>
-      (submissions.data ?? [])
-        .filter((s) => (statusFilter === "all" ? true : s.status === statusFilter))
-        .slice()
-        .sort((a, b) => b.submitted_at.localeCompare(a.submitted_at)),
-    [submissions.data, statusFilter],
+  const pendingSubmitted = useAdminList<PaymentSubmission>(
+    "payment-submissions",
+    "/api/v1/admin/payment-submissions",
+    { page: 1, pageSize: 1, extra: { status: "submitted" } },
   );
-  const pendingCount = useMemo(
-    () =>
-      (submissions.data ?? []).filter(
-        (s) => s.status === "submitted" || s.status === "under_review",
-      ).length,
-    [submissions.data],
+  const pendingUnderReview = useAdminList<PaymentSubmission>(
+    "payment-submissions",
+    "/api/v1/admin/payment-submissions",
+    { page: 1, pageSize: 1, extra: { status: "under_review" } },
   );
+  const pendingCount = pendingSubmitted.total + pendingUnderReview.total;
+  // SPA M-22: default newest-first by submitted_at. When a server
+  // sort is active the rows arrive already ordered — do not re-sort
+  // them client-side (that would undo an ascending sort).
+  const filtered = useMemo(() => {
+    const rows = (submissions.data ?? []).filter((s) =>
+      statusFilter === "all" ? true : s.status === statusFilter,
+    );
+    return sort
+      ? rows
+      : rows.slice().sort((a, b) => b.submitted_at.localeCompare(a.submitted_at));
+  }, [submissions.data, statusFilter, sort]);
+  const { toast } = useToast();
 
-  const columns: ColumnDef<PaymentSubmission, unknown>[] = [
+  // D-15: memoized — goDetail is the only changing dep (useCallback).
+  const columns: ColumnDef<PaymentSubmission, unknown>[] = useMemo(
+    () => [
     {
       accessorKey: "id",
       header: "Submission",
@@ -269,6 +297,20 @@ export function PaymentReviewSection() {
       accessorKey: "customer_name",
       header: "Customer",
       cell: ({ row }) => row.original.customer_name ?? "—",
+    },
+    {
+      // E-15: Product column (PRD §11.6).
+      accessorKey: "product_name",
+      header: "Product",
+      enableSorting: false,
+      cell: ({ row }) => row.original.product_name ?? "—",
+    },
+    {
+      // E-15: Gateway column (PRD §11.6).
+      accessorKey: "gateway_name",
+      header: "Gateway",
+      enableSorting: false,
+      cell: ({ row }) => row.original.gateway_name ?? "—",
     },
     {
       accessorKey: "payment_method_name",
@@ -311,7 +353,9 @@ export function PaymentReviewSection() {
         </Button>
       ),
     },
-  ];
+    ],
+    [goDetail],
+  );
 
   return (
     <section aria-labelledby="payment-review-heading">
@@ -349,6 +393,31 @@ export function PaymentReviewSection() {
         data={filtered}
         serverSearch
         serverPagination
+        serverSort={{ sortableColumns: ["submitted_at"], value: sort, onChange: setSort }}
+        enableRowSelection
+        bulkActions={[
+          {
+            label: "Export selected (CSV)",
+            onSelect: (rows) => {
+              downloadCsv(
+                "payment-submissions.csv",
+                ["Submission", "Order", "Customer", "Product", "Gateway", "Method", "Amount", "Status", "Submitted"],
+                rows.map((r) => [
+                  r.id,
+                  r.order_number ?? "",
+                  r.customer_name ?? "",
+                  r.product_name ?? "",
+                  r.gateway_name ?? "",
+                  r.payment_method_name ?? "",
+                  formatMinorMoney(r.amount_minor, r.currency_code),
+                  r.status,
+                  r.submitted_at,
+                ]),
+              );
+              toast({ title: "Exported", message: `${rows.length} submission(s) downloaded as CSV.`, variant: "success" });
+            },
+          },
+        ]}
         refreshSection="payment-submissions"
         filtersActive={statusFilter !== "all"}
         total={submissions.total}
@@ -416,64 +485,67 @@ function RefundsList() {
     pageSize: parsed.pageSize,
   });
 
-  const columns: ColumnDef<PaymentRefund, unknown>[] = [
-    {
-      accessorKey: "id",
-      header: "Refund",
-      cell: ({ row }) => (
-        <span>
-          <span className="sm-mono">{shortId(row.original.id)}</span>
-          <CopyButton value={row.original.id} label="Copy refund ID" />
-        </span>
-      ),
-    },
-    {
-      accessorKey: "payment_transaction_id",
-      header: "Transaction",
-      cell: ({ row }) => (
-        <span className="sm-mono">{shortId(row.original.payment_transaction_id)}</span>
-      ),
-    },
-    {
-      accessorKey: "amount_minor",
-      header: "Amount",
-      cell: ({ row }) => (
-        <MoneyCell currency={row.original.currency_code} minor={row.original.amount_minor} />
-      ),
-    },
-    {
-      accessorKey: "status",
-      header: "Status",
-      cell: ({ row }) => <StatusBadge status={row.original.status} />,
-    },
-    {
-      accessorKey: "reason",
-      header: "Reason",
-      cell: ({ row }) => <span className="sm-cell-text">{row.original.reason}</span>,
-    },
-    {
-      accessorKey: "provider_refund_id",
-      header: "Provider ref",
-      cell: ({ row }) => (
-        <span className="sm-mono">{row.original.provider_refund_id ?? "—"}</span>
-      ),
-    },
-    {
-      accessorKey: "created_at",
-      header: "Created",
-      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
-    },
-    {
-      id: "actions",
-      header: "",
-      enableSorting: false,
-      cell: ({ row }) => (
-        <Button variant="ghost" size="sm" onClick={() => setSelected(row.original)}>
-          View
-        </Button>
-      ),
-    },
-  ];
+  const columns: ColumnDef<PaymentRefund, unknown>[] = useMemo(
+    () => [
+      {
+        accessorKey: "id",
+        header: "Refund",
+        cell: ({ row }) => (
+          <span>
+            <span className="sm-mono">{shortId(row.original.id)}</span>
+            <CopyButton value={row.original.id} label="Copy refund ID" />
+          </span>
+        ),
+      },
+      {
+        accessorKey: "payment_transaction_id",
+        header: "Transaction",
+        cell: ({ row }) => (
+          <span className="sm-mono">{shortId(row.original.payment_transaction_id)}</span>
+        ),
+      },
+      {
+        accessorKey: "amount_minor",
+        header: "Amount",
+        cell: ({ row }) => (
+          <MoneyCell currency={row.original.currency_code} minor={row.original.amount_minor} />
+        ),
+      },
+      {
+        accessorKey: "status",
+        header: "Status",
+        cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      },
+      {
+        accessorKey: "reason",
+        header: "Reason",
+        cell: ({ row }) => <span className="sm-cell-text">{row.original.reason}</span>,
+      },
+      {
+        accessorKey: "provider_refund_id",
+        header: "Provider ref",
+        cell: ({ row }) => (
+          <span className="sm-mono">{row.original.provider_refund_id ?? "—"}</span>
+        ),
+      },
+      {
+        accessorKey: "created_at",
+        header: "Created",
+        cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
+      },
+      {
+        id: "actions",
+        header: "",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <Button variant="ghost" size="sm" onClick={() => setSelected(row.original)}>
+            View
+          </Button>
+        ),
+      },
+  ],
+    [],
+  )
 
   return (
     <>
@@ -556,11 +628,14 @@ function RecordRefundForm({ onDone, onCancel }: { onDone: () => void; onCancel: 
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
+  // A-04: one key per form instance — a retried refund replays.
+  const formKey = useIdempotencyKey();
   const mutation = useAdminMutation<{ refund: PaymentRefund }, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<{ refund: PaymentRefund }>("/api/v1/admin/refunds", {
         method: "POST",
         body: JSON.stringify(body),
+        idempotencyKey: formKey,
       }),
     invalidateKeys: [listKey("refunds"), listKey("orders")],
     successTitle: "Refund recorded",
@@ -713,7 +788,7 @@ function RecordRefundForm({ onDone, onCancel }: { onDone: () => void; onCancel: 
           <Alert variant="danger">{formError}</Alert>
         </div>
       ) : null}
-      <div className="sm-dialog-footer" style={{ padding: 0, marginTop: 20 }}>
+      <div className="sm-dialog-footer sm-dialog-footer-flush">
         <Button variant="secondary" onClick={onCancel}>
           Cancel
         </Button>
@@ -806,6 +881,8 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
   });
   const [installmentId, setInstallmentId] = useState("");
 
+  // A-04: one key per form instance — a retried claim replays.
+  const formKey = useIdempotencyKey();
   const mutation = useAdminMutation<
     { payment_submission: PaymentSubmission; order: OrderSummary },
     Record<string, unknown>
@@ -813,7 +890,7 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
     mutationFn: (body) =>
       apiRequest<{ payment_submission: PaymentSubmission; order: OrderSummary }>(
         `/api/v1/admin/orders/${orderId}/payment-submissions`,
-        { method: "POST", body: JSON.stringify(body) },
+        { method: "POST", body: JSON.stringify(body), idempotencyKey: formKey },
       ),
     invalidateKeys: [listKey("payment-submissions"), listKey("orders")],
     successTitle: "Payment recorded for review",
@@ -865,8 +942,9 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
       next.transaction_id = "Transaction ID must be at most 160 characters.";
     if (customerNote.trim().length > 1000)
       next.customer_note = "Customer note must be at most 1000 characters.";
-    if (paymentDate.trim() && !/^\d{2}\/\d{2}\/\d{4}$/.test(paymentDate.trim()))
-      next.payment_date_display = "Use DD/MM/YYYY.";
+    // D-06: strict validation — the regex alone accepted 99/99/2026.
+    if (paymentDate.trim() && ddmmyyyyToIso(paymentDate.trim()) === null)
+      next.payment_date_display = "Use a valid DD/MM/YYYY date.";
     setErrors(next);
     if (Object.keys(next).length > 0) return;
 
@@ -880,6 +958,9 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
           `/api/v1/admin/orders/${orderId}/payment-evidence`,
           {
             method: "POST",
+            // A-04: the form's key — a retried evidence upload replays
+            // instead of storing the same file twice.
+            idempotencyKey: formKey,
             body: JSON.stringify({
               filename: evidenceFile.name,
               content_type: evidenceFile.type || "application/octet-stream",
@@ -1130,7 +1211,7 @@ function RecordPaymentForm({ onDone, onCancel }: { onDone: () => void; onCancel:
           <Alert variant="danger">{formError}</Alert>
         </div>
       ) : null}
-      <div className="sm-dialog-footer" style={{ padding: 0, marginTop: 20 }}>
+      <div className="sm-dialog-footer sm-dialog-footer-flush">
         <Button variant="secondary" onClick={onCancel}>
           Cancel
         </Button>
@@ -1386,11 +1467,14 @@ function ApproveForm({
   const orderRemaining = submission.order_remaining_minor ?? submission.amount_minor;
   const maxCredit = Math.max(0, Math.min(creditBalance, orderRemaining));
 
+  // A-04: one key per form instance — a retried approval replays.
+  const formKey = useIdempotencyKey();
   const mutation = useAdminMutation<unknown, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<unknown>(`/api/v1/admin/payment-submissions/${submission.id}/approve`, {
         method: "POST",
         body: JSON.stringify(body),
+        idempotencyKey: formKey,
       }),
     invalidateKeys: [
       detailKey("payment-submissions", submission.id),
@@ -1517,7 +1601,7 @@ function ApproveForm({
           <Alert variant="danger">{formError}</Alert>
         </div>
       ) : null}
-      <div className="sm-dialog-footer" style={{ padding: 0, marginTop: 20 }}>
+      <div className="sm-dialog-footer sm-dialog-footer-flush">
         <Button variant="secondary" onClick={onCancel}>
           Cancel
         </Button>
@@ -1547,11 +1631,14 @@ function RejectForm({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [formError, setFormError] = useState<string | null>(null);
 
+  // A-04: one key per form instance — a retried rejection replays.
+  const formKey = useIdempotencyKey();
   const mutation = useAdminMutation<unknown, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<unknown>(`/api/v1/admin/payment-submissions/${submission.id}/reject`, {
         method: "POST",
         body: JSON.stringify(body),
+        idempotencyKey: formKey,
       }),
     invalidateKeys: [
       detailKey("payment-submissions", submission.id),
@@ -1634,7 +1721,7 @@ function RejectForm({
           <Alert variant="danger">{formError}</Alert>
         </div>
       ) : null}
-      <div className="sm-dialog-footer" style={{ padding: 0, marginTop: 20 }}>
+      <div className="sm-dialog-footer sm-dialog-footer-flush">
         <Button variant="secondary" onClick={onCancel}>
           Cancel
         </Button>

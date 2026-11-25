@@ -41,6 +41,7 @@ import {
   TableSkeleton,
   Textarea,
   useToast,
+  GroupField,
 } from "../components/primitives";
 import { MediaPicker } from "../components/media-picker";
 import { fetchMediaFile, type MediaAssetView } from "../lib/media";
@@ -211,7 +212,10 @@ function GeneralSettingsForm({ initial }: { initial: GeneralSettingsView }) {
             onChange={(e) => setAppName(e.target.value)}
             maxLength={120}
             required
-            autoComplete="off"
+            // D-09: "off" is ignored by browsers and blocks password
+            // managers from offering the right fill; "organization"
+            // is the correct token for an app/organization name.
+            autoComplete="organization"
           />
         </Field>
         <Field label="App title" htmlFor="general-app-title" hint="The browser tab title.">
@@ -222,7 +226,7 @@ function GeneralSettingsForm({ initial }: { initial: GeneralSettingsView }) {
             onChange={(e) => setAppTitle(e.target.value)}
             maxLength={120}
             required
-            autoComplete="off"
+            autoComplete="organization"
           />
         </Field>
         <Field label="App description" htmlFor="general-app-description" hint="Short tagline — shown on the sign-in page and used as the meta description.">
@@ -243,11 +247,13 @@ function GeneralSettingsForm({ initial }: { initial: GeneralSettingsView }) {
             value={supportEmail}
             onChange={(e) => setSupportEmail(e.target.value)}
             maxLength={200}
-            autoComplete="off"
+            // D-09: the email token lets the browser offer the right
+            // address instead of treating this as a generic text field.
+            autoComplete="email"
             placeholder="support@example.com"
           />
         </Field>
-        <Field label="Favicon" hint="PNG, ICO, or SVG, up to 256 KB. Stored in the selected storage driver (Settings → Storage) and served at /api/v1/favicon.">
+        <GroupField label="Favicon" hint="PNG, ICO, or SVG, up to 256 KB. Stored in the selected storage driver (Settings → Storage) and served at /api/v1/favicon.">
           <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
             {faviconUrl ? (
               <img
@@ -298,7 +304,7 @@ function GeneralSettingsForm({ initial }: { initial: GeneralSettingsView }) {
             ) : null}
           </div>
           {faviconInfo ? <div className="sm-muted" style={{ marginTop: 6 }}>{faviconInfo}</div> : null}
-        </Field>
+        </GroupField>
         <div className="sm-form-actions">
           <Button type="submit" variant="accent" disabled={saveMutation.isPending}>
             {saveMutation.isPending ? "Saving…" : "Save general settings"}

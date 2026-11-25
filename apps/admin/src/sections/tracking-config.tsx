@@ -10,6 +10,10 @@
  *   POST   /api/v1/admin/integrated-sites/:siteId/tracking
  *   PATCH  /api/v1/admin/integrated-sites/:siteId/tracking/:configId
  *   DELETE /api/v1/admin/integrated-sites/:siteId/tracking/:configId
+ *   POST   /api/v1/admin/tracking/test-event { pixel_group_id,
+ *     event_name? } — "Send test event" per pixel group (E-18).
+ *     Until Batch 4 lands real CAPI delivery the result is honest
+ *     about being recorded/simulated, never "delivered".
  *
  * A pixel group is one (provider, pixel_id) configuration for one
  * site (migration 0006). Several groups per provider are allowed —
@@ -26,7 +30,7 @@
  */
 import { useState, type FormEvent } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { BarChart3, Pencil, Plus, Trash2 } from "lucide-react";
+import { BarChart3, FlaskConical, Pencil, Plus, Trash2 } from "lucide-react";
 import { apiRequest } from "../lib/api-client";
 import { detailKey } from "../lib/query";
 import {
@@ -35,6 +39,7 @@ import {
   useAdminDetail,
   useAdminList,
   useAdminMutation,
+  useIdempotencyKey,
 } from "../lib/section-kit";
 import {
   Alert,
@@ -55,6 +60,7 @@ import {
   TableSkeleton,
   Toolbar,
   useConfirm,
+  GroupField,
 } from "../components/primitives";
 import type { IntegratedSite, TrackingConfig } from "./integrations";
 
@@ -168,6 +174,8 @@ function TrackingGroups({ site }: { site: IntegratedSite }) {
     | { mode: "create" }
     | { mode: "edit"; config: TrackingConfig }
   >(null);
+  const [testTarget, setTestTarget] = useState<TrackingConfig | null>(null);
+  const [testResult, setTestResult] = useState<string | null>(null);
   const confirm = useConfirm();
 
   const query = useAdminDetail<{ items: TrackingConfig[] }>(
@@ -177,11 +185,14 @@ function TrackingGroups({ site }: { site: IntegratedSite }) {
   );
   const groups = query.data?.items ?? [];
 
+  // A-04: one key per component instance for each consequential POST.
+  const toggleKey = useIdempotencyKey();
+  const testKey = useIdempotencyKey();
   const toggle = useAdminMutation<TrackingConfig, { id: string; status: string }>({
     mutationFn: ({ id, status }) =>
       apiRequest<TrackingConfig>(
         `/api/v1/admin/integrated-sites/${site.id}/tracking/${id}`,
-        { method: "PATCH", body: JSON.stringify({ status }) },
+        { method: "PATCH", body: JSON.stringify({ status }), idempotencyKey: toggleKey },
       ),
     invalidateKeys: [detailKey("tracking-configs", site.id)],
     successTitle: "Pixel group updated",
@@ -195,6 +206,27 @@ function TrackingGroups({ site }: { site: IntegratedSite }) {
       ),
     invalidateKeys: [detailKey("tracking-configs", site.id)],
     successTitle: "Pixel group deleted",
+  });
+
+  // E-18: send a test event for one pixel group. The endpoint is a
+  // pinned route the API worker implements in parallel; the result is
+  // shown verbatim and never claims a real delivery.
+  const sendTest = useAdminMutation<
+    { ok?: boolean; status?: string; message?: string; event_id?: string },
+    { pixel_group_id: string; event_name: string }
+  >({
+    mutationFn: (body) =>
+      apiRequest<{ ok?: boolean; status?: string; message?: string; event_id?: string }>(
+        "/api/v1/admin/tracking/test-event",
+        { method: "POST", body: JSON.stringify(body), idempotencyKey: testKey },
+      ),
+    invalidateKeys: [detailKey("tracking-configs", site.id)],
+    successTitle: "Test event sent",
+    onSuccess: (data) =>
+      setTestResult(
+        data.message ??
+          `Test event recorded (${data.status ?? data.event_id ?? "no status returned"}).`,
+      ),
   });
 
   if (query.isPending) return <TableSkeleton rows={4} />;
@@ -224,6 +256,11 @@ function TrackingGroups({ site }: { site: IntegratedSite }) {
           Create pixel group
         </Button>
       </Toolbar>
+      {testResult ? (
+        <Alert variant="info" onDismiss={() => setTestResult(null)}>
+          {testResult}
+        </Alert>
+      ) : null}
       {groups.length === 0 ? (
         <EmptyState
           icon={BarChart3}
@@ -289,6 +326,13 @@ function TrackingGroups({ site }: { site: IntegratedSite }) {
                             setDialog({ mode: "edit", config: g }),
                         },
                         {
+                          // E-18: send a test event for this group.
+                          icon: FlaskConical,
+                          label: "Send test event",
+                          disabled: g.status !== "enabled",
+                          onSelect: () => setTestTarget(g),
+                        },
+                        {
                           icon: Trash2,
                           label: "Delete",
                           danger: true,
@@ -331,7 +375,85 @@ function TrackingGroups({ site }: { site: IntegratedSite }) {
           onClose={() => setDialog(null)}
         />
       ) : null}
+      {testTarget ? (
+        <SendTestEventDialog
+          group={testTarget}
+          siteName={site.name}
+          sending={sendTest.isPending}
+          onClose={() => setTestTarget(null)}
+          onSend={(eventName) => {
+            sendTest.mutate(
+              { pixel_group_id: testTarget.id, event_name: eventName },
+              {
+                onSuccess: () => setTestTarget(null),
+                onError: () => setTestTarget(null),
+              },
+            );
+          }}
+        />
+      ) : null}
     </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Send test event dialog (E-18)                                       */
+/* ------------------------------------------------------------------ */
+function SendTestEventDialog({
+  group,
+  siteName,
+  sending,
+  onClose,
+  onSend,
+}: {
+  group: TrackingConfig;
+  siteName: string;
+  sending: boolean;
+  onClose: () => void;
+  onSend: (eventName: string) => void;
+}) {
+  const [eventName, setEventName] = useState<(typeof TRACKING_EVENTS)[number]>("PageView");
+  return (
+    <Dialog
+      open
+      onClose={onClose}
+      title="Send test event"
+      size="sm"
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="accent" loading={sending} onClick={() => onSend(eventName)}>
+            Send test event
+          </Button>
+        </>
+      }
+    >
+      <p className="sm-hint" style={{ marginTop: 0 }}>
+        {group.label ?? group.pixel_id} ({PROVIDER_LABELS[group.provider]}) · {siteName}
+      </p>
+      <Field label="Event" htmlFor="test-event-name">
+        <Select
+          id="test-event-name"
+          name="event_name"
+          value={eventName}
+          onChange={(e) =>
+            setEventName(e.target.value as (typeof TRACKING_EVENTS)[number])
+          }
+        >
+          {TRACKING_EVENTS.map((ev) => (
+            <option key={ev} value={ev}>
+              {ev}
+            </option>
+          ))}
+        </Select>
+      </Field>
+      <p className="sm-hint">
+        Until Batch 4 lands real CAPI delivery this only records the event
+        locally — the result says so instead of claiming a delivery.
+      </p>
+    </Dialog>
   );
 }
 
@@ -364,11 +486,13 @@ function TrackingGroupDialog({
   );
   const [errors, setErrors] = useState<Record<string, string>>({});
 
+  // A-04: one key per dialog instance — a retried create replays.
+  const formKey = useIdempotencyKey();
   const create = useAdminMutation<TrackingConfig, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<TrackingConfig>(
         `/api/v1/admin/integrated-sites/${site.id}/tracking`,
-        { method: "POST", body: JSON.stringify(body) },
+        { method: "POST", body: JSON.stringify(body), idempotencyKey: formKey },
       ),
     invalidateKeys: [detailKey("tracking-configs", site.id)],
     successTitle: "Pixel group created",
@@ -531,7 +655,7 @@ function TrackingGroupDialog({
               placeholder="e.g. TEST12345"
             />
           </Field>
-          <Field
+          <GroupField
             label="Enabled events"
             required
             error={errors.enabled_events}
@@ -547,16 +671,16 @@ function TrackingGroupDialog({
                 />
               ))}
             </div>
-          </Field>
-          <Field label="Status">
+          </GroupField>
+          <GroupField label="Status">
             <Switch
               label={enabled ? "Enabled" : "Disabled"}
               checked={enabled}
               onChange={(e) => setEnabled(e.target.checked)}
             />
-          </Field>
+          </GroupField>
         </div>
-        <div className="sm-dialog-footer" style={{ padding: 0, marginTop: 20 }}>
+        <div className="sm-dialog-footer sm-dialog-footer-flush">
           <Button variant="secondary" type="button" onClick={onClose}>
             Cancel
           </Button>

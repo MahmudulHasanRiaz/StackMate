@@ -20,11 +20,12 @@
  * claimed / delivered / simulated / skipped / retrying /
  * dead-lettered counts.
  */
-import { useEffect, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Webhook } from "lucide-react";
 import { apiRequest } from "../lib/api-client";
-import { apiErrorMessage, PageHeader, useAdminMutation } from "../lib/section-kit";
+import { listKey } from "../lib/query";
+import { apiErrorMessage, PageHeader, useAdminList, useAdminMutation, useIdempotencyKey } from "../lib/section-kit";
 import {
   humanizeType,
   resolveResourceName,
@@ -94,11 +95,10 @@ const OUTBOX_FILTERS = [
 ] as const;
 type OutboxFilter = (typeof OUTBOX_FILTERS)[number];
 
-/* One list key per filter — replay and dispatch both invalidate all
-   of them, so a row never sits stale under a filter it just left. */
-const OUTBOX_LIST_KEYS = OUTBOX_FILTERS.map(
-  (f) => ["admin", "outbox-events", "list", f] as const,
-);
+/* D-03: one list-key prefix — replay and dispatch invalidate every
+   outbox list query (any filter/search/page) by prefix, so a row
+   never sits stale under a filter it just left. */
+const OUTBOX_LIST_KEYS = [listKey("outbox-events")] as const;
 
 /* F5 (2026-11-16): filter chips use ONE capitalisation everywhere —
    first letter capitalised ("Pending", "Dead letter"), never a mix
@@ -107,34 +107,6 @@ function filterLabel(f: OutboxFilter): string {
   if (f === "all") return "All";
   if (f === "dead_letter") return "Dead letter";
   return f[0]!.toUpperCase() + f.slice(1);
-}
-
-function useOutboxEvents(filter: OutboxFilter, search: string) {
-  // H-01: the search value is debounced 250ms (same as useAdminList)
-  // and sent as a server `?q=` — the API searches the FULL dataset
-  // (event_key / event_type / aggregate_type / aggregate_id / status),
-  // so a match past the loaded window is never missed. The debounced value joins
-  // the query key, so each distinct search caches separately — and
-  // invalidation by OUTBOX_LIST_KEYS still matches by prefix.
-  const [debouncedSearch, setDebouncedSearch] = useState(search);
-  useEffect(() => {
-    const timer = window.setTimeout(() => setDebouncedSearch(search), 250);
-    return () => window.clearTimeout(timer);
-  }, [search]);
-  const q = debouncedSearch.trim();
-  return useQuery({
-    queryKey: ["admin", "outbox-events", "list", filter, ...(q ? [{ q }] : [])],
-    queryFn: async () => {
-      // The API defaults lists to 25 rows — ask for the max window (100).
-      const params = new URLSearchParams({ limit: "100" });
-      if (filter !== "all") params.set("status", filter);
-      if (q) params.set("q", q);
-      const res = await apiRequest<{ items: OutboxEvent[] }>(
-        `/api/v1/admin/outbox-events?${params}`,
-      );
-      return res.items;
-    },
-  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -146,27 +118,38 @@ export function OutboxSection() {
   const [pageSize, setPageSize] = useState(25);
   const [search, setSearch] = useState("");
   const [viewEvent, setViewEvent] = useState<OutboxEvent | null>(null);
-  const query = useOutboxEvents(filter, search);
+  // D-03: server pagination — page/pageSize thread into the query and
+  // the SERVER total is rendered. The old 100-row client window (and
+  // the client slice over it) is gone: page N now fetches page N.
+  // Search stays server-side (H-01): `?q=` matches the full dataset
+  // (event_key / event_type / aggregate_type / aggregate_id / status).
+  // Note: searching a resolved display name (e.g. an order number)
+  // no longer matches — the order detail page is the way to an
+  // order's events.
+  const query = useAdminList<OutboxEvent>(
+    "outbox-events",
+    "/api/v1/admin/outbox-events",
+    {
+      q: search,
+      page,
+      pageSize,
+      extra: { status: filter !== "all" ? filter : undefined },
+    },
+  );
   const confirm = useConfirm();
   const rows = query.data ?? [];
   const resourceMaps = useResourceMaps();
-  // Search is server-side now (H-01): the `?q=` in useOutboxEvents
-  // searches the full dataset, so the old client-side filter memo
-  // (M-05) is retired — `rows` already holds only the matches.
-  // Note: the server matches event_key / event_type / aggregate_type /
-  // aggregate_id / status; searching a resolved display name (e.g.
-  // an order number) no longer matches — the order detail page is
-  // the way to an order's events.
-  /* F6 (2026-11-16): the outbox had no pagination — client-side paging
-     over the loaded collection, like ListTable. */
-  const pageRows = rows.slice((page - 1) * pageSize, page * pageSize);
+  const pageRows = rows;
 
+  // A-04: one key per section instance — a retried replay replays.
+  const replayKey = useIdempotencyKey();
   const replay = useAdminMutation<OutboxEvent, string>({
     mutationFn: (eventId) =>
       apiRequest<OutboxEvent>(
         `/api/v1/admin/outbox-events/${eventId}/replay`,
         {
           method: "POST",
+          idempotencyKey: replayKey,
         },
       ),
     invalidateKeys: OUTBOX_LIST_KEYS,
@@ -371,7 +354,7 @@ export function OutboxSection() {
           <Pagination
             page={page}
             pageSize={pageSize}
-            total={rows.length}
+            total={query.total}
             onPageChange={setPage}
             onPageSizeChange={(size) => {
               setPageSize(size);

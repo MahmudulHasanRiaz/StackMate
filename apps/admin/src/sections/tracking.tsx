@@ -21,7 +21,7 @@
  * Meta delivery has happened. It never claims an event reached Meta.
  * Real Meta delivery is Batch 4.
  */
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
 import { BarChart3 } from "lucide-react";
@@ -80,6 +80,10 @@ export interface TrackingEvent {
   // "simulated" (audit C-2/D-6): recorded but never sent to Meta —
   // the dispatcher marks Meta CAPI events simulated, never processed.
   status: "received" | "queued" | "processed" | "rejected" | "simulated";
+  /** E-19: true when this event was deduplicated against an earlier
+   *  identical event (sent by the API once the tracking list carries
+   *  the flag — absent on older API builds). */
+  deduplicated?: boolean | null;
   delivery_attempts: number;
   delivered_at: string | null;
   created_at: string;
@@ -105,7 +109,15 @@ export function TrackingSection() {
   const query = useAdminList<TrackingEvent>(
     "tracking-events",
     "/api/v1/admin/tracking/events",
-    { q: search.q, page: search.page, pageSize: search.pageSize },
+    {
+      q: search.q,
+      page: search.page,
+      pageSize: search.pageSize,
+      // D-01: thread the status filter server-side (the API reads
+      // ?status= once the B-05 half lands; the client filter below
+      // stays as the fallback until then).
+      extra: statusFilter !== "all" ? { status: statusFilter } : undefined,
+    },
   );
   const sitesQuery = useAdminList<IntegratedSite>(
     "integrated-sites",
@@ -133,7 +145,9 @@ export function TrackingSection() {
       ? query.data
       : (query.data ?? []).filter((e) => e.status === statusFilter);
 
-  const columns: ColumnDef<TrackingEvent, unknown>[] = [
+  // D-15: memoized — the site-names map is the only changing dep.
+  const columns: ColumnDef<TrackingEvent, unknown>[] = useMemo(
+    () => [
     {
       header: "Event",
       accessorKey: "event_name",
@@ -187,6 +201,20 @@ export function TrackingSection() {
       ),
     },
     {
+      // E-19: dedup indicator (PRD §15.4) — "Deduped" when the server
+      // says this event was deduplicated against an earlier identical
+      // one; "—" otherwise (or while the API does not send the flag).
+      header: "Dedup",
+      accessorKey: "deduplicated",
+      enableSorting: false,
+      cell: ({ row }) =>
+        row.original.deduplicated === true ? (
+          <StatusBadge status="deduped" label="Deduped" />
+        ) : (
+          "—"
+        ),
+    },
+    {
       header: "Delivered at",
       accessorKey: "delivered_at",
       cell: ({ row }) => <DateTimeCell value={row.original.delivered_at} />,
@@ -196,7 +224,9 @@ export function TrackingSection() {
       accessorKey: "created_at",
       cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
     },
-  ];
+    ],
+    [siteNames],
+  );
 
   return (
     <section aria-labelledby="tracking-heading">
@@ -232,6 +262,7 @@ export function TrackingSection() {
         data={filtered}
         serverSearch
         serverPagination
+        disableSorting
         refreshSection="tracking-events"
         filtersActive={statusFilter !== "all"}
         total={query.total}

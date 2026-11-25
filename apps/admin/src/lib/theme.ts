@@ -74,10 +74,3 @@ export function applyTheme(choice: ThemeChoice): void {
     }
   }
 }
-
-export function toggleTheme(): ThemeChoice {
-  const next: ThemeChoice =
-    resolveThemeChoice() === "dark" ? "light" : "dark";
-  applyTheme(next);
-  return next;
-}

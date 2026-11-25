@@ -12,6 +12,9 @@
  * Endpoints used (all `integrations.manage`):
  *   GET  /api/v1/admin/webhooks
  *   POST /api/v1/admin/webhooks
+ *   PATCH /api/v1/admin/webhooks/:id (edit — URL, description, site,
+ *     subscribed events; the secret is never touched here)
+ *   POST /api/v1/admin/webhooks/:id/rotate (new secret shown once)
  *   DELETE /api/v1/admin/webhooks/:id
  *   POST /api/v1/admin/webhooks/:id/test
  *   GET  /api/v1/admin/webhooks/:id/deliveries
@@ -30,10 +33,10 @@
  * timeout) and its result is shown verbatim. This UI never claims a
  * production delivery reached its destination.
  */
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, useMemo} from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
-import { Eye, FlaskConical, Plus, Trash2, Webhook } from "lucide-react";
+import { Eye, FlaskConical, KeyRound, Pencil, Plus, Trash2, Webhook } from "lucide-react";
 import { apiRequest } from "../lib/api-client";
 import { detailKey, listKey } from "../lib/query";
 import {
@@ -45,6 +48,7 @@ import {
   useAdminDetail,
   useAdminList,
   useAdminMutation,
+  useIdempotencyKey,
 } from "../lib/section-kit";
 import {
   Alert,
@@ -155,6 +159,7 @@ export function WebhooksSection() {
   const search = parseListSearch(rawSearch);
   const navigate = useRouteNavigate();
   const [registerOpen, setRegisterOpen] = useState(false);
+  const [editTarget, setEditTarget] = useState<WebhookEndpoint | null>(null);
   const [newSecret, setNewSecret] = useState<{
     keyId: string;
     secret: string;
@@ -211,123 +216,189 @@ export function WebhooksSection() {
   };
 
   const confirm = useConfirm();
+  // A-04: one key per section instance for each consequential POST.
+  const deleteKey = useIdempotencyKey();
+  const rotateKey = useIdempotencyKey();
   const deleteEndpoint = useAdminMutation<WebhookEndpoint, string>({
     mutationFn: (endpointId) =>
       apiRequest<WebhookEndpoint>(`/api/v1/admin/webhooks/${endpointId}`, {
         method: "DELETE",
+        idempotencyKey: deleteKey,
       }),
     invalidateKeys: [listKey("webhooks")],
     successTitle: "Webhook deleted",
   });
 
-  const columns: ColumnDef<WebhookEndpoint, unknown>[] = [
-    {
-      header: "URL",
-      accessorKey: "url",
-      cell: ({ row }) => <span className="sm-mono">{row.original.url}</span>,
-    },
-    {
-      header: "Description",
-      accessorKey: "description",
-      cell: ({ row }) => row.original.description,
-    },
-    {
-      header: "Site",
-      accessorKey: "integrated_site_id",
-      cell: ({ row }) =>
-        row.original.integrated_site_id
-          ? (siteNames.get(row.original.integrated_site_id) ?? (
-              <span className="sm-mono">{row.original.integrated_site_id}</span>
-            ))
-          : "—",
-    },
-    {
-      header: "Events",
-      accessorKey: "subscribed_events",
-      enableSorting: false,
-      cell: ({ row }) => row.original.subscribed_events.join(", "),
-    },
-    {
-      header: "Status",
-      accessorKey: "status",
-      cell: ({ row }) => <StatusBadge status={row.original.status} />,
-    },
-    {
-      header: "Secret key",
-      accessorKey: "secret_key_id",
-      enableSorting: false,
-      cell: ({ row }) => (
-        <span className="sm-mono">
-          {row.original.secret_key_id}
-          <CopyButton
-            value={row.original.secret_key_id}
-            label="Copy secret key ID"
-          />
-        </span>
+  // E-04: rotate the signing secret. The old secret stops working
+  // immediately; the new one is shown once, in the same banner as
+  // registration (never stored).
+  const rotateSecret = useAdminMutation<
+    { endpoint?: WebhookEndpoint; raw_signing_secret_once?: string; secret_key_id?: string },
+    string
+  >({
+    mutationFn: (endpointId) =>
+      apiRequest<{ endpoint?: WebhookEndpoint; raw_signing_secret_once?: string; secret_key_id?: string }>(
+        `/api/v1/admin/webhooks/${endpointId}/rotate`,
+        { method: "POST", idempotencyKey: rotateKey },
       ),
+    invalidateKeys: [listKey("webhooks")],
+    successTitle: "Signing secret rotated",
+    successMessage: "The old secret stops working immediately.",
+    onSuccess: (data) => {
+      if (data.raw_signing_secret_once) {
+        setNewSecret({
+          keyId: data.secret_key_id ?? data.endpoint?.secret_key_id ?? "new key",
+          secret: data.raw_signing_secret_once,
+        });
+      }
     },
-    {
-      header: "Created",
-      accessorKey: "created_at",
-      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
-    },
-    {
-      header: "Actions",
-      id: "actions",
-      enableSorting: false,
-      cell: ({ row }) => {
-        const ep = row.original;
-        // 2+ row actions → one "…" menu (Neon Branches pattern). The test
-        // result surfaces in the page's last-test panel; the mutation
-        // toasts report success/failure, so no inline spinner is lost.
-        return (
-          <RowMenu
-            items={[
-              {
-                icon: FlaskConical,
-                label: "Test delivery",
-                disabled: ep.status !== "active" || testingId === ep.id,
-                onSelect: () => void runTest(ep.id),
-              },
-              {
-                icon: Eye,
-                label: "View details",
-                onSelect: () =>
-                  navigate({
-                    to: "/settings/webhooks/$webhookId",
-                    params: { webhookId: ep.id },
-                  }),
-              },
-              {
-                icon: Trash2,
-                label: "Delete",
-                danger: true,
-                onSelect: () =>
-                  void (async () => {
-                    const ok = await confirm({
-                      title: "Delete webhook endpoint?",
-                      body: (
-                        <div>
-                          <p>
-                            {ep.url} will be permanently deleted and will stop
-                            receiving deliveries. Its past deliveries are
-                            removed with it; outbox history is kept.
-                          </p>
-                        </div>
-                      ),
-                      confirmLabel: "Delete",
-                      danger: true,
-                      warning: `${ep.url} will be permanently deleted.`,
-                    });
-                    if (ok) deleteEndpoint.mutate(ep.id);
-                  })(),
-              },
-            ]}
-          />
-        );
+  });
+
+  const askRotate = async (endpoint: WebhookEndpoint) => {
+    const ok = await confirm({
+      title: "Rotate signing secret?",
+      body: (
+        <div>
+          <p>
+            {endpoint.url} gets a new signing secret. The old secret stops
+            working immediately — update the receiver before rotating, or
+            deliveries will fail signature verification.
+          </p>
+        </div>
+      ),
+      confirmLabel: "Rotate secret",
+      danger: true,
+      warning: "The old secret stops working immediately.",
+    });
+    if (ok) rotateSecret.mutate(endpoint.id);
+  };
+
+  const columns: ColumnDef<WebhookEndpoint, unknown>[] = useMemo(
+    () => [
+      {
+        header: "URL",
+        accessorKey: "url",
+        cell: ({ row }) => <span className="sm-mono">{row.original.url}</span>,
       },
-    },
-  ];
+      {
+        header: "Description",
+        accessorKey: "description",
+        cell: ({ row }) => row.original.description,
+      },
+      {
+        header: "Site",
+        accessorKey: "integrated_site_id",
+        cell: ({ row }) =>
+          row.original.integrated_site_id
+            ? (siteNames.get(row.original.integrated_site_id) ?? (
+                <span className="sm-mono">{row.original.integrated_site_id}</span>
+              ))
+            : "—",
+      },
+      {
+        header: "Events",
+        accessorKey: "subscribed_events",
+        enableSorting: false,
+        cell: ({ row }) => row.original.subscribed_events.join(", "),
+      },
+      {
+        header: "Status",
+        accessorKey: "status",
+        cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      },
+      {
+        header: "Secret key",
+        accessorKey: "secret_key_id",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <span className="sm-mono">
+            {row.original.secret_key_id}
+            <CopyButton
+              value={row.original.secret_key_id}
+              label="Copy secret key ID"
+            />
+          </span>
+        ),
+      },
+      {
+        header: "Created",
+        accessorKey: "created_at",
+        cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
+      },
+      {
+        header: "Actions",
+        id: "actions",
+        enableSorting: false,
+        cell: ({ row }) => {
+          const ep = row.original;
+          // 2+ row actions → one "…" menu (Neon Branches pattern). The test
+          // result surfaces in the page's last-test panel; the mutation
+          // toasts report success/failure, so no inline spinner is lost.
+          return (
+            <RowMenu
+              items={[
+                {
+                  icon: FlaskConical,
+                  label: "Test delivery",
+                  disabled: ep.status !== "active" || testingId === ep.id,
+                  onSelect: () => void runTest(ep.id),
+                },
+                {
+                  icon: Eye,
+                  label: "View details",
+                  onSelect: () =>
+                    navigate({
+                      to: "/settings/webhooks/$webhookId",
+                      params: { webhookId: ep.id },
+                    }),
+                },
+                {
+                  // E-17: edit URL, description, site, subscribed
+                  // events — the secret is never touched here.
+                  icon: Pencil,
+                  label: "Edit",
+                  onSelect: () => setEditTarget(ep),
+                },
+                {
+                  // E-04: rotate the signing secret (new secret
+                  // shown once, old one stops working immediately).
+                  icon: KeyRound,
+                  label: "Rotate secret",
+                  disabled: ep.status === "revoked",
+                  onSelect: () => void askRotate(ep),
+                },
+                {
+                  icon: Trash2,
+                  label: "Delete",
+                  danger: true,
+                  onSelect: () =>
+                    void (async () => {
+                      const ok = await confirm({
+                        title: "Delete webhook endpoint?",
+                        body: (
+                          <div>
+                            <p>
+                              {ep.url} will be permanently deleted and will stop
+                              receiving deliveries. Its past deliveries are
+                              removed with it; outbox history is kept.
+                            </p>
+                          </div>
+                        ),
+                        confirmLabel: "Delete",
+                        danger: true,
+                        warning: `${ep.url} will be permanently deleted.`,
+                      });
+                      if (ok) deleteEndpoint.mutate(ep.id);
+                    })(),
+                },
+              ]}
+            />
+          );
+        },
+      },
+  ],
+    [askRotate, confirm, navigate, runTest, siteNames, testingId],
+  )
 
   return (
     <section aria-labelledby="webhooks-heading">
@@ -399,6 +470,9 @@ export function WebhooksSection() {
           setRegisterOpen(false);
         }}
       />
+      {editTarget ? (
+        <EditWebhookDialog endpoint={editTarget} onClose={() => setEditTarget(null)} />
+      ) : null}
     </section>
   );
 }
@@ -421,11 +495,14 @@ function RegisterWebhookDialog({
   const [events, setEvents] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
 
+  // A-04: one key per dialog instance — a retried registration replays.
+  const formKey = useIdempotencyKey();
   const create = useAdminMutation<RegisteredWebhook, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<RegisteredWebhook>("/api/v1/admin/webhooks", {
         method: "POST",
         body: JSON.stringify(body),
+        idempotencyKey: formKey,
       }),
     invalidateKeys: [listKey("webhooks")],
     successTitle: "Webhook registered",
@@ -542,6 +619,152 @@ function RegisterWebhookDialog({
         <p className="sm-hint">
           The signing secret is shown once after registration. Copy it before
           closing.
+        </p>
+      </form>
+    </Dialog>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Edit webhook dialog — PATCH /api/v1/admin/webhooks/:id (E-17)       */
+/* URL, description, site and subscribed events only. The signing     */
+/* secret is never touched here — rotate it from the row menu.         */
+/* ------------------------------------------------------------------ */
+function EditWebhookDialog({
+  endpoint,
+  onClose,
+}: {
+  endpoint: WebhookEndpoint;
+  onClose: () => void;
+}) {
+  const [url, setUrl] = useState(endpoint.url);
+  const [description, setDescription] = useState(endpoint.description);
+  const [siteId, setSiteId] = useState(endpoint.integrated_site_id ?? "");
+  const [events, setEvents] = useState(endpoint.subscribed_events.join(", "));
+  const [errors, setErrors] = useState<Record<string, string>>({});
+
+  // A-04: one key per dialog instance — a retried edit replays.
+  const formKey = useIdempotencyKey();
+  const update = useAdminMutation<WebhookEndpoint, Record<string, unknown>>({
+    mutationFn: (body) =>
+      apiRequest<WebhookEndpoint>(`/api/v1/admin/webhooks/${endpoint.id}`, {
+        method: "PATCH",
+        body: JSON.stringify(body),
+        idempotencyKey: formKey,
+      }),
+    invalidateKeys: [listKey("webhooks")],
+    successTitle: "Webhook updated",
+    onSuccess: onClose,
+  });
+
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    doSubmit();
+  };
+
+  const doSubmit = () => {
+    const next: Record<string, string> = {};
+    try {
+      const parsed = new URL(url.trim());
+      if (parsed.protocol !== "https:" && parsed.protocol !== "http:")
+        next.url = "Enter a valid http(s) URL.";
+    } catch {
+      next.url = "Enter a valid URL.";
+    }
+    if (description.trim().length < 2)
+      next.description = "Description must be at least 2 characters.";
+    const parsedEvents = events
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (parsedEvents.length === 0)
+      next.events = "Subscribe to at least one event.";
+    setErrors(next);
+    if (Object.keys(next).length > 0) return;
+    update.mutate({
+      url: url.trim(),
+      description: description.trim(),
+      integrated_site_id: siteId || null,
+      subscribed_events: parsedEvents,
+    });
+  };
+
+  return (
+    <Dialog
+      open
+      onClose={onClose}
+      title="Edit webhook"
+      size="md"
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="accent" loading={update.isPending} onClick={doSubmit}>
+            Save changes
+          </Button>
+        </>
+      }
+    >
+      <form onSubmit={submit}>
+        <Field label="URL" required error={errors.url ?? ""} htmlFor="wh-edit-url">
+          <Input
+            id="wh-edit-url"
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://example.com/stackmate-webhook"
+            aria-invalid={Boolean(errors.url) || undefined}
+          />
+        </Field>
+        <Field
+          label="Description"
+          required
+          error={errors.description ?? ""}
+          htmlFor="wh-edit-desc"
+        >
+          <Input
+            id="wh-edit-desc"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            aria-invalid={Boolean(errors.description) || undefined}
+          />
+        </Field>
+        <Field label="Integrated site" htmlFor="wh-edit-site">
+          <SearchableSelect
+            id="wh-edit-site"
+            value={siteId}
+            onChange={(v) => setSiteId(v)}
+            loadOptions={(q, signal) =>
+              loadListOptions<IntegratedSite>(
+                "/api/v1/admin/integrated-sites",
+                q,
+                (s) => ({ value: s.id, label: s.name }),
+                signal,
+              )
+            }
+            leadingOptions={[{ value: "", label: "All sites (no site)" }]}
+            placeholder="All sites (no site)"
+            ariaLabel="Integrated site"
+          />
+        </Field>
+        <Field
+          label="Subscribed events"
+          required
+          hint="Comma-separated event names."
+          error={errors.events ?? ""}
+          htmlFor="wh-edit-events"
+        >
+          <Input
+            id="wh-edit-events"
+            value={events}
+            onChange={(e) => setEvents(e.target.value)}
+            placeholder="order.paid, subscription.renewed"
+            aria-invalid={Boolean(errors.events) || undefined}
+          />
+        </Field>
+        <p className="sm-hint">
+          The signing secret is not changed by editing. Rotate it from the
+          row menu when it needs replacing.
         </p>
       </form>
     </Dialog>

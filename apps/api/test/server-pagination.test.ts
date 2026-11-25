@@ -81,7 +81,13 @@ describe("Server offset pagination (?page=)", () => {
     const signInText = await signIn.text();
     assert.equal(signIn.status, 200, signInText);
     const signInBody = JSON.parse(signInText) as any;
-    superCookie = `stackmate_session=${signInBody.data.session_token}`;
+    // A-01: the session token is cookie-only — sign-in JSON no longer
+    // carries session_token, so the cookie comes from Set-Cookie.
+    const setCookies =
+      typeof signIn.headers.getSetCookie === "function" ? signIn.headers.getSetCookie() : [];
+    const sessionPair = setCookies.find((c) => c.startsWith("stackmate_session="));
+    assert.ok(sessionPair, "sign-in must set a stackmate_session cookie");
+    superCookie = sessionPair!.split(";")[0]!;
 
     // 30 products + 30 customers, insertion order = list order.
     const now = new Date().toISOString();

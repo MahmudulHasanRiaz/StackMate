@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { pgTable, text, timestamp, boolean, varchar, integer, check } from "drizzle-orm/pg-core";
+import { pgTable, text, timestamp, boolean, varchar, integer, index, check } from "drizzle-orm/pg-core";
 
 export const users = pgTable("users", {
   id: text("id").primaryKey(),
@@ -38,7 +38,12 @@ export const sessions = pgTable("sessions", {
   userId: text("user_id")
     .notNull()
     .references(() => users.id, { onDelete: "cascade" }),
-});
+},
+(table) => [
+  // Migration 0021 (audit C-02): Better Auth looks sessions up by
+  // user_id on every sign-in/session check via drizzleDb.
+  index("idx_sessions_user_id").on(table.userId),
+]);
 
 export const accounts = pgTable("accounts", {
   id: text("id").primaryKey(),
@@ -56,7 +61,12 @@ export const accounts = pgTable("accounts", {
   password: text("password"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  // Migration 0021 (audit C-02): Better Auth resolves the credential
+  // account by (provider_id, account_id) on every sign-in.
+  index("idx_accounts_provider_account").on(table.providerId, table.accountId),
+]);
 
 export const verifications = pgTable("verifications", {
   id: text("id").primaryKey(),
@@ -65,7 +75,12 @@ export const verifications = pgTable("verifications", {
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+},
+(table) => [
+  // Migration 0021 (audit C-02): Better Auth looks verifications up
+  // by (identifier, value) (email OTP / verification flows).
+  index("idx_verifications_identifier_value").on(table.identifier, table.value),
+]);
 
 export const staffProfiles = pgTable("staff_profiles", {
   userId: text("user_id")

@@ -26,7 +26,7 @@
  *   new → contacted → qualified → converted / lost.
  * Converting never deletes the lead — history stays.
  */
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, useMemo} from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
 import { Plus, UserPlus } from "lucide-react";
@@ -44,6 +44,7 @@ import {
   useAdminList,
   useAdminMutation,
   type ListSearch,
+  useIdempotencyKey,
 } from "../lib/section-kit";
 import {
   Alert,
@@ -168,73 +169,76 @@ export function LeadsSection() {
     },
   });
 
-  const columns: ColumnDef<LeadDto, unknown>[] = [
-    {
-      accessorKey: "lead_number",
-      header: "Lead",
-      cell: ({ row }) => (
-        <span>
-          <span className="sm-mono">{row.original.lead_number}</span>
-          <CopyButton value={row.original.lead_number} label="Copy lead number" />
-        </span>
-      ),
-    },
-    {
-      accessorKey: "name",
-      header: "Contact",
-      cell: ({ row }) => {
-        const l = row.original;
-        return (
-          <span className="sm-cell-line">
-            <span className="sm-cell-text">{l.name}</span>
-            <span className="sm-hint sm-cell-text">
-              {l.email ?? l.phone ?? "No contact"}
-            </span>
+  const columns: ColumnDef<LeadDto, unknown>[] = useMemo(
+    () => [
+      {
+        accessorKey: "lead_number",
+        header: "Lead",
+        cell: ({ row }) => (
+          <span>
+            <span className="sm-mono">{row.original.lead_number}</span>
+            <CopyButton value={row.original.lead_number} label="Copy lead number" />
           </span>
-        );
+        ),
       },
-    },
-    {
-      accessorKey: "interest",
-      header: "Interest",
-      cell: ({ row }) => row.original.interest ?? "—",
-    },
-    {
-      accessorKey: "source_site",
-      header: "Source",
-      cell: ({ row }) => row.original.source_site?.name ?? "Manual",
-    },
-    {
-      accessorKey: "utm_campaign",
-      header: "Campaign",
-      cell: ({ row }) => row.original.utm_campaign ?? "—",
-    },
-    {
-      accessorKey: "status",
-      header: "Status",
-      cell: ({ row }) => <StatusBadge status={row.original.status} />,
-    },
-    {
-      accessorKey: "assignee_name",
-      header: "Assignee",
-      cell: ({ row }) => row.original.assignee_name ?? "Unassigned",
-    },
-    {
-      accessorKey: "created_at",
-      header: "Created",
-      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
-    },
-    {
-      id: "actions",
-      header: "",
-      enableSorting: false,
-      cell: ({ row }) => (
-        <Button variant="ghost" size="sm" onClick={() => goTo(`/leads/${row.original.id}`)}>
-          View
-        </Button>
-      ),
-    },
-  ];
+      {
+        accessorKey: "name",
+        header: "Contact",
+        cell: ({ row }) => {
+          const l = row.original;
+          return (
+            <span className="sm-cell-line">
+              <span className="sm-cell-text">{l.name}</span>
+              <span className="sm-hint sm-cell-text">
+                {l.email ?? l.phone ?? "No contact"}
+              </span>
+            </span>
+          );
+        },
+      },
+      {
+        accessorKey: "interest",
+        header: "Interest",
+        cell: ({ row }) => row.original.interest ?? "—",
+      },
+      {
+        accessorKey: "source_site",
+        header: "Source",
+        cell: ({ row }) => row.original.source_site?.name ?? "Manual",
+      },
+      {
+        accessorKey: "utm_campaign",
+        header: "Campaign",
+        cell: ({ row }) => row.original.utm_campaign ?? "—",
+      },
+      {
+        accessorKey: "status",
+        header: "Status",
+        cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      },
+      {
+        accessorKey: "assignee_name",
+        header: "Assignee",
+        cell: ({ row }) => row.original.assignee_name ?? "Unassigned",
+      },
+      {
+        accessorKey: "created_at",
+        header: "Created",
+        cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
+      },
+      {
+        id: "actions",
+        header: "",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <Button variant="ghost" size="sm" onClick={() => goTo(`/leads/${row.original.id}`)}>
+            View
+          </Button>
+        ),
+      },
+  ],
+    [goTo],
+  )
 
   const filtered = (query.data ?? []).filter((l) => {
     if (statusFilter && l.status !== statusFilter) return false;
@@ -403,10 +407,11 @@ function CreateLeadDialog({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [formError, setFormError] = useState<string | null>(null);
 
-  const mutation = useAdminMutation<LeadDto, Record<string, unknown>>({
+    const mutationKey = useIdempotencyKey();
+const mutation = useAdminMutation<LeadDto, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<LeadDto>("/api/v1/admin/leads", {
-        method: "POST",
+        method: "POST", idempotencyKey: mutationKey,
         body: JSON.stringify(body),
       }),
     invalidateKeys: [listKey("leads")],
@@ -555,19 +560,21 @@ export function LeadDetailSection({ id }: { id: string }) {
   const [convertError, setConvertError] = useState<string | null>(null);
   const query = useAdminDetail<LeadDetailDto>("leads", id, `/api/v1/admin/leads/${id}`);
 
-  const transitionMutation = useAdminMutation<LeadDetailDto, Record<string, unknown>>({
+    const transitionMutationKey = useIdempotencyKey();
+const transitionMutation = useAdminMutation<LeadDetailDto, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<LeadDetailDto>(`/api/v1/admin/leads/${id}/transition`, {
-        method: "POST",
+        method: "POST", idempotencyKey: transitionMutationKey,
         body: JSON.stringify(body),
       }),
     invalidateKeys: [listKey("leads"), detailKey("leads", id)],
     successTitle: "Lead status updated",
   });
-  const assignMutation = useAdminMutation<LeadDetailDto, Record<string, unknown>>({
+    const assignMutationKey = useIdempotencyKey();
+const assignMutation = useAdminMutation<LeadDetailDto, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<LeadDetailDto>(`/api/v1/admin/leads/${id}/assign`, {
-        method: "POST",
+        method: "POST", idempotencyKey: assignMutationKey,
         body: JSON.stringify(body),
       }),
     invalidateKeys: [listKey("leads"), detailKey("leads", id)],
@@ -609,13 +616,16 @@ export function LeadDetailSection({ id }: { id: string }) {
   const nextStatuses = NEXT_STATUSES[lead.status];
   const canConvert = lead.status !== "converted" && lead.status !== "lost";
 
+  // A-04: one key per detail instance — a retried convert replays
+  // instead of creating a second customer.
+  const convertKey = useIdempotencyKey();
   const onConvert = async () => {
     setConvertError(null);
     setConverting(true);
     try {
       const res = await apiRequest<{ lead: LeadDto; customer: CustomerDto }>(
         `/api/v1/admin/leads/${id}/convert`,
-        { method: "POST", body: JSON.stringify({}) },
+        { method: "POST", body: JSON.stringify({}), idempotencyKey: convertKey },
       );
       // The wizard opens with the resolved customer prefilled; the
       // lead is marked converted only when the order is created.

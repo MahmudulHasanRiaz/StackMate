@@ -12,9 +12,11 @@
  * rows are recorded as status "simulated", and the batch result counts
  * them in `simulated`, not `delivered`, so no report, export, or UI
  * can mistake a simulation for a real delivery. Meta CAPI dispatch is
- * ALWAYS simulated (Batch 4 builds the real Meta client): the tracking
- * event is marked "simulated" with no delivery attempt and no
- * `delivered_at`.
+ * simulated UNLESS the caller passes a `capiDeliver` function
+ * (Batch 4, modules/tracking/capi.ts — Worker E): with it the
+ * tracking event is really delivered and recorded "processed"; without
+ * it the tracking event is marked "simulated" with no delivery
+ * attempt and no `delivered_at`.
  *
  * NOTE (migration remainder): "simulated" is not yet in the
  * `tracking_events` / `outbox_events` / `webhook_deliveries` status
@@ -35,6 +37,8 @@ import {
 import type {
   OutboxEventRecord,
   StackMateDataStore,
+  TrackingConfigRecord,
+  TrackingEventRecord,
   WebhookEndpointRecord,
 } from "../../platform/db/store.ts";
 import { AppError } from "../../shared/errors.ts";
@@ -150,14 +154,21 @@ export async function deleteWebhookEndpointByAdmin(
   });
 }
 
-export async function testWebhookEndpointByAdmin(
+/**
+ * Shared test-delivery transport (E-06): performs ONE synthetic
+ * `webhook.test` delivery against an endpoint — outbox row, SSRF-checked
+ * fetch, delivery row — WITHOUT the audit row. The admin wrapper
+ * (`testWebhookEndpointByAdmin`, staff actor) and the S2S wrapper
+ * (`testWebhookForSite`, integration actor) each add their own audit
+ * row afterwards, so the same delivery cannot be audited twice and the
+ * actor always matches the trust boundary that called it.
+ */
+async function deliverWebhookTestDelivery(
   store: StackMateDataStore,
-  actor: StaffPrincipal,
-  endpointId: string,
+  endpoint: WebhookEndpointRecord,
   config: {
     encryptionKey: string;
     allowHttpLocal?: boolean;
-    requestId: string;
   }
 ): Promise<{
   endpoint_id: string;
@@ -167,12 +178,6 @@ export async function testWebhookEndpointByAdmin(
   delivered: boolean;
   error: string | null;
 }> {
-  assertStaffPermission(actor, "integrations.manage");
-  const endpoint = store.state.webhook_endpoints.find((ep) => ep.id === endpointId);
-  if (!endpoint) throw new AppError("NOT_FOUND", "Webhook endpoint not found.", 404);
-  if (endpoint.status !== "active") {
-    throw new AppError("CONFLICT", `Webhook endpoint is '${endpoint.status}'.`, 409);
-  }
   // SSRF validation at test time, same as registration/delivery.
   await validateSafeExternalUrlAsync(endpoint.url, config.allowHttpLocal ?? false);
   const secret = decryptSecretAtRest(
@@ -270,20 +275,6 @@ export async function testWebhookEndpointByAdmin(
       last_http_status: httpStatus,
       delivered_at: delivered ? doneIso : null,
     });
-    appendAuditLog(state, {
-      actor_type: "staff",
-      actor_user_id: actor.user.id,
-      action: "webhooks.endpoint.tested",
-      resource_type: "webhook_endpoint",
-      resource_id: endpoint.id,
-      outcome: delivered ? "success" : "failed",
-      request_id: config.requestId,
-      // Write-time identity (fix batch #2): the tested row carries no
-      // URL otherwise, so after the endpoint is deleted the audit
-      // resolver could never name it. The URL is public identifier
-      // data, never a secret.
-      changes: { url: endpoint.url, delivery_id: deliveryId, http_status: httpStatus, delivered },
-    });
   });
 
   return {
@@ -294,6 +285,321 @@ export async function testWebhookEndpointByAdmin(
     delivered,
     error,
   };
+}
+
+export async function testWebhookEndpointByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  endpointId: string,
+  config: {
+    encryptionKey: string;
+    allowHttpLocal?: boolean;
+    requestId: string;
+  }
+): Promise<{
+  endpoint_id: string;
+  delivery_id: string;
+  event_type: string;
+  http_status: number | null;
+  delivered: boolean;
+  error: string | null;
+}> {
+  assertStaffPermission(actor, "integrations.manage");
+  const endpoint = store.state.webhook_endpoints.find((ep) => ep.id === endpointId);
+  if (!endpoint) throw new AppError("NOT_FOUND", "Webhook endpoint not found.", 404);
+  if (endpoint.status !== "active") {
+    throw new AppError("CONFLICT", `Webhook endpoint is '${endpoint.status}'.`, 409);
+  }
+  const result = await deliverWebhookTestDelivery(store, endpoint, config);
+  await store.withTransaction((state) => {
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "webhooks.endpoint.tested",
+      resource_type: "webhook_endpoint",
+      resource_id: endpoint.id,
+      outcome: result.delivered ? "success" : "failed",
+      request_id: config.requestId,
+      // Write-time identity (fix batch #2): the tested row carries no
+      // URL otherwise, so after the endpoint is deleted the audit
+      // resolver could never name it. The URL is public identifier
+      // data, never a secret.
+      changes: {
+        url: endpoint.url,
+        delivery_id: result.delivery_id,
+        http_status: result.http_status,
+        delivered: result.delivered,
+      },
+    });
+  });
+  return result;
+}
+
+/* ------------------------------------------------------------------ */
+/* E-04: webhook secret rotation (API §18.6; PRD §16.2)               */
+/* E-06: S2S webhook test (API §15, scope webhooks.test)              */
+/* E-17: webhook endpoint edit (PRD §16; coverage matrix P2)          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Rotate a webhook endpoint's signing secret (E-04), mirroring the
+ * site-credential rotate pattern: a fresh key id + secret are generated,
+ * the new secret is encrypted at rest, and the new secret value is
+ * returned EXACTLY ONCE — the caller must show it to staff and never
+ * store it. The old secret is revoked (the Drizzle persist layer marks
+ * non-current `webhook_endpoint_secrets` rows `revoked`).
+ *
+ * RETIRING-WINDOW GAP (honest limitation): API §18.6 asks for an
+ * overlapping active/retiring window, and the secrets table HAS a
+ * `retiring` status — but the endpoint record carries a single secret
+ * and the dispatcher signs with `endpoint.secret_ciphertext` only, so
+ * an old secret kept `retiring` could never verify a delivery today.
+ * A true overlap window needs dispatcher support for two active
+ * secrets (follow-up, not in this batch). Until then rotation is
+ * immediate: the old secret stops verifying as soon as this call
+ * persists. The returned `previous_key_id` names the revoked secret
+ * for the audit trail.
+ */
+export async function rotateWebhookSecret(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  webhookId: string,
+  config: {
+    encryptionKey: string;
+    keyVersion: string;
+    requestId: string;
+  }
+): Promise<{
+  endpoint: Omit<WebhookEndpointRecord, "secret_ciphertext">;
+  raw_signing_secret_once: string;
+  previous_key_id: string;
+  rotated_at: string;
+}> {
+  assertStaffPermission(actor, "integrations.manage");
+  return store.withTransaction((state) => {
+    const endpoint = state.webhook_endpoints.find((ep) => ep.id === webhookId);
+    if (!endpoint) throw new AppError("NOT_FOUND", "Webhook endpoint not found.", 404);
+    if (endpoint.status === "revoked") {
+      throw new AppError("CONFLICT", "Webhook endpoint is revoked.", 409);
+    }
+    const previousKeyId = endpoint.secret_key_id;
+    const newKeyId = randomOpaqueToken("whsec_key", 10);
+    const rawSecret = randomOpaqueToken("whsec", 28);
+    endpoint.secret_key_id = newKeyId;
+    endpoint.secret_ciphertext = encryptSecretAtRest(
+      rawSecret,
+      config.encryptionKey,
+      config.keyVersion,
+      `webhook_endpoints:${endpoint.id}`
+    );
+    endpoint.key_version = config.keyVersion;
+    const rotatedAt = new Date().toISOString();
+
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "webhooks.endpoint.secret_rotated",
+      resource_type: "webhook_endpoint",
+      resource_id: endpoint.id,
+      outcome: "success",
+      request_id: config.requestId,
+      changes: { url: endpoint.url, previous_key_id: previousKeyId, new_key_id: newKeyId },
+    });
+
+    const { secret_ciphertext: _, ...safeEndpoint } = endpoint;
+    return {
+      endpoint: safeEndpoint,
+      raw_signing_secret_once: rawSecret,
+      previous_key_id: previousKeyId,
+      rotated_at: rotatedAt,
+    };
+  });
+}
+
+/**
+ * Update a webhook endpoint's URL / description / subscribed events
+ * (E-17). The signing secret is NEVER touched here — a URL or
+ * subscription correction must not rotate the secret or lose delivery
+ * history (that was the whole cost of the old delete + re-register
+ * path). A body that changes nothing is a 422. The URL is re-validated
+ * against the SSRF rules, same as registration.
+ *
+ * Dual-key note: `subscribed_events` / `subscribedEvents` are both
+ * accepted and normalized here.
+ */
+export async function updateWebhookEndpoint(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  webhookId: string,
+  rawInput: unknown,
+  config: {
+    allowHttpLocal?: boolean;
+    requestId: string;
+  }
+): Promise<Omit<WebhookEndpointRecord, "secret_ciphertext">> {
+  assertStaffPermission(actor, "integrations.manage");
+  const raw = (rawInput ?? {}) as Record<string, unknown>;
+  const nextUrl = typeof raw.url === "string" ? raw.url : undefined;
+  const nextDescription =
+    typeof raw.description === "string" ? raw.description : undefined;
+  const nextEventsRaw =
+    raw.subscribed_events !== undefined
+      ? raw.subscribed_events
+      : raw.subscribedEvents !== undefined
+        ? raw.subscribedEvents
+        : undefined;
+  if (nextUrl !== undefined) {
+    let parsed: URL;
+    try {
+      parsed = new URL(nextUrl);
+    } catch {
+      throw new AppError("VALIDATION_ERROR", "url must be a valid URL.", 422);
+    }
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      throw new AppError("VALIDATION_ERROR", "url must use http or https.", 422);
+    }
+  }
+  if (nextDescription !== undefined) {
+    const trimmed = nextDescription.trim();
+    if (trimmed.length < 2 || trimmed.length > 160) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        "description must be 2–160 characters.",
+        422
+      );
+    }
+  }
+  let nextEvents: string[] | undefined;
+  if (nextEventsRaw !== undefined) {
+    if (
+      !Array.isArray(nextEventsRaw) ||
+      nextEventsRaw.length === 0 ||
+      nextEventsRaw.some(
+        (e) => typeof e !== "string" || e.trim().length < 3 || e.trim().length > 80
+      )
+    ) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        "subscribed_events must be a non-empty array of event names (3–80 chars).",
+        422
+      );
+    }
+    nextEvents = (nextEventsRaw as string[]).map((e) => e.trim());
+  }
+  if (nextUrl === undefined && nextDescription === undefined && nextEvents === undefined) {
+    throw new AppError("VALIDATION_ERROR", "Nothing to update.", 422);
+  }
+
+  // SSRF re-validation of the new URL happens BEFORE the transaction,
+  // like registration — a blocked URL must not write anything.
+  if (nextUrl !== undefined) {
+    await validateSafeExternalUrlAsync(nextUrl, config.allowHttpLocal ?? false);
+  }
+
+  return store.withTransaction((state) => {
+    const endpoint = state.webhook_endpoints.find((ep) => ep.id === webhookId);
+    if (!endpoint) throw new AppError("NOT_FOUND", "Webhook endpoint not found.", 404);
+    const changes: Record<string, unknown> = {};
+    if (nextUrl !== undefined && nextUrl !== endpoint.url) {
+      endpoint.url = nextUrl;
+      changes.url = nextUrl;
+    }
+    if (nextDescription !== undefined && nextDescription.trim() !== endpoint.description) {
+      endpoint.description = nextDescription.trim();
+      changes.description = endpoint.description;
+    }
+    if (
+      nextEvents !== undefined &&
+      JSON.stringify([...nextEvents].sort()) !==
+        JSON.stringify([...endpoint.subscribed_events].sort())
+    ) {
+      endpoint.subscribed_events = [...nextEvents];
+      changes.subscribed_events = [...nextEvents];
+    }
+    if (Object.keys(changes).length === 0) {
+      throw new AppError("VALIDATION_ERROR", "Nothing to update.", 422);
+    }
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "webhooks.endpoint.updated",
+      resource_type: "webhook_endpoint",
+      resource_id: endpoint.id,
+      outcome: "success",
+      request_id: config.requestId,
+      changes,
+    });
+    const { secret_ciphertext: _, ...safeEndpoint } = endpoint;
+    return safeEndpoint;
+  });
+}
+
+/**
+ * S2S webhook test for one integrated site (E-06): the route
+ * `POST /api/v1/integrations/sites/{siteKey}/webhook-test` (Worker A2)
+ * authenticates the caller first with the signed-server HMAC scope
+ * `webhooks.test`; this service then tests every ACTIVE endpoint the
+ * site owns, reusing the admin test transport. The audit actor is
+ * `integration` (the site), not staff — the trust boundary is the
+ * site's own HMAC credential.
+ */
+export async function testWebhookForSite(
+  store: StackMateDataStore,
+  siteKey: string,
+  config: {
+    encryptionKey: string;
+    allowHttpLocal?: boolean;
+  }
+): Promise<{
+  site_id: string;
+  site_key: string;
+  results: Array<{
+    endpoint_id: string;
+    delivery_id: string;
+    event_type: string;
+    http_status: number | null;
+    delivered: boolean;
+    error: string | null;
+  }>;
+}> {
+  const site = store.state.integrated_sites.find((s) => s.site_key === siteKey);
+  if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
+  if (site.status !== "active") {
+    throw new AppError("UNAUTHORIZED", `Integrated site is '${site.status}'.`, 401);
+  }
+  const endpoints = store.state.webhook_endpoints.filter(
+    (ep) => ep.integrated_site_id === site.id && ep.status === "active"
+  );
+  if (endpoints.length === 0) {
+    throw new AppError(
+      "NOT_FOUND",
+      "No active webhook endpoint exists for this site.",
+      404
+    );
+  }
+  const results = [];
+  for (const endpoint of endpoints) {
+    const result = await deliverWebhookTestDelivery(store, endpoint, config);
+    await store.withTransaction((state) => {
+      appendAuditLog(state, {
+        actor_type: "integration",
+        integrated_site_id: site.id,
+        action: "webhooks.endpoint.tested_by_site",
+        resource_type: "webhook_endpoint",
+        resource_id: endpoint.id,
+        outcome: result.delivered ? "success" : "failed",
+        request_id: `s2s:webhook-test:${site.site_key}`,
+        changes: {
+          url: endpoint.url,
+          delivery_id: result.delivery_id,
+          http_status: result.http_status,
+          delivered: result.delivered,
+        },
+      });
+    });
+    results.push(result);
+  }
+  return { site_id: site.id, site_key: site.site_key, results };
 }
 
 /**
@@ -608,15 +914,42 @@ export function createRealWebhookTransport(options?: {
  *   counts it in `skipped`, never in `delivered` / `retrying` /
  *   `dead_lettered`. CAPI events never take this branch — they are
  *   always simulated (see below).
- * - `tracking.meta_capi.dispatch` events are ALWAYS simulated (Batch 4
- *   builds the real Meta client): the tracking event is marked
- *   "simulated" with no delivery attempt and no `delivered_at` — and
- *   so is the outbox row, the audit row and the result counts, even
- *   when a real webhook transport is configured.
+ * - `tracking.meta_capi.dispatch` events are simulated UNLESS the
+ *   caller passes `options.capiDeliver` (Batch 4's
+ *   `deliverMetaCapiEvent`, modules/tracking/capi.ts — Worker E
+ *   exports it, app.ts wires it in): with it, the tracking event is
+ *   really delivered and recorded "processed" with `delivered_at`;
+ *   without it the event is marked "simulated" with no delivery
+ *   attempt and no `delivered_at` — and so is the outbox row, the
+ *   audit row and the result counts, even when a real webhook
+ *   transport is configured.
  * - Every terminal outcome (delivered / simulated / dead-letter) writes
  *   an audit row (M-14); retries write none — the final outcome owns
  *   the row.
+ * - B-02: delivery runs with bounded concurrency (default 5 in
+ *   flight), and each event's delivery rows + terminal outbox/audit
+ *   writes collapse into ONE transaction per event (previously one
+ *   transaction per delivery row + one terminal transaction, each
+ *   re-running the full combined load). The result carries
+ *   `duration_ms` and the tick is logged, so overlap is observable.
  */
+export interface CapiDeliveryInput {
+  /** First enabled Meta pixel group for the event's site, or null. */
+  pixelGroup: TrackingConfigRecord | null;
+  event: TrackingEventRecord;
+}
+
+export interface CapiDeliveryResult {
+  delivered: boolean;
+  status: string;
+  diagnostics?: unknown;
+}
+
+/** Batch 4 Meta CAPI delivery (modules/tracking/capi.ts). */
+export type CapiDeliverFn = (
+  input: CapiDeliveryInput
+) => Promise<CapiDeliveryResult>;
+
 export async function processTransactionalOutboxBatch(
   store: StackMateDataStore,
   options: {
@@ -626,6 +959,10 @@ export async function processTransactionalOutboxBatch(
     encryptionKey: string;
     allowHttpLocal?: boolean;
     transport?: WebhookTransportFn;
+    /** Batch 4 Meta CAPI delivery; omitted → CAPI stays simulated. */
+    capiDeliver?: CapiDeliverFn;
+    /** Bounded concurrency for delivery attempts (B-02, default 5). */
+    concurrency?: number;
   }
 ): Promise<{
   claimed: number;
@@ -636,72 +973,122 @@ export async function processTransactionalOutboxBatch(
   skipped: number;
   retrying: number;
   dead_lettered: number;
+  /** Wall time of the whole drain in ms (B-02 observability). */
+  duration_ms: number;
 }> {
+  const startedAtMs = Date.now();
   const workerId = options.workerId ?? `worker_${randomUUID().slice(0, 8)}`;
   const batchSize = options.batchSize ?? 25;
   const maxAttempts = options.maxAttempts ?? 5;
   const simulated = options.transport === undefined;
   const transport = options.transport ?? defaultSimulatedTransport;
+  const concurrency = Math.max(1, Math.min(options.concurrency ?? 5, 10));
 
-  // Step 1: Claim batch with lease inside transaction (`FOR UPDATE SKIP LOCKED` semantics)
-  const claimedEvents = await store.withTransaction((state) => {
-    const nowMs = Date.now();
-    const nowIso = new Date(nowMs).toISOString();
-    const leaseUntilIso = new Date(nowMs + 60 * 1000).toISOString();
+  // Step 1: Claim a batch with a lease.
+  // C-05: on a DrizzleStore this is a REAL SQL claim
+  // (UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED),
+  // ordered by available_at, created_at — see
+  // DrizzleStore.claimOutboxEvents). The in-memory fallback below is
+  // NOT row-level locking: it filters the loaded state and relies on
+  // the global writer advisory lock to serialise drains — two
+  // concurrent drains serialize wholesale instead of splitting the
+  // batch. The eligible set is ordered explicitly here too (the old
+  // code relied on the load query's ordering).
+  const drizzleStore = store as unknown as {
+    claimOutboxEvents?: (
+      batchSize: number,
+      workerId: string
+    ) => Promise<OutboxEventRecord[]>;
+  };
+  let claimedEvents: OutboxEventRecord[];
+  if (typeof drizzleStore.claimOutboxEvents === "function") {
+    claimedEvents = await drizzleStore.claimOutboxEvents(batchSize, workerId);
+  } else {
+    claimedEvents = await store.withTransaction((state) => {
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
+      const leaseUntilIso = new Date(nowMs + 60 * 1000).toISOString();
 
-    const eligible = state.outbox_events
-      .filter(
-        (ev) =>
-          (ev.status === "pending" && new Date(ev.available_at).getTime() <= nowMs) ||
-          (ev.status === "processing" &&
-            ev.locked_until !== null &&
-            new Date(ev.locked_until).getTime() <= nowMs)
-      )
-      .slice(0, batchSize);
+      const eligible = state.outbox_events
+        .filter(
+          (ev) =>
+            (ev.status === "pending" && new Date(ev.available_at).getTime() <= nowMs) ||
+            (ev.status === "processing" &&
+              ev.locked_until !== null &&
+              new Date(ev.locked_until).getTime() <= nowMs)
+        )
+        .sort(
+          (a, b) =>
+            new Date(a.available_at).getTime() - new Date(b.available_at).getTime() ||
+            new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+        )
+        .slice(0, batchSize);
 
-    for (const ev of eligible) {
-      ev.status = "processing";
-      ev.locked_by = workerId;
-      ev.locked_until = leaseUntilIso;
-      ev.attempt_count += 1;
-    }
-    return eligible.map((ev) => structuredClone(ev));
-  });
+      for (const ev of eligible) {
+        ev.status = "processing";
+        ev.locked_by = workerId;
+        ev.locked_until = leaseUntilIso;
+        ev.attempt_count += 1;
+      }
+      return eligible.map((ev) => structuredClone(ev));
+    });
+  }
 
-  let delivered = 0;
-  let simulatedCount = 0;
-  let skippedCount = 0;
-  let retrying = 0;
-  let deadLettered = 0;
+  type EventOutcome =
+    | "delivered"
+    | "simulated"
+    | "skipped"
+    | "retrying"
+    | "dead_lettered";
 
-  // Step 2: Process remote side effects OUTSIDE the database transaction
-  for (const ev of claimedEvents) {
-    // D-6: a CAPI dispatch is ALWAYS simulated (no Meta client exists),
-    // even when a real webhook transport is configured — the outbox
-    // row, the audit row and the counts must all agree with the
-    // tracking event, or a report could mistake it for a real Meta
-    // delivery. (Caught by the audit-fix test suite: the terminal
-    // block below used to follow the global `simulated` flag.)
-    const eventSimulated = simulated || ev.event_type === "tracking.meta_capi.dispatch";
-    // Q3: set in the non-CAPI branch below when no active endpoint
-    // subscribes to this event type. CAPI events never reach that
-    // branch, so they can never be marked skipped.
+  interface DeliveryOutcome {
+    endpointId: string;
+    deliveryId: string;
+    httpStatus: number;
+  }
+
+  // Step 2: process remote side effects OUTSIDE the database
+  // transaction, with bounded concurrency (B-02). Each event returns
+  // its outcome; counters are aggregated after the pool drains, so no
+  // shared mutable state is touched from concurrent tasks.
+  async function processOne(ev: OutboxEventRecord): Promise<EventOutcome> {
+    // D-6: a CAPI dispatch is simulated unless a real CAPI deliver
+    // function was injected — even when a real webhook transport is
+    // configured. `capiDelivered` flips only on a real delivery.
+    let capiDelivered = false;
     let noSubscribers = false;
+    const deliveries: DeliveryOutcome[] = [];
     try {
       if (ev.event_type === "tracking.meta_capi.dispatch") {
-        // D-6 / C-2: Meta CAPI delivery is a KNOWN STUB — there is no
-        // Meta client and zero graph.facebook.com calls anywhere in the
-        // API. The tracking event is recorded as "simulated": no
-        // delivery attempt is counted and `delivered_at` stays null, so
-        // no report can mistake it for a real Meta delivery.
-        await store.withTransaction((state) => {
-          const track = state.tracking_events.find(
+        if (options.capiDeliver) {
+          // Batch 4 (Worker E): real Meta CAPI delivery. The pixel
+          // group is resolved from the loaded state; the tracking
+          // event row is updated in the terminal transaction below.
+          // TODO (Worker E): modules/tracking/capi.ts must export
+          // deliverMetaCapiEvent(env, pixelGroup, event) -> { delivered,
+          // status, diagnostics }; app.ts passes it as `capiDeliver`.
+          // Until then this branch is unreachable and CAPI stays
+          // simulated (never recorded delivered).
+          const track = store.state.tracking_events.find(
             (t) => t.id === ev.payload.tracking_event_id
           );
-          if (track) {
-            markSimulated(track);
+          if (!track) throw new Error("TRACKING_EVENT_NOT_FOUND");
+          const pixelGroup =
+            store.state.tracking_configurations.find(
+              (tc) =>
+                tc.integrated_site_id === track.integrated_site_id &&
+                tc.provider === "meta" &&
+                tc.status === "enabled"
+            ) ?? null;
+          const result = await options.capiDeliver({ pixelGroup, event: track });
+          if (!result.delivered) {
+            throw new Error(`CAPI_${result.status}`);
           }
-        });
+          capiDelivered = true;
+        }
+        // Without capiDeliver: simulated — the terminal transaction
+        // below marks the tracking event simulated, no delivery
+        // attempt is counted and `delivered_at` stays null.
       } else {
         // Dispatch to subscribed active webhook endpoints
         const endpoints = store.state.webhook_endpoints.filter(
@@ -757,47 +1144,66 @@ export async function processTransactionalOutboxBatch(
           if (res.status < 200 || res.status >= 300) {
             throw new Error(`HTTP_${res.status}`);
           }
-
-          await store.withTransaction((state) => {
-            const existingDeliv = state.webhook_deliveries.find(
-              (d) => d.webhook_endpoint_id === ep.id && d.delivery_id === deliveryId
-            );
-            const nowIso = new Date().toISOString();
-            if (existingDeliv) {
-              existingDeliv.attempt_count += 1;
-              existingDeliv.last_http_status = res.status;
-              if (simulated) {
-                // D-6: a simulated 200 is not a delivery.
-                markSimulated(existingDeliv);
-                existingDeliv.delivered_at = null;
-              } else {
-                existingDeliv.status = "delivered";
-                existingDeliv.delivered_at = nowIso;
-              }
-            } else {
-              const row = {
-                id: randomUUID(),
-                webhook_endpoint_id: ep.id,
-                event_id: ev.id,
-                delivery_id: deliveryId,
-                status: "delivered" as const,
-                attempt_count: 1,
-                last_http_status: res.status,
-                delivered_at: nowIso as string | null,
-              };
-              if (simulated) {
-                markSimulated(row);
-                row.delivered_at = null;
-              }
-              state.webhook_deliveries.push(row);
-            }
-          });
+          deliveries.push({ endpointId: ep.id, deliveryId, httpStatus: res.status });
         }
       }
 
-      // Mark outbox event terminal: delivered (real), simulated, or
-      // skipped (no subscribed active endpoints — Q3).
+      // B-02: ONE transaction per event — delivery rows + tracking
+      // update + terminal outbox status + audit row together (was one
+      // transaction per delivery row + one terminal transaction).
+      const eventSimulated =
+        ev.event_type === "tracking.meta_capi.dispatch" ? !capiDelivered : simulated;
       await store.withTransaction((state) => {
+        if (ev.event_type === "tracking.meta_capi.dispatch") {
+          const track = state.tracking_events.find(
+            (t) => t.id === ev.payload.tracking_event_id
+          );
+          if (track) {
+            if (capiDelivered) {
+              track.status = "processed";
+              track.delivery_attempts += 1;
+              track.delivered_at = new Date().toISOString();
+            } else {
+              markSimulated(track);
+            }
+          }
+        }
+        for (const d of deliveries) {
+          const existingDeliv = state.webhook_deliveries.find(
+            (x) => x.webhook_endpoint_id === d.endpointId && x.delivery_id === d.deliveryId
+          );
+          const nowIso = new Date().toISOString();
+          if (existingDeliv) {
+            existingDeliv.attempt_count += 1;
+            existingDeliv.last_http_status = d.httpStatus;
+            if (simulated) {
+              // D-6: a simulated 200 is not a delivery.
+              markSimulated(existingDeliv);
+              existingDeliv.delivered_at = null;
+            } else {
+              existingDeliv.status = "delivered";
+              existingDeliv.delivered_at = nowIso;
+            }
+          } else {
+            const row = {
+              id: randomUUID(),
+              webhook_endpoint_id: d.endpointId,
+              event_id: ev.id,
+              delivery_id: d.deliveryId,
+              status: "delivered" as const,
+              attempt_count: 1,
+              last_http_status: d.httpStatus,
+              delivered_at: nowIso as string | null,
+            };
+            if (simulated) {
+              markSimulated(row);
+              row.delivered_at = null;
+            }
+            state.webhook_deliveries.push(row);
+          }
+        }
+        // Mark outbox event terminal: delivered (real), simulated, or
+        // skipped (no subscribed active endpoints — Q3).
         const target = state.outbox_events.find((e) => e.id === ev.id);
         if (target) {
           if (noSubscribers) target.status = "skipped";
@@ -825,11 +1231,12 @@ export async function processTransactionalOutboxBatch(
             : { event_type: ev.event_type },
         });
       });
-      if (noSubscribers) skippedCount += 1;
-      else if (eventSimulated) simulatedCount += 1;
-      else delivered += 1;
+      if (noSubscribers) return "skipped";
+      if (eventSimulated) return "simulated";
+      return "delivered";
     } catch (err) {
       const errorCode = (err as Error).message.slice(0, 80) || "DELIVERY_FAILED";
+      let deadLettered = false;
       await store.withTransaction((state) => {
         const target = state.outbox_events.find((e) => e.id === ev.id);
         if (!target) return;
@@ -839,7 +1246,7 @@ export async function processTransactionalOutboxBatch(
 
         if (target.attempt_count >= maxAttempts) {
           target.status = "dead_letter";
-          deadLettered += 1;
+          deadLettered = true;
           // M-14: a dead-lettered dispatch is auditable (failed outcome).
           appendAuditLog(state, {
             actor_type: "system",
@@ -858,18 +1265,40 @@ export async function processTransactionalOutboxBatch(
           target.status = "pending";
           const backoffMs = Math.min(300_000, 1000 * 2 ** target.attempt_count);
           target.available_at = new Date(Date.now() + backoffMs).toISOString();
-          retrying += 1;
         }
       });
+      return deadLettered ? "dead_lettered" : "retrying";
     }
   }
 
-  return {
+  // Bounded-concurrency pool (B-02): `concurrency` workers pull from
+  // the claimed list; a slow endpoint blocks one worker, not the tick.
+  const outcomes: EventOutcome[] = [];
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, claimedEvents.length) }, async () => {
+    while (nextIndex < claimedEvents.length) {
+      const ev = claimedEvents[nextIndex]!;
+      nextIndex += 1;
+      outcomes.push(await processOne(ev));
+    }
+  });
+  await Promise.all(workers);
+
+  const result = {
     claimed: claimedEvents.length,
-    delivered,
-    simulated: simulatedCount,
-    skipped: skippedCount,
-    retrying,
-    dead_lettered: deadLettered,
+    delivered: outcomes.filter((o) => o === "delivered").length,
+    simulated: outcomes.filter((o) => o === "simulated").length,
+    skipped: outcomes.filter((o) => o === "skipped").length,
+    retrying: outcomes.filter((o) => o === "retrying").length,
+    dead_lettered: outcomes.filter((o) => o === "dead_lettered").length,
+    duration_ms: Date.now() - startedAtMs,
   };
+  // B-02: tick observability — duration + counts on every tick (was:
+  // only errors were logged, so overlap was invisible).
+  console.info(
+    `[stackmate-cron] outbox drain: claimed=${result.claimed} delivered=${result.delivered} ` +
+      `simulated=${result.simulated} skipped=${result.skipped} retrying=${result.retrying} ` +
+      `dead_lettered=${result.dead_lettered} duration_ms=${result.duration_ms}`
+  );
+  return result;
 }

@@ -178,6 +178,9 @@ export const licenseEvents = pgTable("license_events", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 },
 (table) => [
+  // Migration 0021 (audit C-02): event history is read per license,
+  // newest first; license deletes scan the child table.
+  index("idx_license_events_license_created").on(table.licenseId, table.createdAt.desc()),
   check("license_events_actor_type_check", sql`"actor_type" IN ('system', 'staff', 'client')`),
 ]);
 
