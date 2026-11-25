@@ -4,7 +4,11 @@
  * GET /api/auth/ok must return the REAL Better Auth response
  * ({ ok: true }, status 200 — verified against better-auth 1.7.23
  * dist/api/routes/ok.mjs, which returns `ctx.json({ ok: true })`).
- * Building the auth instance for the in-memory store lazily creates a `pg`
+ * F-03 (audit fix-all): the fallback now re-emits Better Auth JSON
+ * responses inside the StackMate `{ data, meta }` envelope, so the
+ * assertion checks `data.ok` — the `{ ok: true }` itself still comes
+ * from the real Better Auth handler, not a mock. Building the auth
+ * instance for the in-memory store lazily creates a `pg`
  * Client + drizzle() but opens no connection, so this needs no live DB.
  *
  * GET /api/auth/session without credentials must still return 401 from
@@ -29,8 +33,14 @@ describe("Better Auth smoke (in-memory test adapter)", () => {
   it("GET /api/auth/ok returns a real Better Auth { ok: true } response", async () => {
     const res = await app.fetch(new Request("http://localhost:8787/api/auth/ok"), env);
     assert.equal(res.status, 200);
-    const body = (await res.json()) as unknown;
-    assert.deepEqual(body, { ok: true });
+    const body = (await res.json()) as {
+      data?: { ok?: boolean };
+      meta?: { api_version?: string };
+    };
+    // F-03: the fallback envelopes Better Auth JSON in { data, meta }.
+    // The ok:true itself still comes from the real Better Auth handler.
+    assert.equal(body.data?.ok, true);
+    assert.equal(body.meta?.api_version, "v1");
   });
 
   it("GET /api/auth/session without credentials still returns 401 from the custom route", async () => {

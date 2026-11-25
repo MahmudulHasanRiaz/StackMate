@@ -274,9 +274,15 @@ describe.skipIf(!DATABASE_URL)("Auth + Email batch (Postgres)", () => {
     // No admin can unset a global-required policy through the API (every
     // admin session is restricted) — the test resets it directly in the
     // DB, the same escape hatch an operator has. This is test-only.
+    // A-11: this suite shares ONE DrizzleStore across requests, and
+    // sign-in skips its reload while the store is fresh (30s) — the
+    // out-of-band SQL change is invisible until the shared store is
+    // reloaded explicitly. (Production creates a store per request, so
+    // the next request's fresh load sees the SQL change.)
     await adminClient.query(
       "UPDATE auth_two_factor_policy SET mode = 'off' WHERE scope = 'global'"
     );
+    await store.loadState();
     const res3 = await signIn(testUserEmail, testUserPassword);
     assert.equal(res3.body.data.principal.two_factor_setup_required, false);
     await setPolicy("global", "off");

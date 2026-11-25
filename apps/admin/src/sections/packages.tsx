@@ -31,7 +31,7 @@
  *  POST   /api/v1/admin/prices/:priceId/disable                packages.manage
  * Price status vocabulary: active | inactive | retired.
  */
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent, useMemo} from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
@@ -51,6 +51,7 @@ import {
   useAdminDetail,
   useAdminList,
   useAdminMutation,
+  useIdempotencyKey,
 } from "../lib/section-kit";
 import {
   Alert,
@@ -72,6 +73,7 @@ import {
   Tabs,
   Textarea,
   useConfirm,
+  GroupField,
 } from "../components/primitives";
 import type { ProductListItem } from "./products";
 import type { FeatureDto } from "./features";
@@ -474,11 +476,12 @@ function CreatePackageDialog({
     (f) => f.status === "active",
   );
 
-  const create = useAdminMutation({
+    const createKey = useIdempotencyKey();
+const create = useAdminMutation({
     mutationFn: (body: Record<string, unknown>) =>
       apiRequest<{ package: PackageDto }>(
         `/api/v1/admin/products/${wizardProductId}/packages`,
-        { method: "POST", body: JSON.stringify(body) },
+        { method: "POST", idempotencyKey: createKey, body: JSON.stringify(body) },
       ),
     invalidateKeys: [
       ["admin", "packages", "list", wizardProductId],
@@ -717,7 +720,7 @@ function CreatePackageDialog({
           </>
         ) : null}
         {step === "features" ? (
-          <Field
+          <GroupField
             label="Features in version 1"
             hint={`Features of ${wizardProduct?.name ?? "this product"} — tick the ones version 1 grants.`}
             {...(errors.grants ? { error: errors.grants } : {})}
@@ -735,7 +738,7 @@ function CreatePackageDialog({
                 {...(errors.grants ? { error: errors.grants } : {})}
               />
             )}
-          </Field>
+          </GroupField>
         ) : null}
         {step === "review" ? (
           <>
@@ -836,6 +839,13 @@ export function PackagesSection() {
     const timer = window.setTimeout(() => setDebouncedPackageSearch(search), 250);
     return () => window.clearTimeout(timer);
   }, [search]);
+  // D-01: the status filter is read before the query so it can be
+  // threaded server-side (?status=) instead of filtering one page.
+  const statusFilter =
+    typeof raw.status === "string" &&
+    (STATUS_FILTERS as readonly string[]).includes(raw.status)
+      ? raw.status
+      : "all";
   const packagesQuery = useQuery({
     queryKey: [
       "admin",
@@ -843,6 +853,7 @@ export function PackagesSection() {
       "list",
       productId ?? "none",
       debouncedPackageSearch,
+      statusFilter,
       list.page ?? 1,
       list.pageSize ?? 25,
     ],
@@ -851,6 +862,7 @@ export function PackagesSection() {
         limit: String(list.pageSize ?? 25),
         page: String(list.page ?? 1),
       });
+      if (statusFilter !== "all") params.set("status", statusFilter);
       if (debouncedPackageSearch.trim()) params.set("q", debouncedPackageSearch.trim());
       const res = await apiRequest<{ items: PackageDto[]; total?: number }>(
         `/api/v1/admin/products/${productId}/packages?${params}`,
@@ -860,83 +872,82 @@ export function PackagesSection() {
     enabled: Boolean(productId),
   });
 
-  const statusFilter =
-    typeof raw.status === "string" &&
-    (STATUS_FILTERS as readonly string[]).includes(raw.status)
-      ? raw.status
-      : "all";
+  // Client filter stays as the fallback until the API reads ?status=.
   const rows = (packagesQuery.data?.items ?? []).filter((p) =>
     statusFilter === "all" ? true : p.status === statusFilter,
   );
 
-  const columns: ColumnDef<PackageDto, unknown>[] = [
-    {
-      accessorKey: "name",
-      header: "Name",
-      cell: ({ row }) => (
-        <a href={`/packages/${row.original.id}`}>{row.original.name}</a>
-      ),
-    },
-    {
-      accessorKey: "package_key",
-      header: "Key",
-      cell: ({ row }) => (
-        <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-          <span className="sm-mono">{row.original.package_key}</span>
-          <CopyButton
-            value={row.original.package_key}
-            label={`Copy key ${row.original.package_key}`}
-          />
-        </span>
-      ),
-    },
-    {
-      accessorKey: "status",
-      header: "Status",
-      cell: ({ row }) => <StatusBadge status={row.original.status} />,
-    },
-    {
-      accessorKey: "current_version_id",
-      header: "Current version",
-      cell: ({ row }) => {
-        const current = row.original.versions.find(
-          (v) => v.id === row.original.current_version_id,
-        );
-        return current ? `v${current.version_number}` : "—";
+  const columns: ColumnDef<PackageDto, unknown>[] = useMemo(
+    () => [
+      {
+        accessorKey: "name",
+        header: "Name",
+        cell: ({ row }) => (
+          <a href={`/packages/${row.original.id}`}>{row.original.name}</a>
+        ),
       },
-    },
-    {
-      accessorKey: "versions",
-      header: "Versions",
-      cell: ({ row }) => (
-        <span className="sm-tabular">{row.original.versions.length}</span>
-      ),
-    },
-    {
-      id: "price",
-      header: "Price",
-      enableSorting: false,
-      cell: ({ row }) => {
-        const current = row.original.versions.find(
-          (v) => v.id === row.original.current_version_id,
-        );
-        const prices = (current?.prices ?? []).filter((pr) => pr.status === "active");
-        if (prices.length === 0) return "—";
-        return prices
-          .map((pr) =>
-            pr.price_kind === "free"
-              ? "Free"
-              : `${formatMinorMoney(pr.amount_minor, pr.currency_code)}${pr.price_kind === "recurring" && pr.interval_unit ? ` / ${pr.interval_count ?? 1} ${pr.interval_unit}${(pr.interval_count ?? 1) > 1 ? "s" : ""}` : ""}`,
-          )
-          .join(" · ");
+      {
+        accessorKey: "package_key",
+        header: "Key",
+        cell: ({ row }) => (
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+            <span className="sm-mono">{row.original.package_key}</span>
+            <CopyButton
+              value={row.original.package_key}
+              label={`Copy key ${row.original.package_key}`}
+            />
+          </span>
+        ),
       },
-    },
-    {
-      accessorKey: "created_at",
-      header: "Created",
-      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
-    },
-  ];
+      {
+        accessorKey: "status",
+        header: "Status",
+        cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      },
+      {
+        accessorKey: "current_version_id",
+        header: "Current version",
+        cell: ({ row }) => {
+          const current = row.original.versions.find(
+            (v) => v.id === row.original.current_version_id,
+          );
+          return current ? `v${current.version_number}` : "—";
+        },
+      },
+      {
+        accessorKey: "versions",
+        header: "Versions",
+        cell: ({ row }) => (
+          <span className="sm-tabular">{row.original.versions.length}</span>
+        ),
+      },
+      {
+        id: "price",
+        header: "Price",
+        enableSorting: false,
+        cell: ({ row }) => {
+          const current = row.original.versions.find(
+            (v) => v.id === row.original.current_version_id,
+          );
+          const prices = (current?.prices ?? []).filter((pr) => pr.status === "active");
+          if (prices.length === 0) return "—";
+          return prices
+            .map((pr) =>
+              pr.price_kind === "free"
+                ? "Free"
+                : `${formatMinorMoney(pr.amount_minor, pr.currency_code)}${pr.price_kind === "recurring" && pr.interval_unit ? ` / ${pr.interval_count ?? 1} ${pr.interval_unit}${(pr.interval_count ?? 1) > 1 ? "s" : ""}` : ""}`,
+            )
+            .join(" · ");
+        },
+      },
+      {
+        accessorKey: "created_at",
+        header: "Created",
+        cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
+      },
+  ],
+    [],
+  )
 
   return (
     <section aria-labelledby="packages-heading">
@@ -1050,6 +1061,7 @@ export function PackagesSection() {
           data={rows}
           serverSearch
           serverPagination
+          disableSorting
           refreshSection="packages"
           filtersActive={statusFilter !== "all"}
           total={packagesQuery.data?.total ?? 0}
@@ -1152,11 +1164,12 @@ function CreatePriceDialog({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
 
-  const create = useAdminMutation({
+    const createKey = useIdempotencyKey();
+const create = useAdminMutation({
     mutationFn: (body: Record<string, unknown>) =>
       apiRequest<PackagePriceDto>(
         `/api/v1/admin/package-versions/${version.id}/prices`,
-        { method: "POST", body: JSON.stringify(body) },
+        { method: "POST", idempotencyKey: createKey, body: JSON.stringify(body) },
       ),
     invalidateKeys: [
       detailKey("packages", packageId),
@@ -1579,10 +1592,11 @@ function NewVersionDialog({
     (f) => f.status === "active",
   );
 
-  const create = useAdminMutation({
+    const createKey = useIdempotencyKey();
+const create = useAdminMutation({
     mutationFn: (body: Record<string, unknown>) =>
       apiRequest<PackageVersionDto>(`/api/v1/admin/packages/${pkg.id}/versions`, {
-        method: "POST",
+        method: "POST", idempotencyKey: createKey,
         body: JSON.stringify(body),
       }),
     invalidateKeys: [
@@ -1791,30 +1805,33 @@ export function PackageDetailSection({ id }: { id: string }) {
 
   const query = useAdminDetail<PackageDto>("packages", id, `/api/v1/admin/packages/${id}`);
 
-  const publishVersion = useAdminMutation({
+    const publishVersionKey = useIdempotencyKey();
+const publishVersion = useAdminMutation({
     mutationFn: (versionId: string) =>
       apiRequest<PackageVersionDto>(
         `/api/v1/admin/package-versions/${versionId}/publish`,
-        { method: "POST" },
+        { method: "POST", idempotencyKey: publishVersionKey },
       ),
     invalidateKeys: [detailKey("packages", id)],
     successTitle: "Version published",
   });
 
-  const retireVersion = useAdminMutation({
+    const retireVersionKey = useIdempotencyKey();
+const retireVersion = useAdminMutation({
     mutationFn: (versionId: string) =>
       apiRequest<PackageVersionDto>(
         `/api/v1/admin/package-versions/${versionId}/retire`,
-        { method: "POST" },
+        { method: "POST", idempotencyKey: retireVersionKey },
       ),
     invalidateKeys: [detailKey("packages", id)],
     successTitle: "Version retired",
   });
 
-  const disablePrice = useAdminMutation({
+    const disablePriceKey = useIdempotencyKey();
+const disablePrice = useAdminMutation({
     mutationFn: (priceId: string) =>
       apiRequest<PackagePriceDto>(`/api/v1/admin/prices/${priceId}/disable`, {
-        method: "POST",
+        method: "POST", idempotencyKey: disablePriceKey,
       }),
     invalidateKeys: [detailKey("packages", id)],
     successTitle: "Price disabled",

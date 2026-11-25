@@ -17,8 +17,8 @@ import {
 import {
   decryptSecretAtRest,
   encryptSecretAtRest,
+  hashTokenPeppered,
   randomOpaqueToken,
-  sha256Hex,
   verifyCanonicalServerRequest,
 } from "../../platform/crypto/index.ts";
 import type {
@@ -119,7 +119,11 @@ export async function registerIntegratedSiteByAdmin(
       integrated_site_id: siteId,
       key_id: keyId,
       credential_type: "hmac_shared_secret",
-      secret_hash: sha256Hex(rawServerSecret),
+      // F-04: HMAC-peppered hash (pepper = the encryption master
+      // secret passed in config); old bare-SHA-256 rows are never
+      // verified by hash — auth decrypts the ciphertext instead — so
+      // no legacy lookup is needed here.
+      secret_hash: hashTokenPeppered(rawServerSecret, config.encryptionKey),
       secret_ciphertext: ciphertext,
       encryption_key_version: config.keyVersion,
       scopes: [...input.allowed_capabilities],
@@ -191,7 +195,7 @@ export async function rotateSiteServerCredentialByAdmin(
       integrated_site_id: siteId,
       key_id: newKeyId,
       credential_type: oldCred.credential_type,
-      secret_hash: sha256Hex(rawSecret),
+      secret_hash: hashTokenPeppered(rawSecret, config.encryptionKey),
       secret_ciphertext: ciphertext,
       encryption_key_version: config.keyVersion,
       scopes: [...oldCred.scopes],
@@ -552,7 +556,7 @@ export async function createSiteCredentialByAdmin(
       integrated_site_id: siteId,
       key_id: keyId,
       credential_type: input.credential_type,
-      secret_hash: sha256Hex(rawSecret),
+      secret_hash: hashTokenPeppered(rawSecret, config.encryptionKey),
       secret_ciphertext: ciphertext,
       encryption_key_version: config.keyVersion,
       scopes: [...input.scopes],

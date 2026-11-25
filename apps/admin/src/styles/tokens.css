@@ -2678,6 +2678,65 @@ a:hover {
   gap: var(--sm-space-2);
   padding: 0 var(--sm-space-4) var(--sm-space-4);
 }
+/* D-13: flush dialog footer — a footer rendered inside a form body
+   (not the Dialog's own footer slot) carries no side/bottom padding
+   and the standard 20px top gap. Replaces the 14 inline
+   `style={{ padding: 0, ... }}` footers in the sections. */
+/* E-20: ListTable column-visibility picker + bulk-action bar. */
+.sm-column-picker {
+  position: relative;
+}
+.sm-column-picker-panel {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 50;
+  min-width: 180px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--sm-surface-raised);
+  border: 1px solid var(--sm-border);
+  border-radius: 4px;
+  padding: 8px;
+  box-shadow: var(--sm-shadow-lg);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.sm-column-picker-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.sm-column-picker-item:hover {
+  background: var(--sm-surface-muted);
+}
+.sm-bulk-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  background: var(--sm-surface-muted);
+  border: 1px solid var(--sm-border);
+  border-radius: 4px;
+}
+.sm-bulk-count {
+  font-size: 13px;
+  font-weight: 600;
+  margin-right: 4px;
+}
+
+.sm-dialog-footer-flush {
+  padding: 0;
+  margin-top: 20px;
+  border: 0;
+}
 @keyframes sm-fade-in {
   from { opacity: 0; }
   to { opacity: 1; }

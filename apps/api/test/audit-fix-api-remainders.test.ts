@@ -31,11 +31,15 @@ import { StackMateDataStore } from "../src/platform/db/store.ts";
 import { DrizzleStore } from "../src/platform/db/drizzle-store.ts";
 import {
   computeLicenseKeyVerifier,
+  computeLicenseKeyVerifierV2,
   decryptSecretAtRest,
   encryptSecretAtRest,
   isLegacyV1Ciphertext,
+  needsReEncryption,
+  reEncryptSecretAtRest,
   validateSafeExternalUrl,
   validateSafeExternalUrlAsync,
+  verifyLicenseKeyVerifier,
 } from "../src/platform/crypto/index.ts";
 import { verifyFaviconBytes } from "../src/modules/general-settings/service.ts";
 import { createCustomerByAdmin } from "../src/modules/customers/service.ts";
@@ -169,12 +173,13 @@ describe("M-4 — master-secret KDF (scrypt v2, v1 dual-decrypt)", () => {
     assert.equal(isLegacyV1Ciphertext(ct), true);
   });
 
-  it("new writes default to v2 (scrypt) and round-trip", () => {
+  it("new writes default to v3 (scrypt over a random per-envelope salt) and round-trip", () => {
     const ct = encryptSecretAtRest("fresh-secret", MASTER, undefined, "test:aad");
-    assert.ok(ct.startsWith("v2:"));
-    assert.equal(ct.split(":").length, 4);
+    assert.ok(ct.startsWith("v3:"));
+    assert.equal(ct.split(":").length, 5);
     assert.equal(decryptSecretAtRest(ct, MASTER, "test:aad"), "fresh-secret");
     assert.equal(isLegacyV1Ciphertext(ct), false);
+    assert.equal(needsReEncryption(ct), false);
   });
 
   it("dual-decrypt fallback: a v2-tagged ciphertext derived under v1 still reads", () => {
@@ -196,6 +201,38 @@ describe("M-4 — master-secret KDF (scrypt v2, v1 dual-decrypt)", () => {
     const b = computeLicenseKeyVerifier("SM-TEST-AAAAA-BBBBB-CCCCC-DDDDD", "verifier-secret");
     assert.equal(a, b);
     assert.ok(a.startsWith("v1:"));
+  });
+
+  it("F-07: v2 license verifier is HKDF-derived and verify accepts both v1 and v2", () => {
+    const raw = "SM-TEST-AAAAA-BBBBB-CCCCC-DDDDD";
+    const v1 = computeLicenseKeyVerifier(raw, "verifier-secret");
+    const v2 = computeLicenseKeyVerifierV2(raw, "verifier-secret");
+    assert.ok(v2.startsWith("v2:"));
+    assert.notEqual(v1, v2);
+    assert.equal(verifyLicenseKeyVerifier(raw, v1, "verifier-secret"), true);
+    assert.equal(verifyLicenseKeyVerifier(raw, v2, "verifier-secret"), true);
+    assert.equal(verifyLicenseKeyVerifier(raw, v2, "wrong-secret"), false);
+    assert.equal(verifyLicenseKeyVerifier("SM-TEST-AAAAA-BBBBB-CCCCC-XXXXX", v2, "verifier-secret"), false);
+  });
+
+  it("F-07: v2 rows re-encrypt to v3 and old v1/v2 rows still decrypt (backward compat)", () => {
+    const v1 = encryptSecretAtRest("old-row", MASTER, "v1", "test:aad");
+    const v2 = encryptSecretAtRest("mid-row", MASTER, "v2", "test:aad");
+    assert.equal(needsReEncryption(v1), true);
+    assert.equal(needsReEncryption(v2), true);
+    assert.equal(decryptSecretAtRest(v1, MASTER, "test:aad"), "old-row");
+    assert.equal(decryptSecretAtRest(v2, MASTER, "test:aad"), "mid-row");
+    for (const old of [v1, v2]) {
+      const v3 = reEncryptSecretAtRest(old, MASTER, "test:aad");
+      assert.ok(v3.startsWith("v3:"));
+      assert.equal(decryptSecretAtRest(v3, MASTER, "test:aad"), decryptSecretAtRest(old, MASTER, "test:aad"));
+      assert.equal(needsReEncryption(v3), false);
+    }
+    // Two v3 envelopes of the same plaintext differ (random salt + IV).
+    const a = encryptSecretAtRest("same", MASTER, "v3", "test:aad");
+    const b = encryptSecretAtRest("same", MASTER, "v3", "test:aad");
+    assert.notEqual(a, b);
+    assert.notEqual(a.split(":")[1], b.split(":")[1]);
   });
 });
 

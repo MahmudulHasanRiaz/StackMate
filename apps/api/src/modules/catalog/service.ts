@@ -55,6 +55,18 @@ export async function createProduct(
               : ["api"]);
 
     const now = new Date().toISOString();
+    // E-13: the logo must reference a real uploaded asset — a dangling
+    // id would render a broken image and violate the FK on reload.
+    if (input.logo_asset_id !== undefined && input.logo_asset_id !== null) {
+      const asset = state.uploaded_assets.find((a) => a.id === input.logo_asset_id);
+      if (!asset) {
+        throw new AppError(
+          "VALIDATION_ERROR",
+          `Logo asset '${input.logo_asset_id}' does not exist.`,
+          422
+        );
+      }
+    }
     const product: ProductRecord = {
       id: randomUUID(),
       code: input.code,
@@ -70,6 +82,7 @@ export async function createProduct(
       status: "draft",
       website_url: input.website_url ?? null,
       documentation_url: input.documentation_url ?? null,
+      logo_asset_id: input.logo_asset_id ?? null,
       created_by_user_id: actor.user.id,
       created_at: now,
       updated_at: now,
@@ -136,6 +149,20 @@ export async function updateProductMetadata(
     if (input.description !== undefined) product.description = input.description;
     if (input.website_url !== undefined) product.website_url = input.website_url;
     if (input.documentation_url !== undefined) product.documentation_url = input.documentation_url;
+    // E-13: null clears the logo; a non-null id must reference a real asset.
+    if (input.logo_asset_id !== undefined) {
+      if (input.logo_asset_id !== null) {
+        const asset = state.uploaded_assets.find((a) => a.id === input.logo_asset_id);
+        if (!asset) {
+          throw new AppError(
+            "VALIDATION_ERROR",
+            `Logo asset '${input.logo_asset_id}' does not exist.`,
+            422
+          );
+        }
+      }
+      product.logo_asset_id = input.logo_asset_id;
+    }
     product.updated_at = new Date().toISOString();
     appendAuditLog(state, {
       actor_type: "staff",
@@ -960,4 +987,211 @@ export async function disablePackagePriceByAdmin(
     });
     return price;
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* E-08: save-as-package + entitlement-snapshot view (PRD §8.2/§8.3)  */
+/* ------------------------------------------------------------------ */
+
+export interface OrderEntitlementSnapshotView {
+  order_id: string;
+  order_number: string;
+  items: Array<{
+    order_item_id: string;
+    product_id: string;
+    product_name_snapshot: string;
+    package_name_snapshot: string | null;
+    package_version_snapshot: number | null;
+    entitlement_snapshot: {
+      snapshot_hash: string;
+      items: Array<{
+        feature_key_snapshot: string;
+        value_type_snapshot: "boolean" | "limit" | "quota" | "metered";
+        entitlement_value: unknown;
+        unit_snapshot: string | null;
+      }>;
+    };
+  }>;
+}
+
+/**
+ * Expose an order's per-item entitlement snapshots (E-08) — the rows
+ * the order detail page renders as the entitlement-snapshot card
+ * (Worker A2 wires the DTO; Worker D renders it). The data already
+ * lives on `order_item.entitlement_snapshot` (immutable, written at
+ * order time); this function only reads it, never recomputes it from
+ * the live feature catalog — a snapshot view must show what the
+ * customer actually bought, not what the features say today.
+ */
+export function getOrderEntitlementSnapshot(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  orderId: string
+): OrderEntitlementSnapshotView {
+  assertStaffPermission(actor, "orders.read");
+  const order = store.state.orders.find((o) => o.id === orderId);
+  if (!order) throw new AppError("NOT_FOUND", "Order not found.", 404);
+  return {
+    order_id: order.id,
+    order_number: order.order_number,
+    items: order.items.map((item) => ({
+      order_item_id: item.id,
+      product_id: item.product_id,
+      product_name_snapshot: item.product_name_snapshot,
+      package_name_snapshot: item.package_name_snapshot,
+      package_version_snapshot: item.package_version_snapshot,
+      entitlement_snapshot: {
+        snapshot_hash: item.entitlement_snapshot.snapshot_hash,
+        items: structuredClone(item.entitlement_snapshot.items),
+      },
+    })),
+  };
+}
+
+/**
+ * Save a custom order's configuration as a reusable draft package
+ * (E-08, PRD §8.2). The package is built from the order items'
+ * IMMUTABLE entitlement snapshots — the same values the customer was
+ * sold — never from the live feature defaults. The created package is
+ * a draft version 1 with no price: pricing is added through the normal
+ * price flow, and publishing stays a separate explicit step.
+ *
+ * Single-product only: packages belong to one product (PRD §6.1), so
+ * a multi-product order cannot become one package (422). The package
+ * key is slugified from the name and de-duplicated (`name-2`, …).
+ */
+export async function saveOrderAsPackage(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  orderId: string,
+  rawInput: unknown,
+  requestId: string
+): Promise<{ package: ProductPackageRecord; version: PackageVersionRecord }> {
+  assertStaffPermission(actor, "packages.manage");
+  const raw = (rawInput ?? {}) as Record<string, unknown>;
+  const name =
+    typeof raw.name === "string" ? raw.name.trim() : "";
+  const description =
+    typeof raw.description === "string" ? raw.description.trim() : undefined;
+  if (name.length < 2 || name.length > 160) {
+    throw new AppError("VALIDATION_ERROR", "name must be 2–160 characters.", 422);
+  }
+  if (description !== undefined && description.length > 2000) {
+    throw new AppError("VALIDATION_ERROR", "description must be at most 2000 characters.", 422);
+  }
+
+  const order = store.state.orders.find((o) => o.id === orderId);
+  if (!order) throw new AppError("NOT_FOUND", "Order not found.", 404);
+  if (order.items.length === 0) {
+    throw new AppError("VALIDATION_ERROR", "Order has no items to save as a package.", 422);
+  }
+  const productIds = [...new Set(order.items.map((i) => i.product_id))];
+  if (productIds.length > 1) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "A package belongs to a single product; this order spans multiple products.",
+      422
+    );
+  }
+  const productId = productIds[0]!;
+  const product = store.state.products.find((p) => p.id === productId);
+  if (!product) throw new AppError("NOT_FOUND", "Product for order not found.", 404);
+
+  const featureGrants: Array<{ product_feature_id: string; entitlement_value: unknown }> = [];
+  const seenKeys = new Set<string>();
+  for (const item of order.items) {
+    if (item.entitlement_snapshot.items.length === 0) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        `Order item '${item.product_name_snapshot}' has no entitlement snapshot.`,
+        422
+      );
+    }
+    for (const snapshotItem of item.entitlement_snapshot.items) {
+      if (seenKeys.has(snapshotItem.feature_key_snapshot)) {
+        throw new AppError(
+          "VALIDATION_ERROR",
+          `Feature '${snapshotItem.feature_key_snapshot}' appears more than once in this order and cannot map to one package grant.`,
+          422
+        );
+      }
+      seenKeys.add(snapshotItem.feature_key_snapshot);
+      const featureDef = store.state.product_features.find(
+        (f) => f.product_id === productId && f.feature_key === snapshotItem.feature_key_snapshot
+      );
+      if (!featureDef) {
+        throw new AppError(
+          "VALIDATION_ERROR",
+          `Feature '${snapshotItem.feature_key_snapshot}' no longer exists on product '${product.code}'.`,
+          422
+        );
+      }
+      let typedValue: unknown;
+      try {
+        typedValue = validateFeatureEntitlementValue(
+          featureDef.value_type,
+          snapshotItem.entitlement_value
+        );
+      } catch (err) {
+        throw new AppError("VALIDATION_ERROR", (err as Error).message, 422);
+      }
+      featureGrants.push({
+        product_feature_id: featureDef.id,
+        entitlement_value: typedValue,
+      });
+    }
+  }
+
+  const slugBase =
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 60) || "package";
+  let packageKey = slugBase;
+  let suffix = 2;
+  while (
+    store.state.product_packages.some(
+      (pkg) => pkg.product_id === productId && pkg.package_key === packageKey
+    )
+  ) {
+    packageKey = `${slugBase}-${suffix}`;
+    suffix += 1;
+  }
+
+  // Reuses the normal package-create path (uniqueness, cross-product
+  // guards, audit row) — the draft version it creates IS the saved
+  // package; no second write path exists.
+  const created = await createProductPackageWithDraftVersion(
+    store,
+    actor,
+    productId,
+    {
+      package_key: packageKey,
+      name,
+      description,
+      features: featureGrants,
+      change_summary: `Saved from order ${order.order_number}`,
+    },
+    requestId
+  );
+
+  await store.withTransaction((state) => {
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "catalog.package.saved_from_order",
+      resource_type: "product_package",
+      resource_id: created.package.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: {
+        order_id: order.id,
+        order_number: order.order_number,
+        package_key: packageKey,
+      },
+    });
+  });
+
+  return created;
 }

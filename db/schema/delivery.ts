@@ -53,6 +53,9 @@ export const webhookEndpoints = pgTable("webhook_endpoints", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 },
 (table) => [
+  // Migration 0021 (audit C-02): webhook lookups + endpoint deletes
+  // scan by integrated_site_id.
+  index("idx_webhook_endpoints_site_id").on(table.integratedSiteId),
   check("webhook_endpoints_status_check", sql`"status" IN ('active', 'disabled', 'revoked')`),
 ]);
 
@@ -95,6 +98,9 @@ export const webhookDeliveries = pgTable(
   },
   (table) => [
     unique("uq_webhook_deliveries_endpoint_delivery").on(table.webhookEndpointId, table.deliveryId),
+    // Migration 0021 (audit C-02): delivery history is read per
+    // endpoint + event; parent deletes scan by endpoint.
+    index("idx_webhook_deliveries_endpoint_event").on(table.webhookEndpointId, table.eventId),
     check("webhook_deliveries_status_check", sql`"status" IN ('pending', 'delivered', 'retrying', 'failed', 'simulated')`),
   ]
 );

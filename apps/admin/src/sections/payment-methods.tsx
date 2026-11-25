@@ -36,6 +36,7 @@ import {
   useAdminList,
   useAdminMutation,
   type ListSearch,
+  useIdempotencyKey,
 } from "../lib/section-kit";
 import {
   Alert,
@@ -56,6 +57,7 @@ import {
   Textarea,
   ErrorState,
   useConfirm,
+  GroupField,
 } from "../components/primitives";
 
 /* ------------------------------------------------------------------ */
@@ -172,73 +174,76 @@ export function PaymentMethodsSection() {
     [providers.data],
   );
 
-  const columns: ColumnDef<PaymentMethod, unknown>[] = [
-    {
-      accessorKey: "display_name",
-      header: "Method",
-      cell: ({ row }) => (
-        <span>
-          <strong>{row.original.display_name}</strong>
-          {row.original.account_label ? (
-            <span className="sm-hint"> — {row.original.account_label}</span>
-          ) : null}
-        </span>
-      ),
-    },
-    {
-      accessorKey: "method_key",
-      header: "Key",
-      cell: ({ row }) => (
-        <span className="sm-mono">
-          {row.original.method_key} <CopyButton value={row.original.method_key} />
-        </span>
-      ),
-    },
-    {
-      accessorKey: "method_kind",
-      header: "Kind",
-      cell: ({ row }) => KIND_LABELS[row.original.method_kind],
-    },
-    {
-      accessorKey: "provider_id",
-      header: "Provider",
-      cell: ({ row }) => providerById.get(row.original.provider_id)?.display_name ?? "—",
-    },
-    {
-      accessorKey: "configuration.account_number",
-      header: "Account",
-      cell: ({ row }) => (
-        <span className="sm-mono">{row.original.configuration.account_number}</span>
-      ),
-    },
-    {
-      accessorKey: "is_enabled",
-      header: "Status",
-      cell: ({ row }) => (
-        <StatusBadge status={row.original.is_enabled ? "enabled" : "disabled"} />
-      ),
-    },
-    {
-      accessorKey: "sort_order",
-      header: "Sort",
-      cell: ({ row }) => <span className="sm-tabular">{row.original.sort_order}</span>,
-    },
-    {
-      accessorKey: "created_at",
-      header: "Created",
-      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
-    },
-    {
-      id: "actions",
-      header: "Actions",
-      enableSorting: false,
-      cell: ({ row }) => (
-        <Button variant="secondary" size="sm" onClick={() => goDetail(row.original.id)}>
-          View
-        </Button>
-      ),
-    },
-  ];
+  const columns: ColumnDef<PaymentMethod, unknown>[] = useMemo(
+    () => [
+      {
+        accessorKey: "display_name",
+        header: "Method",
+        cell: ({ row }) => (
+          <span>
+            <strong>{row.original.display_name}</strong>
+            {row.original.account_label ? (
+              <span className="sm-hint"> — {row.original.account_label}</span>
+            ) : null}
+          </span>
+        ),
+      },
+      {
+        accessorKey: "method_key",
+        header: "Key",
+        cell: ({ row }) => (
+          <span className="sm-mono">
+            {row.original.method_key} <CopyButton value={row.original.method_key} />
+          </span>
+        ),
+      },
+      {
+        accessorKey: "method_kind",
+        header: "Kind",
+        cell: ({ row }) => KIND_LABELS[row.original.method_kind],
+      },
+      {
+        accessorKey: "provider_id",
+        header: "Provider",
+        cell: ({ row }) => providerById.get(row.original.provider_id)?.display_name ?? "—",
+      },
+      {
+        accessorKey: "configuration.account_number",
+        header: "Account",
+        cell: ({ row }) => (
+          <span className="sm-mono">{row.original.configuration.account_number}</span>
+        ),
+      },
+      {
+        accessorKey: "is_enabled",
+        header: "Status",
+        cell: ({ row }) => (
+          <StatusBadge status={row.original.is_enabled ? "enabled" : "disabled"} />
+        ),
+      },
+      {
+        accessorKey: "sort_order",
+        header: "Sort",
+        cell: ({ row }) => <span className="sm-tabular">{row.original.sort_order}</span>,
+      },
+      {
+        accessorKey: "created_at",
+        header: "Created",
+        cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
+      },
+      {
+        id: "actions",
+        header: "Actions",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <Button variant="secondary" size="sm" onClick={() => goDetail(row.original.id)}>
+            View
+          </Button>
+        ),
+      },
+  ],
+    [KIND_LABELS, providerById],
+  )
 
   return (
     <section aria-labelledby="payment-methods-heading">
@@ -348,47 +353,50 @@ function ProvidersTable({
   onCreate: () => void;
 }) {
   const [editing, setEditing] = useState<PaymentProvider | null>(null);
-  const columns: ColumnDef<PaymentProvider, unknown>[] = [
-    {
-      accessorKey: "display_name",
-      header: "Provider",
-      cell: ({ row }) => <strong>{row.original.display_name}</strong>,
-    },
-    {
-      accessorKey: "provider_key",
-      header: "Key",
-      cell: ({ row }) => (
-        <span className="sm-mono">
-          {row.original.provider_key} <CopyButton value={row.original.provider_key} />
-        </span>
-      ),
-    },
-    {
-      accessorKey: "provider_type",
-      header: "Type",
-      cell: ({ row }) => PROVIDER_TYPE_LABELS[row.original.provider_type],
-    },
-    {
-      accessorKey: "adapter_key",
-      header: "Adapter",
-      cell: ({ row }) => <span className="sm-mono">{row.original.adapter_key}</span>,
-    },
-    {
-      accessorKey: "status",
-      header: "Status",
-      cell: ({ row }) => <StatusBadge status={row.original.status} />,
-    },
-    {
-      id: "actions",
-      header: "Actions",
-      enableSorting: false,
-      cell: ({ row }) => (
-        <Button variant="secondary" size="sm" icon={Pencil} onClick={() => setEditing(row.original)}>
-          Edit
-        </Button>
-      ),
-    },
-  ];
+  const columns: ColumnDef<PaymentProvider, unknown>[] = useMemo(
+    () => [
+      {
+        accessorKey: "display_name",
+        header: "Provider",
+        cell: ({ row }) => <strong>{row.original.display_name}</strong>,
+      },
+      {
+        accessorKey: "provider_key",
+        header: "Key",
+        cell: ({ row }) => (
+          <span className="sm-mono">
+            {row.original.provider_key} <CopyButton value={row.original.provider_key} />
+          </span>
+        ),
+      },
+      {
+        accessorKey: "provider_type",
+        header: "Type",
+        cell: ({ row }) => PROVIDER_TYPE_LABELS[row.original.provider_type],
+      },
+      {
+        accessorKey: "adapter_key",
+        header: "Adapter",
+        cell: ({ row }) => <span className="sm-mono">{row.original.adapter_key}</span>,
+      },
+      {
+        accessorKey: "status",
+        header: "Status",
+        cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      },
+      {
+        id: "actions",
+        header: "Actions",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <Button variant="secondary" size="sm" icon={Pencil} onClick={() => setEditing(row.original)}>
+            Edit
+          </Button>
+        ),
+      },
+  ],
+    [PROVIDER_TYPE_LABELS],
+  )
   return (
     <>
       <ListTable<PaymentProvider>
@@ -450,7 +458,8 @@ function ProviderForm({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [formError, setFormError] = useState<string | null>(null);
 
-  const mutation = useAdminMutation<PaymentProvider, Record<string, unknown>>({
+    const mutationKey = useIdempotencyKey();
+const mutation = useAdminMutation<PaymentProvider, Record<string, unknown>>({
     mutationFn: (body) =>
       initial
         ? apiRequest<PaymentProvider>(`/api/v1/admin/payment-providers/${initial.id}`, {
@@ -458,7 +467,7 @@ function ProviderForm({
             body: JSON.stringify(body),
           })
         : apiRequest<PaymentProvider>("/api/v1/admin/payment-providers", {
-            method: "POST",
+            method: "POST", idempotencyKey: mutationKey,
             body: JSON.stringify(body),
           }),
     invalidateKeys: [listKey("payment-providers")],
@@ -556,7 +565,7 @@ function ProviderForm({
           <Alert variant="danger">{formError}</Alert>
         </div>
       ) : null}
-      <div className="sm-dialog-footer" style={{ padding: 0, marginTop: 20 }}>
+      <div className="sm-dialog-footer sm-dialog-footer-flush">
         <Button variant="secondary" onClick={onCancel}>
           Cancel
         </Button>
@@ -596,10 +605,11 @@ function MethodCreateForm({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [formError, setFormError] = useState<string | null>(null);
 
-  const mutation = useAdminMutation<PaymentMethod, Record<string, unknown>>({
+    const mutationKey = useIdempotencyKey();
+const mutation = useAdminMutation<PaymentMethod, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<PaymentMethod>("/api/v1/admin/payment-methods", {
-        method: "POST",
+        method: "POST", idempotencyKey: mutationKey,
         body: JSON.stringify(body),
       }),
     invalidateKeys: [listKey("payment-methods")],
@@ -761,7 +771,7 @@ function MethodCreateForm({
       </div>
       {methodKind === "bank_account" ? (
         <div style={{ marginTop: 16 }}>
-          <Field label="Transfer rails" required error={errors.transfer_rails ?? ""}>
+          <GroupField label="Transfer rails" required error={errors.transfer_rails ?? ""}>
             <span>
               {RAILS.map((rail) => (
                 <Checkbox
@@ -772,7 +782,7 @@ function MethodCreateForm({
                 />
               ))}
             </span>
-          </Field>
+          </GroupField>
         </div>
       ) : null}
       <div style={{ marginTop: 16 }}>
@@ -791,7 +801,7 @@ function MethodCreateForm({
           <Alert variant="danger">{formError}</Alert>
         </div>
       ) : null}
-      <div className="sm-dialog-footer" style={{ padding: 0, marginTop: 20 }}>
+      <div className="sm-dialog-footer sm-dialog-footer-flush">
         <Button variant="secondary" onClick={onCancel}>
           Cancel
         </Button>
@@ -816,10 +826,11 @@ export function PaymentMethodDetailSection({ id }: { id: string }) {
     [providers.data],
   );
 
-  const toggleMutation = useAdminMutation<PaymentMethod, { enabled: boolean }>({
+    const toggleMutationKey = useIdempotencyKey();
+const toggleMutation = useAdminMutation<PaymentMethod, { enabled: boolean }>({
     mutationFn: ({ enabled }) =>
       apiRequest<PaymentMethod>(`/api/v1/admin/payment-methods/${id}/${enabled ? "enable" : "disable"}`, {
-        method: "POST",
+        method: "POST", idempotencyKey: toggleMutationKey,
       }),
     invalidateKeys: [detailKey("payment-methods", id), listKey("payment-methods")],
     successTitle: "Payment method updated",
@@ -1062,7 +1073,7 @@ function MethodEditForm({
       </div>
       {method.method_kind === "bank_account" ? (
         <div style={{ marginTop: 16 }}>
-          <Field label="Transfer rails" required error={errors.transfer_rails ?? ""}>
+          <GroupField label="Transfer rails" required error={errors.transfer_rails ?? ""}>
             <span>
               {RAILS.map((rail) => (
                 <Checkbox
@@ -1073,7 +1084,7 @@ function MethodEditForm({
                 />
               ))}
             </span>
-          </Field>
+          </GroupField>
         </div>
       ) : null}
       <div style={{ marginTop: 16 }}>
@@ -1086,7 +1097,7 @@ function MethodEditForm({
           <Alert variant="danger">{formError}</Alert>
         </div>
       ) : null}
-      <div className="sm-dialog-footer" style={{ padding: 0, marginTop: 20 }}>
+      <div className="sm-dialog-footer sm-dialog-footer-flush">
         <Button variant="secondary" onClick={onCancel}>
           Cancel
         </Button>

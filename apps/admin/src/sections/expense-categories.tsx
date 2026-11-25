@@ -18,7 +18,7 @@
  *  - DELETE /api/v1/admin/expense-categories/:id   (409 when expenses exist)
  * See lib/api-client.ts for the camelCase/snake_case casing shim.
  */
-import { useState } from "react";
+import { useState, useMemo} from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
@@ -231,65 +231,68 @@ export function ExpenseCategoriesSection() {
     if (ok) deleteMutation.mutate(category);
   };
 
-  const columns: ColumnDef<ExpenseCategory, unknown>[] = [
-    {
-      accessorKey: "name",
-      header: "Category",
-      cell: ({ row }) => {
-        const Icon = expenseIconFor(row.original.icon);
-        return (
-          <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-            <ColorDot color={row.original.color} />
-            <Icon size={16} strokeWidth={2} aria-hidden="true" />
-            <strong>{row.original.name}</strong>
-          </span>
-        );
+  const columns: ColumnDef<ExpenseCategory, unknown>[] = useMemo(
+    () => [
+      {
+        accessorKey: "name",
+        header: "Category",
+        cell: ({ row }) => {
+          const Icon = expenseIconFor(row.original.icon);
+          return (
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+              <ColorDot color={row.original.color} />
+              <Icon size={16} strokeWidth={2} aria-hidden="true" />
+              <strong>{row.original.name}</strong>
+            </span>
+          );
+        },
       },
-    },
-    {
-      accessorKey: "icon",
-      header: "Icon",
-      cell: ({ row }) => expenseIconLabel(row.original.icon),
-    },
-    {
-      accessorKey: "expenseCount",
-      header: "Expenses",
-      cell: ({ row }) => <span className="sm-tabular">{row.original.expenseCount}</span>,
-    },
-    {
-      accessorKey: "isActive",
-      header: "Status",
-      cell: ({ row }) => (
-        <StatusBadge status={row.original.isActive ? "active" : "inactive"} />
-      ),
-    },
-    {
-      id: "actions",
-      header: "",
-      enableSorting: false,
-      cell: ({ row }) => (
-        <RowMenu
-          items={[
-            {
-              icon: Pencil,
-              label: "Edit",
-              onSelect: () => setEditing(row.original),
-            },
-            {
-              label: row.original.isActive ? "Deactivate" : "Activate",
-              onSelect: () => onToggle(row.original),
-            },
-            {
-              icon: Trash2,
-              label: "Delete",
-              danger: true,
-              onSelect: () => void onDelete(row.original),
-            },
-          ]}
-        />
-      ),
-    },
-  ];
+      {
+        accessorKey: "icon",
+        header: "Icon",
+        cell: ({ row }) => expenseIconLabel(row.original.icon),
+      },
+      {
+        accessorKey: "expenseCount",
+        header: "Expenses",
+        cell: ({ row }) => <span className="sm-tabular">{row.original.expenseCount}</span>,
+      },
+      {
+        accessorKey: "isActive",
+        header: "Status",
+        cell: ({ row }) => (
+          <StatusBadge status={row.original.isActive ? "active" : "inactive"} />
+        ),
+      },
+      {
+        id: "actions",
+        header: "",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <RowMenu
+            items={[
+              {
+                icon: Pencil,
+                label: "Edit",
+                onSelect: () => setEditing(row.original),
+              },
+              {
+                label: row.original.isActive ? "Deactivate" : "Activate",
+                onSelect: () => onToggle(row.original),
+              },
+              {
+                icon: Trash2,
+                label: "Delete",
+                danger: true,
+                onSelect: () => void onDelete(row.original),
+              },
+            ]}
+          />
+        ),
+      },
+  ],
+    [expenseIconFor, expenseIconLabel, onDelete, onToggle, setEditing],
+  )
 
   return (
     <section aria-labelledby="expense-categories-heading">
@@ -505,7 +508,7 @@ function CategoryForm({
           <Alert variant="danger">{formError}</Alert>
         </div>
       ) : null}
-      <div className="sm-dialog-footer" style={{ padding: 0, marginTop: 20 }}>
+      <div className="sm-dialog-footer sm-dialog-footer-flush">
         <Button variant="secondary" onClick={onCancel}>
           Cancel
         </Button>

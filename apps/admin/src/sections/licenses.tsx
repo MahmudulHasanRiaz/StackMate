@@ -29,24 +29,34 @@
  *    license_status, entitlement_version, entitlement_expires_at,
  *    next_validation_after — and an entitlement_token, which is
  *    deliberately NOT rendered anywhere in this file.
- * POST /api/v1/admin/licenses/manual-grants exists but is NOT wired
- * here: it needs customer/product pickers owned by other sections.
+ *  - POST /api/v1/admin/licenses/manual-grants — licenses.manage;
+ *    manual grant dialog (E-07) below. The issued key is shown once
+ *    and never stored.
+ *  - POST /api/v1/admin/licenses/:id/activations/:activationId/transfer
+ *    — licenses.manage; transfer dialog (E-03) on the detail page.
+ *    Body shape is the assumed { new_installation_id,
+ *    new_domain_normalized, reason } — the API worker aligns it.
  */
 import { useMemo, useState, type FormEvent } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { useRouter, useSearch } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
 import { Eye, KeyRound } from "lucide-react";
 import { apiRequest, ApiClientError } from "../lib/api-client";
+import { ddmmyyyyToIso, normalizeDateInput } from "../lib/dates";
 import { detailKey, listKey } from "../lib/query";
 import {
   DetailLayout,
   ListTable,
   PageHeader,
   apiErrorMessage,
+  detailLabelResolver,
+  loadListOptions,
   parseListSearch,
   useAdminDetail,
   useAdminList,
   useAdminMutation,
+  useIdempotencyKey,
 } from "../lib/section-kit";
 import {
   Alert,
@@ -55,15 +65,21 @@ import {
   CopyButton,
   DateCell,
   DateTimeCell,
+  Dialog,
   EmptyState,
   ErrorState,
   Field,
   Input,
+  SearchableSelect,
   Select,
   StatusBadge,
   TableSkeleton,
+  Textarea,
   useConfirm,
 } from "../components/primitives";
+import type { CustomerDto } from "./customers";
+import type { FeatureDto } from "./features";
+import type { ProductListItem } from "./products";
 
 /* ------------------------------------------------------------------ */
 /* DTOs (shapes verified against apps/api/src/app.ts + store.ts)        */
@@ -143,11 +159,19 @@ export function LicensesSection() {
   const statusFilter = (LICENSE_STATUSES as readonly string[]).includes(statusParam)
     ? statusParam
     : "all";
+  // D-01: server sort (?sort=created_at:asc|desc — the API supports
+  // it) + server status filter, threaded into the list query.
+  const [sort, setSort] = useState<string | undefined>(undefined);
+  const [grantOpen, setGrantOpen] = useState(false);
 
   const query = useAdminList<LicenseListItem>("licenses", "/api/v1/admin/licenses", {
     q: parsed.q,
     page,
     pageSize,
+    extra: {
+      ...(statusFilter !== "all" ? { status: statusFilter } : {}),
+      ...(sort ? { sort } : {}),
+    },
   });
 
   const updateSearch = (patch: {
@@ -254,12 +278,18 @@ export function LicensesSection() {
         breadcrumb={[{ label: "Licenses & Activations" }]}
         title="Licenses & Activations"
         help="Issued licenses, activation seats, and key checks"
+        action={
+          <Button variant="primary" icon={KeyRound} onClick={() => setGrantOpen(true)}>
+            Manual grant
+          </Button>
+        }
       />
       <ListTable
         columns={columns}
         data={filtered}
         serverSearch
         serverPagination
+        serverSort={{ sortableColumns: ["created_at"], value: sort, onChange: setSort }}
         refreshSection="licenses"
         filtersActive={statusFilter !== "all"}
         total={query.total}
@@ -295,7 +325,278 @@ export function LicensesSection() {
         getRowId={(row) => row.id}
       />
       <ValidateKeyCard />
+      {grantOpen ? <ManualGrantDialog onClose={() => setGrantOpen(false)} /> : null}
     </section>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Manual grant — POST /api/v1/admin/licenses/manual-grants (E-07)     */
+/* The issued key is shown ONCE and never stored: it lives only in    */
+/* this dialog's state and is dropped when the dialog closes.          */
+/* ------------------------------------------------------------------ */
+function parseFeatureValue(raw: string): unknown {
+  const v = raw.trim();
+  if (v === "true") return true;
+  if (v === "false") return false;
+  if (/^-?\d+$/.test(v)) return Number(v);
+  return v;
+}
+
+function ManualGrantDialog({ onClose }: { onClose: () => void }) {
+  const [customerId, setCustomerId] = useState("");
+  const [productId, setProductId] = useState("");
+  const [activationLimit, setActivationLimit] = useState("1");
+  const [expiresDisplay, setExpiresDisplay] = useState("");
+  const [reason, setReason] = useState("");
+  const [entValues, setEntValues] = useState<Record<string, string>>({});
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [formError, setFormError] = useState<string | null>(null);
+  const [issuedKey, setIssuedKey] = useState<string | null>(null);
+  // A-04: one key per dialog instance — a retried grant replays.
+  const formKey = useIdempotencyKey();
+
+  const featuresQuery = useQuery({
+    queryKey: ["admin", "products", productId, "features"],
+    queryFn: async () => {
+      const res = await apiRequest<{ items: FeatureDto[] }>(
+        `/api/v1/admin/products/${productId}/features?limit=100`,
+      );
+      return res.items;
+    },
+    enabled: productId !== "",
+  });
+  const features = (featuresQuery.data ?? []).filter((f) => f.status === "active");
+
+  const mutation = useAdminMutation<{ issued_license_key_once?: string | null }, Record<string, unknown>>({
+    mutationFn: (body) =>
+      apiRequest<{ issued_license_key_once?: string | null }>(
+        "/api/v1/admin/licenses/manual-grants",
+        { method: "POST", body: JSON.stringify(body), idempotencyKey: formKey },
+      ),
+    invalidateKeys: [listKey("licenses")],
+    successTitle: "License granted",
+    onSuccess: (data) => setIssuedKey(data.issued_license_key_once ?? null),
+  });
+
+  const submit = () => {
+    const next: Record<string, string> = {};
+    if (!customerId) next.customer_id = "Choose a customer.";
+    if (!productId) next.product_id = "Choose a product.";
+    const limit = Number(activationLimit);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 10000)
+      next.activation_limit = "Activation limit must be a whole number from 1 to 10000.";
+    const expiresIso = expiresDisplay.trim()
+      ? ddmmyyyyToIso(expiresDisplay.trim())
+      : null;
+    if (expiresDisplay.trim() && expiresIso === null)
+      next.expires_at = "Use a valid DD/MM/YYYY date, or leave empty for no expiry.";
+    if (reason.trim().length < 3) next.reason = "Reason needs at least 3 characters.";
+    else if (reason.trim().length > 500) next.reason = "Reason must be at most 500 characters.";
+    setErrors(next);
+    if (Object.keys(next).length > 0) return;
+    setFormError(null);
+    // Entitlements are keyed by feature_key with the typed value
+    // shape ({ value_type, value }); a feature left blank is omitted
+    // and keeps the product default.
+    const entitlements: Record<string, unknown> = {};
+    for (const f of features) {
+      const v = (entValues[f.id] ?? "").trim();
+      if (!v) continue;
+      entitlements[f.feature_key] = {
+        value_type: f.value_type,
+        value: parseFeatureValue(v),
+      };
+    }
+    mutation.mutate(
+      {
+        customer_id: customerId,
+        product_id: productId,
+        activation_limit: limit,
+        ...(expiresIso ? { expires_at: expiresIso } : { expires_at: null }),
+        reason: reason.trim(),
+        entitlements,
+      },
+      {
+        onError: (err) => setFormError(err instanceof Error ? err.message : "Request failed"),
+      },
+    );
+  };
+
+  return (
+    <Dialog open size="md" onClose={onClose} title="Manual grant">
+      {issuedKey ? (
+        <div>
+          <Alert variant="success">
+            License granted. Copy the key now — it is shown once and is never
+            stored or shown again.
+          </Alert>
+          <div style={{ marginTop: 16 }}>
+            <Field label="License key (shown once)">
+              <span className="sm-mono">
+                {issuedKey}
+                <CopyButton value={issuedKey} label="Copy license key" />
+              </span>
+            </Field>
+          </div>
+          <div className="sm-dialog-footer sm-dialog-footer-flush">
+            <Button variant="primary" onClick={onClose}>
+              Done
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            submit();
+          }}
+        >
+          {formError ? <Alert variant="danger">{formError}</Alert> : null}
+          <div className="sm-form-grid" style={{ marginTop: 16 }}>
+            <Field label="Customer" required htmlFor="grant-customer" error={errors.customer_id ?? ""}>
+              <SearchableSelect
+                id="grant-customer"
+                value={customerId}
+                onChange={(v) => setCustomerId(v)}
+                loadOptions={(q, signal) =>
+                  loadListOptions<CustomerDto>(
+                    "/api/v1/admin/customers",
+                    q,
+                    (c) => ({
+                      value: c.id,
+                      label: c.email ? `${c.name} — ${c.email}` : c.name,
+                    }),
+                    signal,
+                  )
+                }
+                resolveLabel={detailLabelResolver<CustomerDto>(
+                  (id) => `/api/v1/admin/customers/${id}`,
+                  (c) => (c.email ? `${c.name} — ${c.email}` : c.name),
+                )}
+                placeholder="Type a name, email or phone…"
+                ariaLabel="Customer"
+              />
+            </Field>
+            <Field label="Product" required htmlFor="grant-product" error={errors.product_id ?? ""}>
+              <SearchableSelect
+                id="grant-product"
+                value={productId}
+                onChange={(v) => {
+                  setProductId(v);
+                  setEntValues({});
+                }}
+                loadOptions={(q, signal) =>
+                  loadListOptions<ProductListItem>(
+                    "/api/v1/admin/products",
+                    q,
+                    (p) => ({ value: p.id, label: p.name }),
+                    signal,
+                  )
+                }
+                resolveLabel={detailLabelResolver<ProductListItem>(
+                  (id) => `/api/v1/admin/products/${id}`,
+                  (p) => p.name,
+                )}
+                placeholder="Type a product name…"
+                ariaLabel="Product"
+              />
+            </Field>
+            <Field label="Activation limit" required htmlFor="grant-limit" error={errors.activation_limit ?? ""}>
+              <Input
+                id="grant-limit"
+                name="activation_limit"
+                inputMode="numeric"
+                value={activationLimit}
+                onChange={(e) => setActivationLimit(e.target.value)}
+                aria-invalid={Boolean(errors.activation_limit) || undefined}
+              />
+            </Field>
+            <Field label="Expires (DD/MM/YYYY)" htmlFor="grant-expires" hint="Leave empty for no expiry." error={errors.expires_at ?? ""}>
+              <Input
+                id="grant-expires"
+                name="expires_at"
+                value={expiresDisplay}
+                onChange={(e) => setExpiresDisplay(normalizeDateInput(e.target.value))}
+                placeholder="DD/MM/YYYY"
+                aria-invalid={Boolean(errors.expires_at) || undefined}
+              />
+            </Field>
+          </div>
+          <div style={{ marginTop: 16 }}>
+            <Field label="Reason" required htmlFor="grant-reason" error={errors.reason ?? ""}>
+              <Textarea
+                id="grant-reason"
+                name="reason"
+                value={reason}
+                onChange={(e) => setReason(e.target.value)}
+                maxLength={500}
+                rows={3}
+                placeholder="Why is this license being granted manually?"
+              />
+            </Field>
+          </div>
+          {productId !== "" ? (
+            <div style={{ marginTop: 16 }}>
+              <h3 className="sm-card-title">Entitlements</h3>
+              {featuresQuery.isPending ? (
+                <p className="sm-hint">Loading product features…</p>
+              ) : features.length === 0 ? (
+                <p className="sm-hint">This product has no active features — the grant uses the product defaults.</p>
+              ) : (
+                <div className="sm-form-grid">
+                  {features.map((f) => (
+                    <Field
+                      key={f.id}
+                      label={f.name}
+                      htmlFor={`grant-ent-${f.id}`}
+                      hint={`${f.feature_key} · ${f.value_type}${f.unit ? ` (${f.unit})` : ""} — leave blank for the product default.`}
+                    >
+                      {f.value_type === "boolean" ? (
+                        <Select
+                          id={`grant-ent-${f.id}`}
+                          name={`ent-${f.feature_key}`}
+                          value={entValues[f.id] ?? ""}
+                          onChange={(e) =>
+                            setEntValues((v) => ({ ...v, [f.id]: e.target.value }))
+                          }
+                        >
+                          <option value="">Default</option>
+                          <option value="true">true</option>
+                          <option value="false">false</option>
+                        </Select>
+                      ) : (
+                        <Input
+                          id={`grant-ent-${f.id}`}
+                          name={`ent-${f.feature_key}`}
+                          value={entValues[f.id] ?? ""}
+                          onChange={(e) =>
+                            setEntValues((v) => ({ ...v, [f.id]: e.target.value }))
+                          }
+                          placeholder={
+                            f.default_value !== null && f.default_value !== undefined
+                              ? String(f.default_value)
+                              : ""
+                          }
+                        />
+                      )}
+                    </Field>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : null}
+          <div className="sm-dialog-footer sm-dialog-footer-flush">
+            <Button variant="secondary" onClick={onClose}>
+              Cancel
+            </Button>
+            <Button variant="accent" loading={mutation.isPending} onClick={submit}>
+              Grant license
+            </Button>
+          </div>
+        </form>
+      )}
+    </Dialog>
   );
 }
 
@@ -446,6 +747,7 @@ function ValidateKeyCard() {
 /* ------------------------------------------------------------------ */
 export function LicenseDetailSection({ id }: { id: string }) {
   const confirm = useConfirm();
+  const [transferTarget, setTransferTarget] = useState<LicenseActivation | null>(null);
   const query = useAdminDetail<LicenseDetail>(
     "licenses",
     id,
@@ -458,11 +760,15 @@ export function LicenseDetailSection({ id }: { id: string }) {
     `/api/v1/admin/licenses/${id}/activations`,
   );
 
+  // A-04: one key per section instance for each consequential POST.
+  const lifecycleKey = useIdempotencyKey();
+  const deactivateKey = useIdempotencyKey();
   const lifecycle = useAdminMutation<unknown, "suspend" | "resume" | "revoke">({
     mutationFn: (action) =>
       apiRequest(`/api/v1/admin/licenses/${id}/${action}`, {
         method: "POST",
         body: JSON.stringify({ reason: `License ${action} by staff` }),
+        idempotencyKey: lifecycleKey,
       }),
     invalidateKeys: [
       detailKey("licenses", id),
@@ -476,7 +782,7 @@ export function LicenseDetailSection({ id }: { id: string }) {
     mutationFn: (activationId) =>
       apiRequest(
         `/api/v1/admin/licenses/${id}/activations/${activationId}/deactivate`,
-        { method: "POST", body: JSON.stringify({}) },
+        { method: "POST", body: JSON.stringify({}), idempotencyKey: deactivateKey },
       ),
     invalidateKeys: [
       detailKey("licenses", id),
@@ -682,15 +988,25 @@ export function LicenseDetailSection({ id }: { id: string }) {
                       </td>
                       <td>
                         {a.status === "active" ? (
-                          <Button
-                            variant="danger-ghost"
-                            size="sm"
-                            disabled={busy}
-                            loading={deactivate.isPending && deactivate.variables === a.id}
-                            onClick={() => void askDeactivate(a)}
-                          >
-                            Deactivate
-                          </Button>
+                          <span style={{ display: "inline-flex", gap: 8 }}>
+                            <Button
+                              variant="secondary"
+                              size="sm"
+                              disabled={busy}
+                              onClick={() => setTransferTarget(a)}
+                            >
+                              Transfer
+                            </Button>
+                            <Button
+                              variant="danger-ghost"
+                              size="sm"
+                              disabled={busy}
+                              loading={deactivate.isPending && deactivate.variables === a.id}
+                              onClick={() => void askDeactivate(a)}
+                            >
+                              Deactivate
+                            </Button>
+                          </span>
                         ) : (
                           "—"
                         )}
@@ -703,6 +1019,13 @@ export function LicenseDetailSection({ id }: { id: string }) {
           )}
         </div>
 
+        {transferTarget ? (
+          <TransferActivationDialog
+            licenseId={id}
+            activation={transferTarget}
+            onClose={() => setTransferTarget(null)}
+          />
+        ) : null}
         <div className="sm-card">
           <h2 className="sm-card-title">Entitlement snapshots</h2>
           {lic.entitlement_snapshots.length === 0 ? (
@@ -742,5 +1065,139 @@ export function LicenseDetailSection({ id }: { id: string }) {
         </div>
       </DetailLayout>
     </section>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Transfer activation — POST .../activations/:id/transfer (E-03)      */
+/* Body shape is the assumed { new_installation_id,                    */
+/* new_domain_normalized, reason } — no spec/docs body shape exists;   */
+/* the API worker aligns the endpoint to this shape.                   */
+/* ------------------------------------------------------------------ */
+function TransferActivationDialog({
+  licenseId,
+  activation,
+  onClose,
+}: {
+  licenseId: string;
+  activation: LicenseActivation;
+  onClose: () => void;
+}) {
+  const [installationId, setInstallationId] = useState("");
+  const [domain, setDomain] = useState("");
+  const [reason, setReason] = useState("");
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [formError, setFormError] = useState<string | null>(null);
+  // A-04: one key per dialog instance — a retried transfer replays.
+  const formKey = useIdempotencyKey();
+
+  const mutation = useAdminMutation<unknown, Record<string, unknown>>({
+    mutationFn: (body) =>
+      apiRequest(
+        `/api/v1/admin/licenses/${licenseId}/activations/${activation.id}/transfer`,
+        { method: "POST", body: JSON.stringify(body), idempotencyKey: formKey },
+      ),
+    invalidateKeys: [
+      detailKey("licenses", licenseId),
+      listKey("licenses"),
+      listKey("license-activations"),
+    ],
+    successTitle: "Activation transferred",
+    successMessage: "The seat now belongs to the new installation.",
+    onSuccess: onClose,
+  });
+
+  const submit = () => {
+    const next: Record<string, string> = {};
+    if (installationId.trim().length < 6)
+      next.new_installation_id = "New installation ID needs at least 6 characters.";
+    else if (installationId.trim().length > 200)
+      next.new_installation_id = "New installation ID must be at most 200 characters.";
+    if (!domain.trim()) next.new_domain_normalized = "New domain is required.";
+    else if (domain.trim().length > 253)
+      next.new_domain_normalized = "New domain must be at most 253 characters.";
+    if (reason.trim().length < 3) next.reason = "Reason needs at least 3 characters.";
+    else if (reason.trim().length > 500)
+      next.reason = "Reason must be at most 500 characters.";
+    setErrors(next);
+    if (Object.keys(next).length > 0) return;
+    setFormError(null);
+    mutation.mutate(
+      {
+        new_installation_id: installationId.trim(),
+        new_domain_normalized: domain.trim().toLowerCase(),
+        reason: reason.trim(),
+      },
+      {
+        onError: (err) => setFormError(err instanceof Error ? err.message : "Request failed"),
+      },
+    );
+  };
+
+  return (
+    <Dialog open size="md" onClose={onClose} title="Transfer activation">
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          submit();
+        }}
+      >
+        <Alert variant="warning">
+          The {activation.environment} installation
+          {activation.domain_normalized ? ` at ${activation.domain_normalized}` : ""} stops
+          validating and the seat moves to the new installation.
+        </Alert>
+        {formError ? (
+          <div style={{ marginTop: 16 }}>
+            <Alert variant="danger">{formError}</Alert>
+          </div>
+        ) : null}
+        <div className="sm-form-grid" style={{ marginTop: 16 }}>
+          <Field label="New installation ID" required htmlFor="transfer-installation" error={errors.new_installation_id ?? ""}>
+            <Input
+              id="transfer-installation"
+              name="new_installation_id"
+              value={installationId}
+              onChange={(e) => setInstallationId(e.target.value)}
+              maxLength={200}
+              placeholder="e.g. site-installation-42"
+              aria-invalid={Boolean(errors.new_installation_id) || undefined}
+            />
+          </Field>
+          <Field label="New domain" required htmlFor="transfer-domain" error={errors.new_domain_normalized ?? ""}>
+            <Input
+              id="transfer-domain"
+              name="new_domain_normalized"
+              value={domain}
+              onChange={(e) => setDomain(e.target.value)}
+              maxLength={253}
+              placeholder="e.g. example.com"
+              aria-invalid={Boolean(errors.new_domain_normalized) || undefined}
+            />
+          </Field>
+        </div>
+        <div style={{ marginTop: 16 }}>
+          <Field label="Reason" required htmlFor="transfer-reason" error={errors.reason ?? ""}>
+            <Textarea
+              id="transfer-reason"
+              name="reason"
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              maxLength={500}
+              rows={3}
+              placeholder="Why is this activation moving?"
+            />
+          </Field>
+        </div>
+        <div className="sm-dialog-footer sm-dialog-footer-flush">
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="accent" loading={mutation.isPending} onClick={submit}>
+            Transfer activation
+          </Button>
+        </div>
+      </form>
+    </Dialog>
   );
 }

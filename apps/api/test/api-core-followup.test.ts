@@ -37,7 +37,7 @@ describe("API-core follow-up: M-10 fallback gate + H-3 suspend routes", () => {
   async function apiRequest(
     path: string,
     options: { method?: string; body?: unknown; cookie?: string } = {}
-  ): Promise<{ status: number; body: any }> {
+  ): Promise<{ status: number; body: any; headers: Headers }> {
     const headers = new Headers({ "Content-Type": "application/json" });
     if (options.cookie) headers.set("Cookie", options.cookie);
     const init: RequestInit = { method: options.method ?? "GET", headers };
@@ -50,7 +50,17 @@ describe("API-core follow-up: M-10 fallback gate + H-3 suspend routes", () => {
     } catch {
       body = text;
     }
-    return { status: res.status, body };
+    return { status: res.status, body, headers: res.headers };
+  }
+
+  // A-01: the session token is cookie-only — sign-in JSON no longer
+  // carries session_token, so the cookie comes from Set-Cookie.
+  function sessionCookieFromHeaders(resHeaders: Headers): string {
+    const setCookies =
+      typeof resHeaders.getSetCookie === "function" ? resHeaders.getSetCookie() : [];
+    const pair = setCookies.find((c) => c.startsWith("stackmate_session="));
+    assert.ok(pair, "sign-in must set a stackmate_session cookie");
+    return pair!.split(";")[0]!;
   }
 
   beforeAll(async () => {
@@ -73,7 +83,7 @@ describe("API-core follow-up: M-10 fallback gate + H-3 suspend routes", () => {
       body: { email: "followup-admin@stackmate.local", password: "FollowupSuperPass123!" },
     });
     assert.equal(signIn.status, 200, JSON.stringify(signIn.body));
-    superCookie = `stackmate_session=${signIn.body.data.session_token}`;
+    superCookie = sessionCookieFromHeaders(signIn.headers);
 
     const target = await apiRequest("/api/v1/admin/users", {
       method: "POST",
@@ -175,7 +185,7 @@ describe("API-core follow-up: M-10 fallback gate + H-3 suspend routes", () => {
       body: { email: "suspend-target@stackmate.local", password: "SuspendTargetPass123!" },
     });
     assert.equal(staffSignIn.status, 200, JSON.stringify(staffSignIn.body));
-    const staffCookie = `stackmate_session=${staffSignIn.body.data.session_token}`;
+    const staffCookie = sessionCookieFromHeaders(staffSignIn.headers);
     const res = await apiRequest(`/api/v1/admin/users/${superUserId}/suspend`, {
       method: "PATCH",
       cookie: staffCookie,

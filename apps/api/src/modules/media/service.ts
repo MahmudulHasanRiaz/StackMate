@@ -152,8 +152,22 @@ export function clampMediaListParams(params: MediaListParams): {
 /**
  * Server-side list over the FULL media_assets dataset (owner hard
  * rule, PLAN §29): `q` matches filename (substring, case-insensitive)
- * OR any tag; `kind` and `folder` filter server-side too. `limit`
- * caps AFTER filtering — a match at row 500 is found.
+ * OR an exact tag token (case-insensitive). `kind` and `folder`
+ * filter server-side too. `limit` caps AFTER filtering — a match at
+ * row 500 is found.
+ *
+ * C-03 companion: the tags GIN index (migration 0022,
+ * idx_media_assets_tags_gin) only accelerates array-containment
+ * operators (@>, &&) — the old `unnest(tags) ... ILIKE '%q%'`
+ * predicate unnested every row and never used the index. Tags are
+ * normalized lowercase tokens at write time (normalizeTags:
+ * ^[a-z0-9][a-z0-9_-]*$, max 10), so the tag search is exact
+ * containment on the lowercased query: `tags @> ARRAY[lower(q)]`.
+ * SEMANTICS CHANGE vs the old predicate: a tag previously matched
+ * on substring ("log" found tag "logo"); now only the whole token
+ * matches. Filename search stays substring ILIKE (served by the
+ * filename trigram index), so incremental typing still finds files
+ * by name.
  */
 export async function listMediaAssets(
   db: MediaDb,
@@ -165,7 +179,7 @@ export async function listMediaAssets(
     const like = `%${escapeLikePattern(q)}%`;
     const match = or(
       ilike(mediaAssets.originalFilename, like),
-      sql`EXISTS (SELECT 1 FROM unnest(${mediaAssets.tags}) AS t WHERE t ILIKE ${like})`,
+      sql`${mediaAssets.tags} @> ARRAY[${q.toLowerCase()}]::text[]`,
     );
     if (match) conditions.push(match);
   }
@@ -213,6 +227,39 @@ export async function requireMediaAsset(
   const row = await getMediaAsset(db, id);
   if (!row) throw new AppError("NOT_FOUND", "Media asset not found.", 404);
   return row;
+}
+
+/**
+ * B-07: lightweight row lookups for app.ts routes — direct SQL by id,
+ * no full-store load (the avatar route used to load the whole state
+ * to find one user row). `getMediaRowById` is the same single-row
+ * query as `getMediaAsset`, under the name the route wiring expects.
+ */
+export async function getMediaRowById(
+  db: MediaDb,
+  id: string,
+): Promise<typeof mediaAssets.$inferSelect | null> {
+  return getMediaAsset(db, id);
+}
+
+/**
+ * B-07: the user's stored avatar R2 object key (`avatars/...`), or
+ * null when the user has none (Gravatar/initials fallback) or the
+ * stored value is a media-library content URL rather than a key.
+ * Direct SQL on `users.avatar_url` — no store load.
+ */
+export async function getUserAvatarObjectKey(
+  db: MediaDb,
+  userId: string,
+): Promise<string | null> {
+  const rows = await db
+    .select({ avatarUrl: schema.users.avatarUrl })
+    .from(schema.users)
+    .where(eq(schema.users.id, userId))
+    .limit(1);
+  const value = rows[0]?.avatarUrl ?? null;
+  if (!value || !value.startsWith("avatars/")) return null;
+  return value;
 }
 
 export interface MediaUploadInput {

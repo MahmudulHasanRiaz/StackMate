@@ -65,6 +65,16 @@ describe("StackMate End-to-End Domain, Security, Concurrency & Hyperdrive Test S
     return { status: res.status, body, headers: res.headers };
   }
 
+  // A-01: the session token is cookie-only — sign-in JSON no longer
+  // carries session_token, so the cookie comes from Set-Cookie.
+  function sessionCookieFromHeaders(resHeaders: Headers): string {
+    const setCookies =
+      typeof resHeaders.getSetCookie === "function" ? resHeaders.getSetCookie() : [];
+    const pair = setCookies.find((c) => c.startsWith("stackmate_session="));
+    assert.ok(pair, "sign-in must set a stackmate_session cookie");
+    return pair!.split(";")[0]!;
+  }
+
   async function bootstrapAndLoginSuperAdmin(): Promise<{
     cookie: string;
     token: string;
@@ -91,9 +101,11 @@ describe("StackMate End-to-End Domain, Security, Concurrency & Hyperdrive Test S
       }),
     });
     assert.equal(signInRes.status, 200);
-    const token = signInRes.body.data.session_token;
+    const cookie = sessionCookieFromHeaders(signInRes.headers);
+    // Test-adapter cookie value IS the raw session token (used as Bearer).
+    const token = cookie.split("=")[1]!;
     return {
-      cookie: `stackmate_session=${token}`,
+      cookie,
       token,
       userId: signInRes.body.data.principal.user.id,
     };
@@ -267,7 +279,7 @@ describe("StackMate End-to-End Domain, Security, Concurrency & Hyperdrive Test S
       }),
     });
     assert.equal(financeSignIn.status, 200);
-    const financeCookie = `stackmate_session=${financeSignIn.body.data.session_token}`;
+    const financeCookie = sessionCookieFromHeaders(financeSignIn.headers);
 
     // Finance manager CANNOT create catalog products (`products.create` denied)
     const forbiddenProductRes = await apiRequest(
@@ -528,7 +540,10 @@ describe("StackMate End-to-End Domain, Security, Concurrency & Hyperdrive Test S
     );
     assert.equal(spoofPurchaseRes.status, 403);
 
-    // 6. Public website fetches catalog (increments cachedQueries metric) and creates idempotent checkout order
+    // 6. Public website fetches catalog (runs real queries — B-11
+    // removed the false cachedQueries counter, so the metric that
+    // proves the load happened is uncachedQueries) and creates
+    // idempotent checkout order
     const pubCatRes = await apiRequest(
       `/api/v1/public/sites/${siteKey}/products`,
       {
@@ -538,7 +553,7 @@ describe("StackMate End-to-End Domain, Security, Concurrency & Hyperdrive Test S
     );
     assert.equal(pubCatRes.status, 200);
     assert.equal(pubCatRes.body.data.items.length, 1);
-    assert.ok(store.queryMetrics.cachedQueries >= 1);
+    assert.ok(store.queryMetrics.uncachedQueries >= 1);
 
     const checkoutBody = {
       items: [

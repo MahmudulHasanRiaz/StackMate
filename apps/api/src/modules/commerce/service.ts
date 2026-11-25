@@ -9,8 +9,10 @@ import {
   validateFeatureEntitlementValue,
 } from "../../../../../packages/contracts/src/index.ts";
 import {
+  decodeCheckoutAccessToken,
   issueCheckoutAccessToken,
   randomOpaqueToken,
+  type CheckoutTokenPayload,
 } from "../../platform/crypto/index.ts";
 import type {
   CustomerRecord,
@@ -70,6 +72,50 @@ export function generateInvoiceForOrderInTx(
   };
   state.invoices.push(invoice);
   return invoice;
+}
+
+/**
+ * A-03: the checkout response body must never be persisted with its
+ * live bearer token (idempotency_records.response_body is DB-readable).
+ * `sanitizeCheckoutResponseBody` replaces the token with null and
+ * keeps only its decoded payload (oid/ref/sid/exp — none of it secret);
+ * `reissueCheckoutResponseBody` mints a fresh token from that payload
+ * on replay, so a replayed checkout still returns a usable token.
+ * Legacy rows (stored before this fix) keep their verbatim token and
+ * are returned unchanged — the token expires within 2h and the row
+ * itself within 24h (F-13 + B-12 prune).
+ */
+export function sanitizeCheckoutResponseBody<T extends { checkout_access_token: string }>(
+  body: T
+): Omit<T, "checkout_access_token"> & {
+  checkout_access_token: null;
+  checkout_token_payload: CheckoutTokenPayload;
+} {
+  const payload = decodeCheckoutAccessToken(body.checkout_access_token);
+  const { checkout_access_token: _token, ...rest } = body;
+  return { ...rest, checkout_access_token: null, checkout_token_payload: payload };
+}
+
+export function reissueCheckoutResponseBody<T extends { checkout_access_token: string }>(
+  stored: unknown,
+  checkoutTokenSecret: string
+): T {
+  const rec = stored as Record<string, unknown>;
+  const payload = rec["checkout_token_payload"] as CheckoutTokenPayload | undefined;
+  if (
+    payload &&
+    typeof payload.oid === "string" &&
+    typeof payload.ref === "string" &&
+    typeof payload.sid === "string" &&
+    typeof payload.exp === "number"
+  ) {
+    const { checkout_token_payload: _payload, ...rest } = rec;
+    return {
+      ...rest,
+      checkout_access_token: issueCheckoutAccessToken(payload, checkoutTokenSecret),
+    } as T;
+  }
+  return stored as T;
 }
 
 /**
@@ -414,6 +460,13 @@ export async function createPublicCheckoutOrder(
         checkout_access_token: checkoutAccessToken,
         checkout_token_expires_at: new Date(expUnix * 1000).toISOString(),
       };
+    },
+    {
+      // A-03: persist the body with the token redacted; replays
+      // re-issue it deterministically from the stored payload.
+      sanitizeStoredBody: sanitizeCheckoutResponseBody,
+      reissueBody: (stored) =>
+        reissueCheckoutResponseBody(stored, input.checkoutTokenSecret),
     }
   );
 

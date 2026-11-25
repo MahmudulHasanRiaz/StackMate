@@ -1,5 +1,6 @@
 /**
- * StackMate Central API Application (Hono / Cloudflare Workers Fetch Standard).
+ * StackMate Central API Application (Cloudflare Workers Fetch Standard —
+ * a plain fetch handler, no framework).
  *
  * Composes:
  * 1. Environment validation (`resolveRuntimeConfig`).
@@ -19,6 +20,8 @@ import {
   createCollectionEnvelope,
   createErrorEnvelope,
   createSuccessEnvelope,
+  decodeCursor,
+  encodeCursor,
   formatDisplayDateDDMMYYYY,
   formatDisplayDateTimeDDMMYYYY,
   RecordManualRefundSchema,
@@ -30,6 +33,15 @@ import {
   type WorkerExecutionContext,
 } from "./env.ts";
 import { verifyCheckoutAccessToken } from "./platform/crypto/index.ts";
+import {
+  decryptSecretAtRest,
+  encryptSecretAtRest,
+  sha256Hex,
+  verifyTokenHash,
+} from "./platform/crypto/index.ts";
+import { verifyMediaBytes } from "./platform/storage/media-validation.ts";
+import { and, eq } from "drizzle-orm";
+import { passwordResetTokens as baPasswordResetTokens } from "../../../db/schema/auth-config.ts";
 import { StackMateDataStore } from "./platform/db/store.ts";
 import { createBetterAuth } from "./modules/identity/better-auth.ts";
 import {
@@ -43,11 +55,13 @@ import {
 } from "./modules/email/service.ts";
 import {
   loadAuthConfig,
+  loadSmtpSettings,
   saveOAuthProvider,
   saveSmtpSettings,
   saveTwoFactorPolicy,
   toAuthConfigView,
   type ResolvedAuthConfig,
+  type ResolvedSmtpSettings,
 } from "./modules/auth-config/service.ts";
 import {
   DEFAULT_GENERAL_SETTINGS,
@@ -79,6 +93,8 @@ import {
   type DriverDeps,
 } from "./platform/storage/driver.ts";
 import { AppError } from "./shared/errors.ts";
+import { MAX_MEDIA_BYTES } from "./platform/storage/media-validation.ts";
+import { sql } from "drizzle-orm";
 import {
   isTimestampInOverviewRange,
   parseOverviewRange,
@@ -113,6 +129,7 @@ import {
   recordTwoFactorStateChange,
   resetStaffPasswordByToken,
   resolveStaffPrincipal,
+  resolveTokenPepper,
   revokeStaffInvitationByAdmin,
   signInStaffSession,
   signOutStaffSession,
@@ -136,6 +153,7 @@ import {
   disablePackagePriceByAdmin,
   publishPackageVersion,
   retirePackageVersionByAdmin,
+  saveOrderAsPackage,
   updatePackagePriceByAdmin,
   updateProductFeatureByAdmin,
   updateProductMetadata,
@@ -171,6 +189,8 @@ import {
   approvePaymentSubmissionByStaff,
   createPaymentMethodByAdmin,
   createPaymentProviderByAdmin,
+  deletePaymentMethodByAdmin,
+  deletePaymentProviderByAdmin,
   recordManualPaymentClaimByAdmin,
   recordManualRefundByAdmin,
   rejectPaymentSubmissionByStaff,
@@ -192,6 +212,7 @@ import {
   createManualLicenseGrantByAdmin,
   deactivateLicenseActivationByAdmin,
   deactivateLicenseInstallation,
+  transferActivation,
   transitionLicenseStatusByAdmin,
   validateLicenseInstallation,
 } from "./modules/licensing/service.ts";
@@ -216,6 +237,7 @@ import {
   createTrackingConfigByAdmin,
   deleteTrackingConfigByAdmin,
   ingestExternalTrackingEvent,
+  sendTrackingTestEvent,
   updateTrackingConfigByAdmin,
 } from "./modules/tracking/service.ts";
 import {
@@ -224,7 +246,10 @@ import {
   processTransactionalOutboxBatch,
   registerWebhookEndpointByAdmin,
   replayOutboxEventByAdmin,
+  rotateWebhookSecret,
   testWebhookEndpointByAdmin,
+  testWebhookForSite,
+  updateWebhookEndpoint,
 } from "./modules/webhooks/service.ts";
 import { appendAuditLog, resolveAuditResourceDisplayName } from "./modules/audit/service.ts";
 import {
@@ -247,6 +272,12 @@ import {
   saveReminderSettings,
 } from "./modules/reminders/service.ts";
 import { searchGlobal } from "./modules/search/service.ts";
+import {
+  CRON_JOB_OUTBOX_DRAIN,
+  CRON_JOB_RENEWAL_SWEEP,
+  releaseCronLease,
+  tryAcquireCronLease,
+} from "./platform/cron-lease.ts";
 import {
   markSweepRemindersSent,
   runRenewalExpirySweep,
@@ -309,43 +340,6 @@ function setupTokenMatches(provided: string, expected: string): boolean {
   const a = createHash("sha256").update(provided, "utf8").digest();
   const b = createHash("sha256").update(expected, "utf8").digest();
   return timingSafeEqual(a, b);
-}
-
-/**
- * H-7: fail closed when staging/production still points at localhost
- * URLs. The URL vars default to http://localhost:5173/8787 in env.ts,
- * so a deployed API that never set them would silently run against
- * loopback. This runs AFTER store resolution (at the top of
- * handleRequest / handleScheduled) — never inside
- * resolveRuntimeConfig, where a throw would escape as a bare Worker
- * exception instead of the JSON error envelope. Test/local envs are
- * exempt: localhost is correct there.
- */
-function assertProductionUrlVars(env: StackMateBindings): void {
-  if (env.APP_ENV !== "staging" && env.APP_ENV !== "production") return;
-  const localhostHosts = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
-  const check = (name: string, value: string | undefined): void => {
-    if (!value) return;
-    let host = "";
-    try {
-      host = new URL(value).hostname.toLowerCase();
-    } catch {
-      return;
-    }
-    if (localhostHosts.has(host)) {
-      throw new AppError(
-        "INTERNAL_ERROR",
-        `Server misconfiguration: ${name} points at localhost in ${env.APP_ENV}.`,
-        500
-      );
-    }
-  };
-  check("APP_URL", env.APP_URL);
-  check("API_URL", env.API_URL);
-  check("BETTER_AUTH_URL", env.BETTER_AUTH_URL);
-  for (const origin of env.TRUSTED_ORIGINS.split(",")) {
-    check("TRUSTED_ORIGINS", origin.trim());
-  }
 }
 
 /**
@@ -479,6 +473,28 @@ export function createStackMateApp(
   }
 
   /**
+   * C-10: pg.Clients created by the Better Auth fallback path in
+   * getBetterAuth (below) are tracked per store and ended when the
+   * request finishes (see fetchHandler's finally). Without this each
+   * request that took the non-`drizzleDb` branch leaked a client
+   * object — a connection is only opened if Better Auth actually
+   * queries, but the object itself was never ended.
+   */
+  const betterAuthFallbackClients = new WeakMap<
+    object,
+    Array<{ end: () => Promise<unknown> }>
+  >();
+
+  async function closeBetterAuthFallbackClients(
+    store: StackMateDataStore
+  ): Promise<void> {
+    const clients = betterAuthFallbackClients.get(store);
+    if (!clients || clients.length === 0) return;
+    betterAuthFallbackClients.delete(store);
+    await Promise.all(clients.map((c) => c.end().catch(() => {})));
+  }
+
+  /**
    * Build the Better Auth instance for one request from the request's store.
    * A DrizzleStore exposes its `drizzleDb` directly. Any other store (the
    * in-memory test adapter) gets a lazily created `pg` Client + drizzle()
@@ -512,6 +528,11 @@ export function createStackMateApp(
     const client = new Client({
       connectionString: env.HYPERDRIVE_NO_CACHE.connectionString,
     });
+    // C-10: track the fallback client so fetchHandler ends it when
+    // the request finishes (see closeBetterAuthFallbackClients).
+    const tracked = betterAuthFallbackClients.get(store) ?? [];
+    tracked.push(client);
+    betterAuthFallbackClients.set(store, tracked);
     return createBetterAuth(env, drizzle(client), authConfig);
   }
 
@@ -526,7 +547,15 @@ export function createStackMateApp(
   async function sendEmailViaSmtp(
     store: StackMateDataStore,
     env: StackMateBindings,
-    message: { to: string; subject: string; text: string; html?: string }
+    message: { to: string; subject: string; text: string; html?: string },
+    // B-15: preloaded SMTP settings for the cron tick (loaded once per
+    // tick in handleScheduled). Worker B adds the matching optional 4th
+    // parameter to sendStackMateEmail — until then the extra argument
+    // is ignored at runtime and the per-send load inside
+    // sendStackMateEmail still runs; the cast keeps this compiling
+    // either way and the tick-level gate below still saves N loads
+    // when SMTP is not configured at all.
+    preloadedSmtp?: ResolvedSmtpSettings | null
   ): Promise<SendResult> {
     const db = (store as unknown as { drizzleDb?: unknown }).drizzleDb as
       | Parameters<typeof sendStackMateEmail>[0]
@@ -537,14 +566,21 @@ export function createStackMateApp(
         error: "Email is not configured. Set up SMTP in Settings → Email.",
       };
     }
-    return sendStackMateEmail(
+    const sendWithPreloaded = sendStackMateEmail as (
+      db: Parameters<typeof sendStackMateEmail>[0],
+      deps: Parameters<typeof sendStackMateEmail>[1],
+      message: Parameters<typeof sendStackMateEmail>[2],
+      preloadedSmtp?: ResolvedSmtpSettings | null
+    ) => Promise<SendResult>;
+    return sendWithPreloaded(
       db,
       {
         encryptionKey: env.ENCRYPTION_KEY_V1,
         keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION,
         appUrl: env.APP_URL,
       },
-      message
+      message,
+      preloadedSmtp ?? undefined
     );
   }
 
@@ -656,10 +692,20 @@ export function createStackMateApp(
       });
     }
 
+    // A-06: `cf-connecting-ip` is authoritative when present. `x-real-ip`
+    // is client-controlled and is trusted ONLY when the request did NOT
+    // come through Cloudflare (no `cf-connecting-ip` and no `cf-ray`) —
+    // behind Cloudflare a spoofed `x-real-ip` must never pick the
+    // rate-limit bucket. Without either header the request is bucketed
+    // under loopback.
+    const cfConnectingIp = request.headers.get("cf-connecting-ip");
+    const viaCloudflare =
+      cfConnectingIp !== null || request.headers.get("cf-ray") !== null;
     const clientIp =
-      request.headers.get("cf-connecting-ip") ??
-      request.headers.get("x-real-ip") ??
-      "127.0.0.1";
+      cfConnectingIp ??
+      (viaCloudflare
+        ? "127.0.0.1"
+        : (request.headers.get("x-real-ip") ?? "127.0.0.1"));
 
     const jsonResponse = <T>(data: T, status = 200, extraHeaders?: Record<string, string>) =>
       new Response(JSON.stringify(createSuccessEnvelope(data, requestId)), {
@@ -686,25 +732,170 @@ export function createStackMateApp(
       });
     };
 
-    // M-1: `total` is the pre-limit count (the full filtered set), so
-    // clients can paginate. It is additive inside `data` — the
-    // contracts envelope type gains no field here (contracts is outside
-    // this batch's files); the runtime JSON carries it and the SPA
-    // reads it. Callers that do not pass a total get no `total` key.
+    // A-06: per-token attempt cap for one-time-token endpoints
+    // (password reset, invitation accept, 2FA recovery confirm): at
+    // most 5 attempts per token (keyed by the token's SHA-256, never
+    // the raw token) inside one hour; the 6th attempt answers 429 AND
+    // invalidates the token via onExhausted, so a brute-forced token
+    // cannot be retried indefinitely. Successful attempts consume the
+    // token in the service layer, so the cap only ever binds failures.
+    const capTokenAttempts = async (
+      bucketKey: string,
+      onExhausted: () => Promise<void>
+    ): Promise<void> => {
+      try {
+        await store.checkRateLimit(bucketKey, 5, 60 * 60_000);
+      } catch (error) {
+        if (error instanceof AppError && error.code === "RATE_LIMIT_EXCEEDED") {
+          await onExhausted().catch(() => {});
+        }
+        throw error;
+      }
+    };
+
+    // A-04: dispatcher-level idempotency for the §20.1 commands whose
+    // services cannot be wrapped in `store.executeIdempotent` directly
+    // — every one of them runs its own `store.withTransaction`, and a
+    // nested withTransaction DEADLOCKS (drizzle-store.ts header: the
+    // instance lock / advisory lock serializes writers). So the
+    // reserve → execute → complete phases run as THREE separate
+    // transactions instead of one:
+    //   1. reserve: inside one transaction, find the (scope, key) row
+    //      (payload-hash mismatch → 409 IDEMPOTENCY_KEY_REUSED,
+    //      still-processing → 409 IDEMPOTENCY_IN_PROGRESS, completed
+    //      → replay the stored body, failed → allow a retry) or
+    //      insert a "processing" placeholder. The reserve transaction
+    //      serializes concurrent duplicates, so two identical retries
+    //      cannot both execute.
+    //   2. execute the service (its own transaction) outside any
+    //      idempotency transaction.
+    //   3. complete: mark the row completed with the (possibly
+    //      redacted — see redactForStore) response body.
+    // A failed execution marks the row "failed" (best-effort) so the
+    // next retry with the same key re-executes instead of wedging on
+    // IDEMPOTENCY_IN_PROGRESS. The header is OPTIONAL: without a key
+    // the command runs exactly as before (the SPA sends one key per
+    // form instance — the SPA half of A-04); with a key it is
+    // replay-safe. Secrets (license keys, raw credential secrets,
+    // entitlement tokens) are NEVER stored in the row — redactForStore
+    // strips them and reissueOnReplay re-derives them (decrypt the
+    // stored ciphertext, or re-run a naturally-idempotent service).
+    const runIdempotentCommand = async <T>(options: {
+      scope: string;
+      key: string | null | undefined;
+      payload: unknown;
+      statusCode: number;
+      fn: () => Promise<T>;
+      redactForStore?: (body: T) => unknown;
+      reissueOnReplay?: (storedBody: unknown) => Promise<T> | T;
+    }): Promise<{ status: number; body: T; replayed: boolean }> => {
+      const rawKey = options.key?.trim() ?? "";
+      if (rawKey === "") {
+        return { status: options.statusCode, body: await options.fn(), replayed: false };
+      }
+      if (rawKey.length < 8 || rawKey.length > 128) {
+        throw new AppError(
+          "VALIDATION_ERROR",
+          "Idempotency-Key header must be between 8 and 128 characters.",
+          400
+        );
+      }
+      const requestHash = sha256Hex(JSON.stringify(options.payload ?? {}));
+      const nowIso = new Date().toISOString();
+      const expiresAt = new Date(Date.now() + 24 * 3600 * 1000).toISOString();
+      const findRecord = (state: typeof store.state) =>
+        state.idempotency_records.find(
+          (r) => r.scope_key === options.scope && r.idempotency_key === rawKey
+        );
+      const reserved = await store.withTransaction((state) => {
+        const existing = findRecord(state);
+        if (existing) {
+          if (existing.request_hash !== requestHash) {
+            throw new AppError(
+              "IDEMPOTENCY_KEY_REUSED",
+              "Idempotency-Key was already used with a different request payload.",
+              409
+            );
+          }
+          if (existing.status === "processing") {
+            throw new AppError(
+              "IDEMPOTENCY_IN_PROGRESS",
+              "A request with this Idempotency-Key is currently processing.",
+              409
+            );
+          }
+          if (existing.status === "failed") {
+            existing.status = "processing";
+            existing.response_body = null;
+            return { replay: false as const };
+          }
+          return {
+            replay: true as const,
+            body: existing.response_body,
+            status: existing.response_status,
+          };
+        }
+        state.idempotency_records.push({
+          id: randomUUID(),
+          scope_key: options.scope,
+          idempotency_key: rawKey,
+          request_hash: requestHash,
+          status: "processing",
+          response_status: options.statusCode,
+          response_body: null,
+          expires_at: expiresAt,
+          created_at: nowIso,
+        });
+        return { replay: false as const };
+      });
+      if (reserved.replay) {
+        const body = options.reissueOnReplay
+          ? await options.reissueOnReplay(reserved.body)
+          : (reserved.body as T);
+        return { status: reserved.status, body, replayed: true };
+      }
+      let body: T;
+      try {
+        body = await options.fn();
+      } catch (error) {
+        await store
+          .withTransaction((state) => {
+            const rec = findRecord(state);
+            if (rec && rec.status === "processing") rec.status = "failed";
+          })
+          .catch(() => {});
+        throw error;
+      }
+      const storedBody = options.redactForStore ? options.redactForStore(body) : body;
+      await store
+        .withTransaction((state) => {
+          const rec = findRecord(state);
+          if (rec) {
+            rec.status = "completed";
+            rec.response_status = options.statusCode;
+            rec.response_body = storedBody;
+          }
+        })
+        .catch(() => {});
+      return { status: options.statusCode, body, replayed: false };
+    };
+
+    // B-05: `total` is the pre-limit count (the full filtered set), so
+    // clients can paginate. It lives in the contracts collection type
+    // now (ApiCollectionData.total) — no untyped cast. Callers that do
+    // not pass a total get no `total` key. `extraHeaders` carries
+    // per-route cache directives (B-08: public catalog GETs).
     const collectionResponse = <T>(
       items: T[],
       nextCursor: string | null = null,
       status = 200,
-      total?: number
+      total?: number,
+      extraHeaders?: Record<string, string>
     ) => {
-      const envelope = createCollectionEnvelope(items, nextCursor, requestId) as {
-        data: { items: T[]; next_cursor: string | null; total?: number };
-        meta: { request_id: string; api_version: string };
-      };
-      if (total !== undefined) envelope.data.total = total;
+      const envelope = createCollectionEnvelope(items, nextCursor, requestId, total);
       return new Response(JSON.stringify(envelope), {
         status,
-        headers: buildStandardHeaders(requestId, originHeader, trustedOrigins),
+        headers: buildStandardHeaders(requestId, originHeader, trustedOrigins, extraHeaders),
       });
     };
 
@@ -772,8 +963,92 @@ export function createStackMateApp(
       limit: number,
       page = 1,
       nextCursor: string | null = null,
-      status = 200
-    ) => collectionResponse(applyListPage(filtered, limit, page), nextCursor, status, filtered.length);
+      status = 200,
+      extraHeaders?: Record<string, string>
+    ) =>
+      collectionResponse(
+        applyListPage(filtered, limit, page),
+        nextCursor,
+        status,
+        filtered.length,
+        extraHeaders
+      );
+    // B-05: cursor pagination for the append-heavy lists (audit logs,
+    // tracking events, outbox). Offset paging over append-heavy tables
+    // can skip/duplicate rows between pages as rows are inserted; a
+    // cursor pins the position. Rows are newest-first
+    // (created_at DESC, id DESC tiebreak); the cursor is the last row
+    // of the previous page. A malformed ?cursor= is a 400, never a
+    // silent restart from page 1. SQL pagination (count(*) +
+    // limit/offset in SQL, media template) still waits on B-01 — the
+    // store still full-loads per request, so a SQL page would not save
+    // the load; the cursor makes paging stable until then.
+    const applyCursorPage = <T extends { id: string; created_at: string }>(
+      sortedDesc: T[],
+      limit: number,
+      cursor: string | null
+    ): { page: T[]; nextCursor: string | null } => {
+      let start = 0;
+      if (cursor !== null && cursor !== "") {
+        let decoded: { created_at: string; id: string };
+        try {
+          decoded = decodeCursor(cursor);
+        } catch {
+          throw new AppError("VALIDATION_ERROR", "Malformed pagination cursor.", 400);
+        }
+        start = sortedDesc.findIndex(
+          (row) =>
+            row.created_at < decoded.created_at ||
+            (row.created_at === decoded.created_at && row.id < decoded.id)
+        );
+        if (start === -1) return { page: [], nextCursor: null };
+      }
+      const page = sortedDesc.slice(start, start + limit);
+      const nextCursor =
+        page.length === limit && start + limit < sortedDesc.length
+          ? encodeCursor({
+              created_at: page[page.length - 1]!.created_at,
+              id: page[page.length - 1]!.id,
+            })
+          : null;
+      return { page, nextCursor };
+    };
+    // Newest-first sort shared by the cursor-paged lists (created_at
+    // DESC, id DESC tiebreak — the same order applyCursorPage assumes).
+    const sortNewestFirst = <T extends { id: string; created_at: string }>(items: T[]): T[] =>
+      [...items].sort((a, b) => {
+        if (a.created_at !== b.created_at) return a.created_at < b.created_at ? 1 : -1;
+        return a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+      });
+    // E-09/E-11: renewal buckets over subscriptions. Windows are UTC
+    // calendar days off the YYYY-MM-DD part of next_renewal_at (all
+    // renewal timestamps are stored UTC). Buckets are disjoint:
+    // cancelled → cancelled; past_due → failed; renewal date past →
+    // overdue; within 7 days → due; within 30 days → upcoming. Rows
+    // with no next_renewal_at, or a renewal more than 30 days out,
+    // belong to no bucket (they are not actionable yet).
+    const RENEWAL_UPCOMING_DAYS = 30;
+    const RENEWAL_DUE_DAYS = 7;
+    const renewalDayOf = (iso: string | null | undefined): string | null =>
+      typeof iso === "string" && iso.length >= 10 ? iso.slice(0, 10) : null;
+    const addDaysIso = (day: string, days: number): string => {
+      const d = new Date(`${day}T00:00:00.000Z`);
+      d.setUTCDate(d.getUTCDate() + days);
+      return d.toISOString().slice(0, 10);
+    };
+    const renewalBucketOf = (
+      sub: { status: string; next_renewal_at: string | null },
+      todayDay: string
+    ): "upcoming" | "due" | "overdue" | "failed" | "cancelled" | null => {
+      if (sub.status === "cancelled") return "cancelled";
+      if (sub.status === "past_due") return "failed";
+      const day = renewalDayOf(sub.next_renewal_at);
+      if (day === null) return null;
+      if (day < todayDay) return "overdue";
+      if (day <= addDaysIso(todayDay, RENEWAL_DUE_DAYS)) return "due";
+      if (day <= addDaysIso(todayDay, RENEWAL_UPCOMING_DAYS)) return "upcoming";
+      return null;
+    };
     const includesQuery = (haystack: string | null | undefined, q: string): boolean =>
       !q ? true : (haystack ?? "").toLowerCase().includes(q);
     // Digits-only queries (e.g. a phone fragment) also match the digit
@@ -846,6 +1121,51 @@ export function createStackMateApp(
       }
       return parseJsonText(text);
     };
+    // A-08: streaming cap for multipart uploads. request.formData()
+    // buffers the whole body before any validation, so a chunked
+    // (length-less) upload bypassed the 6 MB gate and buffered
+    // unbounded in Worker memory. This reads the stream with a running
+    // byte count and 413s past the per-route cap (media 100 MB, avatar
+    // 2 MB) WITHOUT ever holding more than cap+1 chunk, then parses
+    // the capped bytes as multipart — never buffer-then-validate.
+    // A present Content-Length past the cap 413s without reading.
+    const readCappedMultipartFormData = async (
+      req: Request,
+      capBytes: number
+    ): Promise<FormData> => {
+      const declaredLength = Number(req.headers.get("Content-Length") ?? "0");
+      if (declaredLength > capBytes) {
+        throw new AppError("PAYLOAD_TOO_LARGE", "Request payload exceeds limit.", 413);
+      }
+      const body = req.body;
+      if (!body) return new FormData();
+      const reader = body.getReader();
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > capBytes) {
+          await reader.cancel().catch(() => {});
+          throw new AppError("PAYLOAD_TOO_LARGE", "Request payload exceeds limit.", 413);
+        }
+        chunks.push(value);
+      }
+      if (total === 0) return new FormData();
+      const merged = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        merged.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      const rebuilt = new Request(req.url, {
+        method: req.method,
+        headers: req.headers,
+        body: merged,
+      });
+      return rebuilt.formData();
+    };
     // Lenient variant for handlers that treat a missing/malformed body
     // as "no body" (public token endpoints). A 413 is never swallowed:
     // an oversize body must fail loudly.
@@ -859,14 +1179,19 @@ export function createStackMateApp(
     };
 
     try {
-      // H-7: fail closed on localhost URL vars in staging/production
-      // (runs after store resolution, so a misconfiguration answers
-      // with the JSON error envelope, never a bare Worker exception).
-      assertProductionUrlVars(env);
-
-      // Reject oversized JSON bodies (> 6 MB)
+      // A-09: the staging/production URL-var check lives in
+      // resolveRuntimeConfig (env.ts) and runs at boot, before any
+      // store resolution — there is no per-request check here anymore.
+      // Reject oversized JSON bodies (> 6 MB). A-08: the gate applies
+      // only to JSON/text bodies — check Content-Type first. A
+      // multipart upload (media, avatar) legitimately exceeds 6 MB
+      // (advertised media cap is 100 MB); multipart bodies get their
+      // own streaming cap per route (readCappedMultipartFormData)
+      // instead of this gate.
       const contentLength = Number(request.headers.get("Content-Length") ?? "0");
-      if (contentLength > 6 * 1024 * 1024) {
+      const contentType = request.headers.get("Content-Type") ?? "";
+      const isMultipartBody = contentType.toLowerCase().includes("multipart/form-data");
+      if (!isMultipartBody && contentLength > 6 * 1024 * 1024) {
         throw new AppError("PAYLOAD_TOO_LARGE", "Request payload exceeds limit.", 413);
       }
 
@@ -947,12 +1272,17 @@ export function createStackMateApp(
       // Cacheable — the object key contains the content hash, so a
       // re-upload changes the key.
       if (method === "GET" && pathname === "/api/v1/favicon") {
+        // A-16: SVGs are served with the same sandbox CSP + nosniff
+        // as media SVGs (a stored SVG must never execute, even opened
+        // top-level directly). nosniff applies to every favicon type.
         const defaultFavicon = () =>
           new Response(DEFAULT_FAVICON_SVG, {
             status: 200,
             headers: {
               "Content-Type": "image/svg+xml",
               "Cache-Control": "public, max-age=86400",
+              "X-Content-Type-Options": "nosniff",
+              "Content-Security-Policy": "sandbox",
             },
           });
         const maybeDrizzle = store as unknown as { drizzleDb?: unknown };
@@ -969,11 +1299,16 @@ export function createStackMateApp(
         const obj = await bucket?.get(row.faviconObjectKey);
         if (!obj) return defaultFavicon();
         const bytes = await obj.arrayBuffer();
+        const faviconContentType = row.faviconContentType ?? "image/png";
         return new Response(bytes, {
           status: 200,
           headers: {
-            "Content-Type": row.faviconContentType ?? "image/png",
+            "Content-Type": faviconContentType,
             "Cache-Control": "public, max-age=86400",
+            "X-Content-Type-Options": "nosniff",
+            ...(faviconContentType === "image/svg+xml"
+              ? { "Content-Security-Policy": "sandbox" }
+              : {}),
           },
         });
       }
@@ -1086,6 +1421,17 @@ export function createStackMateApp(
           // bucket. Keyed by email hash (never the raw email) so the
           // bucket key leaks nothing. Unknown emails accumulate too,
           // so a 429 reveals nothing about whether the account exists.
+          // F-08 / OD-12 (owner decision pending — behaviour
+          // deliberately UNCHANGED here): per-account lockout is also
+          // an account-lockout DoS — anyone who knows a staff email
+          // can lock that account for 15 minutes at will, repeatedly,
+          // and the per-IP bucket does not stop it because the lockout
+          // key is per-email. Options for the owner: accept the
+          // trade-off (documented), add a CAPTCHA / proof-of-work /
+          // IP-reputation step before counting failures toward the
+          // lockout, or lock out per (account, IP) instead of per
+          // account alone. Do not "fix" this unilaterally — it
+          // changes the sign-in security posture.
           const normalizedSignInEmail = body.email.trim().toLowerCase();
           const signInLockoutKey = `signin-fail:${createHash("sha256").update(normalizedSignInEmail, "utf8").digest("hex")}`;
           if (await store.isRateLimited(signInLockoutKey, 10, 15 * 60_000)) {
@@ -1121,8 +1467,13 @@ export function createStackMateApp(
           // legitimate user out. Best-effort: a reset failure must
           // never break a successful sign-in.
           await store.resetRateLimit(signInLockoutKey).catch(() => {});
+          // A-01: the session token is cookie-only — it is NEVER
+          // returned in the JSON body (the SPA never reads the field;
+          // any XSS/script/extension/proxy logging bodies could steal
+          // a live staff session from it). The cookie below (Better
+          // Auth set_cookie, or the HttpOnly stackmate_session cookie
+          // on the test-adapter path) is the only channel.
           const payload = {
-            session_token: signedIn.session_token,
             expires_at: signedIn.expires_at,
             principal: signedIn.principal,
           };
@@ -1240,6 +1591,32 @@ export function createStackMateApp(
               422
             );
           }
+          // A-06: per-token attempt cap (5/hour, then the invitation
+          // is expired) — a brute-forced invitation token cannot be
+          // retried indefinitely.
+          await capTokenAttempts(`invite-attempt:${sha256Hex(body.token)}`, async () => {
+            const pepper = resolveTokenPepper(store, env.ENCRYPTION_KEY_V1);
+            await store.withTransaction((state) => {
+              const invitation = (state.staff_invitations ?? []).find(
+                (i) =>
+                  i.status === "pending" &&
+                  verifyTokenHash(body.token!, i.token_hash, pepper)
+              );
+              if (invitation) {
+                invitation.status = "expired";
+                invitation.updated_at = new Date().toISOString();
+                appendAuditLog(state, {
+                  actor_type: "system",
+                  action: "identity.invitation.expired",
+                  resource_type: "staff_invitation",
+                  resource_id: invitation.id,
+                  outcome: "success",
+                  request_id: requestId,
+                  changes: { email: invitation.email, reason: "too_many_attempts" },
+                });
+              }
+            });
+          });
           const accepted = await acceptStaffInvitation(
             store,
             {
@@ -1360,6 +1737,26 @@ export function createStackMateApp(
           if (!body.token || !body.new_password) {
             throw new AppError("VALIDATION_ERROR", "token and new_password are required.", 422);
           }
+          // A-06: per-token attempt cap (5/hour, then the token row is
+          // deleted) — a brute-forced reset token cannot be retried
+          // indefinitely. On the test adapter there is no token table
+          // (tokens live only in Drizzle), so invalidation is a no-op
+          // there and the cap alone still binds.
+          await capTokenAttempts(`reset-attempt:${sha256Hex(body.token)}`, async () => {
+            const db = (store as unknown as { drizzleDb?: unknown }).drizzleDb as
+              | Parameters<typeof loadAuthConfig>[0]
+              | undefined;
+            if (!db) return;
+            await db
+              .delete(baPasswordResetTokens)
+              .where(
+                and(
+                  eq(baPasswordResetTokens.tokenHash, sha256Hex(body.token!)),
+                  eq(baPasswordResetTokens.purpose, "password_reset")
+                )
+              )
+              .catch(() => {});
+          });
           const result = await resetStaffPasswordByToken(store, {
             token: body.token,
             newPassword: body.new_password,
@@ -1442,6 +1839,23 @@ export function createStackMateApp(
           if (!body.token || !body.password) {
             throw new AppError("VALIDATION_ERROR", "token and password are required.", 422);
           }
+          // A-06: per-token attempt cap (5/hour, then the recovery
+          // token row is deleted) — same rule as reset-password.
+          await capTokenAttempts(`recovery-attempt:${sha256Hex(body.token)}`, async () => {
+            const db = (store as unknown as { drizzleDb?: unknown }).drizzleDb as
+              | Parameters<typeof loadAuthConfig>[0]
+              | undefined;
+            if (!db) return;
+            await db
+              .delete(baPasswordResetTokens)
+              .where(
+                and(
+                  eq(baPasswordResetTokens.tokenHash, sha256Hex(body.token!)),
+                  eq(baPasswordResetTokens.purpose, "two_factor_recovery")
+                )
+              )
+              .catch(() => {});
+          });
           const auth = await getBetterAuth(env, store);
           const result = await recoverTwoFactorByToken(
             store,
@@ -1521,24 +1935,137 @@ export function createStackMateApp(
             pathname,
           });
         const fallbackResponse = await auth.handler(request);
+        // F-03: the fallback used to return Better Auth's raw Response
+        // (flat `{ code, message }` errors, no standard headers). JSON
+        // responses are re-emitted in the StackMate envelope with the
+        // standard headers merged (Set-Cookie preserved — the session
+        // cookies must survive the rewrite). Two exceptions:
+        //  - non-JSON responses (OAuth 302 redirects, empty bodies)
+        //    pass through untouched — wrapping would break the flow;
+        //  - /api/auth/two-factor/* keeps its RAW body: the SPA's
+        //    rawApiRequest reads `{ totpURI, backupCodes }` directly
+        //    from enable, and the spec allows the raw shape there.
+        //    Only the headers are standardized on those paths.
         // M-10: audit 2FA state changes that happen through the
         // fallback — Better Auth itself writes no StackMate audit row.
         // Only on a successful response: a failed enable/disable
         // changes nothing. recordTwoFactorStateChange never throws
         // (a failed audit write must not break the 2FA response).
-        if (
-          fallbackResponse.ok &&
-          fallbackPrincipal &&
-          (pathname === "/api/auth/two-factor/enable" ||
-            pathname === "/api/auth/two-factor/disable")
-        ) {
-          await recordTwoFactorStateChange(store, {
-            userId: fallbackPrincipal.user.id,
-            enabled: pathname === "/api/auth/two-factor/enable",
-            requestId,
+        // A-13: same for update-user — a profile change through the
+        // fallback writes an audit row (action
+        // `identity.auth.update_user`, distinct from PATCH /me's
+        // `identity.profile.name_updated`, which stays the account
+        // menu's own audited path).
+        if (fallbackResponse.ok && fallbackPrincipal) {
+          if (
+            pathname === "/api/auth/two-factor/enable" ||
+            pathname === "/api/auth/two-factor/disable"
+          ) {
+            await recordTwoFactorStateChange(store, {
+              userId: fallbackPrincipal.user.id,
+              enabled: pathname === "/api/auth/two-factor/enable",
+              requestId,
+            });
+          } else if (pathname === "/api/auth/update-user") {
+            await store
+              .withTransaction((state) => {
+                appendAuditLog(state, {
+                  actor_type: "staff",
+                  actor_user_id: fallbackPrincipal.user.id,
+                  action: "identity.auth.update_user",
+                  resource_type: "user",
+                  resource_id: fallbackPrincipal.user.id,
+                  outcome: "success",
+                  request_id: requestId,
+                });
+              })
+              .catch(() => {});
+          }
+        }
+        const fallbackContentType =
+          fallbackResponse.headers.get("Content-Type") ?? "";
+        if (!fallbackContentType.includes("application/json")) {
+          return fallbackResponse;
+        }
+        const fallbackText = await fallbackResponse.text();
+        let fallbackBody: unknown = null;
+        try {
+          fallbackBody = JSON.parse(fallbackText);
+        } catch {
+          return fallbackResponse;
+        }
+        const fallbackHeaders = new Headers(
+          buildStandardHeaders(requestId, originHeader, trustedOrigins)
+        );
+        const fallbackCookies =
+          typeof fallbackResponse.headers.getSetCookie === "function"
+            ? fallbackResponse.headers.getSetCookie()
+            : [];
+        for (const cookie of fallbackCookies) {
+          fallbackHeaders.append("Set-Cookie", cookie);
+        }
+        const isTwoFactorPath = pathname.startsWith("/api/auth/two-factor/");
+        if (isTwoFactorPath) {
+          return new Response(JSON.stringify(fallbackBody), {
+            status: fallbackResponse.status,
+            headers: fallbackHeaders,
           });
         }
-        return fallbackResponse;
+        if (fallbackResponse.ok) {
+          return new Response(
+            JSON.stringify(createSuccessEnvelope(fallbackBody, requestId)),
+            { status: fallbackResponse.status, headers: fallbackHeaders }
+          );
+        }
+        const flatError = fallbackBody as { code?: unknown; message?: unknown } | null;
+        const flatCode = typeof flatError?.code === "string" ? flatError.code : "";
+        const flatMessage =
+          typeof flatError?.message === "string" ? flatError.message : "";
+        const knownCodes = new Set([
+          "VALIDATION_ERROR",
+          "BAD_REQUEST",
+          "UNAUTHORIZED",
+          "FORBIDDEN",
+          "NOT_FOUND",
+          "GONE",
+          "CONFLICT",
+          "RATE_LIMIT_EXCEEDED",
+          "INTERNAL_ERROR",
+        ]);
+        const mappedCode = knownCodes.has(flatCode)
+          ? (flatCode as
+              | "VALIDATION_ERROR"
+              | "BAD_REQUEST"
+              | "UNAUTHORIZED"
+              | "FORBIDDEN"
+              | "NOT_FOUND"
+              | "GONE"
+              | "CONFLICT"
+              | "RATE_LIMIT_EXCEEDED"
+              | "INTERNAL_ERROR")
+          : fallbackResponse.status === 401
+            ? "UNAUTHORIZED"
+            : fallbackResponse.status === 403
+              ? "FORBIDDEN"
+              : fallbackResponse.status === 404
+                ? "NOT_FOUND"
+                : fallbackResponse.status === 429
+                  ? "RATE_LIMIT_EXCEEDED"
+                  : fallbackResponse.status === 400 ||
+                      fallbackResponse.status === 422
+                    ? "VALIDATION_ERROR"
+                    : "INTERNAL_ERROR";
+        return new Response(
+          JSON.stringify(
+            createErrorEnvelope(
+              mappedCode,
+              flatMessage || `Better Auth request failed with status ${fallbackResponse.status}.`,
+              requestId,
+              flatCode && flatCode !== mappedCode ? { better_auth_code: flatCode } : null
+            )
+          ),
+          { status: fallbackResponse.status, headers: fallbackHeaders }
+        );
       }
 
       // 3. License Client API (/api/v1/licenses/*)
@@ -1561,12 +2088,34 @@ export function createStackMateApp(
 
         if (method === "POST" && pathname === "/api/v1/licenses/activate") {
           const body = await readJsonBody(request);
-          const result = await activateLicenseInstallation(store, body, {
-            verifierSecret: env.LICENSE_VERIFIER_SECRET,
-            issuerUrl: env.API_URL,
-            requestId,
+          // A-04: activation is idempotent per Idempotency-Key. The
+          // service itself is naturally idempotent per installation
+          // (same installation_id → same activation row, no second
+          // seat consumed), so a replay RE-RUNS it for a fresh
+          // entitlement token instead of returning a stored one — the
+          // token is a bearer credential and is never stored in the
+          // idempotency row (A-03 class). The row still guards
+          // key-reuse-with-a-different-payload (409).
+          const activated = await runIdempotentCommand({
+            scope: "license_activate",
+            key: request.headers.get("Idempotency-Key"),
+            payload: body,
+            statusCode: 200,
+            fn: () =>
+              activateLicenseInstallation(store, body, {
+                verifierSecret: env.LICENSE_VERIFIER_SECRET,
+                issuerUrl: env.API_URL,
+                requestId,
+              }),
+            redactForStore: (result) => ({ ...result, entitlement_token: null }),
+            reissueOnReplay: () =>
+              activateLicenseInstallation(store, body, {
+                verifierSecret: env.LICENSE_VERIFIER_SECRET,
+                issuerUrl: env.API_URL,
+                requestId,
+              }),
           });
-          return jsonResponse(result, 200);
+          return jsonResponse(activated.body, 200);
         }
 
         if (method === "POST" && pathname === "/api/v1/licenses/validate") {
@@ -1590,7 +2139,23 @@ export function createStackMateApp(
 
       // 4. Public Website & Checkout API (/api/v1/public/*)
       if (pathname.startsWith("/api/v1/public/")) {
-        await store.checkRateLimit(`public:${clientIp}`, 120);
+        // A-06: tracking ingest does NOT share this bucket (see the
+        // handler below — its own per-site + per-IP buckets), so one
+        // abusive site/IP can flood tracking_events without starving
+        // checkout/catalog.
+        const isTrackingIngest =
+          method === "POST" && pathname.endsWith("/tracking/events");
+        if (!isTrackingIngest) {
+          await store.checkRateLimit(`public:${clientIp}`, 120);
+        }
+        // B-08: the public catalog changes rarely and ADR-0005 blesses
+        // 60s staleness — catalog GETs are HTTP-cacheable (60s +
+        // 15s stale-while-revalidate). Auth/finance/license/admin
+        // responses keep no-store (or no header): only these four
+        // catalog GETs carry this header.
+        const PUBLIC_CATALOG_CACHE_HEADERS = {
+          "Cache-Control": "public, max-age=60, stale-while-revalidate=15",
+        };
         const siteKeyHeader = request.headers.get("X-StackMate-Site-Key")?.trim();
 
         const mProducts = matchPath("/api/v1/public/sites/:siteKey/products", pathname);
@@ -1604,8 +2169,11 @@ export function createStackMateApp(
           );
           if (!site) throw new AppError("UNAUTHORIZED", "Invalid or inactive site key.", 401);
 
-          // Uses Hyperdrive cached read path (ADR-0005)
-          store.queryMetrics.cachedQueries += 1;
+          // B-11: the old `store.queryMetrics.cachedQueries += 1` here
+          // was false — the data comes from the uncached full-state
+          // load (HYPERDRIVE_NO_CACHE), never a cached read path, so
+          // the counter over-reported cached reads. Removed; OD-04
+          // (wire real HYPERDRIVE_CACHED or delete it) is still open.
           const allowedProducts = store.state.products
             .filter((p) => p.status === "active" && site.product_ids.includes(p.id))
             .map((p) => ({
@@ -1618,7 +2186,7 @@ export function createStackMateApp(
               documentation_url: p.documentation_url,
             }));
           const { limit, page } = parseListQuery(url.searchParams);
-          return pagedCollectionResponse(allowedProducts, limit, page);
+          return pagedCollectionResponse(allowedProducts, limit, page, null, 200, PUBLIC_CATALOG_CACHE_HEADERS);
         }
 
         const mPackages = matchPath(
@@ -1641,7 +2209,6 @@ export function createStackMateApp(
             throw new AppError("NOT_FOUND", "Published product not found for this site.", 404);
           }
 
-          store.queryMetrics.cachedQueries += 1;
           const packages = store.state.product_packages
             .filter((pkg) => pkg.product_id === product.id && pkg.status === "active")
             .map((pkg) => {
@@ -1682,7 +2249,7 @@ export function createStackMateApp(
             .filter((item): item is NonNullable<typeof item> => item !== null);
 
           const { limit, page } = parseListQuery(url.searchParams);
-          return pagedCollectionResponse(packages, limit, page);
+          return pagedCollectionResponse(packages, limit, page, null, 200, PUBLIC_CATALOG_CACHE_HEADERS);
         }
 
         // Batch 1: single-product detail for a site's public catalogue —
@@ -1711,7 +2278,6 @@ export function createStackMateApp(
           if (!product || !site.product_ids.includes(product.id)) {
             throw new AppError("NOT_FOUND", "Published product not found for this site.", 404);
           }
-          store.queryMetrics.cachedQueries += 1;
           const packages = store.state.product_packages
             .filter((pkg) => pkg.product_id === product.id && pkg.status === "active")
             .map((pkg) => {
@@ -1768,7 +2334,7 @@ export function createStackMateApp(
                 default_value: f.default_value,
               })),
             packages,
-          });
+          }, 200, PUBLIC_CATALOG_CACHE_HEADERS);
         }
 
         // Batch 1: single published package-version detail for a site.
@@ -1804,7 +2370,6 @@ export function createStackMateApp(
           if (!product || !site.product_ids.includes(product.id)) {
             throw new AppError("NOT_FOUND", "Published package version not found for this site.", 404);
           }
-          store.queryMetrics.cachedQueries += 1;
           return jsonResponse({
             package_key: pkg.package_key,
             name: pkg.name,
@@ -1832,7 +2397,7 @@ export function createStackMateApp(
                 trial_days: pr.trial_days,
                 setup_fee_minor: pr.setup_fee_minor,
               })),
-          });
+          }, 200, PUBLIC_CATALOG_CACHE_HEADERS);
         }
 
         const mCheckoutCreate = matchPath(
@@ -2057,6 +2622,11 @@ export function createStackMateApp(
         );
         if (method === "POST" && mPublicTrack) {
           const siteKey = mPublicTrack.params.siteKey!;
+          // A-06: tracking ingest gets its own buckets — per-site
+          // (600/min, so one site cannot flood the table) + a lower
+          // per-IP cap (60/min) inside that site.
+          await store.checkRateLimit(`tracking-site:${siteKey}`, 600);
+          await store.checkRateLimit(`tracking:${siteKey}:${clientIp}`, 60);
           const rawBody = await readJsonBody(request);
           const result = await ingestExternalTrackingEvent(store, siteKey, rawBody);
           return jsonResponse(result, 202);
@@ -2358,6 +2928,40 @@ export function createStackMateApp(
           const result = await ingestLead(store, site, parseJsonText(rawBodyText), requestId);
           return jsonResponse(result, result.created ? 201 : 200);
         }
+
+        // E-06: S2S webhook test (API spec §15, scope webhooks.test).
+        // An integrated site tests its webhook subscription from its
+        // own server context — distinct from the admin
+        // POST /api/v1/admin/webhooks/:id/test. HMAC-authenticated
+        // like the other S2S routes; the service reuses the admin test
+        // transport.
+        const mServerWebhookTest = matchPath(
+          "/api/v1/integrations/sites/:siteKey/webhook-test",
+          pathname
+        );
+        if (method === "POST" && mServerWebhookTest) {
+          const siteKey = mServerWebhookTest.params.siteKey!;
+          const rawBodyText = await readCappedText(request);
+          await authenticateSignedServerRequest(store, {
+            siteKey,
+            requiredScope: "webhooks.test",
+            keyIdHeader: request.headers.get("X-StackMate-Key-Id") ?? undefined,
+            timestampHeader: request.headers.get("X-StackMate-Timestamp") ?? undefined,
+            nonceHeader: request.headers.get("X-StackMate-Nonce") ?? undefined,
+            contentSha256Header: request.headers.get("X-StackMate-Content-SHA256") ?? undefined,
+            signatureHeader: request.headers.get("X-StackMate-Signature") ?? undefined,
+            method,
+            host: url.host,
+            rawPathAndQuery: `${url.pathname}${url.search}`,
+            rawBody: rawBodyText,
+            encryptionKey: env.ENCRYPTION_KEY_V1,
+          });
+          const res = await testWebhookForSite(store, siteKey, {
+            encryptionKey: env.ENCRYPTION_KEY_V1,
+            allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
+          });
+          return jsonResponse(res);
+        }
       }
 
       // 6. Staff Admin API (/api/v1/admin/*)
@@ -2412,6 +3016,12 @@ export function createStackMateApp(
             403
           );
         }
+
+        // A-06: the admin block was unthrottled — a stolen session
+        // could hammer expensive handlers without a 429. Per-session
+        // + per-IP bucket, 600/min (generous for the SPA's parallel
+        // panels; the sign-in lockout bucket below stays separate).
+        await store.checkRateLimit(`admin:${principal.user.id}:${clientIp}`, 600);
 
         // Identity & RBAC routes
         if (method === "GET" && pathname === "/api/v1/admin/me") {
@@ -2494,7 +3104,8 @@ export function createStackMateApp(
         // No media-library row — the avatar is a profile asset, not a
         // library asset. The previous object is deleted best-effort.
         if (method === "POST" && pathname === "/api/v1/admin/me/avatar") {
-          const form = await request.formData();
+          // A-08: streaming 2 MB multipart cap (never buffer-then-validate).
+          const form = await readCappedMultipartFormData(request, 2 * 1024 * 1024);
           const file = form.get("file");
           if (!(file instanceof File)) {
             throw new AppError(
@@ -2521,6 +3132,11 @@ export function createStackMateApp(
           if (bytes.length > 2 * 1024 * 1024) {
             throw new AppError("VALIDATION_ERROR", "Avatar must be 2 MB or smaller.", 413);
           }
+          // A-17: verify magic bytes (same check as media/evidence
+          // uploads) — the client-claimed MIME alone is not trusted.
+          // verifyMediaBytes also returns the bytes to store; avatars
+          // are never SVG, so the bytes pass through unchanged.
+          verifyMediaBytes(bytes, file.type);
           const driver = await resolveStorageDriver(driverDepsForRequest(store, env));
           const key = `avatars/${principal.user.id}/${randomUUID()}.${ext}`;
           await driver.put(key, bytes, file.type);
@@ -2535,15 +3151,35 @@ export function createStackMateApp(
         if (method === "GET" && pathname === "/api/v1/admin/me/avatar") {
           const key = store.state.users.find((u) => u.id === principal.user.id)?.avatar_url;
           if (!key) throw new AppError("NOT_FOUND", "No avatar is set.", 404);
+          // B-07: avatar gets the media treatment — the key is
+          // content-addressed (a fresh uuid on every upload, so the
+          // key changes exactly when the bytes do), so an ETag derived
+          // from the key is stable per version and `immutable` is safe
+          // (the SPA already cache-busts with ?k=). nosniff included.
+          // (Serving from a lightweight single-row lookup instead of
+          // the full store load still waits on B-01/A-10: the store
+          // is resolved in fetchHandler before routing; this handler
+          // itself only reads one user row + one object.)
+          const etag = `"${createHash("sha256").update(key, "utf8").digest("hex")}"`;
+          const avatarHeaders: Record<string, string> = {
+            "Cache-Control": "private, max-age=3600, immutable",
+            "X-Content-Type-Options": "nosniff",
+            ETag: etag,
+          };
+          const ifNoneMatch = request.headers.get("if-none-match");
+          if (
+            ifNoneMatch !== null &&
+            (ifNoneMatch.trim() === "*" ||
+              ifNoneMatch.split(",").some((tag) => tag.trim() === etag))
+          ) {
+            return new Response(null, { status: 304, headers: avatarHeaders });
+          }
           const driver = await resolveStorageDriver(driverDepsForRequest(store, env));
           const obj = await driver.get(key);
           if (!obj) throw new AppError("NOT_FOUND", "Avatar not found.", 404);
           return new Response(obj.bytes, {
             status: 200,
-            headers: {
-              "Content-Type": obj.contentType,
-              "Cache-Control": "private, max-age=3600",
-            },
+            headers: { ...avatarHeaders, "Content-Type": obj.contentType },
           });
         }
 
@@ -2594,7 +3230,7 @@ export function createStackMateApp(
             .catch(() => {});
 
         if (method === "GET" && pathname === "/api/v1/admin/auth-config") {
-          assertStaffPermission(principal, "users.manage");
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           const config = await loadAuthConfig(requireAuthConfigDb(), authConfigDeps);
           // Serialize through the view mapper: the raw ResolvedAuthConfig
           // is camelCase (twoFactorPolicy — the page reads
@@ -2604,7 +3240,7 @@ export function createStackMateApp(
           return jsonResponse(toAuthConfigView(config));
         }
         if (method === "PUT" && pathname === "/api/v1/admin/auth-config/oauth") {
-          assertStaffPermission(principal, "users.manage");
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           const body = (await readJsonBodyLenient(request)) as {
             provider?: string;
             enabled?: boolean;
@@ -2634,7 +3270,7 @@ export function createStackMateApp(
           method === "PUT" &&
           pathname === "/api/v1/admin/auth-config/two-factor-policy"
         ) {
-          assertStaffPermission(principal, "users.manage");
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           const body = (await readJsonBodyLenient(request)) as {
             scope?: string;
             mode?: string;
@@ -2651,7 +3287,7 @@ export function createStackMateApp(
           return jsonResponse(saved);
         }
         if (method === "PUT" && pathname === "/api/v1/admin/auth-config/smtp") {
-          assertStaffPermission(principal, "users.manage");
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           const body = (await readJsonBodyLenient(request)) as {
             host?: string;
             port?: number;
@@ -2688,7 +3324,7 @@ export function createStackMateApp(
           return jsonResponse(saved);
         }
         if (method === "POST" && pathname === "/api/v1/admin/auth-config/smtp/test") {
-          assertStaffPermission(principal, "users.manage");
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           const body = (await readJsonBodyLenient(request)) as { to?: string };
           // Test mail goes ONLY to the admin's own address — the
           // endpoint must never become an open mail relay.
@@ -2742,12 +3378,12 @@ export function createStackMateApp(
             })
             .catch(() => {});
         if (method === "GET" && pathname === "/api/v1/admin/general-settings") {
-          assertStaffPermission(principal, "users.manage");
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           const row = await loadGeneralSettings(requireGeneralSettingsDb());
           return jsonResponse(row ? { ...publicViewOf(row), favicon_content_type: row.faviconContentType, favicon_byte_size: row.faviconByteSize } : { ...DEFAULT_GENERAL_SETTINGS, favicon_content_type: null, favicon_byte_size: null });
         }
         if (method === "PUT" && pathname === "/api/v1/admin/general-settings") {
-          assertStaffPermission(principal, "users.manage");
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           const body = (await readJsonBodyLenient(request)) as {
             app_name?: string;
             app_title?: string;
@@ -2766,7 +3402,7 @@ export function createStackMateApp(
           return jsonResponse(saved);
         }
         if (method === "POST" && pathname === "/api/v1/admin/general-settings/favicon") {
-          assertStaffPermission(principal, "users.manage");
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           const body = (await readJsonBody(request)) as {
             filename?: string;
             content_type?: string;
@@ -2828,7 +3464,7 @@ export function createStackMateApp(
             .catch(() => {});
 
         if (method === "GET" && pathname === "/api/v1/admin/media") {
-          assertStaffPermission(principal, "media.view");
+          await assertStaffPermissionAudited(store, principal, "media.view", requestId);
           const result = await listMediaAssets(requireMediaDb(), {
             q: url.searchParams.get("q") ?? undefined,
             kind: (url.searchParams.get("kind") ?? undefined) as
@@ -2853,14 +3489,15 @@ export function createStackMateApp(
 
         // Folders BEFORE the :id match — "folders" would otherwise match :id.
         if (method === "GET" && pathname === "/api/v1/admin/media/folders") {
-          assertStaffPermission(principal, "media.view");
+          await assertStaffPermissionAudited(store, principal, "media.view", requestId);
           const folders = await listMediaFolders(requireMediaDb());
           return jsonResponse({ folders });
         }
 
         if (method === "POST" && pathname === "/api/v1/admin/media") {
-          assertStaffPermission(principal, "media.manage");
-          const form = await request.formData();
+          await assertStaffPermissionAudited(store, principal, "media.manage", requestId);
+          // A-08: streaming 100 MB multipart cap (MAX_MEDIA_BYTES).
+          const form = await readCappedMultipartFormData(request, MAX_MEDIA_BYTES);
           const file = form.get("file");
           if (!(file instanceof File)) {
             throw new AppError(
@@ -2921,12 +3558,12 @@ export function createStackMateApp(
         if (mMediaDetail) {
           const mediaId = mMediaDetail.params.id!;
           if (method === "GET") {
-            assertStaffPermission(principal, "media.view");
+            await assertStaffPermissionAudited(store, principal, "media.view", requestId);
             const row = await requireMediaAsset(requireMediaDb(), mediaId);
             return jsonResponse(mediaViewOf(row));
           }
           if (method === "PATCH") {
-            assertStaffPermission(principal, "media.manage");
+            await assertStaffPermissionAudited(store, principal, "media.manage", requestId);
             const body = (await readJsonBodyLenient(request)) as {
               original_filename?: string;
               folder?: string;
@@ -2958,7 +3595,7 @@ export function createStackMateApp(
             return jsonResponse(view);
           }
           if (method === "DELETE") {
-            assertStaffPermission(principal, "media.manage");
+            await assertStaffPermissionAudited(store, principal, "media.manage", requestId);
             const db = requireMediaDb();
             const row = await requireMediaAsset(db, mediaId);
             await deleteMediaAsset(db, driverDepsForRequest(store, env), mediaId);
@@ -2976,8 +3613,9 @@ export function createStackMateApp(
           // PLAN §34: regenerate thumbnails for an existing image —
           // the backfill path for pre-0013 files (the browser
           // generates the variants from the loaded original).
-          assertStaffPermission(principal, "media.manage");
-          const form = await request.formData();
+          await assertStaffPermissionAudited(store, principal, "media.manage", requestId);
+          // A-08: streaming multipart cap (thumbnails are small WebP variants; the media cap is the ceiling).
+          const form = await readCappedMultipartFormData(request, MAX_MEDIA_BYTES);
           const thumbFile = form.get("thumbnail");
           const thumbSmallFile = form.get("thumbnail_small");
           const asset = await regenerateMediaThumbnail(
@@ -3011,7 +3649,7 @@ export function createStackMateApp(
 
         const mMediaContent = matchPath("/api/v1/admin/media/:id/content", pathname);
         if (method === "GET" && mMediaContent) {
-          assertStaffPermission(principal, "media.view");
+          await assertStaffPermissionAudited(store, principal, "media.view", requestId);
           const url = new URL(request.url);
           const variantRaw = url.searchParams.get("variant");
           const variant =
@@ -3102,12 +3740,12 @@ export function createStackMateApp(
         // favicon + payment evidence stored under the previous driver
         // until switched back — the UI warns about this explicitly.
         if (method === "GET" && pathname === "/api/v1/admin/storage-settings") {
-          assertStaffPermission(principal, "users.manage");
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           const settings = await loadStorageSettings(requireMediaDb()).catch(() => null);
           return jsonResponse(settings ?? DEFAULT_STORAGE_SETTINGS);
         }
         if (method === "PUT" && pathname === "/api/v1/admin/storage-settings") {
-          assertStaffPermission(principal, "users.manage");
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           const body = (await readJsonBodyLenient(request)) as {
             driver?: "r2" | "local";
             local_path?: string | null;
@@ -3131,7 +3769,7 @@ export function createStackMateApp(
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/users") {
-          assertStaffPermission(principal, "users.manage");
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           const { q, limit, page } = parseListQuery(url.searchParams);
           // H-03: ?status=active narrows the combobox/server list to
           // active staff (unknown values match nothing, unknown params
@@ -3212,7 +3850,7 @@ export function createStackMateApp(
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/roles") {
-          assertStaffPermission(principal, "users.manage");
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           const { limit, page } = parseListQuery(url.searchParams);
           return pagedCollectionResponse(store.state.roles, limit, page);
         }
@@ -3223,7 +3861,7 @@ export function createStackMateApp(
           // RBAC surface otherwise. Deliberately NOT paged (M-1): it is
           // a fixed catalogue, not a table, so it cannot grow
           // unboundedly; the role editor needs the whole list at once.
-          assertStaffPermission(principal, "users.manage");
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           return collectionResponse([...store.allPermissions]);
         }
 
@@ -3264,7 +3902,7 @@ export function createStackMateApp(
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/users/invitations") {
-          assertStaffPermission(principal, "users.manage");
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           const { limit, page } = parseListQuery(url.searchParams);
           const items = (store.state.staff_invitations ?? []).map((inv) => {
             const { token_hash: _h, ...safe } = inv;
@@ -3320,7 +3958,7 @@ export function createStackMateApp(
 
         const mUserDetail = matchPath("/api/v1/admin/users/:userId", pathname);
         if (method === "GET" && mUserDetail) {
-          assertStaffPermission(principal, "users.manage");
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           const user = store.state.users.find((u) => u.id === mUserDetail.params.userId);
           if (!user) throw new AppError("NOT_FOUND", "User not found.", 404);
           const roleIds = new Set(
@@ -3375,7 +4013,7 @@ export function createStackMateApp(
 
         // Products, Features, Packages & Prices
         if (method === "GET" && pathname === "/api/v1/admin/products") {
-          assertStaffPermission(principal, "products.read");
+          await assertStaffPermissionAudited(store, principal, "products.read", requestId);
           const { q, limit, page } = parseListQuery(url.searchParams);
           const items = store.state.products
             .filter(
@@ -3408,7 +4046,7 @@ export function createStackMateApp(
 
         const mProductDetail = matchPath("/api/v1/admin/products/:productId", pathname);
         if (method === "GET" && mProductDetail) {
-          assertStaffPermission(principal, "products.read");
+          await assertStaffPermissionAudited(store, principal, "products.read", requestId);
           const product = store.state.products.find(
             (p) => p.id === mProductDetail.params.productId
           );
@@ -3467,7 +4105,7 @@ export function createStackMateApp(
 
         const mProductFeatures = matchPath("/api/v1/admin/products/:productId/features", pathname);
         if (method === "GET" && mProductFeatures) {
-          assertStaffPermission(principal, "products.read");
+          await assertStaffPermissionAudited(store, principal, "products.read", requestId);
           const { q, limit, page } = parseListQuery(url.searchParams);
           const items = store.state.product_features
             .filter((f) => f.product_id === mProductFeatures.params.productId)
@@ -3516,7 +4154,7 @@ export function createStackMateApp(
 
         const mProductPackages = matchPath("/api/v1/admin/products/:productId/packages", pathname);
         if (method === "GET" && mProductPackages) {
-          assertStaffPermission(principal, "products.read");
+          await assertStaffPermissionAudited(store, principal, "products.read", requestId);
           const { q, limit, page } = parseListQuery(url.searchParams);
           const pkgs = store.state.product_packages
             .filter((p) => p.product_id === mProductPackages.params.productId)
@@ -3571,7 +4209,7 @@ export function createStackMateApp(
 
         const mVerDetail = matchPath("/api/v1/admin/package-versions/:versionId", pathname);
         if (method === "GET" && mVerDetail) {
-          assertStaffPermission(principal, "products.read");
+          await assertStaffPermissionAudited(store, principal, "products.read", requestId);
           const ver = store.state.package_versions.find(
             (v) => v.id === mVerDetail.params.versionId
           );
@@ -3604,7 +4242,7 @@ export function createStackMateApp(
           pathname
         );
         if (method === "GET" && mVerPrices) {
-          assertStaffPermission(principal, "products.read");
+          await assertStaffPermissionAudited(store, principal, "products.read", requestId);
           const prices = store.state.package_prices.filter(
             (pr) => pr.package_version_id === mVerPrices.params.versionId
           );
@@ -3633,7 +4271,7 @@ export function createStackMateApp(
           pathname
         );
         if (method === "GET" && mFeatureDetail) {
-          assertStaffPermission(principal, "products.read");
+          await assertStaffPermissionAudited(store, principal, "products.read", requestId);
           const feature = store.state.product_features.find(
             (f) =>
               f.id === mFeatureDetail.params.featureId &&
@@ -3679,7 +4317,7 @@ export function createStackMateApp(
 
         const mPackageDetail = matchPath("/api/v1/admin/packages/:packageId", pathname);
         if (method === "GET" && mPackageDetail) {
-          assertStaffPermission(principal, "products.read");
+          await assertStaffPermissionAudited(store, principal, "products.read", requestId);
           const pkg = store.state.product_packages.find(
             (p) => p.id === mPackageDetail.params.packageId
           );
@@ -3731,7 +4369,7 @@ export function createStackMateApp(
 
         const mPriceDetail = matchPath("/api/v1/admin/prices/:priceId", pathname);
         if (method === "GET" && mPriceDetail) {
-          assertStaffPermission(principal, "products.read");
+          await assertStaffPermissionAudited(store, principal, "products.read", requestId);
           const price = store.state.package_prices.find(
             (pr) => pr.id === mPriceDetail.params.priceId
           );
@@ -3786,7 +4424,7 @@ export function createStackMateApp(
 
         // Customers, Orders & Invoices
         if (method === "GET" && pathname === "/api/v1/admin/customers") {
-          assertStaffPermission(principal, "customers.read");
+          await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
           const { q, limit, page } = parseListQuery(url.searchParams);
           const items = store.state.customers
             .filter(
@@ -3826,7 +4464,7 @@ export function createStackMateApp(
 
         const mCustDetail = matchPath("/api/v1/admin/customers/:customerId", pathname);
         if (method === "GET" && mCustDetail) {
-          assertStaffPermission(principal, "customers.read");
+          await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
           const customer = store.state.customers.find(
             (c) => c.id === mCustDetail.params.customerId
           );
@@ -3922,7 +4560,7 @@ export function createStackMateApp(
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/orders") {
-          assertStaffPermission(principal, "orders.read");
+          await assertStaffPermissionAudited(store, principal, "orders.read", requestId);
           const statusFilter = url.searchParams.get("payment_status");
           // H-03: ?open_only=true narrows to orders with a balance due
           // (remaining > 0 from verified payments) — the payment-review
@@ -3971,19 +4609,41 @@ export function createStackMateApp(
           // F-12: the order's on_date boundary is a business date in the
           // configured timezone (defaults to Asia/Dhaka inside the
           // service when omitted).
-          const created = await createOrderByAdmin(store, principal, body, requestId, {
-            timeZone: env.DEFAULT_TIMEZONE,
+          // A-04: admin order creation is idempotent per
+          // Idempotency-Key (a retried create after a network timeout
+          // replays the first order instead of minting a second).
+          const created = await runIdempotentCommand({
+            scope: "admin_order_create",
+            key: request.headers.get("Idempotency-Key"),
+            payload: body,
+            statusCode: 201,
+            fn: () =>
+              createOrderByAdmin(store, principal, body, requestId, {
+                timeZone: env.DEFAULT_TIMEZONE,
+              }),
           });
-          return jsonResponse(created, 201);
+          return jsonResponse(created.body, created.replayed ? 200 : 201);
         }
 
         const mOrderAdminDetail = matchPath("/api/v1/admin/orders/:orderId", pathname);
         if (method === "GET" && mOrderAdminDetail) {
-          assertStaffPermission(principal, "orders.read");
+          await assertStaffPermissionAudited(store, principal, "orders.read", requestId);
           const order = store.state.orders.find((o) => o.id === mOrderAdminDetail.params.orderId);
           if (!order) throw new AppError("NOT_FOUND", "Order not found.", 404);
           return jsonResponse({
             ...order,
+            // E-19: attribution is stored per order (UTM + fbp/fbc —
+            // order_attributions has no referrer column, so there is
+            // none to show) — surfaced explicitly instead of relying
+            // on the spread above, so the SPA can render it on order
+            // detail (PRD §15.5).
+            attribution: order.attribution ?? null,
+            // E-08: per-item entitlement snapshots, aggregated at
+            // order level for the snapshot card (each item already
+            // carries its own entitlement_snapshot; this is the same
+            // data, one level up, so detail never has to dig into
+            // items to show what was actually sold).
+            entitlement_snapshot: order.items.map((i) => i.entitlement_snapshot),
             // Site name for the detail page: the order shows source
             // "website" but never named the site (live gap on ORD-10005,
             // a Test-site order). Null for admin orders (no site).
@@ -4013,8 +4673,28 @@ export function createStackMateApp(
           });
         }
 
+        // E-08: save a (custom) order's configuration as a reusable
+        // package (PRD §8.2). 201 with the created package.
+        const mOrderSaveAsPackage = matchPath(
+          "/api/v1/admin/orders/:orderId/save-as-package",
+          pathname
+        );
+        if (method === "POST" && mOrderSaveAsPackage) {
+          // M-9: saving as a package creates a package — packages.manage.
+          await assertStaffPermissionAudited(store, principal, "packages.manage", requestId);
+          const body = await readJsonBody(request);
+          const created = await saveOrderAsPackage(
+            store,
+            principal,
+            mOrderSaveAsPackage.params.orderId!,
+            body,
+            requestId
+          );
+          return jsonResponse(created, 201);
+        }
+
         if (method === "GET" && pathname === "/api/v1/admin/invoices") {
-          assertStaffPermission(principal, "orders.read");
+          await assertStaffPermissionAudited(store, principal, "orders.read", requestId);
           const { limit, page } = parseListQuery(url.searchParams);
           return pagedCollectionResponse(store.state.invoices, limit, page);
         }
@@ -4039,7 +4719,7 @@ export function createStackMateApp(
 
         const mCustOrders = matchPath("/api/v1/admin/customers/:customerId/orders", pathname);
         if (method === "GET" && mCustOrders) {
-          assertStaffPermission(principal, "customers.read");
+          await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
           const customer = store.state.customers.find(
             (c) => c.id === mCustOrders.params.customerId
           );
@@ -4062,7 +4742,7 @@ export function createStackMateApp(
           pathname
         );
         if (method === "GET" && mCustSubs) {
-          assertStaffPermission(principal, "customers.read");
+          await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
           const customer = store.state.customers.find(
             (c) => c.id === mCustSubs.params.customerId
           );
@@ -4079,7 +4759,7 @@ export function createStackMateApp(
           pathname
         );
         if (method === "GET" && mCustLicenses) {
-          assertStaffPermission(principal, "customers.read");
+          await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
           const customer = store.state.customers.find(
             (c) => c.id === mCustLicenses.params.customerId
           );
@@ -4101,7 +4781,7 @@ export function createStackMateApp(
           pathname
         );
         if (method === "GET" && mCustAddresses) {
-          assertStaffPermission(principal, "customers.read");
+          await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
           const { limit, page } = parseListQuery(url.searchParams);
           return pagedCollectionResponse(
             await listCustomerAddresses(store, principal, mCustAddresses.params.customerId!),
@@ -4160,7 +4840,7 @@ export function createStackMateApp(
           pathname
         );
         if (method === "GET" && mCustReports) {
-          assertStaffPermission(principal, "customers.read");
+          await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
           const { limit, page } = parseListQuery(url.searchParams);
           return pagedCollectionResponse(
             await listCustomerReports(store, principal, mCustReports.params.customerId!),
@@ -4206,7 +4886,7 @@ export function createStackMateApp(
           pathname
         );
         if (method === "GET" && mCustPayments) {
-          assertStaffPermission(principal, "customers.read");
+          await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
           const customer = store.state.customers.find(
             (c) => c.id === mCustPayments.params.customerId
           );
@@ -4234,7 +4914,7 @@ export function createStackMateApp(
           pathname
         );
         if (method === "GET" && mCustInstallations) {
-          assertStaffPermission(principal, "customers.read");
+          await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
           const { limit, page } = parseListQuery(url.searchParams);
           return pagedCollectionResponse(
             store.state.licenses
@@ -4255,7 +4935,7 @@ export function createStackMateApp(
           pathname
         );
         if (method === "GET" && mCustActivity) {
-          assertStaffPermission(principal, "customers.read");
+          await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
           const customer = store.state.customers.find(
             (c) => c.id === mCustActivity.params.customerId
           );
@@ -4296,7 +4976,7 @@ export function createStackMateApp(
           pathname
         );
         if (method === "GET" && mCustTickets) {
-          assertStaffPermission(principal, "tickets.view");
+          await assertStaffPermissionAudited(store, principal, "tickets.view", requestId);
           const { limit, page } = parseListQuery(url.searchParams);
           return pagedCollectionResponse(
             store.state.support_tickets.filter(
@@ -4339,7 +5019,7 @@ export function createStackMateApp(
 
         const mOrderInvoices = matchPath("/api/v1/admin/orders/:orderId/invoices", pathname);
         if (method === "GET" && mOrderInvoices) {
-          assertStaffPermission(principal, "orders.read");
+          await assertStaffPermissionAudited(store, principal, "orders.read", requestId);
           const order = store.state.orders.find(
             (o) => o.id === mOrderInvoices.params.orderId
           );
@@ -4370,7 +5050,7 @@ export function createStackMateApp(
           pathname
         );
         if (method === "GET" && mOrderInstallments) {
-          assertStaffPermission(principal, "orders.read");
+          await assertStaffPermissionAudited(store, principal, "orders.read", requestId);
           const order = store.state.orders.find(
             (o) => o.id === mOrderInstallments.params.orderId
           );
@@ -4411,7 +5091,7 @@ export function createStackMateApp(
 
         const mInvoiceDetail = matchPath("/api/v1/admin/invoices/:invoiceId", pathname);
         if (method === "GET" && mInvoiceDetail) {
-          assertStaffPermission(principal, "orders.read");
+          await assertStaffPermissionAudited(store, principal, "orders.read", requestId);
           const invoice = store.state.invoices.find(
             (i) => i.id === mInvoiceDetail.params.invoiceId
           );
@@ -4459,7 +5139,7 @@ export function createStackMateApp(
           return { email: user.email, roles };
         };
         if (method === "GET" && pathname === "/api/v1/admin/tickets") {
-          assertStaffPermission(principal, "tickets.view");
+          await assertStaffPermissionAudited(store, principal, "tickets.view", requestId);
           const statusFilter = url.searchParams.get("status");
           const priorityFilter = url.searchParams.get("priority");
           const customerFilter = url.searchParams.get("customer_id");
@@ -4501,7 +5181,7 @@ export function createStackMateApp(
         }
         const mTicketDetail = matchPath("/api/v1/admin/tickets/:ticketId", pathname);
         if (method === "GET" && mTicketDetail) {
-          assertStaffPermission(principal, "tickets.view");
+          await assertStaffPermissionAudited(store, principal, "tickets.view", requestId);
           const ticket = store.state.support_tickets.find(
             (t) => t.id === mTicketDetail.params.ticketId
           );
@@ -4614,7 +5294,7 @@ export function createStackMateApp(
 
         // Customer+Order batch (ADR-0009): Leads.
         if (method === "GET" && pathname === "/api/v1/admin/leads") {
-          assertStaffPermission(principal, "leads.view");
+          await assertStaffPermissionAudited(store, principal, "leads.view", requestId);
           const statusFilter = url.searchParams.get("status");
           const siteFilter = url.searchParams.get("source_site_id");
           const campaignFilter = url.searchParams.get("utm_campaign");
@@ -4657,7 +5337,7 @@ export function createStackMateApp(
         }
         const mLeadDetail = matchPath("/api/v1/admin/leads/:leadId", pathname);
         if (method === "GET" && mLeadDetail) {
-          assertStaffPermission(principal, "leads.view");
+          await assertStaffPermissionAudited(store, principal, "leads.view", requestId);
           const lead = store.state.leads.find((l) => l.id === mLeadDetail.params.leadId);
           if (!lead) throw new AppError("NOT_FOUND", "Lead not found.", 404);
           return jsonResponse({
@@ -4746,11 +5426,11 @@ export function createStackMateApp(
         // collection (populated by the store load query). The save is
         // the users.manage gate, like SMTP.
         if (method === "GET" && pathname === "/api/v1/admin/reminder-settings") {
-          assertStaffPermission(principal, "users.manage");
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           return jsonResponse(getReminderSettings(store.state));
         }
         if (method === "PUT" && pathname === "/api/v1/admin/reminder-settings") {
-          assertStaffPermission(principal, "users.manage");
+          await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
           const body = await readJsonBody(request);
           const db = (store as unknown as { drizzleDb?: unknown }).drizzleDb as
             | Parameters<typeof saveReminderSettings>[0]
@@ -4813,7 +5493,7 @@ export function createStackMateApp(
           // H-1: the admin evidence upload is a privileged write —
           // require payments.approve at the route (the service asserts
           // it again when the principal is passed as actor below).
-          assertStaffPermission(principal, "payments.approve");
+          await assertStaffPermissionAudited(store, principal, "payments.approve", requestId);
           const body = (await readJsonBody(request)) as {
             filename: string;
             content_type: string;
@@ -4857,7 +5537,7 @@ export function createStackMateApp(
 
         // Payment Providers, Methods, Submissions & Verification
         if (method === "GET" && pathname === "/api/v1/admin/payment-providers") {
-          assertStaffPermission(principal, "payments.read");
+          await assertStaffPermissionAudited(store, principal, "payments.read", requestId);
           const { q, limit, page } = parseListQuery(url.searchParams);
           return pagedCollectionResponse(
             store.state.payment_providers.filter((p) => includesQuery(p.display_name, q)),
@@ -4866,7 +5546,7 @@ export function createStackMateApp(
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/payment-methods") {
-          assertStaffPermission(principal, "payments.read");
+          await assertStaffPermissionAudited(store, principal, "payments.read", requestId);
           // H-03: ?is_enabled=true/false narrows the combobox/server
           // list to enabled/disabled methods. Unknown params ignored.
           const isEnabledParam = url.searchParams.get("is_enabled");
@@ -4919,9 +5599,23 @@ export function createStackMateApp(
           return jsonResponse(updated);
         }
 
+        // E-16: delete a payment provider (PRD §11.2 lifecycle).
+        // Same guard pattern as webhook-endpoint delete: history is
+        // preserved, the provider row goes.
+        if (method === "DELETE" && mProviderDetail) {
+          await assertStaffPermissionAudited(store, principal, "payments.methods.manage", requestId);
+          const deleted = await deletePaymentProviderByAdmin(
+            store,
+            principal,
+            mProviderDetail.params.providerId!,
+            requestId
+          );
+          return jsonResponse(deleted);
+        }
+
         const mMethodDetail = matchPath("/api/v1/admin/payment-methods/:methodId", pathname);
         if (method === "GET" && mMethodDetail) {
-          assertStaffPermission(principal, "payments.read");
+          await assertStaffPermissionAudited(store, principal, "payments.read", requestId);
           const methodRec = store.state.payment_methods.find(
             (m) => m.id === mMethodDetail.params.methodId
           );
@@ -4942,6 +5636,19 @@ export function createStackMateApp(
             requestId
           );
           return jsonResponse(updated);
+        }
+
+        // E-16: delete a payment method (PRD §11.2 lifecycle).
+        // Same guard pattern as webhook-endpoint delete.
+        if (method === "DELETE" && mMethodDetail) {
+          await assertStaffPermissionAudited(store, principal, "payments.methods.manage", requestId);
+          const deleted = await deletePaymentMethodByAdmin(
+            store,
+            principal,
+            mMethodDetail.params.methodId!,
+            requestId
+          );
+          return jsonResponse(deleted);
         }
 
         const mMethodEnable = matchPath(
@@ -4986,7 +5693,7 @@ export function createStackMateApp(
           pathname
         );
         if (method === "GET" && mSubmissionDetail) {
-          assertStaffPermission(principal, "payments.read");
+          await assertStaffPermissionAudited(store, principal, "payments.read", requestId);
           const sub = store.state.payment_submissions.find(
             (s) => s.id === mSubmissionDetail.params.submissionId
           );
@@ -5022,7 +5729,7 @@ export function createStackMateApp(
           pathname
         );
         if (method === "GET" && mSubmissionHistory) {
-          assertStaffPermission(principal, "payments.read");
+          await assertStaffPermissionAudited(store, principal, "payments.read", requestId);
           const sub = store.state.payment_submissions.find(
             (s) => s.id === mSubmissionHistory.params.submissionId
           );
@@ -5037,7 +5744,7 @@ export function createStackMateApp(
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/payment-submissions") {
-          assertStaffPermission(principal, "payments.read");
+          await assertStaffPermissionAudited(store, principal, "payments.read", requestId);
           const statusFilter = url.searchParams.get("status");
           const filteredSubmissions = store.state.payment_submissions.filter(
             (s) => (!statusFilter ? true : s.status === statusFilter),
@@ -5084,18 +5791,64 @@ export function createStackMateApp(
           // dispatcher (audited variant, so a denial is recorded).
           await assertStaffPermissionAudited(store, principal, "payments.approve", requestId);
           const body = await readJsonBody(request);
-          const result = await approvePaymentSubmissionByStaff(
-            store,
-            principal,
-            mSubmissionApprove.params.submissionId!,
-            body,
-            {
-              licenseVerifierSecret: env.LICENSE_VERIFIER_SECRET,
-              requestId,
-              timeZone: env.DEFAULT_TIMEZONE,
-            }
-          );
-          return jsonResponse(result, 200);
+          // A-04: approval is idempotent per Idempotency-Key. The
+          // stored replay body must NEVER hold plaintext license keys
+          // (A-03 class): issued_license_key_once values are stored
+          // ENCRYPTED under the master key (same at-rest protection as
+          // site credential secrets) and decrypted on replay.
+          const approved = await runIdempotentCommand({
+            scope: `admin_payment_approve:${mSubmissionApprove.params.submissionId}`,
+            key: request.headers.get("Idempotency-Key"),
+            payload: body,
+            statusCode: 200,
+            fn: () =>
+              approvePaymentSubmissionByStaff(
+                store,
+                principal,
+                mSubmissionApprove.params.submissionId!,
+                body,
+                {
+                  licenseVerifierSecret: env.LICENSE_VERIFIER_SECRET,
+                  requestId,
+                  timeZone: env.DEFAULT_TIMEZONE,
+                }
+              ),
+            redactForStore: (result) => ({
+              ...result,
+              issued_licenses: result.issued_licenses.map((il) => ({
+                ...il,
+                issued_license_key_once: encryptSecretAtRest(
+                  il.issued_license_key_once,
+                  env.ENCRYPTION_KEY_V1,
+                  env.ACTIVE_ENCRYPTION_KEY_VERSION,
+                  `idempotency:admin_payment_approve:${mSubmissionApprove.params.submissionId}`
+                ),
+              })),
+            }),
+            reissueOnReplay: (stored) => {
+              const storedResult = stored as {
+                issued_licenses?: Array<{
+                  issued_license_key_once?: string;
+                  [key: string]: unknown;
+                }>;
+                [key: string]: unknown;
+              };
+              return {
+                ...storedResult,
+                issued_licenses: (storedResult.issued_licenses ?? []).map((il) => ({
+                  ...il,
+                  issued_license_key_once: il.issued_license_key_once
+                    ? decryptSecretAtRest(
+                        il.issued_license_key_once,
+                        env.ENCRYPTION_KEY_V1,
+                        `idempotency:admin_payment_approve:${mSubmissionApprove.params.submissionId}`
+                      )
+                    : il.issued_license_key_once,
+                })),
+              } as Awaited<ReturnType<typeof approvePaymentSubmissionByStaff>>;
+            },
+          });
+          return jsonResponse(approved.body, 200);
         }
 
         const mSubmissionReject = matchPath(
@@ -5107,14 +5860,24 @@ export function createStackMateApp(
           // dispatcher (audited variant, so a denial is recorded).
           await assertStaffPermissionAudited(store, principal, "payments.reject", requestId);
           const body = await readJsonBody(request);
-          const result = await rejectPaymentSubmissionByStaff(
-            store,
-            principal,
-            mSubmissionReject.params.submissionId!,
-            body,
-            requestId
-          );
-          return jsonResponse(result, 200);
+          // A-04: rejection is idempotent per Idempotency-Key (the
+          // response carries no secrets, so the stored body is used
+          // as-is on replay).
+          const rejected = await runIdempotentCommand({
+            scope: `admin_payment_reject:${mSubmissionReject.params.submissionId}`,
+            key: request.headers.get("Idempotency-Key"),
+            payload: body,
+            statusCode: 200,
+            fn: () =>
+              rejectPaymentSubmissionByStaff(
+                store,
+                principal,
+                mSubmissionReject.params.submissionId!,
+                body,
+                requestId
+              ),
+          });
+          return jsonResponse(rejected.body, 200);
         }
 
         // Refunds (D-4 / F-03): manual refunds only — no gateway.
@@ -5123,7 +5886,7 @@ export function createStackMateApp(
         // writes the audit row; the route validates the envelope with
         // RecordManualRefundSchema and gates on payments.approve.
         if (method === "POST" && pathname === "/api/v1/admin/refunds") {
-          assertStaffPermission(principal, "payments.approve");
+          await assertStaffPermissionAudited(store, principal, "payments.approve", requestId);
           const body = await readJsonBody(request);
           const parsed = RecordManualRefundSchema.safeParse(body);
           if (!parsed.success) {
@@ -5137,22 +5900,38 @@ export function createStackMateApp(
           // parse to `undefined` when absent; the service input takes
           // `string | null`, so normalize absent to null (the refine
           // above guarantees exactly one of the two ids is set).
-          const created = await recordManualRefundByAdmin(
-            store,
-            principal,
-            {
+          // A-04: manual refunds are idempotent per Idempotency-Key —
+          // a retried refund replays the first instead of refunding
+          // twice. (assertStaffPermission here is swapped to the
+          // audited variant by F-01 below.)
+          const created = await runIdempotentCommand({
+            scope: "admin_refund_create",
+            key: request.headers.get("Idempotency-Key"),
+            payload: {
               ...parsed.data,
               payment_transaction_id: parsed.data.payment_transaction_id ?? null,
               order_id: parsed.data.order_id ?? null,
               provider_refund_id: parsed.data.provider_refund_id ?? null,
             },
-            requestId,
-          );
-          return jsonResponse(created, 201);
+            statusCode: 201,
+            fn: () =>
+              recordManualRefundByAdmin(
+                store,
+                principal,
+                {
+                  ...parsed.data,
+                  payment_transaction_id: parsed.data.payment_transaction_id ?? null,
+                  order_id: parsed.data.order_id ?? null,
+                  provider_refund_id: parsed.data.provider_refund_id ?? null,
+                },
+                requestId
+              ),
+          });
+          return jsonResponse(created.body, created.replayed ? 200 : 201);
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/refunds") {
-          assertStaffPermission(principal, "payments.read");
+          await assertStaffPermissionAudited(store, principal, "payments.read", requestId);
           const { q, limit, page } = parseListQuery(url.searchParams);
           const items = store.state.payment_refunds.filter(
             (r) =>
@@ -5166,7 +5945,7 @@ export function createStackMateApp(
 
         const mRefundDetail = matchPath("/api/v1/admin/refunds/:refundId", pathname);
         if (method === "GET" && mRefundDetail) {
-          assertStaffPermission(principal, "payments.read");
+          await assertStaffPermissionAudited(store, principal, "payments.read", requestId);
           const refund = store.state.payment_refunds.find(
             (r) => r.id === mRefundDetail.params.refundId
           );
@@ -5176,7 +5955,7 @@ export function createStackMateApp(
 
         const mAssetContent = matchPath("/api/v1/admin/assets/:assetId/content", pathname);
         if (method === "GET" && mAssetContent) {
-          assertStaffPermission(principal, "payments.read");
+          await assertStaffPermissionAudited(store, principal, "payments.read", requestId);
           const asset = store.state.uploaded_assets.find(
             (a) => a.id === mAssetContent.params.assetId
           );
@@ -5188,13 +5967,21 @@ export function createStackMateApp(
           const assetDriver = await resolveStorageDriver(driverDepsForRequest(store, env));
           const obj = await assetDriver.get(asset.object_key);
           if (!obj) throw new AppError("NOT_FOUND", "Object content not found.", 404);
+          // A-17: nosniff on evidence downloads, and ?download=1
+          // forces a save-as download (like the media content route)
+          // instead of inline preview.
+          const safeFilename = asset.original_filename.replace(/["\\\r\n]/g, "");
+          const evidenceDownload = url.searchParams.get("download") === "1";
           return new Response(obj.bytes, {
             status: 200,
             headers: {
               "Content-Type": asset.content_type,
               "Content-Length": String(obj.size),
               "Cache-Control": "private, no-store",
-              "Content-Disposition": `inline; filename="${asset.original_filename}"`,
+              "Content-Disposition": evidenceDownload
+                ? `attachment; filename="${safeFilename}"`
+                : `inline; filename="${safeFilename}"`,
+              "X-Content-Type-Options": "nosniff",
               "X-Request-ID": requestId,
             },
           });
@@ -5202,7 +5989,7 @@ export function createStackMateApp(
 
         // Subscriptions & Licenses
         if (method === "GET" && pathname === "/api/v1/admin/subscriptions") {
-          assertStaffPermission(principal, "subscriptions.read");
+          await assertStaffPermissionAudited(store, principal, "subscriptions.read", requestId);
           const { q, limit, page } = parseListQuery(url.searchParams);
           const items = store.state.subscriptions
             .filter(
@@ -5224,10 +6011,78 @@ export function createStackMateApp(
           return pagedCollectionResponse(items, limit, page);
         }
 
+        // E-09: renewals view (PRD §12.5) — the work queue the
+        // subscriptions list cannot show: ?bucket=upcoming|due|overdue|
+        // failed|cancelled (no bucket = all bucketed rows). Buckets are
+        // the shared renewalBucketOf definitions (disjoint; rows with
+        // no next_renewal_at or a renewal >30 days out belong to no
+        // bucket). Sorted nearest-renewal-first so the most urgent row
+        // is on top; each row carries customer + product like the
+        // subscriptions list.
+        if (method === "GET" && pathname === "/api/v1/admin/renewals") {
+          await assertStaffPermissionAudited(store, principal, "subscriptions.read", requestId);
+          const bucketParam = url.searchParams.get("bucket");
+          const validBuckets = ["upcoming", "due", "overdue", "failed", "cancelled"] as const;
+          const bucketFilter =
+            bucketParam !== null &&
+            (validBuckets as readonly string[]).includes(bucketParam)
+              ? (bucketParam as (typeof validBuckets)[number])
+              : bucketParam === null
+                ? null
+                : undefined;
+          if (bucketFilter === undefined) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              "Unknown renewals bucket. Use upcoming, due, overdue, failed, or cancelled.",
+              400
+            );
+          }
+          const { q, limit, page } = parseListQuery(url.searchParams);
+          const todayDay = new Date().toISOString().slice(0, 10);
+          const items = store.state.subscriptions
+            .map((s) => ({
+              subscription: s,
+              bucket: renewalBucketOf(s, todayDay),
+            }))
+            .filter((row) => row.bucket !== null)
+            .filter((row) => (bucketFilter === null ? true : row.bucket === bucketFilter))
+            .filter(
+              (row) =>
+                includesQuery(row.subscription.subscription_number, q) ||
+                includesQuery(
+                  store.state.customers.find((c) => c.id === row.subscription.customer_id)
+                    ?.name,
+                  q
+                )
+            )
+            .sort((a, b) => {
+              const aDay = renewalDayOf(a.subscription.next_renewal_at) ?? "9999-12-31";
+              const bDay = renewalDayOf(b.subscription.next_renewal_at) ?? "9999-12-31";
+              if (aDay !== bDay) return aDay < bDay ? -1 : 1;
+              return a.subscription.id.localeCompare(b.subscription.id);
+            })
+            .map((row) => ({
+              ...row.subscription,
+              bucket: row.bucket,
+              customer:
+                store.state.customers.find((c) => c.id === row.subscription.customer_id) ??
+                null,
+              product:
+                store.state.products.find((p) => p.id === row.subscription.product_id) ?? null,
+              next_renewal_display: row.subscription.next_renewal_at
+                ? formatDisplayDateDDMMYYYY(
+                    row.subscription.next_renewal_at,
+                    env.DEFAULT_TIMEZONE
+                  )
+                : null,
+            }));
+          return pagedCollectionResponse(items, limit, page);
+        }
+
         // Batch 1: subscription detail.
         const mSubDetail = matchPath("/api/v1/admin/subscriptions/:subscriptionId", pathname);
         if (method === "GET" && mSubDetail) {
-          assertStaffPermission(principal, "subscriptions.read");
+          await assertStaffPermissionAudited(store, principal, "subscriptions.read", requestId);
           const sub = store.state.subscriptions.find(
             (s) => s.id === mSubDetail.params.subscriptionId
           );
@@ -5253,13 +6108,13 @@ export function createStackMateApp(
           // M-9: the mutation maps to its write permission at the
           // dispatcher (audited variant, so a denial is recorded).
           await assertStaffPermissionAudited(store, principal, "subscriptions.manage", requestId);
-          const idempotencyKey =
-            request.headers.get("Idempotency-Key") ?? `ren_${mSubRenewal.params.subscriptionId}`;
+          // A-02: NO default key — without a header the service
+          // derives ren_<id>_period_<n> from the next period.
           const res = await generateSubscriptionRenewalInvoice(
             store,
             principal,
             mSubRenewal.params.subscriptionId!,
-            idempotencyKey,
+            request.headers.get("Idempotency-Key"),
             requestId
           );
           return jsonResponse(res, res.replayed ? 200 : 201);
@@ -5290,7 +6145,7 @@ export function createStackMateApp(
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/licenses") {
-          assertStaffPermission(principal, "licenses.read");
+          await assertStaffPermissionAudited(store, principal, "licenses.read", requestId);
           // Never expose license_key_hash or raw keys in list responses (API Spec §12.3)
           const { q, limit, page } = parseListQuery(url.searchParams);
           const filteredLicenses = store.state.licenses.filter(
@@ -5345,13 +6200,100 @@ export function createStackMateApp(
           return jsonResponse(granted, 201);
         }
 
+        // E-05: signing-key lifecycle admin API (PRD §13.5; API spec
+        // §16.6). Rotation/revocation exist only as store methods
+        // until now — these routes expose them, permission-gated and
+        // audit-logged. Placed BEFORE the :licenseId detail match:
+        // GET /admin/licenses/signing-keys would otherwise match
+        // licenseId="signing-keys" and 404.
+        // List: public JWKs (never private material) + status per key
+        // (active vs retired — revoked keys leave the store, so they
+        // never appear here, same as the public endpoint).
+        if (method === "GET" && pathname === "/api/v1/admin/licenses/signing-keys") {
+          await assertStaffPermissionAudited(store, principal, "licenses.read", requestId);
+          const keys = store.listPublicSigningKeys();
+          return jsonResponse({
+            active_key_id: store.activeSigningKeyId,
+            keys: keys.map((jwk) => ({
+              key_id: (jwk as { kid?: unknown }).kid ?? null,
+              status:
+                (jwk as { kid?: unknown }).kid === store.activeSigningKeyId
+                  ? "active"
+                  : "retired",
+              public_key_jwk: jwk,
+            })),
+          });
+        }
+
+        if (method === "POST" && pathname === "/api/v1/admin/licenses/signing-keys/rotate") {
+          await assertStaffPermissionAudited(store, principal, "licenses.manage", requestId);
+          const body = (await readJsonBodyLenient(request)) as { key_id?: unknown };
+          const requestedId =
+            typeof body.key_id === "string" && body.key_id.trim().length > 0
+              ? body.key_id.trim()
+              : undefined;
+          // The store derives a fresh id when none is given
+          // (DrizzleStore); the in-memory store needs an explicit one,
+          // so derive the same shape here when absent.
+          const nextKeyId =
+            requestedId ??
+            `key-${new Date().toISOString().slice(0, 10)}-${randomUUID().slice(0, 8)}`;
+          const rotated = await store.rotateSigningKey(nextKeyId);
+          await store.withTransaction((state) => {
+            appendAuditLog(state, {
+              actor_type: "staff",
+              actor_user_id: principal.user.id,
+              action: "licenses.signing_key.rotated",
+              resource_type: "signing_key",
+              resource_id: rotated.keyId,
+              outcome: "success",
+              request_id: requestId,
+              changes: { key_id: rotated.keyId },
+            });
+          });
+          return jsonResponse(
+            {
+              key_id: rotated.keyId,
+              status: "active",
+              public_key_jwk: rotated.publicKeyJwk,
+            },
+            201
+          );
+        }
+
+        const mSigningKeyRevoke = matchPath(
+          "/api/v1/admin/licenses/signing-keys/:keyId/revoke",
+          pathname
+        );
+        if (method === "POST" && mSigningKeyRevoke) {
+          // Revoke is irreversible for that key id — licenses.revoke,
+          // like license revocation. The active key can never be
+          // revoked (rotate first); the store enforces it with 409.
+          await assertStaffPermissionAudited(store, principal, "licenses.revoke", requestId);
+          const keyId = mSigningKeyRevoke.params.keyId!;
+          await store.revokeSigningKey(keyId);
+          await store.withTransaction((state) => {
+            appendAuditLog(state, {
+              actor_type: "staff",
+              actor_user_id: principal.user.id,
+              action: "licenses.signing_key.revoked",
+              resource_type: "signing_key",
+              resource_id: keyId,
+              outcome: "success",
+              request_id: requestId,
+              changes: { key_id: keyId },
+            });
+          });
+          return jsonResponse({ revoked: true, key_id: keyId });
+        }
+
         // Batch 1: license detail + activations.
         // NOTE: GET /api/v1/admin/licenses/manual-grants would also match
         // this pattern with licenseId="manual-grants" — but that path has
         // no GET route, so a 404 here is correct; the POST above runs first.
         const mLicenseDetail = matchPath("/api/v1/admin/licenses/:licenseId", pathname);
         if (method === "GET" && mLicenseDetail) {
-          assertStaffPermission(principal, "licenses.read");
+          await assertStaffPermissionAudited(store, principal, "licenses.read", requestId);
           const lic = store.state.licenses.find(
             (l) => l.id === mLicenseDetail.params.licenseId
           );
@@ -5379,7 +6321,7 @@ export function createStackMateApp(
           pathname
         );
         if (method === "GET" && mLicenseActivations) {
-          assertStaffPermission(principal, "licenses.read");
+          await assertStaffPermissionAudited(store, principal, "licenses.read", requestId);
           const lic = store.state.licenses.find(
             (l) => l.id === mLicenseActivations.params.licenseId
           );
@@ -5402,6 +6344,26 @@ export function createStackMateApp(
             principal,
             mActivationDeactivate.params.licenseId!,
             mActivationDeactivate.params.activationId!,
+            body,
+            requestId
+          );
+          return jsonResponse(result);
+        }
+
+        const mActivationTransfer = matchPath(
+          "/api/v1/admin/licenses/:licenseId/activations/:activationId/transfer",
+          pathname
+        );
+        if (method === "POST" && mActivationTransfer) {
+          // E-03: audited activation transfer (Roadmap Stage 6 exit;
+          // API spec §12.2).
+          await assertStaffPermissionAudited(store, principal, "licenses.manage", requestId);
+          const body = await readJsonBody(request);
+          const result = await transferActivation(
+            store,
+            principal,
+            mActivationTransfer.params.licenseId!,
+            mActivationTransfer.params.activationId!,
             body,
             requestId
           );
@@ -5467,7 +6429,7 @@ export function createStackMateApp(
 
         // Integrated Sites, Credentials, Tracking, Webhooks
         if (method === "GET" && pathname === "/api/v1/admin/integrated-sites") {
-          assertStaffPermission(principal, "integrations.manage");
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
           const { q, limit, page } = parseListQuery(url.searchParams);
           const sites = store.state.integrated_sites
             .filter(
@@ -5504,7 +6466,7 @@ export function createStackMateApp(
         // Batch 1: site detail + lifecycle + products + credentials + domains.
         const mSiteDetail = matchPath("/api/v1/admin/integrated-sites/:siteId", pathname);
         if (method === "GET" && mSiteDetail) {
-          assertStaffPermission(principal, "integrations.manage");
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
           const site = store.state.integrated_sites.find(
             (s) => s.id === mSiteDetail.params.siteId
           );
@@ -5614,7 +6576,7 @@ export function createStackMateApp(
           pathname
         );
         if (method === "GET" && mSiteCredentials) {
-          assertStaffPermission(principal, "integrations.manage");
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
           const site = store.state.integrated_sites.find(
             (s) => s.id === mSiteCredentials.params.siteId
           );
@@ -5633,18 +6595,53 @@ export function createStackMateApp(
           // dispatcher (audited variant, so a denial is recorded).
           await assertStaffPermissionAudited(store, principal, "integrations.rotate_credentials", requestId);
           const body = await readJsonBody(request);
-          const created = await createSiteCredentialByAdmin(
-            store,
-            principal,
-            mSiteCredentials.params.siteId!,
-            body,
-            {
-              encryptionKey: env.ENCRYPTION_KEY_V1,
-              keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION,
-              requestId,
-            }
-          );
-          return jsonResponse(created, 201);
+          // A-04: credential creation is idempotent per
+          // Idempotency-Key. The raw secret is shown ONCE — it is
+          // never stored in the idempotency row (A-03 class); on
+          // replay it is re-derived by decrypting the stored
+          // ciphertext of the created credential row.
+          const created = await runIdempotentCommand({
+            scope: `admin_credential_create:${mSiteCredentials.params.siteId}`,
+            key: request.headers.get("Idempotency-Key"),
+            payload: body,
+            statusCode: 201,
+            fn: () =>
+              createSiteCredentialByAdmin(
+                store,
+                principal,
+                mSiteCredentials.params.siteId!,
+                body,
+                {
+                  encryptionKey: env.ENCRYPTION_KEY_V1,
+                  keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION,
+                  requestId,
+                }
+              ),
+            redactForStore: (result) => ({ ...result, raw_secret_once: null }),
+            reissueOnReplay: (stored) => {
+              const storedResult = stored as {
+                credential?: { id?: string };
+                raw_secret_once?: string | null;
+                [key: string]: unknown;
+              };
+              const credId = storedResult.credential?.id;
+              const row = credId
+                ? store.state.site_credentials.find((c) => c.id === credId)
+                : undefined;
+              return {
+                ...storedResult,
+                raw_secret_once:
+                  row?.secret_ciphertext && row.secret_ciphertext.length > 0
+                    ? decryptSecretAtRest(
+                        row.secret_ciphertext,
+                        env.ENCRYPTION_KEY_V1,
+                        `site_credentials:${row.id}`
+                      )
+                    : null,
+              } as Awaited<ReturnType<typeof createSiteCredentialByAdmin>>;
+            },
+          });
+          return jsonResponse(created.body, created.replayed ? 200 : 201);
         }
 
         const mSiteCredRevoke = matchPath(
@@ -5753,18 +6750,53 @@ export function createStackMateApp(
           // M-9: the mutation maps to its write permission at the
           // dispatcher (audited variant, so a denial is recorded).
           await assertStaffPermissionAudited(store, principal, "integrations.rotate_credentials", requestId);
-          const rotated = await rotateSiteServerCredentialByAdmin(
-            store,
-            principal,
-            mRotateCred.params.siteId!,
-            mRotateCred.params.credentialId!,
-            {
-              encryptionKey: env.ENCRYPTION_KEY_V1,
-              keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION,
-              requestId,
-            }
-          );
-          return jsonResponse(rotated);
+          // A-04: rotation is idempotent per Idempotency-Key (a
+          // retried rotation replays the first new credential instead
+          // of minting a second one). The raw secret is re-derived
+          // from the stored ciphertext on replay, never stored in the
+          // idempotency row.
+          const rotated = await runIdempotentCommand({
+            scope: `admin_credential_rotate:${mRotateCred.params.credentialId}`,
+            key: request.headers.get("Idempotency-Key"),
+            payload: {},
+            statusCode: 200,
+            fn: () =>
+              rotateSiteServerCredentialByAdmin(
+                store,
+                principal,
+                mRotateCred.params.siteId!,
+                mRotateCred.params.credentialId!,
+                {
+                  encryptionKey: env.ENCRYPTION_KEY_V1,
+                  keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION,
+                  requestId,
+                }
+              ),
+            redactForStore: (result) => ({ ...result, raw_secret_once: null }),
+            reissueOnReplay: (stored) => {
+              const storedResult = stored as {
+                new_credential?: { id?: string };
+                raw_secret_once?: string | null;
+                [key: string]: unknown;
+              };
+              const credId = storedResult.new_credential?.id;
+              const row = credId
+                ? store.state.site_credentials.find((c) => c.id === credId)
+                : undefined;
+              return {
+                ...storedResult,
+                raw_secret_once:
+                  row?.secret_ciphertext && row.secret_ciphertext.length > 0
+                    ? decryptSecretAtRest(
+                        row.secret_ciphertext,
+                        env.ENCRYPTION_KEY_V1,
+                        `site_credentials:${row.id}`
+                      )
+                    : null,
+              } as Awaited<ReturnType<typeof rotateSiteServerCredentialByAdmin>>;
+            },
+          });
+          return jsonResponse(rotated.body);
         }
 
         const mSiteTracking = matchPath(
@@ -5795,7 +6827,7 @@ export function createStackMateApp(
         // one (201, 409 on a duplicate (provider, pixel_id)); the
         // toggle is PATCH status — no redundant endpoint.
         if (method === "GET" && mSiteTracking) {
-          assertStaffPermission(principal, "tracking.manage");
+          await assertStaffPermissionAudited(store, principal, "tracking.manage", requestId);
           const site = store.state.integrated_sites.find(
             (s) => s.id === mSiteTracking.params.siteId
           );
@@ -5868,14 +6900,74 @@ export function createStackMateApp(
 
         if (method === "GET" && pathname === "/api/v1/admin/tracking/events") {
           // L-6: read-only roles hold tracking.read (migration 0016).
-          assertStaffPermission(principal, "tracking.read");
+          await assertStaffPermissionAudited(store, principal, "tracking.read", requestId);
           const { limit, page } = parseListQuery(url.searchParams);
-          return pagedCollectionResponse(store.state.tracking_events, limit, page);
+          // E-19: dedup flag on every row. Duplicates are never stored
+          // (ingest returns the first-seen row instead of inserting a
+          // second one), so a stored row is first-seen unless another
+          // row shares (site, event_name, event_id) with an earlier
+          // created_at — derived here, so the flag stays truthful if
+          // duplicates ever do get stored.
+          const firstSeenByKey = new Map<string, { created_at: string; id: string }>();
+          for (const e of store.state.tracking_events) {
+            const key = `${e.integrated_site_id}|${e.event_name}|${e.event_id}`;
+            const prev = firstSeenByKey.get(key);
+            if (
+              !prev ||
+              e.created_at < prev.created_at ||
+              (e.created_at === prev.created_at && e.id < prev.id)
+            ) {
+              firstSeenByKey.set(key, { created_at: e.created_at, id: e.id });
+            }
+          }
+          const items = store.state.tracking_events.map((e) => ({
+            ...e,
+            deduplicated:
+              firstSeenByKey.get(`${e.integrated_site_id}|${e.event_name}|${e.event_id}`)
+                ?.id !== e.id,
+          }));
+          // B-05: cursor pagination (?cursor=) — see audit-logs.
+          const cursorParam = url.searchParams.get("cursor");
+          if (cursorParam !== null) {
+            const { page: cursorPage, nextCursor } = applyCursorPage(
+              sortNewestFirst(items),
+              limit,
+              cursorParam
+            );
+            return collectionResponse(cursorPage, nextCursor, 200, items.length);
+          }
+          return pagedCollectionResponse(items, limit, page);
+        }
+
+        // E-18: send a tracking test event (PRD §15.6; API spec §17.5
+        // — dedup policy must be verified in test events before
+        // production). Ingests a synthetic event through the normal
+        // pipeline with the pixel group's test code attached.
+        if (method === "POST" && pathname === "/api/v1/admin/tracking/test-event") {
+          await assertStaffPermissionAudited(store, principal, "tracking.manage", requestId);
+          const body = (await readJsonBody(request)) as {
+            pixel_group_id?: unknown;
+            event_name?: unknown;
+          };
+          if (
+            typeof body.pixel_group_id !== "string" ||
+            body.pixel_group_id.trim() === "" ||
+            typeof body.event_name !== "string" ||
+            body.event_name.trim() === ""
+          ) {
+            throw new AppError(
+              "VALIDATION_ERROR",
+              "pixel_group_id and event_name are required.",
+              422
+            );
+          }
+          const result = await sendTrackingTestEvent(store, principal, body, requestId);
+          return jsonResponse(result, 202);
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/webhooks") {
           // L-6: read-only roles hold integrations.read (migration 0016).
-          assertStaffPermission(principal, "integrations.read");
+          await assertStaffPermissionAudited(store, principal, "integrations.read", requestId);
           const endpoints = store.state.webhook_endpoints.map(
             ({ secret_ciphertext: _, ...safe }) => safe
           );
@@ -5914,6 +7006,49 @@ export function createStackMateApp(
           return jsonResponse(deleted);
         }
 
+        // E-17: edit a webhook endpoint (PRD §16; coverage P2) — URL +
+        // subscribed events only; the secret is untouched (rotation is
+        // the separate POST .../rotate below).
+        if (method === "PATCH" && mWebhookDelete) {
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
+          // The service reads url / description / subscribed_events
+          // (or subscribedEvents) off the raw body — pass it through.
+          const body = await readJsonBody(request);
+          const updated = await updateWebhookEndpoint(
+            store,
+            principal,
+            mWebhookDelete.params.webhookId!,
+            body,
+            {
+              allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
+              requestId,
+            }
+          );
+          return jsonResponse(updated);
+        }
+
+        // E-04: rotate a webhook secret (API spec §18.6) — mirrors the
+        // site-credential rotate pattern: a new secret is issued
+        // (shown once by the service), the old one retires.
+        const mWebhookRotate = matchPath(
+          "/api/v1/admin/webhooks/:webhookId/rotate",
+          pathname
+        );
+        if (method === "POST" && mWebhookRotate) {
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
+          const result = await rotateWebhookSecret(
+            store,
+            principal,
+            mWebhookRotate.params.webhookId!,
+            {
+              encryptionKey: env.ENCRYPTION_KEY_V1,
+              keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION,
+              requestId,
+            }
+          );
+          return jsonResponse(result);
+        }
+
         // Batch 1: webhook test delivery + delivery history + outbox reads/replay.
         const mWebhookTest = matchPath(
           "/api/v1/admin/webhooks/:webhookId/test",
@@ -5937,7 +7072,7 @@ export function createStackMateApp(
         );
         if (method === "GET" && mWebhookDeliveries) {
           // L-6: read-only roles hold integrations.read (migration 0016).
-          assertStaffPermission(principal, "integrations.read");
+          await assertStaffPermissionAudited(store, principal, "integrations.read", requestId);
           const endpoint = store.state.webhook_endpoints.find(
             (ep) => ep.id === mWebhookDeliveries.params.webhookId
           );
@@ -5953,7 +7088,7 @@ export function createStackMateApp(
 
         if (method === "GET" && pathname === "/api/v1/admin/outbox-events") {
           // L-6: read-only roles hold integrations.read (migration 0016).
-          assertStaffPermission(principal, "integrations.read");
+          await assertStaffPermissionAudited(store, principal, "integrations.read", requestId);
           const statusFilter = url.searchParams.get("status");
           // Server-side `?q=` (search batch): matches event_key /
           // event_type / aggregate_type / aggregate_id / status
@@ -5976,6 +7111,16 @@ export function createStackMateApp(
                 includesQuery(e.aggregate_id, q) ||
                 includesQuery(e.status, q),
             );
+          // B-05: cursor pagination (?cursor=) — see audit-logs.
+          const cursorParam = url.searchParams.get("cursor");
+          if (cursorParam !== null) {
+            const { page: cursorPage, nextCursor } = applyCursorPage(
+              sortNewestFirst(items),
+              limit,
+              cursorParam
+            );
+            return collectionResponse(cursorPage, nextCursor, 200, items.length);
+          }
           return pagedCollectionResponse(items, limit, page);
         }
 
@@ -5997,7 +7142,7 @@ export function createStackMateApp(
         }
 
         if (method === "POST" && pathname === "/api/v1/admin/outbox/dispatch") {
-          assertStaffPermission(principal, "integrations.manage");
+          await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
           // C-2: pass the real transport — without it the dispatcher
           // runs simulated and records "simulated" (never "delivered").
           const summary = await processTransactionalOutboxBatch(store, {
@@ -6021,7 +7166,7 @@ export function createStackMateApp(
         // reconstructed from current state, so products / subscriptions /
         // licenses / queues / all-time customer total are NOT range-scoped.
         if (method === "GET" && pathname === "/api/v1/admin/analytics/overview") {
-          assertStaffPermission(principal, "products.read");
+          await assertStaffPermissionAudited(store, principal, "products.read", requestId);
           // M-8: revenue is finance data — only callers who can see
           // payments see it. There is no finance.* permission in the
           // seed catalogue (only the finance_manager ROLE, which holds
@@ -6051,14 +7196,89 @@ export function createStackMateApp(
             (s) => s.status === "submitted" || s.status === "under_review"
           );
 
+          // B-06: one call instead of four — the overview carries the
+          // three dashboard panels' top-5 rows (Worker D consumes
+          // `panels`; the SPA's separate panel queries stay as a
+          // fallback until it switches over). Panels are server-sorted
+          // over the full set, so a row is never hidden by a
+          // creation-sorted ?limit=100 window (the old D-02 gap).
+          // E-11: upcoming_renewals = renewable subscriptions whose
+          // next renewal falls within 30 days (the upcoming + due
+          // buckets of the renewals view).
+          const todayDay = new Date().toISOString().slice(0, 10);
+          const upcomingRenewals = store.state.subscriptions.filter((s) => {
+            const bucket = renewalBucketOf(s, todayDay);
+            return bucket === "upcoming" || bucket === "due";
+          });
+          const customerById = new Map(store.state.customers.map((c) => [c.id, c]));
+          const panels = {
+            recent_orders: sortByTimestamp(store.state.orders, "created_at", "desc")
+              .slice(0, 5)
+              .map((o) => ({
+                ...o,
+                customer: customerById.get(o.customer_id) ?? null,
+                paid_amount_minor: computeOrderPaid(store.state, o.id),
+                remaining_minor: computeOrderRemaining(store.state, o),
+                created_date_display: formatDisplayDateDDMMYYYY(
+                  o.created_at,
+                  env.DEFAULT_TIMEZONE
+                ),
+              })),
+            pending_submissions: [...pendingSubmissions]
+              .sort((a, b) => (a.submitted_at < b.submitted_at ? 1 : -1))
+              .slice(0, 5)
+              .map((s) => ({
+                ...s,
+                customer: customerById.get(s.customer_id) ?? null,
+                order_number:
+                  store.state.orders.find((o) => o.id === s.order_id)?.order_number ?? null,
+              })),
+            expiring_licenses: [...store.state.licenses]
+              .filter((l) => {
+                if (l.status !== "active") return false;
+                const day = renewalDayOf(l.expires_at);
+                return (
+                  day !== null &&
+                  day >= todayDay &&
+                  day <= addDaysIso(todayDay, RENEWAL_UPCOMING_DAYS)
+                );
+              })
+              .sort((a, b) => (a.expires_at ?? "") < (b.expires_at ?? "") ? -1 : 1)
+              .slice(0, 5)
+              .map((l) => {
+                const { license_key_hash: _h, issued_raw_key_once: _r, ...safe } = l;
+                const customer = customerById.get(l.customer_id);
+                const product = store.state.products.find((p) => p.id === l.product_id);
+                return {
+                  ...safe,
+                  customer_name: customer?.name ?? null,
+                  product_code: product?.code ?? null,
+                  product_name: product?.name ?? null,
+                  active_activations_count: l.activations.filter((a) => a.status === "active")
+                    .length,
+                  expires_date_display: l.expires_at
+                    ? formatDisplayDateDDMMYYYY(l.expires_at, env.DEFAULT_TIMEZONE)
+                    : "Lifetime",
+                };
+              }),
+          };
+
           return jsonResponse({
             currency_code: env.DEFAULT_CURRENCY,
             total_products: store.state.products.length,
             active_products: store.state.products.filter((p) => p.status === "active").length,
             total_customers: store.state.customers.length,
-            total_orders: ordersInRange.length,
-            paid_orders: paidOrdersInRange.length,
-            pending_payment_submissions: pendingSubmissions.length,
+            // F-02: order/payment counts are finance data too — gated
+            // on the same canSeeRevenue predicate as
+            // verified_revenue_minor (null, not 0, when the caller
+            // lacks payments.read, so a missing value is never
+            // mistaken for "no orders"). The SPA hides these cards on
+            // null, as it does for revenue.
+            total_orders: canSeeRevenue ? ordersInRange.length : null,
+            paid_orders: canSeeRevenue ? paidOrdersInRange.length : null,
+            pending_payment_submissions: canSeeRevenue ? pendingSubmissions.length : null,
+            upcoming_renewals: upcomingRenewals.length,
+            panels,
             active_subscriptions: store.state.subscriptions.filter((s) => s.status === "active")
               .length,
             active_licenses: store.state.licenses.filter((l) => l.status === "active").length,
@@ -6089,7 +7309,7 @@ export function createStackMateApp(
         };
 
         if (method === "GET" && pathname === "/api/v1/admin/expense-categories") {
-          assertStaffPermission(principal, "expenses.read");
+          await assertStaffPermissionAudited(store, principal, "expenses.read", requestId);
           const { q, limit, page } = parseExpenseListQuery();
           const isActiveRaw = url.searchParams.get("is_active");
           const isActive =
@@ -6118,7 +7338,7 @@ export function createStackMateApp(
           pathname,
         );
         if (method === "GET" && mExpenseCategoryDetail) {
-          assertStaffPermission(principal, "expenses.read");
+          await assertStaffPermissionAudited(store, principal, "expenses.read", requestId);
           const category = await getExpenseCategory(
             store,
             principal,
@@ -6162,7 +7382,7 @@ export function createStackMateApp(
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/expenses") {
-          assertStaffPermission(principal, "expenses.read");
+          await assertStaffPermissionAudited(store, principal, "expenses.read", requestId);
           const { q, limit, page } = parseExpenseListQuery();
           const range = parseOverviewRange(url.searchParams);
           const items = await listExpenses(store, principal, {
@@ -6189,7 +7409,7 @@ export function createStackMateApp(
 
         const mExpenseDetail = matchPath("/api/v1/admin/expenses/:expenseId", pathname);
         if (method === "GET" && mExpenseDetail) {
-          assertStaffPermission(principal, "expenses.read");
+          await assertStaffPermissionAudited(store, principal, "expenses.read", requestId);
           const expense = await getExpense(
             store,
             principal,
@@ -6236,7 +7456,7 @@ export function createStackMateApp(
         // definition (paid + completed in range, order totals) minus
         // succeeded refunds recorded in range; see pnl.ts header.
         if (method === "GET" && pathname === "/api/v1/admin/analytics/profit-loss") {
-          assertStaffPermission(principal, "expenses.read");
+          await assertStaffPermissionAudited(store, principal, "expenses.read", requestId);
           const range = parseOverviewRange(url.searchParams);
           const productId = url.searchParams.get("productId");
           const result = computeProfitLoss(store.state, {
@@ -6248,7 +7468,7 @@ export function createStackMateApp(
         }
 
         if (method === "GET" && pathname === "/api/v1/admin/audit-logs") {
-          assertStaffPermission(principal, "audit_logs.read");
+          await assertStaffPermissionAudited(store, principal, "audit_logs.read", requestId);
           // H-05: server-side filters (like the other list endpoints).
           // ?q= matches action / resource type / resource id / actor /
           // display name; ?action=, ?resource=, ?outcome=, ?actor=
@@ -6292,7 +7512,82 @@ export function createStackMateApp(
                 includesQuery(a.actor_user_id, q) ||
                 includesQuery(a.resource_display_name, q),
             );
+          // B-05: cursor pagination (?cursor=) for this append-heavy
+          // list — offset paging can skip/duplicate rows as new audit
+          // rows are appended. ?cursor= absent keeps the offset path.
+          const cursorParam = url.searchParams.get("cursor");
+          if (cursorParam !== null) {
+            const { page: cursorPage, nextCursor } = applyCursorPage(
+              sortNewestFirst(items),
+              limit,
+              cursorParam
+            );
+            return collectionResponse(cursorPage, nextCursor, 200, items.length);
+          }
           return pagedCollectionResponse(items, limit, page);
+        }
+
+        // E-21: scheduled-jobs visibility (PRD §22) — runs of the
+        // every-minute cron (outbox drain + renewal sweep) and any
+        // other scheduled job, read DIRECTLY from the
+        // scheduled_job_runs table (Worker C: db/schema/jobs.ts —
+        // id, job_key, started_at, finished_at, status, summary,
+        // error; index on (job_key, started_at DESC)). Never through
+        // the store load. No drizzleDb (in-memory store) → 503; table
+        // not migrated yet (42P01) → 503 with a plain message, never
+        // a 500. Response: collection of { job_key, started_at,
+        // finished_at, status, summary }.
+        if (method === "GET" && pathname === "/api/v1/admin/jobs") {
+          await assertStaffPermissionAudited(store, principal, "audit_logs.read", requestId);
+          const { limit, page } = parseListQuery(url.searchParams);
+          const maybeDrizzle = store as unknown as { drizzleDb?: unknown };
+          if (!maybeDrizzle.drizzleDb) {
+            throw new AppError(
+              "STORE_UNAVAILABLE",
+              "Scheduled jobs require a database.",
+              503
+            );
+          }
+          const db = maybeDrizzle.drizzleDb as Parameters<typeof listMediaAssets>[0];
+          const offset = (page - 1) * limit;
+          let rows: Array<Record<string, unknown>>;
+          let total: number;
+          try {
+            const rowsRes = (await db.execute(
+              sql`SELECT job_key, started_at, finished_at, status, summary
+                   FROM scheduled_job_runs
+                   ORDER BY started_at DESC
+                   LIMIT ${limit} OFFSET ${offset}`
+            )) as unknown as { rows?: Array<Record<string, unknown>> };
+            rows = rowsRes.rows ?? [];
+            const countRes = (await db.execute(
+              sql`SELECT count(*) AS value FROM scheduled_job_runs`
+            )) as unknown as { rows?: Array<Record<string, unknown>> };
+            total = Number(countRes.rows?.[0]?.value ?? 0);
+          } catch (err) {
+            if ((err as { code?: unknown } | null)?.code === "42P01") {
+              throw new AppError(
+                "STORE_UNAVAILABLE",
+                "Scheduled jobs are not available yet (scheduled_job_runs is not migrated).",
+                503
+              );
+            }
+            throw err;
+          }
+          const toIso = (v: unknown): string | null =>
+            v instanceof Date ? v.toISOString() : typeof v === "string" ? v : null;
+          return collectionResponse(
+            rows.map((r) => ({
+              job_key: r.job_key ?? null,
+              started_at: toIso(r.started_at),
+              finished_at: toIso(r.finished_at),
+              status: r.status ?? null,
+              summary: (r.summary as Record<string, unknown> | null) ?? null,
+            })),
+            null,
+            200,
+            total
+          );
         }
       }
 
@@ -6347,10 +7642,46 @@ export function createStackMateApp(
   ) {
     const env = resolveRuntimeConfig(rawEnv);
     const store = await resolveRequestStore(env, ctx);
+    // A-05 guard (cron lease, platform/cron-lease.ts): one lease per
+    // job per tick — outbox_drain + renewal_sweep are independent jobs,
+    // so a stuck drain never blocks the sweep and vice versa. A job
+    // whose lease is still held by a previous tick is SKIPPED (logged),
+    // never run twice. Each lease releases with a run summary in the
+    // inner finally, BEFORE closeRequestStore ends the store's pg
+    // client (the release itself needs the DB). No drizzleDb
+    // (in-memory/test store) → no lease, the tick runs unguarded as
+    // today. (The task's pinned 'cron_tick' single lease predates the
+    // landed module — the landed per-job leases are wired instead.)
+    const leaseDb = (store as unknown as { drizzleDb?: unknown }).drizzleDb as
+      | Parameters<typeof tryAcquireCronLease>[0]
+      | undefined;
+    const acquireLease = async (jobKey: string): Promise<boolean> => {
+      if (!leaseDb) return true;
+      try {
+        return await tryAcquireCronLease(leaseDb, jobKey);
+      } catch (err) {
+        // A lease-acquire DB failure must not kill the tick (the
+        // 2026-11-16 uncaught-exception pattern) — log loudly and run
+        // this job unguarded, as today.
+        console.error(
+          `[stackmate-cron] lease acquire failed for '${jobKey}' — running unguarded`,
+          err instanceof Error ? err.message : "unknown error"
+        );
+        return true;
+      }
+    };
+    const releaseLease = async (jobKey: string, summary: unknown): Promise<void> => {
+      if (!leaseDb) return;
+      await releaseCronLease(leaseDb, jobKey, summary).catch((err) => {
+        console.error(
+          `[stackmate-cron] failed to release '${jobKey}' lease`,
+          err instanceof Error ? err.message : "unknown error"
+        );
+      });
+    };
     try {
-      // H-7: fail closed on localhost URL vars in staging/production
-      // (after store resolution, same as the fetch path).
-      assertProductionUrlVars(env);
+      // A-09: URL-var validation is in resolveRuntimeConfig (above) —
+      // no per-request check here either.
       // The await is LOAD-BEARING (cron bug 2026-11-16): `return
       // <pending promise>` runs this finally block BEFORE the promise
       // settles, so without it closeRequestStore ends the store's pg
@@ -6363,40 +7694,118 @@ export function createStackMateApp(
       // dispatcher runs simulated and records "simulated" (never
       // "delivered"). Meta CAPI events stay simulated by design
       // (Batch 4 builds the real Meta client).
-      const drainResult = await processTransactionalOutboxBatch(store, {
-        encryptionKey: env.ENCRYPTION_KEY_V1,
-        allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
-        transport: createRealWebhookTransport({
-          allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
-        }),
-      });
+      let drainResult: Awaited<ReturnType<typeof processTransactionalOutboxBatch>> | null =
+        null;
+      if (await acquireLease(CRON_JOB_OUTBOX_DRAIN)) {
+        try {
+          drainResult = await processTransactionalOutboxBatch(store, {
+            encryptionKey: env.ENCRYPTION_KEY_V1,
+            allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
+            transport: createRealWebhookTransport({
+              allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
+            }),
+          });
+        } finally {
+          await releaseLease(CRON_JOB_OUTBOX_DRAIN, drainResult ?? { skipped: false });
+        }
+      } else {
+        console.log(
+          "[stackmate-cron] outbox drain skipped: previous tick still holds the lease"
+        );
+      }
       // Renewal + expiry sweep (ADR-0009): runs AFTER the drain, so a
       // sweep failure can never block outbox delivery. The sweep itself
       // never throws (its report carries per-item errors); the reminder
       // sends below are best-effort and a failed send is NOT marked
       // sent, so the next minute's run retries it (send-first-then-mark).
-      try {
-        const sweep = await runRenewalExpirySweep(store, {
-          licenseVerifierSecret: env.LICENSE_VERIFIER_SECRET,
-          requestId: `cron:sweep:${new Date().toISOString()}`,
-          timeZone: env.DEFAULT_TIMEZONE,
-        });
-        const sent: typeof sweep.reminders_due = [];
-        for (const reminder of sweep.reminders_due) {
-          const result = await sendEmailViaSmtp(store, env, {
-            to: reminder.to_email,
-            subject: reminder.subject,
-            text: reminder.text,
+      if (await acquireLease(CRON_JOB_RENEWAL_SWEEP)) {
+        let sweepSummary: Record<string, unknown> = { skipped: false };
+        try {
+          const sweep = await runRenewalExpirySweep(store, {
+            licenseVerifierSecret: env.LICENSE_VERIFIER_SECRET,
+            requestId: `cron:sweep:${new Date().toISOString()}`,
+            timeZone: env.DEFAULT_TIMEZONE,
           });
-          if (result.sent) sent.push(reminder);
+          // B-15: load SMTP settings ONCE per tick (decrypt included)
+          // and reuse for every reminder send, instead of one load +
+          // decrypt per reminder. When SMTP is not configured the loop
+          // is skipped outright — no per-reminder load at all. The
+          // preloaded settings are threaded through sendEmailViaSmtp
+          // (Worker B's optional param on sendStackMateEmail — not
+          // landed yet, so the per-send load inside it still runs;
+          // the tick-level gate + plumbing are in place).
+          const smtpDb = (store as unknown as { drizzleDb?: unknown })
+            .drizzleDb as Parameters<typeof sendStackMateEmail>[0] | undefined;
+          let preloadedSmtp: ResolvedSmtpSettings | null = null;
+          if (smtpDb) {
+            preloadedSmtp = await loadSmtpSettings(smtpDb, {
+              encryptionKey: env.ENCRYPTION_KEY_V1,
+              keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION,
+            }).catch(() => null);
+          }
+          const smtpReady =
+            preloadedSmtp !== null &&
+            preloadedSmtp.enabled &&
+            Boolean(preloadedSmtp.host) &&
+            Boolean(preloadedSmtp.from_address);
+          const sent: typeof sweep.reminders_due = [];
+          if (sweep.reminders_due.length > 0 && !smtpReady) {
+            console.log(
+              "[stackmate-cron] SMTP not configured — skipping",
+              sweep.reminders_due.length,
+              "reminder(s) this tick"
+            );
+          }
+          for (const reminder of sweep.reminders_due) {
+            if (!smtpReady) break;
+            const result = await sendEmailViaSmtp(
+              store,
+              env,
+              {
+                to: reminder.to_email,
+                subject: reminder.subject,
+                text: reminder.text,
+              },
+              preloadedSmtp
+            );
+            if (result.sent) sent.push(reminder);
+          }
+          if (sent.length > 0) await markSweepRemindersSent(store, sent);
+          sweepSummary = {
+            reminders_due: sweep.reminders_due.length,
+            reminders_sent: sent.length,
+          };
+        } catch (err) {
+          // Never fail the cron (and never mask the drain result) for
+          // sweep or reminder-mail errors — the next run retries.
+          // F-10: log the message only, never the raw error object.
+          console.error(
+            "[stackmate-cron] renewal sweep failed",
+            err instanceof Error ? err.message : "unknown error"
+          );
+          sweepSummary = {
+            sweep_error: err instanceof Error ? err.message : "unknown error",
+          };
+        } finally {
+          await releaseLease(CRON_JOB_RENEWAL_SWEEP, sweepSummary);
         }
-        if (sent.length > 0) await markSweepRemindersSent(store, sent);
-      } catch (err) {
-        // Never fail the cron (and never mask the drain result) for
-        // sweep or reminder-mail errors — the next run retries.
-        console.error("[stackmate-cron] renewal sweep failed", err);
+      } else {
+        console.log(
+          "[stackmate-cron] renewal sweep skipped: previous tick still holds the lease"
+        );
       }
-      return drainResult;
+      // The scheduled return type is the drain report — a skipped drain
+      // answers with the zeroed report shape, never a different object.
+      return (
+        drainResult ?? {
+          claimed: 0,
+          delivered: 0,
+          simulated: 0,
+          skipped: 0,
+          retrying: 0,
+          dead_lettered: 0,
+        }
+      );
     } finally {
       // The cron uses the same request-scoped store path as fetch (see
       // closeRequestStore): a factory-created store is closed here.
@@ -6418,6 +7827,74 @@ export function createStackMateApp(
     ctx?: WorkerExecutionContext
   ): Promise<Response> {
     const env = resolveRuntimeConfig(rawEnv);
+    const requestId = `req_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    const trustedOrigins = env.TRUSTED_ORIGINS.split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const originHeader = request.headers.get("Origin");
+    const earlyUrl = new URL(request.url);
+    const earlyPathname = earlyUrl.pathname.replace(/\/+$/, "") || "/";
+    const earlyMethod = request.method.toUpperCase();
+    const earlyResponse = (data: unknown, status = 200) =>
+      new Response(JSON.stringify(createSuccessEnvelope(data, requestId)), {
+        status,
+        headers: buildStandardHeaders(requestId, originHeader, trustedOrigins),
+      });
+
+    // A-10: /health and /setup-status answer BEFORE any store
+    // resolution — the cheapest, most-polled endpoints used to pay a
+    // full store creation (~10 pg queries + a fresh connect) for a
+    // one-bit answer.
+    //  - health/ready: env/bindings only, no database at all.
+    //  - setup-status: one `SELECT EXISTS (… super_admin …)` on a
+    //    lightweight throwaway client in storeFactory mode (closed
+    //    before answering), or the injected store's own check in
+    //    injected-store mode (no factory call either way). A failure
+    //    of the lightweight query falls through to the normal store
+    //    path, which answers STORE_UNAVAILABLE as before.
+    if (
+      earlyMethod === "GET" &&
+      (earlyPathname === "/api/v1/health" || earlyPathname === "/api/v1/ready")
+    ) {
+      return earlyResponse({
+        status: "ok",
+        service: "stackmate-api",
+        environment: env.APP_ENV,
+        default_currency: env.DEFAULT_CURRENCY,
+        default_timezone: env.DEFAULT_TIMEZONE,
+        hyperdrive: {
+          uncached_binding_configured: Boolean(env.HYPERDRIVE_NO_CACHE?.connectionString),
+          cached_binding_configured: Boolean(env.HYPERDRIVE_CACHED?.connectionString),
+        },
+        timestamp: new Date().toISOString(),
+      });
+    }
+    if (earlyMethod === "GET" && earlyPathname === "/api/v1/setup-status") {
+      try {
+        let provisioned: boolean;
+        if (!storeFactory && injectedStore) {
+          provisioned = await isSuperAdminProvisioned(injectedStore);
+        } else {
+          const { Client } = await import("pg");
+          const probe = new Client({
+            connectionString: env.HYPERDRIVE_NO_CACHE.connectionString,
+          });
+          try {
+            await probe.connect();
+            const res = await probe.query(
+              "SELECT EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE r.key = 'super_admin') AS provisioned"
+            );
+            provisioned = res.rows[0]?.provisioned === true;
+          } finally {
+            await probe.end().catch(() => {});
+          }
+        }
+        return earlyResponse({ setup_required: !provisioned });
+      } catch {
+        // Fall through to the normal store path below.
+      }
+    }
+
     let store: StackMateDataStore;
     try {
       store = await resolveRequestStore(env, ctx);
@@ -6430,23 +7907,23 @@ export function createStackMateApp(
       // failure. resolveRuntimeConfig above still throws (loud 1101) on
       // missing bindings/secrets — that is a deployment error, not a
       // transient store failure.
-      const requestId = `req_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
-      const trustedOrigins = env.TRUSTED_ORIGINS.split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      const originHeader = request.headers.get("Origin");
-      console.error("[stackmate] store creation failed", requestId, error);
+      const failureRequestId = requestId;
+      console.error(
+        "[stackmate] store creation failed",
+        failureRequestId,
+        error instanceof Error ? error.message : "unknown error"
+      );
       return new Response(
         JSON.stringify(
           createErrorEnvelope(
             "STORE_UNAVAILABLE",
             "The data store is temporarily unavailable. Please retry.",
-            requestId
+            failureRequestId
           )
         ),
         {
           status: 500,
-          headers: buildStandardHeaders(requestId, originHeader, trustedOrigins),
+          headers: buildStandardHeaders(failureRequestId, originHeader, trustedOrigins),
         }
       );
     }
@@ -6460,6 +7937,10 @@ export function createStackMateApp(
       // the runtime sends it is safe. An injected store is never
       // closed: its lifetime belongs to its owner.
       if (storeFactory) await closeRequestStore(store);
+      // C-10: end any Better Auth fallback pg.Client created for this
+      // request (injected-store mode only — factory stores always have
+      // drizzleDb, so they never take the fallback branch).
+      await closeBetterAuthFallbackClients(store);
     }
   }
 

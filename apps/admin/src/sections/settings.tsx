@@ -14,7 +14,7 @@
  * /settings (e.g. /settings/websites) with its own detail routes;
  * the settings index redirects to the first category.
  */
-import { BarChart3, BookOpen, CreditCard, Globe, HardDrive, Mail, Settings2, ShieldCheck, Tag, Webhook, type LucideIcon } from "lucide-react";
+import { BarChart3, BookOpen, CreditCard, Globe, HardDrive, KeyRound, Mail, Settings2, ShieldCheck, Tag, Webhook, type LucideIcon } from "lucide-react";
 
 export interface SettingsCategory {
   slug: string;
@@ -110,6 +110,16 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
     to: "/settings/authentication",
     group: "Security",
     permission: "users.manage",
+  },
+  {
+    // E-05: signing-key lifecycle (rotate/revoke) lives in Settings
+    // with the other license material, not in the main menu.
+    slug: "signing-keys",
+    label: "Signing Keys",
+    icon: KeyRound,
+    to: "/settings/signing-keys",
+    group: "Security",
+    permission: "licenses.manage",
   },
   {
     // Customer+Order batch (ADR-0009): the receiver requirements for

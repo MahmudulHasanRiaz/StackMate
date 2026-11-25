@@ -8,7 +8,7 @@
 > not yet exercised live) / **partial** / **blocked** / **not implemented**.
 
 - **Branch**: `feat/stackmate-full-implementation` (base `429124e`, PR #1 branch)
-- **Last verified**: 2026-11-22 (Node v24.22.1, local PostgreSQL 16 on `127.0.0.1:5432/stackmate_test` — vitest 431/431, 51 files; tsc api+admin; vite build; lint 253 files; migrations 81 tables / 18 migrations; wrangler dry-run staging all green; jsdom smoke 259/259 + chunk-retry 11/11 + session-gate 5/5 + Q5 6/6; sidebar-hover audit 44/44; headless-Chromium responsive audit 74/74; real-browser probe 37/37; dashboard probe 23/23). Live staging: fix-all batch + M-23 avatar fix verified live 2026-11-22 (see PLAN §37); error-fix + C-2 follow-ups pushed to staging but their Git builds have not created versions yet — see item 14.
+- **Last verified**: 2026-11-25 (Node v24.22.1, local PostgreSQL 16 on `127.0.0.1:5432/stackmate_test` — vitest 556/556, 59 files; tsc api+admin; vite build; lint 298 files; migrations 85 tables / 26 migrations (0020–0025); wrangler dry-run staging; check-openapi 103 paths / 145 operations; smoke-check PASS). Audit #2 fix-all (103 findings, batches A–F) complete + verified locally, NOT pushed / NOT live — see PLAN §39. Live staging: fix-all batch + M-23 avatar fix verified live 2026-11-22 (see PLAN §37); error-fix + C-2 follow-ups pushed to staging but their Git builds have not created versions yet — see item 14.
 - **What changed vs the ZIP**: the production store, Better Auth, and the
   verification scripts were broken/fake in the ZIP and have been corrected —
   see `docs/implementation/RECONCILIATION.md`.
@@ -102,17 +102,27 @@
 1. **No automatic subscription expiry exists — FIXED 2026-11-17 (ADR-0009 §5).** The every-minute cron now runs `runRenewalExpirySweep` after the outbox drain: subscriptions past `current_period_end` go `past_due` inside the grace window and `expired` after it (licenses suspended at that moment); licenses past `grace_until` go `expired` + `license.expired` outbox event. Verified by `apps/api/test/renewal-sweep.test.ts` (4/4).
 2. **An expired license's status is never persisted — PARTLY FIXED 2026-11-17 (ADR-0009 §5).** The sweep's `expireLicenseInTx` persists the flip in its own transaction, so sweep-expired licenses read `expired` in the DB. The validate-time lazy flip in `assertLicenseIsUsable` still rolls back (it throws inside `withTransaction`) — expiry is re-derived on every validation there, and the sweep is the durable path.
 3. **Public checkout never dedupes customers by email — FIXED 2026-11-17 (ADR-0009 §3).** `createPublicCheckoutOrder` now resolves via `resolveOrCreateCustomerInTx` (email match → same customer, new phone attaches as secondary; conflict → 409). The business-workflow suite's test 8 now asserts ONE customer row for the shared email (it used to assert 2).
-4. **CHECK constraints are SQL-only**: 98 CHECK constraints exist in migration
-   0000 and are enforced by Postgres at runtime, but the Drizzle schema does
-   not reproduce them — `drizzle-kit generate` will never emit them.
-   Same for the 6 immutability triggers + 1 function (SQL-only by nature) and
-   the `product_packages.current_version_id` FK (SQL-only to avoid a TS
-   circular-reference cycle). See `db/schema/README.md`.
-4. **10 tables are never used by any business service**: `payment_refunds`,
-   `notifications`, `license_validation_logs`,
+4. **CHECK constraints are declared in the Drizzle schema since migration
+   0014 (audit F-11)** — 124 live CHECKs via `check()`; `drizzle-kit
+   generate` reproduces them (see `db/schema/README.md` for the
+   superseded/re-added duplicate arithmetic). The 6 immutability
+   triggers + 1 function stay SQL-only by nature, as does the
+   `product_packages.current_version_id` FK (SQL-only to avoid a TS
+   circular-reference cycle). (This paragraph previously claimed the
+   CHECKs were SQL-only — stale since 0014; corrected 2026-11-25,
+   audit F-15.)
+4. **7 tables are never used by any business service**: `notifications`,
+   `license_validation_logs`,
    `subscription_events`, `order_adjustments`, `product_releases`,
-   `product_distribution_channels`, `product_integration_profiles`,
-   `verifications`, `tracking_deliveries`.
+   `product_integration_profiles`,
+   `tracking_deliveries`.
+   (Corrected 2026-11-25, audit F-15(a) + C-07: `payment_refunds` HAS
+   endpoints + a standalone `/refunds` UI since the finish-everything
+   batch; `product_distribution_channels` IS synced from the product's
+   channel array by the store; `verifications` IS used by Better Auth
+   via `drizzleDb`. The remaining 7 are the dead-schema surface —
+   owner decision OD-09 PENDING, recorded in DB spec §26 DB-13; no
+   table is dropped or wired up until then.)
    (`license_events` is now written by the activation module + sweep and
    `customer_addresses` is wired up by the 0009 address endpoints; `accounts`
    is now used — Better Auth credential rows; `staff_profiles`
@@ -131,8 +141,10 @@
    until the lockfile's group was changed to `root:root`. CI runners are
    unaffected. `pnpm install` also prints a non-fatal EPERM for
    `node_modules/.modules.yaml` in this sandbox.
-10. **No password-change UI in the admin SPA** (endpoint + tests only).
-11. **Batch 1 known gaps (2026-11-15, do not hide):** (a) No `GET /api/v1/admin/webhooks/:id` — the webhook detail page reads from the list. (b) Tracking config UI not built (`PUT .../tracking` exists — Meta pixel/token/events) — needs a scope decision. (c) `POST /api/v1/admin/licenses/manual-grants` exists but is unwired in the SPA (needs customer/product pickers). (d) List endpoints return full collections — pagination/filtering/sorting are client-side; no server pagination or server-side filters exist (incl. audit-logs). (e) Site registration still seeds its primary domain as already `verified` (Batch 2 scope — the separate domain-register endpoint correctly starts at `pending`). (f) Meta CAPI delivery is still a STUB (outbox marks events processed without calling graph.facebook.com) and outbound webhook delivery is still simulated except the test endpoint's real fetch — the SPA says so plainly with banners, it does not claim otherwise. (g) No email system — invitations return a one-time token for out-of-band delivery; no accept-invitation URL exists. (Staff invitations 503 note REMOVED 2026-11-15 ~22:35 +06: the wiring patch was applied by the parent before the Batch 1 push; invitations are live.)
+10. **Password-change UI — FIXED 2026-11-16 (account-widget batch).**
+    The dialog exists in the admin SPA (`apps/admin/src/components/shell.tsx`,
+    `POST /api/auth/change-password`). (Corrected 2026-11-25, audit F-15(b).)
+11. **Batch 1 known gaps (2026-11-15, do not hide):** (a) No `GET /api/v1/admin/webhooks/:id` — the webhook detail page reads from the list. (b) Tracking config UI — FIXED (built: `apps/admin/src/sections/tracking-config.tsx`, route `router.tsx:530`; pixel groups + test-event code config). (c) `POST /api/v1/admin/licenses/manual-grants` exists but is unwired in the SPA (needs customer/product pickers). (d) Server pagination — FIXED (true offset `?page=`, 21/23 ListTables server-paged; audit-logs has `?q=` + filters — see item 13). (e) Site registration — FIXED (primary domain starts `pending`, not `verified`; `dns_txt` via DoH, `manual_review` unchanged, `http_file` still 409 by design — see item 13). (f) Outbound webhook delivery — FIXED (real webhook transport is now the default path; only Meta CAPI remains simulated — events honestly read `"simulated"`, never `"delivered"`; see item 13). (g) No email system — invitations return a one-time token for out-of-band delivery; no accept-invitation URL exists. (Staff invitations 503 note REMOVED 2026-11-15 ~22:35 +06: the wiring patch was applied by the parent before the Batch 1 push; invitations are live.)
 12. **Not verified in this session**: admin UI at 390px mobile width;
     `bootstrap-super-admin` script against a live server (it now requires
     the operator-set SETUP_TOKEN); the manual-payment happy path end to end

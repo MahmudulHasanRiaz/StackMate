@@ -299,12 +299,19 @@ export function generateRenewalInvoiceInTx(
 /**
  * Generates an idempotent manual-payment renewal order and invoice for a recurring subscription (PRD §12.4, Database Design §21.3).
  * Does NOT extend active subscription period until the customer's manual payment is verified and approved.
+ *
+ * A-02: the idempotency key is NEVER defaulted to a constant. When the
+ * caller passes no usable key, one is derived from the NEXT period
+ * (`ren_<id>_period_<n>`): a pending period re-derives its own number
+ * (so a retry replays that period's invoice), while a fresh renewal
+ * derives the next number (so the second manual renewal creates a NEW
+ * order/invoice instead of replaying the first forever).
  */
 export async function generateSubscriptionRenewalInvoice(
   store: StackMateDataStore,
   actor: StaffPrincipal,
   subscriptionId: string,
-  idempotencyKey: string,
+  idempotencyKey: string | null | undefined,
   requestId: string
 ): Promise<{
   replayed: boolean;
@@ -314,9 +321,14 @@ export async function generateSubscriptionRenewalInvoice(
   checkout_access_token_reference: string;
 }> {
   assertStaffPermission(actor, "subscriptions.manage");
+  const providedKey = idempotencyKey?.trim() ?? "";
+  const effectiveKey =
+    providedKey.length > 0
+      ? providedKey
+      : deriveRenewalIdempotencyKey(store, subscriptionId);
   const res = await store.executeIdempotent(
     `subscription_renewal:${subscriptionId}`,
-    idempotencyKey,
+    effectiveKey,
     { subscription_id: subscriptionId },
     201,
     (state) => {
@@ -330,6 +342,26 @@ export async function generateSubscriptionRenewalInvoice(
     replayed: res.replayed,
     ...res.body,
   };
+}
+
+/**
+ * A-02: derive the renewal idempotency key from the next period, read
+ * from the store's loaded state (the same state the renewal transaction
+ * snapshots — a pending period re-derives its own number, so a retry
+ * replays instead of minting a duplicate; a missing subscription falls
+ * back to a per-subscription key and the transaction still 404s).
+ */
+function deriveRenewalIdempotencyKey(
+  store: StackMateDataStore,
+  subscriptionId: string
+): string {
+  const sub = store.state.subscriptions.find((s) => s.id === subscriptionId);
+  if (!sub) return `ren_${subscriptionId}`;
+  const pending = sub.periods.find((p) => p.status === "pending");
+  const nextPeriodNumber = pending
+    ? pending.period_number
+    : sub.periods.reduce((max, p) => Math.max(max, p.period_number), 0) + 1;
+  return `ren_${subscriptionId}_period_${nextPeriodNumber}`;
 }
 
 export async function transitionSubscriptionStatus(

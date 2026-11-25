@@ -25,10 +25,15 @@
  *  3. Concurrent withTransactions on SEPARATE stores (own clients) do
  *     not corrupt each other (the advisory lock serializes writers).
  *  4. close() ends the store's OWN client; other stores keep working.
- *  5. App-level GET /api/v1/health + GET /api/v1/setup-status through
- *     a request-scoped storeFactory stay cheap in pg queries per
- *     request (was 55 + 51 before Batch 0; ~10 with the singleton)
- *     AND use a fresh client per request, closed afterwards.
+ *  5. App-level GET /api/v1/health + GET /api/v1/setup-status stay
+ *     cheap in pg queries per request (was 55 + 51 before Batch 0;
+ *     ~10 with the singleton). A-10 (2026-11-25) moved both endpoints
+ *     BEFORE any store resolution: health answers with no database at
+ *     all, setup-status with one SELECT EXISTS on a lightweight
+ *     throwaway client — so neither calls the request-scoped
+ *     storeFactory at all (0 store creations). The fresh-client-per-
+ *     request property for store-backed requests is pinned by tests
+ *     3 and 4 instead.
  *
  * Requires DATABASE_URL (same convention as the other Postgres suites);
  * skips cleanly without it. Uses its own database
@@ -254,6 +259,63 @@ describe.skipIf(!DATABASE_URL)("perf regression (Postgres)", () => {
     }
   }, 60_000);
 
+  it("A-11: a staff-principal lookup costs a few targeted queries, never a full load", async () => {
+    const { DrizzleStore } = await import(
+      "../src/platform/db/drizzle-store.ts"
+    );
+    // Seed a user + super_admin assignment (roles come from migration 0001).
+    const userId = randomUUID();
+    const email = `perf-principal-${randomUUID().slice(0, 8)}@stackmate.local`;
+    await storeA.withTransaction((state) => {
+      state.users.push({
+        id: userId,
+        name: "Perf Principal",
+        email,
+        email_verified: true,
+        password_hash: "test-only-hash",
+        two_factor_enabled: false,
+        status: "active",
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      });
+      const role = state.roles.find((r) => r.key === "super_admin")!;
+      state.user_roles.push({
+        user_id: userId,
+        role_id: role.id,
+        assigned_at: new Date().toISOString(),
+      });
+    });
+    const targeted = await DrizzleStore.createTargeted({
+      connectionString: regressionDbUrl,
+    });
+    extraStores.push(targeted);
+    // The combined load's marker is json_agg — a principal lookup
+    // must issue zero of them (user + roles + 2FA policy = 3 queries).
+    let jsonAgg = 0;
+    let total = 0;
+    const orig = Client.prototype.query as (...args: unknown[]) => unknown;
+    const patched = function (this: unknown, ...args: unknown[]) {
+      total += 1;
+      const sql = String(
+        (args[0] as { text?: unknown } | undefined)?.text ?? args[0] ?? ""
+      );
+      if (sql.toLowerCase().includes("json_agg")) jsonAgg += 1;
+      return (orig as (...a: unknown[]) => unknown).apply(this, args);
+    };
+    Client.prototype.query = patched as never;
+    try {
+      const principal = await targeted.findStaffPrincipalByEmail(email);
+      assert.ok(principal);
+      assert.equal(principal.user.email, email);
+      assert.ok(principal.roles.includes("super_admin"));
+      assert.ok(principal.permissions.length > 0);
+    } finally {
+      Client.prototype.query = orig as never;
+    }
+    assert.equal(jsonAgg, 0, "principal lookup ran the combined full-state load");
+    assert.ok(total <= 6, `principal lookup should take ~3 queries, saw ${total}`);
+  }, 60_000);
+
   it("concurrent withTransactions on separate stores (own clients) do not corrupt", async () => {
     const storeB = await freshStore();
     const tags = Array.from({ length: 8 }, (_, i) => `CONC-${i}`);
@@ -287,13 +349,18 @@ describe.skipIf(!DATABASE_URL)("perf regression (Postgres)", () => {
     assert.ok(Array.isArray(state.customers));
   }, 60_000);
 
-  it("health + setup-status through a request-scoped storeFactory stay cheap and use a fresh client per request", async () => {
+  it("health + setup-status answer before any store (A-10) and stay cheap", async () => {
     const { DrizzleStore } = await import(
       "../src/platform/db/drizzle-store.ts"
     );
-    // Record every client the factory creates: each request must get
-    // its own instance, and the app must close it when the request
-    // finishes (no cross-request reuse, no leaked connections).
+    // A-10: /health and /setup-status answer BEFORE any store
+    // resolution (app.ts early path) — health with no database at all,
+    // setup-status with one SELECT EXISTS on a lightweight throwaway
+    // pg Client (not via storeFactory, closed before answering). So the
+    // factory must NOT be called for these requests, and the per-request
+    // pg query count is 0 (health) / 1 (setup-status). The old assertion
+    // (6 store creations, one fresh client per request) pinned the
+    // pre-A-10 design and contradicts the shipped early path.
     const createdClients: Client[] = [];
     const app = createStackMateApp({
       storeFactory: async () => {
@@ -307,6 +374,7 @@ describe.skipIf(!DATABASE_URL)("perf regression (Postgres)", () => {
     const counter = countQueriesGlobally();
     const healthMs: number[] = [];
     const setupMs: number[] = [];
+    const healthQueries: number[] = [];
     const setupQueries: number[] = [];
     try {
       for (let i = 0; i < 3; i++) {
@@ -319,6 +387,7 @@ describe.skipIf(!DATABASE_URL)("perf regression (Postgres)", () => {
         const t1 = process.hrtime.bigint();
         assert.equal(h.status, 200, await h.text());
         healthMs.push(Number(t1 - t0) / 1e6);
+        healthQueries.push(counter.counts().count);
         counter.reset();
         const t2 = process.hrtime.bigint();
         const s = await app.fetch(
@@ -347,31 +416,24 @@ describe.skipIf(!DATABASE_URL)("perf regression (Postgres)", () => {
       `PERF-REGRESSION setup-status ms: ${setupMs.map((v) => v.toFixed(0)).join(", ")} avg ${avg(setupMs).toFixed(0)}`
     );
     console.log(
+      `PERF-REGRESSION pg queries per health request: ${healthQueries.join(", ")}`
+    );
+    console.log(
       `PERF-REGRESSION pg queries per setup-status request: ${setupQueries.join(", ")}`
     );
-    // Structural: 6 requests → 6 distinct clients, each closed after
-    // its request (a shared client would show 1 distinct instance and
-    // a live connection afterwards).
-    assert.equal(createdClients.length, 6, `expected 6 store creations, saw ${createdClients.length}`);
-    assert.equal(
-      new Set(createdClients).size,
-      6,
-      "each request must get a FRESH pg Client instance (no cross-request reuse)"
-    );
-    for (const [i, client] of createdClients.entries()) {
-      await queryMustReject(
-        client,
-        `client ${i} must be ended after its request (store closed by the app)`
-      );
-    }
+    // Structural (A-10): neither endpoint resolves a store.
+    assert.equal(createdClients.length, 0, `expected 0 store creations, saw ${createdClients.length}`);
     // Before Batch 0: create 55 queries + setup-status 51 = 106 per
     // request. With the singleton: create ~6 + handler (BEGIN + lock +
-    // load + COMMIT = 4) = ~10. Request-scoped keeps the combined load
-    // + caps cache, so warm-cache create is still ~6 and a
-    // setup-status request stays ~10. The bound leaves headroom for
-    // the signing-key section and a cold-cache first request.
+    // load + COMMIT = 4) = ~10. A-10 removes the store entirely:
+    // health 0 queries, setup-status exactly the one EXISTS probe
+    // (bound 2 leaves headroom; a fallthrough to the store path would
+    // blow past it and fail loudly here).
+    for (const q of healthQueries) {
+      assert.equal(q, 0, `health request issued ${q} pg queries (expected 0)`);
+    }
     for (const q of setupQueries) {
-      assert.ok(q <= 15, `setup-status request issued ${q} pg queries (expected <= 15)`);
+      assert.ok(q >= 1 && q <= 2, `setup-status request issued ${q} pg queries (expected 1, bound 2)`);
     }
   }, 60_000);
 });

@@ -407,103 +407,106 @@ export function ExpensesSection() {
     parsed.categoryId || parsed.productId || parsed.from || parsed.to,
   );
 
-  const columns: ColumnDef<Expense, unknown>[] = [
-    {
-      accessorKey: "expenseDate",
-      header: "Date",
-      cell: ({ row }) => (
-        <span className="sm-tabular">
-          {row.original.expenseDate ? isoToDdmmyyyy(row.original.expenseDate) : "—"}
-        </span>
-      ),
-    },
-    {
-      accessorKey: "vendor",
-      header: "Vendor",
-      cell: ({ row }) => (
-        <span className="sm-cell-text">{row.original.vendor ?? "—"}</span>
-      ),
-    },
-    {
-      accessorKey: "categoryId",
-      header: "Category",
-      cell: ({ row }) => {
-        const fallback = categoryById.get(row.original.categoryId);
-        const name = row.original.categoryName ?? fallback?.name ?? "—";
-        const color = row.original.categoryColor ?? fallback?.color ?? null;
-        return (
-          <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-            <span
-              aria-hidden="true"
-              style={{
-                display: "inline-block",
-                width: 10,
-                height: 10,
-                borderRadius: "50%",
-                backgroundColor: color ?? "#64748B",
-                flexShrink: 0,
-              }}
-            />
-            {name}
+  const columns: ColumnDef<Expense, unknown>[] = useMemo(
+    () => [
+      {
+        accessorKey: "expenseDate",
+        header: "Date",
+        cell: ({ row }) => (
+          <span className="sm-tabular">
+            {row.original.expenseDate ? isoToDdmmyyyy(row.original.expenseDate) : "—"}
           </span>
-        );
-      },
-    },
-    {
-      accessorKey: "productId",
-      header: "Product",
-      cell: ({ row }) =>
-        row.original.productId
-          ? (row.original.productName ?? productById.get(row.original.productId)?.name ?? "—")
-          : "—",
-    },
-    {
-      accessorKey: "amountMinor",
-      header: "Amount",
-      cell: ({ row }) => (
-        <MoneyCell currency={EXPENSE_CURRENCY} minor={row.original.amountMinor} />
-      ),
-    },
-    {
-      accessorKey: "receiptMediaId",
-      header: "Receipt",
-      cell: ({ row }) =>
-        row.original.receiptUrl ? (
-          <a className="sm-link-btn" href={row.original.receiptUrl} target="_blank" rel="noreferrer">
-            View receipt
-          </a>
-        ) : row.original.receiptMediaId ? (
-          <a
-            className="sm-link-btn"
-            href={`/api/v1/admin/media/${row.original.receiptMediaId}/content`}
-            target="_blank"
-            rel="noreferrer"
-          >
-            View receipt
-          </a>
-        ) : (
-          "—"
         ),
-    },
-    {
-      id: "actions",
-      header: "",
-      enableSorting: false,
-      cell: ({ row }) => (
-        <RowMenu
-          items={[
-            { icon: Pencil, label: "Edit", onSelect: () => setEditing(row.original) },
-            {
-              icon: Trash2,
-              label: "Delete",
-              danger: true,
-              onSelect: () => void onDelete(row.original),
-            },
-          ]}
-        />
-      ),
-    },
-  ];
+      },
+      {
+        accessorKey: "vendor",
+        header: "Vendor",
+        cell: ({ row }) => (
+          <span className="sm-cell-text">{row.original.vendor ?? "—"}</span>
+        ),
+      },
+      {
+        accessorKey: "categoryId",
+        header: "Category",
+        cell: ({ row }) => {
+          const fallback = categoryById.get(row.original.categoryId);
+          const name = row.original.categoryName ?? fallback?.name ?? "—";
+          const color = row.original.categoryColor ?? fallback?.color ?? null;
+          return (
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+              <span
+                aria-hidden="true"
+                style={{
+                  display: "inline-block",
+                  width: 10,
+                  height: 10,
+                  borderRadius: "50%",
+                  backgroundColor: color ?? "#64748B",
+                  flexShrink: 0,
+                }}
+              />
+              {name}
+            </span>
+          );
+        },
+      },
+      {
+        accessorKey: "productId",
+        header: "Product",
+        cell: ({ row }) =>
+          row.original.productId
+            ? (row.original.productName ?? productById.get(row.original.productId)?.name ?? "—")
+            : "—",
+      },
+      {
+        accessorKey: "amountMinor",
+        header: "Amount",
+        cell: ({ row }) => (
+          <MoneyCell currency={EXPENSE_CURRENCY} minor={row.original.amountMinor} />
+        ),
+      },
+      {
+        accessorKey: "receiptMediaId",
+        header: "Receipt",
+        cell: ({ row }) =>
+          row.original.receiptUrl ? (
+            <a className="sm-link-btn" href={row.original.receiptUrl} target="_blank" rel="noreferrer">
+              View receipt
+            </a>
+          ) : row.original.receiptMediaId ? (
+            <a
+              className="sm-link-btn"
+              href={`/api/v1/admin/media/${row.original.receiptMediaId}/content`}
+              target="_blank"
+              rel="noreferrer"
+            >
+              View receipt
+            </a>
+          ) : (
+            "—"
+          ),
+      },
+      {
+        id: "actions",
+        header: "",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <RowMenu
+            items={[
+              { icon: Pencil, label: "Edit", onSelect: () => setEditing(row.original) },
+              {
+                icon: Trash2,
+                label: "Delete",
+                danger: true,
+                onSelect: () => void onDelete(row.original),
+              },
+            ]}
+          />
+        ),
+      },
+  ],
+    [EXPENSE_CURRENCY, categoryById, productById],
+  )
 
   return (
     <section aria-labelledby="expenses-heading">
@@ -812,7 +815,7 @@ function ExpenseForm({
           <Alert variant="danger">{formError}</Alert>
         </div>
       ) : null}
-      <div className="sm-dialog-footer" style={{ padding: 0, marginTop: 20 }}>
+      <div className="sm-dialog-footer sm-dialog-footer-flush">
         <Button variant="secondary" onClick={onCancel}>
           Cancel
         </Button>

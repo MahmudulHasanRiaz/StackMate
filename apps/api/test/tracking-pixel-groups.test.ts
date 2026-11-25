@@ -33,14 +33,25 @@ describe("Tracking pixel groups (in-memory)", () => {
     path: string,
     init: RequestInit = {},
     cookie?: string,
-  ): Promise<{ status: number; body: any }> {
+  ): Promise<{ status: number; body: any; headers: Headers }> {
     const headers = new Headers(init.headers || {});
     if (cookie) headers.set("Cookie", cookie);
     const res = await app.fetch(
       new Request(`http://localhost:8787${path}`, { ...init, headers }),
       env,
     );
-    return { status: res.status, body: await res.json() };
+    return { status: res.status, body: await res.json(), headers: res.headers };
+  }
+
+
+  // A-01: the session token is cookie-only — sign-in JSON no longer
+  // carries session_token, so the cookie comes from Set-Cookie.
+  function sessionCookieFromHeaders(resHeaders: Headers): string {
+    const setCookies =
+      typeof resHeaders.getSetCookie === "function" ? resHeaders.getSetCookie() : [];
+    const pair = setCookies.find((c) => c.startsWith("stackmate_session="));
+    assert.ok(pair, "sign-in must set a stackmate_session cookie");
+    return pair!.split(";")[0]!;
   }
 
   async function bootstrapAndLoginSuperAdmin(): Promise<string> {
@@ -64,7 +75,7 @@ describe("Tracking pixel groups (in-memory)", () => {
       }),
     });
     assert.equal(signInRes.status, 200);
-    return `stackmate_session=${signInRes.body.data.session_token}`;
+    return sessionCookieFromHeaders(signInRes.headers);
   }
 
   async function createSite(cookie: string): Promise<{ id: string; siteKey: string }> {

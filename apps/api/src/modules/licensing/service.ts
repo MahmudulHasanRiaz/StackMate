@@ -20,9 +20,10 @@ import {
 } from "../../../../../packages/contracts/src/index.ts";
 import {
   computeInstallationIdHash,
-  computeLicenseKeyVerifier,
+  computeLicenseKeyVerifierV2,
   generateFormattedLicenseKey,
   signEntitlementJws,
+  verifyLicenseKeyVerifier,
 } from "../../platform/crypto/index.ts";
 import type {
   DatabaseState,
@@ -99,7 +100,7 @@ export function issueLicenseForOrderItemInTx(
   state.sequence_counters.license += 1;
   const licenseNumber = `LIC-${state.sequence_counters.license}`;
   const { rawKey, hint } = generateFormattedLicenseKey(product.code);
-  const keyHash = computeLicenseKeyVerifier(rawKey, verifierSecret);
+  const keyHash = computeLicenseKeyVerifierV2(rawKey, verifierSecret);
 
   const nowIso = new Date().toISOString();
   const expiresAt = subscription?.current_period_end ?? null;
@@ -229,6 +230,24 @@ function buildSignedEntitlementToken(
   };
 }
 
+/**
+ * F-07: find a license by raw key through verifyLicenseKeyVerifier —
+ * v2 rows verify with the v2 derivation, v1 rows with v1, so minting
+ * v2 never orphans a legacy license. Cost is one HMAC per candidate
+ * row (the scan is already O(licenses) in-memory); the future
+ * targeted-SQL path (DrizzleStore.findLicenseForValidation, currently
+ * unwired) must compute the candidate hashes instead of this scan.
+ */
+function findLicenseByRawKey(
+  state: DatabaseState,
+  rawKey: string,
+  verifierSecret: string
+): LicenseRecord | undefined {
+  return state.licenses.find((l) =>
+    verifyLicenseKeyVerifier(rawKey, l.license_key_hash, verifierSecret)
+  );
+}
+
 function assertLicenseIsUsable(
   state: DatabaseState,
   license: LicenseRecord,
@@ -299,8 +318,7 @@ export async function activateLicenseInstallation(
   const input = ActivateLicenseRequestSchema.parse(rawInput);
 
   return store.withTransaction((state) => {
-    const keyHash = computeLicenseKeyVerifier(input.license_key, config.verifierSecret);
-    const license = state.licenses.find((l) => l.license_key_hash === keyHash);
+    const license = findLicenseByRawKey(state, input.license_key, config.verifierSecret);
     if (!license) {
       throw new AppError("LICENSE_INVALID", "Invalid license key.", 401);
     }
@@ -435,8 +453,7 @@ export async function validateLicenseInstallation(
   const input = ValidateLicenseRequestSchema.parse(rawInput);
 
   return store.withTransaction((state) => {
-    const keyHash = computeLicenseKeyVerifier(input.license_key, config.verifierSecret);
-    const license = state.licenses.find((l) => l.license_key_hash === keyHash);
+    const license = findLicenseByRawKey(state, input.license_key, config.verifierSecret);
     if (!license) {
       throw new AppError("LICENSE_INVALID", "Invalid license key.", 401);
     }
@@ -482,8 +499,7 @@ export async function deactivateLicenseInstallation(
   const input = DeactivateLicenseRequestSchema.parse(rawInput);
 
   return store.withTransaction((state) => {
-    const keyHash = computeLicenseKeyVerifier(input.license_key, config.verifierSecret);
-    const license = state.licenses.find((l) => l.license_key_hash === keyHash);
+    const license = findLicenseByRawKey(state, input.license_key, config.verifierSecret);
     if (!license) {
       throw new AppError("LICENSE_INVALID", "Invalid license key.", 401);
     }
@@ -581,7 +597,9 @@ export async function createManualLicenseGrantByAdmin(
     state.sequence_counters.license += 1;
     const licenseNumber = `LIC-${state.sequence_counters.license}`;
     const { rawKey, hint } = generateFormattedLicenseKey(product.code);
-    const keyHash = computeLicenseKeyVerifier(rawKey, verifierSecret);
+    // F-07: new licenses mint v2 (HKDF-derived HMAC key). Lookups below
+    // verify through verifyLicenseKeyVerifier, so v1 rows keep working.
+    const keyHash = computeLicenseKeyVerifierV2(rawKey, verifierSecret);
 
     const nowIso = new Date().toISOString();
     const licenseId = randomUUID();
@@ -893,4 +911,300 @@ export async function deactivateLicenseActivationByAdmin(
     });
     return { license, activation };
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* E-03: license activation transfer (Roadmap Stage 6 exit, API §12.2) */
+/* E-05: signing-key lifecycle wrappers (PRD §13.5, API §16.6)        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Transfer one activation to a new installation (E-03).
+ *
+ * Audited staff command, not a generic PATCH: the source activation is
+ * deactivated and the target installation is activated in ONE
+ * transaction, reusing the activate/deactivate primitives' rules —
+ * the license must be usable (not revoked/suspended), the target must
+ * not already hold an active activation, and the source must be
+ * active. A previously-deactivated activation for the target
+ * installation is reactivated instead of consuming a second seat, the
+ * same idempotency the activation endpoint provides. The raw license
+ * key is never involved: staff authorize by session + `licenses.manage`.
+ *
+ * Dual-key note: `installation_id` / `installationId` (and
+ * `site_url` / `siteUrl`) are both accepted and normalized here.
+ */
+export async function transferActivation(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  licenseId: string,
+  activationId: string,
+  rawInput: unknown,
+  requestId: string
+): Promise<{
+  license: LicenseRecord;
+  from_activation: LicenseActivationRecord;
+  to_activation: LicenseActivationRecord;
+}> {
+  assertStaffPermission(actor, "licenses.manage");
+  const raw = (rawInput ?? {}) as Record<string, unknown>;
+  // Dual-key note: `installation_id` / `installationId` (and
+  // `site_url` / `siteUrl`) are both accepted and normalized here.
+  // The SPA transfer dialog sends the `new_*` aliases
+  // (`new_installation_id`, `new_domain_normalized`) — accept those
+  // too, so the UI and the service agree on the body shape.
+  const installationId =
+    typeof raw.installation_id === "string"
+      ? raw.installation_id
+      : typeof raw.installationId === "string"
+        ? raw.installationId
+        : typeof raw.new_installation_id === "string"
+          ? raw.new_installation_id
+          : null;
+  const siteUrl =
+    typeof raw.site_url === "string"
+      ? raw.site_url
+      : typeof raw.siteUrl === "string"
+        ? raw.siteUrl
+        : typeof raw.new_domain_normalized === "string"
+          ? raw.new_domain_normalized
+          : null;
+  const environmentRaw =
+    typeof raw.environment === "string" && raw.environment.trim().length > 0
+      ? raw.environment.trim()
+      : null;
+  const environment: LicenseActivationRecord["environment"] | null =
+    environmentRaw === null
+      ? null
+      : environmentRaw === "production" ||
+          environmentRaw === "staging" ||
+          environmentRaw === "development" ||
+          environmentRaw === "other"
+        ? environmentRaw
+        : null;
+  if (environmentRaw !== null && environment === null) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "environment must be one of: production, staging, development, other.",
+      422
+    );
+  }
+  const reason =
+    typeof raw.reason === "string" && raw.reason.trim().length > 0
+      ? raw.reason.trim()
+      : "Transferred by staff";
+  if (!installationId || installationId.trim().length === 0) {
+    throw new AppError("VALIDATION_ERROR", "installation_id is required.", 422);
+  }
+
+  return store.withTransaction((state) => {
+    const license = state.licenses.find((l) => l.id === licenseId);
+    if (!license) throw new AppError("NOT_FOUND", "License not found.", 404);
+    if (license.status === "revoked") {
+      throw new AppError("LICENSE_REVOKED", "This license has been revoked.", 403);
+    }
+    if (license.status === "suspended") {
+      throw new AppError("LICENSE_SUSPENDED", "This license is currently suspended.", 403);
+    }
+    const source = license.activations.find((a) => a.id === activationId);
+    if (!source) throw new AppError("NOT_FOUND", "License activation not found.", 404);
+    if (source.status !== "active") {
+      throw new AppError(
+        "CONFLICT",
+        `Activation is already '${source.status}'.`,
+        409
+      );
+    }
+
+    const targetHash = computeInstallationIdHash(license.id, installationId);
+    if (targetHash === source.installation_id_hash) {
+      throw new AppError(
+        "CONFLICT",
+        "Target installation is the same as the source installation.",
+        409
+      );
+    }
+    const existingTarget = license.activations.find(
+      (a) => a.installation_id_hash === targetHash
+    );
+    if (existingTarget?.status === "active") {
+      throw new AppError(
+        "CONFLICT",
+        "Target installation already holds an active activation for this license.",
+        409
+      );
+    }
+    if (existingTarget?.status === "blocked") {
+      throw new AppError("INSTALLATION_NOT_ACTIVE", "Target installation has been blocked.", 403);
+    }
+
+    let normalizedDomain: string | null = null;
+    if (siteUrl) {
+      try {
+        normalizedDomain = normalizeInstallationDomain(siteUrl);
+      } catch (err) {
+        throw new AppError("DOMAIN_NOT_ALLOWED", (err as Error).message, 422);
+      }
+    }
+
+    const nowIso = new Date().toISOString();
+    // Free the source seat first: the transfer can never exceed the
+    // activation limit, because the deactivation happens in the same
+    // transaction as the new activation.
+    source.status = "deactivated";
+    source.deactivated_at = nowIso;
+
+    let target: LicenseActivationRecord;
+    if (existingTarget) {
+      // Reactivate a previously-deactivated installation (same
+      // idempotency as activateLicenseInstallation) — no second seat.
+      existingTarget.status = "active";
+      existingTarget.deactivated_at = null;
+      existingTarget.last_seen_at = nowIso;
+      if (normalizedDomain) existingTarget.domain_normalized = normalizedDomain;
+      if (environment) existingTarget.environment = environment;
+      target = existingTarget;
+    } else {
+      target = {
+        id: randomUUID(),
+        license_id: license.id,
+        installation_id_hash: targetHash,
+        domain_normalized: normalizedDomain,
+        environment: environment ?? source.environment,
+        status: "active",
+        activated_at: nowIso,
+        last_seen_at: nowIso,
+        deactivated_at: null,
+        metadata: {
+          transferred_from_activation_id: source.id,
+          transfer_reason: reason,
+          integration_profile: null,
+          product_version: null,
+          client_version: null,
+        },
+        created_at: nowIso,
+      };
+      license.activations.push(target);
+    }
+    license.updated_at = nowIso;
+
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "licensing.activation.transferred",
+      resource_type: "license",
+      resource_id: license.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: {
+        license_number: license.license_number,
+        activation_id: source.id,
+        to_activation_id: target.id,
+        reason,
+      },
+    });
+
+    return { license, from_activation: source, to_activation: target };
+  });
+}
+
+/**
+ * E-05: signing-key lifecycle as audited admin operations. The store
+ * methods (`rotateSigningKey` / `revokeSigningKey`) already exist and
+ * are durable on DrizzleStore (encrypted private JWK in `signing_keys`,
+ * old row retired in the same transaction) — these wrappers only add
+ * the permission gate, the audit row, and a safe return shape. The
+ * private key material is NEVER returned: only the public JWK (which
+ * already carries `kid`) leaves the service.
+ */
+export function listSigningKeysByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal
+): { active_key_id: string; keys: Array<Record<string, unknown>> } {
+  assertStaffPermission(actor, "licenses.read");
+  return {
+    active_key_id: store.activeSigningKeyId,
+    keys: store.listPublicSigningKeys(),
+  };
+}
+
+export async function rotateSigningKeyByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  rawInput: unknown,
+  requestId: string
+): Promise<{
+  active_key_id: string;
+  previous_key_id: string;
+  public_key: Record<string, unknown>;
+}> {
+  assertStaffPermission(actor, "licenses.manage");
+  const raw = (rawInput ?? {}) as Record<string, unknown>;
+  const provided =
+    typeof raw.key_id === "string"
+      ? raw.key_id
+      : typeof raw.keyId === "string"
+        ? raw.keyId
+        : null;
+  let newKeyId: string;
+  if (provided !== null) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{2,80}$/.test(provided)) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        "key_id must start with a letter or digit and use only letters, digits, hyphens, or underscores (3–81 chars).",
+        422
+      );
+    }
+    newKeyId = provided;
+  } else {
+    const day = new Date().toISOString().slice(0, 10);
+    newKeyId = `sm-ed25519-${day}-${randomUUID().slice(0, 8)}`;
+  }
+  const previousKeyId = store.activeSigningKeyId;
+  // DrizzleStore persists the new key + retires the old row in one
+  // transaction; the base store does the in-memory equivalent.
+  const material = await store.rotateSigningKey(newKeyId);
+  await store.withTransaction((state) => {
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "licensing.signing_key.rotated",
+      resource_type: "signing_key",
+      resource_id: material.keyId,
+      outcome: "success",
+      request_id: requestId,
+      changes: { previous_key_id: previousKeyId, new_key_id: material.keyId },
+    });
+  });
+  return {
+    active_key_id: material.keyId,
+    previous_key_id: previousKeyId,
+    public_key: material.publicKeyJwk,
+  };
+}
+
+export async function revokeSigningKeyByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  keyId: string,
+  requestId: string
+): Promise<{ revoked_key_id: string }> {
+  // Destructive and irreversible for tokens signed with this key —
+  // gated on licenses.revoke, the same permission as license revocation.
+  assertStaffPermission(actor, "licenses.revoke");
+  // The store refuses the active key (rotate first) and unknown ids.
+  await store.revokeSigningKey(keyId);
+  await store.withTransaction((state) => {
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "licensing.signing_key.revoked",
+      resource_type: "signing_key",
+      resource_id: keyId,
+      outcome: "success",
+      request_id: requestId,
+      changes: { key_id: keyId },
+    });
+  });
+  return { revoked_key_id: keyId };
 }

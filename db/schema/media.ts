@@ -50,6 +50,17 @@ export const mediaAssets = pgTable(
     index("idx_media_assets_folder_created").on(table.folder, table.createdAt.desc()),
     index("idx_media_assets_mime_created").on(table.mimeType, table.createdAt.desc()),
     index("idx_media_assets_created").on(table.createdAt.desc()),
+    // Migration 0022 (audit C-03): media search is a leading-wildcard
+    // ILIKE on original_filename + a tags-array search. The trigram
+    // GIN index serves %q% ILIKE; the GIN index on tags serves the
+    // array search without unnesting every row. pg_trgm is a Postgres
+    // contrib extension (see migration 0022 header for the portability
+    // note); the tags GIN index needs no extension.
+    index("idx_media_assets_original_filename_trgm").using(
+      "gin",
+      sql`"original_filename" gin_trgm_ops`
+    ),
+    index("idx_media_assets_tags_gin").using("gin", table.tags),
     check("media_assets_driver_check", sql`"driver" IN ('r2', 'local')`),
     check("media_assets_byte_size_check", sql`"byte_size" > 0`),
     check("media_assets_width_check", sql`"width" IS NULL OR "width" > 0`),

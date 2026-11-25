@@ -1825,3 +1825,100 @@ export async function updateInstallmentByAdmin(
     return inst;
   });
 }
+
+/* ------------------------------------------------------------------ */
+/* E-16: payment provider / method delete (PRD §11.2, matrix J3)      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Delete a payment provider (E-16). Same guard pattern as webhook-
+ * endpoint delete: financial history is NEVER deleted with it.
+ *
+ * - A provider that still owns methods is a 409 — delete (or move)
+ *   the methods first; silently dropping them would orphan the
+ *   submissions that reference them.
+ * - A provider with no methods deletes cleanly; submissions and
+ *   transactions never reference a provider directly (they reference
+ *   the method), so no financial row is touched. Disable (not delete)
+ *   stays the right call for a provider that must keep its history
+ *   reachable — deletion is for misconfigured/retired providers only.
+ */
+export async function deletePaymentProviderByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  providerId: string,
+  requestId: string
+): Promise<PaymentProviderRecord> {
+  assertStaffPermission(actor, "payments.methods.manage");
+  return store.withTransaction((state) => {
+    const provider = state.payment_providers.find((p) => p.id === providerId);
+    if (!provider) throw new AppError("NOT_FOUND", "Payment provider not found.", 404);
+    const methods = state.payment_methods.filter((m) => m.provider_id === providerId);
+    if (methods.length > 0) {
+      throw new AppError(
+        "CONFLICT",
+        `Payment provider still owns ${methods.length} payment method(s). Delete the methods first.`,
+        409
+      );
+    }
+    state.payment_providers = state.payment_providers.filter((p) => p.id !== providerId);
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "payments.provider.deleted",
+      resource_type: "payment_provider",
+      resource_id: provider.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { provider_key: provider.provider_key, display_name: provider.display_name },
+    });
+    return provider;
+  });
+}
+
+/**
+ * Delete a payment method (E-16). Same guard pattern as webhook-
+ * endpoint delete, but stricter on history: a method referenced by ANY
+ * submission, transaction, or order is a 409 — the financial trail
+ * must survive the method. Disable the method instead when history
+ * must stay reachable. A method with zero references deletes cleanly.
+ */
+export async function deletePaymentMethodByAdmin(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  methodId: string,
+  requestId: string
+): Promise<PaymentMethodRecord> {
+  assertStaffPermission(actor, "payments.methods.manage");
+  return store.withTransaction((state) => {
+    const method = state.payment_methods.find((m) => m.id === methodId);
+    if (!method) throw new AppError("NOT_FOUND", "Payment method not found.", 404);
+    const submissionCount = state.payment_submissions.filter(
+      (s) => s.payment_method_id === methodId
+    ).length;
+    const transactionCount = state.payment_transactions.filter(
+      (t) => t.payment_method_id === methodId
+    ).length;
+    const orderCount = state.orders.filter((o) => o.payment_method_id === methodId).length;
+    const references = submissionCount + transactionCount + orderCount;
+    if (references > 0) {
+      throw new AppError(
+        "CONFLICT",
+        `Payment method is referenced by ${submissionCount} submission(s), ${transactionCount} transaction(s) and ${orderCount} order(s). Disable it instead of deleting.`,
+        409
+      );
+    }
+    state.payment_methods = state.payment_methods.filter((m) => m.id !== methodId);
+    appendAuditLog(state, {
+      actor_type: "staff",
+      actor_user_id: actor.user.id,
+      action: "payments.method.deleted",
+      resource_type: "payment_method",
+      resource_id: method.id,
+      outcome: "success",
+      request_id: requestId,
+      changes: { method_key: method.method_key, display_name: method.display_name },
+    });
+    return method;
+  });
+}

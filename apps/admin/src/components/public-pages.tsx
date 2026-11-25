@@ -47,6 +47,23 @@ function tokenFromUrl(): string {
   return new URLSearchParams(window.location.search).get("token") ?? "";
 }
 
+/** F-06: read ?token= once, then strip it from the URL (the ?error=
+ *  cleanup pattern in auth.tsx) — the token is a credential and must
+ *  not linger in history, shared links, or the referrer. The value
+ *  itself is never logged or rendered; it lives only in state. */
+function useUrlToken(): string {
+  const [token] = useState(tokenFromUrl);
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has("token")) {
+      params.delete("token");
+      const next = `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ""}${window.location.hash}`;
+      window.history.replaceState(null, "", next);
+    }
+  }, []);
+  return token;
+}
+
 function errorMessage(err: unknown, fallback: string): string {
   if (err instanceof ApiClientError) return err.message;
   if (err instanceof Error) return err.message;
@@ -76,7 +93,7 @@ function PublicShell({
 }
 
 export function ResetPasswordPage() {
-  const [token] = useState(tokenFromUrl);
+  const token = useUrlToken();
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [busy, setBusy] = useState(false);
@@ -160,7 +177,7 @@ export function ResetPasswordPage() {
 }
 
 export function AcceptInvitationPage() {
-  const [token] = useState(tokenFromUrl);
+  const token = useUrlToken();
   const [name, setName] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -249,7 +266,7 @@ export function AcceptInvitationPage() {
 }
 
 export function TwoFactorRecoveryPage() {
-  const [token] = useState(tokenFromUrl);
+  const token = useUrlToken();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);

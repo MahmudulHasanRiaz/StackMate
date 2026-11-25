@@ -27,6 +27,8 @@
  */
 import {
   createContext,
+  lazy,
+  Suspense,
   useCallback,
   useContext,
   useEffect,
@@ -35,6 +37,7 @@ import {
   type ReactNode,
 } from "react";
 import { useGeneralConfig } from "../lib/general-config";
+import { sessionExpiryLabel } from "../lib/session";
 import type {
   GlobalSearchGroup,
   GlobalSearchResponse,
@@ -48,6 +51,7 @@ import {
 import {
   ArrowLeft,
   BarChart3,
+  CalendarClock,
   ChevronDown,
   ClipboardCheck,
   Images,
@@ -60,6 +64,7 @@ import {
   Package,
   Receipt,
   RefreshCw,
+  Repeat,
   ScrollText,
   Search,
   Send,
@@ -78,9 +83,19 @@ import {
 } from "lucide-react";
 import { ApiClientError, apiRequest } from "../lib/api-client";
 import { queryClient } from "../lib/query";
+import { useIdempotencyKey } from "../lib/section-kit";
 import { humanizeType } from "../lib/resolve-names";
 import { applyTheme, resolveThemeChoice, type ThemeChoice } from "../lib/theme";
-import { TwoFactorDisable, TwoFactorSetup } from "./two-factor-setup";
+// D-16: two-factor-setup pulls in qrcode-generator — lazy so the QR
+// lib stays out of the initial bundle. router.tsx lazy-loads the same
+// module for the forced-2FA flow; the static import here used to pin
+// it into the main chunk (build warning).
+const TwoFactorSetup = lazy(() =>
+  import("./two-factor-setup").then((m) => ({ default: m.TwoFactorSetup })),
+);
+const TwoFactorDisable = lazy(() =>
+  import("./two-factor-setup").then((m) => ({ default: m.TwoFactorDisable })),
+);
 import { MediaPicker } from "./media-picker";
 import {
   Alert,
@@ -96,8 +111,10 @@ import {
   MenuItem,
   MenuSectionLabel,
   MenuSub,
+  Skeleton,
   StatusBadge,
   useToast,
+  GroupField,
 } from "./primitives";
 import { SETTINGS_CATEGORIES } from "../sections/settings";
 
@@ -225,6 +242,7 @@ export const NAVIGATION_GROUPS: ReadonlyArray<{
     group: "Recurring & Access",
     items: [
       { to: "/subscriptions", label: "Subscriptions", icon: RefreshCw, permission: "subscriptions.read" },
+      { to: "/renewals", label: "Renewals", icon: Repeat, permission: "subscriptions.read" },
       { to: "/licenses", label: "Licenses & Activations", icon: KeyRound, permission: "licenses.read" },
     ],
   },
@@ -235,6 +253,7 @@ export const NAVIGATION_GROUPS: ReadonlyArray<{
       { to: "/audit-logs", label: "Audit Log", icon: ScrollText, permission: "audit_logs.read" },
       { to: "/tracking-events", label: "Tracking Events", icon: BarChart3, permission: "tracking.manage" },
       { to: "/outbox", label: "Outbox & Deliveries", icon: Send, permission: "integrations.manage" },
+      { to: "/jobs", label: "Scheduled Jobs", icon: CalendarClock, permission: "integrations.manage" },
     ],
   },
 ];
@@ -992,7 +1011,7 @@ function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }
             library (or upload new from the same place) or remove the
             custom photo. The media-picker pattern is used everywhere
             an upload exists (ADR-0011). */}
-        <Field
+        <GroupField
           label="Avatar"
           hint="Your photo — shown in the account menu and search results. Without one, your Gravatar photo shows, or your initials."
         >
@@ -1020,7 +1039,7 @@ function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }
               </Button>
             ) : null}
           </div>
-        </Field>
+        </GroupField>
         <Field label="Name" required error={fieldError} htmlFor="profile-name">
           <Input
             id="profile-name"
@@ -1048,6 +1067,14 @@ function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }
           <Input id="profile-roles" value={principal.roles.map((r) => humanizeType(r)).join(", ")} disabled />
         </Field>
         <Field
+          label="Session"
+          hint="Staff sessions last 12 hours from sign-in. Signing out ends it immediately."
+        >
+          <p className="sm-hint" style={{ margin: 0 }}>
+            {sessionExpiryLabel()}
+          </p>
+        </Field>
+        <GroupField
           label="Two-factor authentication"
           hint={
             principal.two_factor_enabled
@@ -1067,7 +1094,7 @@ function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }
               </Button>
             )}
           </div>
-        </Field>
+        </GroupField>
       </div>
     </Dialog>
     <Dialog
@@ -1080,21 +1107,25 @@ function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }
       }
     >
       {twoFactorMode === "setup" ? (
-        <TwoFactorSetup
-          onDone={() => {
-            toast({ title: "Two-factor authentication is on" });
-            void refreshPrincipal();
-          }}
-          onCancel={() => setTwoFactorMode("none")}
-        />
+        <Suspense fallback={<Skeleton height={120} />}>
+          <TwoFactorSetup
+            onDone={() => {
+              toast({ title: "Two-factor authentication is on" });
+              void refreshPrincipal();
+            }}
+            onCancel={() => setTwoFactorMode("none")}
+          />
+        </Suspense>
       ) : twoFactorMode === "disable" ? (
-        <TwoFactorDisable
-          onDone={() => {
-            toast({ title: "Two-factor authentication is off" });
-            void refreshPrincipal();
-          }}
-          onCancel={() => setTwoFactorMode("none")}
-        />
+        <Suspense fallback={<Skeleton height={120} />}>
+          <TwoFactorDisable
+            onDone={() => {
+              toast({ title: "Two-factor authentication is off" });
+              void refreshPrincipal();
+            }}
+            onCancel={() => setTwoFactorMode("none")}
+          />
+        </Suspense>
       ) : null}
     </Dialog>
     <MediaPicker
@@ -1119,6 +1150,8 @@ function PasswordDialog({ open, onClose }: { open: boolean; onClose: () => void 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<{ next?: string; confirm?: string }>({});
+  // A-04: one key per dialog instance — a retried change replays.
+  const passwordKey = useIdempotencyKey();
 
   useEffect(() => {
     if (open) {
@@ -1143,9 +1176,12 @@ function PasswordDialog({ open, onClose }: { open: boolean; onClose: () => void 
     setSaving(true);
     setError(null);
     try {
+      // A-04: one key per dialog instance — a retried password change
+      // replays instead of erroring on the already-changed password.
       await apiRequest("/api/auth/change-password", {
         method: "POST",
         body: JSON.stringify({ current_password: current, new_password: next }),
+        idempotencyKey: passwordKey,
       });
       toast({
         title: "Password changed",
@@ -1364,6 +1400,10 @@ function AccountMenu() {
           ) : (
             <StatusBadge status="pending" label="Checking…" />
           )}
+        </div>
+        <div className="sm-menu-status-row" role="status">
+          <span className="sm-menu-item-label">Session</span>
+          <span className="sm-hint">{sessionExpiryLabel()}</span>
         </div>
         <MenuDivider />
         <MenuItem icon={LogOut} danger onClick={() => void signOut()}>

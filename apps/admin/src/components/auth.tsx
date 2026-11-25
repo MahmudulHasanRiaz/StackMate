@@ -31,6 +31,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { apiRequest, rawApiRequest, ApiClientError } from "../lib/api-client";
 import { useGeneralConfig } from "../lib/general-config";
+import { recordSessionStart } from "../lib/session";
 import { Alert, Button, Field, Input, Skeleton } from "./primitives";
 import type { StaffPrincipalDto } from "./shell";
 
@@ -149,9 +150,20 @@ export function AuthScreen({
         setTotpCode("");
         return;
       }
+      // E-22: the session starts here (the account menu / profile
+      // derive the expiry from this timestamp).
+      recordSessionStart();
       onSignedIn(res.principal);
     } catch (err) {
-      setError(errorMessage(err, "Sign-in failed"));
+      // E-22: a 429 is the sign-in throttle — say plainly that the
+      // account is locked for now instead of a generic failure.
+      if (err instanceof ApiClientError && err.statusCode === 429) {
+        setError(
+          "Too many sign-in attempts — this account is temporarily locked. Try again in 15 minutes.",
+        );
+      } else {
+        setError(errorMessage(err, "Sign-in failed"));
+      }
     } finally {
       setSigningIn(false);
     }
@@ -170,9 +182,17 @@ export function AuthScreen({
       // Verify set the session cookie (fetch sends credentials) — load
       // the principal to finish sign-in.
       const me = await apiRequest<StaffPrincipalDto>("/api/v1/admin/me");
+      // E-22: the session starts at the completed 2FA verification.
+      recordSessionStart();
       onSignedIn(me);
     } catch (err) {
-      setError(errorMessage(err, "Verification failed"));
+      if (err instanceof ApiClientError && err.statusCode === 429) {
+        setError(
+          "Too many verification attempts — try again in 15 minutes.",
+        );
+      } else {
+        setError(errorMessage(err, "Verification failed"));
+      }
     } finally {
       setVerifying(false);
     }

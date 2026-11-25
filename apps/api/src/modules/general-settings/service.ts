@@ -90,15 +90,48 @@ export function publicViewOf(row: typeof generalSettings.$inferSelect | null): {
   };
 }
 
+/**
+ * B-14: module-level 30s cache for the singleton row, mirroring the
+ * auth-config pattern exactly (same TTL, same optional-cacheKey
+ * shape). The row is read on ~every request (app name, title,
+ * favicon) and changes only via the admin panel, so a 30s stale
+ * window is safe — and any save invalidates immediately.
+ * Cache key: the caller passes one (e.g. the Hyperdrive connection
+ * string, as auth-config does) when the DB handle is per-request;
+ * without a key every load hits the DB, exactly as before.
+ */
+const GENERAL_SETTINGS_CACHE_TTL_MS = 30_000;
+const generalSettingsCache = new Map<
+  string,
+  { row: typeof generalSettings.$inferSelect | null; at: number }
+>();
+
+export function invalidateGeneralSettingsCache(cacheKey?: string): void {
+  if (cacheKey === undefined) {
+    generalSettingsCache.clear();
+    return;
+  }
+  generalSettingsCache.delete(cacheKey);
+}
+
 export async function loadGeneralSettings(
-  db: GeneralSettingsDb
+  db: GeneralSettingsDb,
+  cacheKey?: string
 ): Promise<typeof generalSettings.$inferSelect | null> {
+  if (cacheKey !== undefined) {
+    const hit = generalSettingsCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < GENERAL_SETTINGS_CACHE_TTL_MS) return hit.row;
+  }
   const rows = await db
     .select()
     .from(generalSettings)
     .where(eq(generalSettings.id, GENERAL_SETTINGS_ID))
     .limit(1);
-  return rows[0] ?? null;
+  const row = rows[0] ?? null;
+  if (cacheKey !== undefined) {
+    generalSettingsCache.set(cacheKey, { row, at: Date.now() });
+  }
+  return row;
 }
 
 export interface SaveGeneralSettingsInput {
@@ -158,10 +191,11 @@ function validateGeneralSettingsInput(input: SaveGeneralSettingsInput): void {
  */
 export async function saveGeneralSettings(
   db: GeneralSettingsDb,
-  input: SaveGeneralSettingsInput
+  input: SaveGeneralSettingsInput,
+  cacheKey?: string
 ): Promise<GeneralSettingsView> {
   validateGeneralSettingsInput(input);
-  const existing = await loadGeneralSettings(db);
+  const existing = await loadGeneralSettings(db, cacheKey);
   const next = {
     appName:
       input.app_name !== undefined
@@ -199,6 +233,9 @@ export async function saveGeneralSettings(
   } else {
     await db.insert(generalSettings).values({ id: GENERAL_SETTINGS_ID, ...next });
   }
+  // B-14: the saved row must be visible on the very next load — never
+  // serve the pre-save cached row. The re-read below is uncached.
+  invalidateGeneralSettingsCache(cacheKey);
   const saved = await loadGeneralSettings(db);
   if (!saved) throw new AppError("INTERNAL_ERROR", "General settings could not be saved.", 500);
   return viewOf(saved);
@@ -216,8 +253,15 @@ export async function saveGeneralSettings(
  * past byte 2048 (or an `onload` handler, or a `javascript:` link)
  * must never reach R2. (Audit L-9: the old code decoded only the first
  * 2048 bytes and checked only `<script>`.)
+ *
+ * A-16: returns the bytes to STORE — for SVG the SANITIZED bytes from
+ * `sanitizeSvgText` (as media uploads do), never the original upload.
+ * The active-content regex gate runs on the ORIGINAL text (so an
+ * upload carrying a handler is rejected, not silently cleaned) and
+ * matches a handler after ANY separator (`<svg/onload=…>` and
+ * `<animate/onbegin=…>` evaded the old whitespace-only gate).
  */
-export function verifyFaviconBytes(bytes: Uint8Array, declaredMimeType: string): void {
+export function verifyFaviconBytes(bytes: Uint8Array, declaredMimeType: string): Uint8Array {
   const mime = declaredMimeType.trim().toLowerCase();
   if (!ALLOWED_FAVICON_MIME_TYPES.has(mime)) {
     throw new AppError(
@@ -234,7 +278,7 @@ export function verifyFaviconBytes(bytes: Uint8Array, declaredMimeType: string):
     if (!sig.every((b, idx) => bytes[idx] === b)) {
       throw new AppError("UNSUPPORTED_MEDIA_TYPE", "File signature does not match PNG format.", 415);
     }
-    return;
+    return bytes;
   }
   if (mime === "image/x-icon" || mime === "image/vnd.microsoft.icon") {
     // ICO: 00 00 01 00 (icon) or 00 00 02 00 (cursor).
@@ -245,13 +289,14 @@ export function verifyFaviconBytes(bytes: Uint8Array, declaredMimeType: string):
     if (!isIcon && !isCursor) {
       throw new AppError("UNSUPPORTED_MEDIA_TYPE", "File signature does not match ICO format.", 415);
     }
-    return;
+    return bytes;
   }
   // image/svg+xml — decode the FULL bytes and run the parser-based
   // sanitizer: it throws (415) unless the document is well-formed XML
   // with an <svg> root. The sanitizer drops disallowed content
-  // silently, so active content is rejected explicitly below — the
-  // stored bytes are the original upload, never the sanitized text.
+  // silently, so active content is rejected explicitly below — and the
+  // STORED bytes are the sanitized text (A-16), never the original
+  // upload.
   //
   // A leading XML declaration (`<?xml version="1.0" …?>`) is stripped
   // first: the shared parser rejects EVERY declaration today
@@ -265,12 +310,14 @@ export function verifyFaviconBytes(bytes: Uint8Array, declaredMimeType: string):
   const text = new TextDecoder("utf-8", { fatal: false })
     .decode(bytes)
     .replace(/^\uFEFF?<\?xml(?:\s[^>]*)?\?>\s*/, "");
-  sanitizeSvgText(text);
+  // A-16: reject active content on the ORIGINAL text, with a separator
+  // class that also catches `<svg/onload=…>` / `<animate/onbegin=…>`
+  // (the old `\s` gate let a `/` separator through).
   if (
     /<script[\s>]/i.test(text) ||
     /<\/script>/i.test(text) ||
     /<foreignObject[\s>]/i.test(text) ||
-    /\son[a-z]+\s*=/i.test(text) ||
+    /(?:[\s\/'"`]|^)on[a-z]+\s*=/i.test(text) ||
     /javascript\s*:/i.test(text)
   ) {
     throw new AppError(
@@ -279,6 +326,8 @@ export function verifyFaviconBytes(bytes: Uint8Array, declaredMimeType: string):
       415
     );
   }
+  // A-16: store the SANITIZED bytes, never the original upload.
+  return new TextEncoder().encode(sanitizeSvgText(text));
 }
 
 function faviconExtension(mime: string): string {
@@ -301,7 +350,8 @@ export async function storeFavicon(
     contentType: string;
     bytes: Uint8Array;
     bucketName: string;
-  }
+  },
+  cacheKey?: string
 ): Promise<{ favicon_url: string; content_type: string; byte_size: number }> {
   if (input.bytes.byteLength > MAX_FAVICON_BYTES) {
     throw new AppError(
@@ -310,16 +360,20 @@ export async function storeFavicon(
       413
     );
   }
-  verifyFaviconBytes(input.bytes, input.contentType);
+  // A-16: store the bytes verifyFaviconBytes returns — sanitized for
+  // SVG, the upload itself otherwise. The content-hash key below must
+  // hash the STORED bytes, so a re-upload of the same SVG hits the
+  // same key.
+  const bytesToStore = verifyFaviconBytes(input.bytes, input.contentType);
   const mime = input.contentType.trim().toLowerCase();
-  const key = `branding/favicon-${sha256Hex(input.bytes)}.${faviconExtension(mime)}`;
+  const key = `branding/favicon-${sha256Hex(bytesToStore)}.${faviconExtension(mime)}`;
   const stored = await storeValidatedPrivateObject({
     driver,
     bucketName: input.bucketName,
     objectKey: key,
     originalFilename: input.filename,
     contentType: mime,
-    bytes: input.bytes,
+    bytes: bytesToStore,
     maxBytes: MAX_FAVICON_BYTES,
   });
   const existing = await loadGeneralSettings(db);
@@ -341,6 +395,8 @@ export async function storeFavicon(
   } else {
     await db.insert(generalSettings).values({ id: GENERAL_SETTINGS_ID, ...next });
   }
+  // B-14: a new favicon changes the row — invalidate the cache.
+  invalidateGeneralSettingsCache(cacheKey);
   return {
     favicon_url: "/api/v1/favicon",
     content_type: stored.contentType,

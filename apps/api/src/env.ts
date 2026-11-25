@@ -140,6 +140,17 @@ export function resolveRuntimeConfig(rawEnv: Partial<StackMateBindings> = {}): S
   const setupToken =
     rawEnv.SETUP_TOKEN ?? process.env.SETUP_TOKEN ?? "";
 
+  // Resolved URL vars (shared by the isProd validation below and the
+  // returned config, so the validated values are the served values).
+  const appUrl = rawEnv.APP_URL ?? process.env.APP_URL ?? "http://localhost:5173";
+  const apiUrl = rawEnv.API_URL ?? process.env.API_URL ?? "http://localhost:8787";
+  const betterAuthUrl =
+    rawEnv.BETTER_AUTH_URL ?? process.env.BETTER_AUTH_URL ?? "http://localhost:8787";
+  const trustedOrigins =
+    rawEnv.TRUSTED_ORIGINS ??
+    process.env.TRUSTED_ORIGINS ??
+    "http://localhost:5173,http://localhost:8787";
+
   if (isProd) {
     if (!betterAuthSecret || betterAuthSecret.length < 32) {
       throw new Error("BETTER_AUTH_SECRET must be set and at least 32 characters in staging/production.");
@@ -149,6 +160,38 @@ export function resolveRuntimeConfig(rawEnv: Partial<StackMateBindings> = {}): S
     }
     if (!licenseVerifierSecret || !checkoutTokenSecret) {
       throw new Error("LICENSE_VERIFIER_SECRET and CHECKOUT_TOKEN_SECRET must be set in staging/production.");
+    }
+    // A-09: the URL vars are validated HERE, at boot/config time —
+    // never per-request. A staging/production deploy that still
+    // points at localhost, or carries an unparseable URL value, fails
+    // fast instead of serving (or silently passing a broken value
+    // through the per-request check, as the old code did for
+    // unparseable values). Test/local envs are exempt: localhost is
+    // correct there. The RESOLVED values are validated — not just the
+    // explicitly-set ones — so a staging deploy that OMITS the vars
+    // still fails closed on the localhost defaults.
+    const localhostHosts = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+    const checkUrlVar = (name: string, value: string | undefined): void => {
+      if (!value) return;
+      let parsed: URL;
+      try {
+        parsed = new URL(value);
+      } catch {
+        throw new Error(
+          `Server misconfiguration: ${name} ('${value}') is not a parseable URL in ${appEnv}.`
+        );
+      }
+      if (localhostHosts.has(parsed.hostname.toLowerCase())) {
+        throw new Error(
+          `Server misconfiguration: ${name} points at localhost in ${appEnv}.`
+        );
+      }
+    };
+    checkUrlVar("APP_URL", appUrl);
+    checkUrlVar("API_URL", apiUrl);
+    checkUrlVar("BETTER_AUTH_URL", betterAuthUrl);
+    for (const origin of trustedOrigins.split(",")) {
+      checkUrlVar("TRUSTED_ORIGINS", origin.trim() || undefined);
     }
     // A short SETUP_TOKEN is barely better than none: reject it at boot
     // instead of serving a weakly-gated bootstrap endpoint. Unset is
@@ -166,19 +209,16 @@ export function resolveRuntimeConfig(rawEnv: Partial<StackMateBindings> = {}): S
 
   return {
     APP_ENV: appEnv,
-    APP_URL: rawEnv.APP_URL ?? process.env.APP_URL ?? "http://localhost:5173",
-    API_URL: rawEnv.API_URL ?? process.env.API_URL ?? "http://localhost:8787",
+    APP_URL: appUrl,
+    API_URL: apiUrl,
     DEFAULT_TIMEZONE: rawEnv.DEFAULT_TIMEZONE ?? process.env.DEFAULT_TIMEZONE ?? "Asia/Dhaka",
     DEFAULT_CURRENCY: rawEnv.DEFAULT_CURRENCY ?? process.env.DEFAULT_CURRENCY ?? "BDT",
-    TRUSTED_ORIGINS:
-      rawEnv.TRUSTED_ORIGINS ??
-      process.env.TRUSTED_ORIGINS ??
-      "http://localhost:5173,http://localhost:8787",
+    TRUSTED_ORIGINS: trustedOrigins,
     BETTER_AUTH_SECRET: betterAuthSecret,
-    BETTER_AUTH_URL: rawEnv.BETTER_AUTH_URL ?? process.env.BETTER_AUTH_URL ?? "http://localhost:8787",
+    BETTER_AUTH_URL: betterAuthUrl,
     ENCRYPTION_KEY_V1: encryptionKeyV1,
     ACTIVE_ENCRYPTION_KEY_VERSION:
-      rawEnv.ACTIVE_ENCRYPTION_KEY_VERSION ?? process.env.ACTIVE_ENCRYPTION_KEY_VERSION ?? "v2",
+      rawEnv.ACTIVE_ENCRYPTION_KEY_VERSION ?? process.env.ACTIVE_ENCRYPTION_KEY_VERSION ?? "v3",
     LICENSE_VERIFIER_SECRET: licenseVerifierSecret,
     CHECKOUT_TOKEN_SECRET: checkoutTokenSecret,
     SETUP_TOKEN: setupToken || undefined,

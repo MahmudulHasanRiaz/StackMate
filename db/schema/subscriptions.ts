@@ -86,6 +86,18 @@ export const subscriptionPeriods = pgTable(
     renewalOrderId: uuid("renewal_order_id").references(() => orders.id, {
       onDelete: "restrict",
     }),
+    // NOTE (migration 0023, audit C-04): the FKs to invoices(id) and
+    // payment_transactions(id) live ONLY in migration 0023 SQL
+    // (subscription_periods_invoice_id_fkey and
+    // subscription_periods_payment_transaction_id_fkey, both
+    // ON DELETE SET NULL). They are NOT declared here with
+    // .references(): invoices.ts already imports subscriptions.ts,
+    // so a column-level .references() closure makes TypeScript's
+    // inference circular (TS7022/TS7024) — same SQL-only precedent as
+    // licenses.current_entitlement_snapshot_id (migration 0014),
+    // product_packages.current_version_id, signing_keys.
+    // supersedes_key_id, and leads.converted_order_id. See also the
+    // SQL-only CHECKs/triggers note in db/schema/README.md.
     invoiceId: uuid("invoice_id"),
     paymentTransactionId: uuid("payment_transaction_id"),
     activatedAt: timestamp("activated_at", { withTimezone: true }),
@@ -116,10 +128,20 @@ export const subscriptionEvents = pgTable("subscription_events", {
   relatedOrderId: uuid("related_order_id").references(() => orders.id, {
     onDelete: "restrict",
   }),
+  // NOTE (migration 0023, audit C-04): the FK to invoices(id) lives
+  // ONLY in migration 0023 SQL
+  // (subscription_events_related_invoice_id_fkey, ON DELETE SET NULL)
+  // — same circular-import SQL-only precedent as the
+  // subscription_periods invoice/payment FKs above (invoices.ts
+  // already imports subscriptions.ts; .references() would be
+  // circular, TS7022/TS7024).
   relatedInvoiceId: uuid("related_invoice_id"),
   metadata: jsonb("metadata").notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 },
 (table) => [
+  // Migration 0021 (audit C-02): event history is read per
+  // subscription; subscription deletes scan the child table.
+  index("idx_subscription_events_subscription_id").on(table.subscriptionId),
   check("subscription_events_actor_type_check", sql`"actor_type" IN ('system', 'staff', 'customer', 'provider')`),
 ]);

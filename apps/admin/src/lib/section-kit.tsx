@@ -33,7 +33,7 @@
  * All five states (loading / empty / no-results / error / populated) are
  * handled here, so the silent-blank failure is impossible.
  */
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   flexRender,
   getCoreRowModel,
@@ -42,14 +42,17 @@ import {
   getSortedRowModel,
   useReactTable,
   type ColumnDef,
+  type RowSelectionState,
   type SortingState,
+  type VisibilityState,
 } from "@tanstack/react-table";
 import { keepPreviousData, useMutation, useQuery, type UseMutationOptions } from "@tanstack/react-query";
-import { ArrowDown, ArrowUp, ArrowUpDown, PackageSearch, RefreshCw } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, Columns3, PackageSearch, RefreshCw } from "lucide-react";
 import { apiRequest, ApiClientError } from "./api-client";
 import { detailKey, listKey, queryClient } from "./query";
 import {
   Breadcrumb,
+  Button,
   EmptyState,
   ErrorState,
   IconButton,
@@ -313,6 +316,32 @@ export function detailLabelResolver<T>(
   };
 }
 
+/**
+ * A-04: one idempotency key per form instance (not per click).
+ * Call it at the top of a form/dialog component and pass the returned
+ * key as `idempotencyKey` on every consequential POST that form makes
+ * (create / approve / activate / rotate / refund / invite / grant).
+ * A retry after a network timeout then replays instead of executing
+ * twice; a fresh form instance gets a fresh key. The key is stable
+ * for the component's lifetime (useState initializer runs once).
+ */
+export function useIdempotencyKey(): string {
+  const [key] = useState(() => crypto.randomUUID());
+  return key;
+}
+
+/** E-20: download rows as a CSV file (bulk-export action). */
+export function downloadCsv(filename: string, header: string[], rows: string[][]) {
+  const esc = (v: string) => `"${v.replace(/"/g, '""')}"`;
+  const text = [header, ...rows].map((r) => r.map(esc).join(",")).join("\n");
+  const url = URL.createObjectURL(new Blob([text], { type: "text/csv" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 export function useAdminMutation<TData, TVariables>(options: {
   mutationFn: (variables: TVariables) => Promise<TData>;
   invalidateKeys: readonly (readonly unknown[])[];
@@ -395,9 +424,15 @@ export function ListTable<T>({
   getRowId,
   serverSearch = false,
   refreshSection,
+  refreshQueryKey,
   filtersActive = false,
   total,
   serverPagination = false,
+  disableSorting = false,
+  serverSort,
+  enableRowSelection = false,
+  onSelectionChange,
+  bulkActions,
 }: {
   columns: ColumnDef<T, unknown>[];
   data: T[] | undefined;
@@ -427,6 +462,10 @@ export function ListTable<T>({
    *  useAdminList) — renders a Refresh button that invalidates the
    *  list query, the manual counterpart to the 30s staleTime. */
   refreshSection?: string;
+  /** D-10: an exact query key to invalidate instead — for tables
+   *  whose rows come from a detail query (e.g. a site's domains),
+   *  where no list key exists to refresh. */
+  refreshQueryKey?: readonly unknown[];
   /** Audit L-02: true when any toolbar filter is set to a non-default
    *  value — the toolbar stays visible on an empty collection so the
    *  user can see (and clear) what filtered everything out. The
@@ -446,9 +485,58 @@ export function ListTable<T>({
    *  ?limit=100 window behaviour (client-side paging within the
    *  loaded rows). */
   serverPagination?: boolean;
+  /** D-01: the server has no sort for this list (or the section has
+   *  not threaded one) — render every header as plain text. Client
+   *  sorting over one loaded page would imply a global order that
+   *  does not exist. */
+  disableSorting?: boolean;
+  /** D-01 (server sort): when provided, only `sortableColumns` get
+   *  sortable headers and clicks call `onChange` with
+   *  `<columnId>:asc|desc` (or undefined to clear) — the section
+   *  threads that value into useAdminList's `extra: { sort }` and the
+   *  server orders the full set. No client-side sort runs. */
+  serverSort?: {
+    sortableColumns: string[];
+    value: string | undefined;
+    onChange: (sort: string | undefined) => void;
+  };
+  /** E-20: row selection + bulk actions (PRD §17.5). Adds a checkbox
+   *  column; `bulkActions` render above the table while rows are
+   *  selected. Selection is per loaded page. */
+  enableRowSelection?: boolean;
+  onSelectionChange?: (rows: T[]) => void;
+  bulkActions?: Array<{
+    label: string;
+    danger?: boolean;
+    disabled?: boolean;
+    onSelect: (rows: T[]) => void;
+  }>;
 }) {
   const [sorting, setSorting] = useState<SortingState>([]);
+  const [columnVisibility, setColumnVisibility] = useState<VisibilityState>({});
+  const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
+  const [columnsOpen, setColumnsOpen] = useState(false);
+  const columnsPickerRef = useRef<HTMLDivElement | null>(null);
   const rows = useMemo(() => data ?? [], [data]);
+  // E-20: selection column (never hideable, never sortable).
+  const tableColumns = useMemo<ColumnDef<T, unknown>[]>(() => {
+    if (!enableRowSelection) return columns;
+    const selectColumn: ColumnDef<T, unknown> = {
+      id: "__select",
+      header: "",
+      enableSorting: false,
+      enableHiding: false,
+      cell: ({ row }) => (
+        <input
+          type="checkbox"
+          aria-label="Select row"
+          checked={row.getIsSelected()}
+          onChange={(e) => row.toggleSelected(e.target.checked)}
+        />
+      ),
+    };
+    return [selectColumn, ...columns];
+  }, [columns, enableRowSelection]);
 
   // Server pagination: when `serverPagination` is on, the rows are
   // exactly the server's page — the table renders them as-is and
@@ -471,37 +559,20 @@ export function ListTable<T>({
     }
   }, [isLoading, page, loadedPages, onPageChange]);
 
-  // Neon list pattern: the search is full-width, directly under the
-  // breadcrumb — the toolbar below it holds only filters/actions.
-  // The Refresh affordance (audit L-04) sits at the search row's
-  // right; the row is shared by the populated and the empty states.
-  const searchRow = (
-    <div className="sm-list-search">
-      <Input
-        className="sm-search-input"
-        type="search"
-        placeholder="Search…"
-        aria-label="Search"
-        value={search}
-        onChange={(e) => onSearchChange(e.target.value)}
-      />
-      {refreshSection ? (
-        <IconButton
-          label="Refresh list"
-          icon={RefreshCw}
-          onClick={() =>
-            void queryClient.invalidateQueries({ queryKey: listKey(refreshSection) })
-          }
-        />
-      ) : null}
-    </div>
-  );
-
   const table = useReactTable({
     data: rows,
-    columns,
-    state: { sorting, globalFilter: search, pagination: { pageIndex: page - 1, pageSize } },
+    columns: tableColumns,
+    state: {
+      sorting,
+      columnVisibility,
+      rowSelection,
+      globalFilter: search,
+      pagination: { pageIndex: page - 1, pageSize },
+    },
     onSortingChange: setSorting,
+    onColumnVisibilityChange: setColumnVisibility,
+    onRowSelectionChange: setRowSelection,
+    enableRowSelection,
     onPaginationChange: (updater) => {
       const next =
         typeof updater === "function"
@@ -511,7 +582,9 @@ export function ListTable<T>({
       if (next.pageSize !== pageSize) onPageSizeChange(next.pageSize);
     },
     getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel(),
+    // D-01: no client-side sort when the server sorts (serverSort)
+    // or when sorting is disabled — the rows arrive already ordered.
+    ...(serverSort || disableSorting ? {} : { getSortedRowModel: getSortedRowModel() }),
     getFilteredRowModel: getFilteredRowModel(),
     // Audit follow-up (server pagination): when the rows are the
     // server's page, TanStack must NOT slice them — its pagination
@@ -532,6 +605,76 @@ export function ListTable<T>({
         },
     ...(getRowId ? { getRowId: (row: T) => getRowId(row) } : {}),
   });
+
+  // E-20: report the selected rows to the section (for bulk
+  // actions); selection is per loaded page.
+  const selectedRows = table.getSelectedRowModel().rows.map((r) => r.original);
+  useEffect(() => {
+    onSelectionChange?.(selectedRows);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rowSelection]);
+  useEffect(() => {
+    if (!columnsOpen) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (!columnsPickerRef.current?.contains(e.target as Node)) setColumnsOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [columnsOpen]);
+
+  // Neon list pattern: the search is full-width, directly under the
+  // breadcrumb — the toolbar below it holds only filters/actions.
+  // The Refresh affordance (audit L-04) sits at the search row's
+  // right; the row is shared by the populated and the empty states.
+  const searchRow = (
+    <div className="sm-list-search">
+      <Input
+        className="sm-search-input"
+        type="search"
+        placeholder="Search…"
+        aria-label="Search"
+        value={search}
+        onChange={(e) => onSearchChange(e.target.value)}
+      />
+      {refreshSection || refreshQueryKey ? (
+        <IconButton
+          label="Refresh list"
+          icon={RefreshCw}
+          onClick={() =>
+            void queryClient.invalidateQueries({
+              queryKey: refreshQueryKey ?? listKey(refreshSection!),
+            })
+          }
+        />
+      ) : null}
+      {/* E-20: column visibility (TanStack native). Every hideable
+          column is listed; the selection column is never listed. */}
+      <div className="sm-column-picker" ref={columnsPickerRef}>
+        <IconButton
+          label="Choose columns"
+          icon={Columns3}
+          onClick={() => setColumnsOpen((v) => !v)}
+        />
+        {columnsOpen ? (
+          <div className="sm-column-picker-panel" role="menu" aria-label="Choose columns">
+            {table
+              .getAllLeafColumns()
+              .filter((c) => c.getCanHide())
+              .map((c) => (
+                <label key={c.id} className="sm-column-picker-item">
+                  <input
+                    type="checkbox"
+                    checked={c.getIsVisible()}
+                    onChange={(e) => c.toggleVisibility(e.target.checked)}
+                  />
+                  <span>{String(c.columnDef.header ?? c.id)}</span>
+                </label>
+              ))}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
 
   if (isLoading) return <TableSkeleton rows={5} />;
   if (isError) {
@@ -589,6 +732,28 @@ export function ListTable<T>({
     <div>
       {searchRow}
       {toolbar ? <Toolbar>{toolbar}</Toolbar> : null}
+      {enableRowSelection && selectedRows.length > 0 && bulkActions?.length ? (
+        <div className="sm-bulk-bar" role="group" aria-label="Bulk actions">
+          <span className="sm-bulk-count">{selectedRows.length} selected</span>
+          {bulkActions.map((a) => (
+            <Button
+              key={a.label}
+              variant={a.danger ? "danger" : "secondary"}
+              size="sm"
+              disabled={a.disabled}
+              onClick={() => {
+                a.onSelect(selectedRows);
+                setRowSelection({});
+              }}
+            >
+              {a.label}
+            </Button>
+          ))}
+          <Button variant="ghost" size="sm" onClick={() => setRowSelection({})}>
+            Clear
+          </Button>
+        </div>
+      ) : null}
       {filteredCount === 0 ? (
         <div className="sm-table-flat">
           <EmptyState
@@ -611,8 +776,20 @@ export function ListTable<T>({
               {table.getHeaderGroups().map((headerGroup) => (
                 <tr key={headerGroup.id}>
                   {headerGroup.headers.map((header) => {
-                    const canSort = header.column.getCanSort();
-                    const sorted = header.column.getIsSorted();
+                    // D-01: serverSort → only the listed columns sort,
+                    // via the server; disableSorting → nothing sorts.
+                    const canSort = disableSorting
+                      ? false
+                      : serverSort
+                        ? serverSort.sortableColumns.includes(header.column.id)
+                        : header.column.getCanSort();
+                    const sorted = serverSort
+                      ? serverSort.value === `${header.column.id}:asc`
+                        ? "asc"
+                        : serverSort.value === `${header.column.id}:desc`
+                          ? "desc"
+                          : false
+                      : header.column.getIsSorted();
                     return (
                       <th
                         key={header.id}
@@ -627,7 +804,20 @@ export function ListTable<T>({
                         {canSort ? (
                           <button
                             type="button"
-                            onClick={() => header.column.toggleSorting()}
+                            onClick={() => {
+                              if (serverSort) {
+                                const id = header.column.id;
+                                const next =
+                                  serverSort.value === `${id}:asc`
+                                    ? `${id}:desc`
+                                    : serverSort.value === `${id}:desc`
+                                      ? undefined
+                                      : `${id}:asc`;
+                                serverSort.onChange(next);
+                              } else {
+                                header.column.toggleSorting();
+                              }
+                            }}
                             aria-label={`Sort by ${String(header.column.columnDef.header ?? header.id)}`}
                           >
                             {flexRender(header.column.columnDef.header, header.getContext())}

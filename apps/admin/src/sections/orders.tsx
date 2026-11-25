@@ -34,7 +34,7 @@
  * the routes (with validateSearch) are registered. The cast can then be
  * dropped.
  */
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, useMemo} from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
@@ -58,6 +58,7 @@ import {
   useAdminDetail,
   useAdminList,
   useAdminMutation,
+  useIdempotencyKey,
   type ListSearch,
 } from "../lib/section-kit";
 import {
@@ -81,6 +82,7 @@ import {
   Textarea,
   useConfirm,
   type SearchableOption,
+  GroupField,
 } from "../components/primitives";
 import {
   CollapsibleSection,
@@ -226,6 +228,27 @@ export interface OrderDetailDto extends OrderDto {
   installments: OrderInstallmentDto[];
   invoices: InvoiceDto[];
   payment_submissions: PaymentSubmissionDto[];
+  /** E-19: attribution for website orders (UTM / Meta click ids /
+   *  referrer) — rendered only when the API sends it. */
+  attribution?: {
+    utm_source?: string | null;
+    utm_medium?: string | null;
+    utm_campaign?: string | null;
+    fbp?: string | null;
+    fbc?: string | null;
+    referrer?: string | null;
+  } | null;
+  /** E-08: the entitlement snapshot granted by this order — rendered
+   *  only when the API sends it. */
+  entitlement_snapshot?: {
+    version_number?: number | null;
+    items?: Array<{
+      feature_key?: string;
+      value_type?: string | null;
+      value?: unknown;
+      unlimited?: boolean | null;
+    }>;
+  } | null;
 }
 
 export interface InvoiceDetailDto extends InvoiceDto {
@@ -307,101 +330,104 @@ export function OrdersSection() {
         ? { customerId: rawSearch.customer, leadId: null, productId: null, interest: null }
         : null;
 
-  const columns: ColumnDef<OrderListDto, unknown>[] = [
-    {
-      accessorKey: "order_number",
-      header: "Order",
-      cell: ({ row }) => {
-        const o = row.original;
-        return (
-          <span className="sm-cell-line">
-            <span className="sm-mono sm-cell-text">
-              {/* Order number is the row link (owner 2026-11-18: needing
-                 the View button is annoying) — plain anchor, the same
-                 pattern as the customer name link (the detail routes are
-                 built by makeDetailRoute helpers, so the typed Link's
-                 `to` union does not carry them; see goTo's `as never`
-                 cast). View stays as a secondary action. */}
-              <a href={`/orders/${o.id}`}>{o.order_number}</a>
+  const columns: ColumnDef<OrderListDto, unknown>[] = useMemo(
+    () => [
+      {
+        accessorKey: "order_number",
+        header: "Order",
+        cell: ({ row }) => {
+          const o = row.original;
+          return (
+            <span className="sm-cell-line">
+              <span className="sm-mono sm-cell-text">
+                {/* Order number is the row link (owner 2026-11-18: needing
+                   the View button is annoying) — plain anchor, the same
+                   pattern as the customer name link (the detail routes are
+                   built by makeDetailRoute helpers, so the typed Link's
+                   `to` union does not carry them; see goTo's `as never`
+                   cast). View stays as a secondary action. */}
+                <a href={`/orders/${o.id}`}>{o.order_number}</a>
+              </span>
+              <CopyButton value={o.order_number} label="Copy order number" />
+              <span className="sm-hint sm-cell-text">{o.source}</span>
             </span>
-            <CopyButton value={o.order_number} label="Copy order number" />
-            <span className="sm-hint sm-cell-text">{o.source}</span>
-          </span>
-        );
+          );
+        },
       },
-    },
-    {
-      accessorKey: "customer",
-      header: "Customer",
-      cell: ({ row }) => {
-        const c = row.original.customer;
-        if (!c) return "—";
-        return (
-          <span className="sm-cell-line">
-            <span className="sm-cell-text">{c.name}</span>
-            <span className="sm-hint sm-cell-text">
-              {c.email ?? c.customer_number}
+      {
+        accessorKey: "customer",
+        header: "Customer",
+        cell: ({ row }) => {
+          const c = row.original.customer;
+          if (!c) return "—";
+          return (
+            <span className="sm-cell-line">
+              <span className="sm-cell-text">{c.name}</span>
+              <span className="sm-hint sm-cell-text">
+                {c.email ?? c.customer_number}
+              </span>
             </span>
-          </span>
-        );
+          );
+        },
       },
-    },
-    {
-      accessorKey: "status",
-      header: "Status",
-      cell: ({ row }) => <StatusBadge status={row.original.status} />,
-    },
-    {
-      accessorKey: "payment_status",
-      header: "Payment",
-      cell: ({ row }) => <StatusBadge status={row.original.payment_status} />,
-    },
-    {
-      accessorKey: "total_minor",
-      header: "Total",
-      cell: ({ row }) => (
-        <MoneyCell
-          currency={row.original.currency_code}
-          minor={row.original.total_minor}
-        />
-      ),
-    },
-    {
-      accessorKey: "paid_amount_minor",
-      header: "Paid",
-      cell: ({ row }) => (
-        <MoneyCell
-          currency={row.original.currency_code}
-          minor={row.original.paid_amount_minor ?? 0}
-        />
-      ),
-    },
-    {
-      accessorKey: "remaining_minor",
-      header: "Due",
-      cell: ({ row }) => (
-        <MoneyCell
-          currency={row.original.currency_code}
-          minor={row.original.remaining_minor ?? row.original.total_minor}
-        />
-      ),
-    },
-    {
-      accessorKey: "created_at",
-      header: "Created",
-      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
-    },
-    {
-      id: "actions",
-      header: "",
-      enableSorting: false,
-      cell: ({ row }) => (
-        <Button variant="ghost" size="sm" onClick={() => goTo(`/orders/${row.original.id}`)}>
-          View
-        </Button>
-      ),
-    },
-  ];
+      {
+        accessorKey: "status",
+        header: "Status",
+        cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      },
+      {
+        accessorKey: "payment_status",
+        header: "Payment",
+        cell: ({ row }) => <StatusBadge status={row.original.payment_status} />,
+      },
+      {
+        accessorKey: "total_minor",
+        header: "Total",
+        cell: ({ row }) => (
+          <MoneyCell
+            currency={row.original.currency_code}
+            minor={row.original.total_minor}
+          />
+        ),
+      },
+      {
+        accessorKey: "paid_amount_minor",
+        header: "Paid",
+        cell: ({ row }) => (
+          <MoneyCell
+            currency={row.original.currency_code}
+            minor={row.original.paid_amount_minor ?? 0}
+          />
+        ),
+      },
+      {
+        accessorKey: "remaining_minor",
+        header: "Due",
+        cell: ({ row }) => (
+          <MoneyCell
+            currency={row.original.currency_code}
+            minor={row.original.remaining_minor ?? row.original.total_minor}
+          />
+        ),
+      },
+      {
+        accessorKey: "created_at",
+        header: "Created",
+        cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
+      },
+      {
+        id: "actions",
+        header: "",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <Button variant="ghost" size="sm" onClick={() => goTo(`/orders/${row.original.id}`)}>
+            View
+          </Button>
+        ),
+      },
+  ],
+    [],
+  )
 
   const filtered =
     paymentFilter === ""
@@ -495,11 +521,17 @@ export function OrderDetailSection({ id }: { id: string }) {
     `/api/v1/admin/orders/${id}`,
   );
 
+  // A-04: one key per section instance for each consequential POST.
+  const cancelKey = useIdempotencyKey();
+  const completeKey = useIdempotencyKey();
+  const invoiceKey = useIdempotencyKey();
+  const voidKey = useIdempotencyKey();
   const cancelMutation = useAdminMutation<OrderDetailDto, void>({
     mutationFn: () =>
       apiRequest<OrderDetailDto>(`/api/v1/admin/orders/${id}/cancel`, {
         method: "POST",
         body: JSON.stringify({}),
+        idempotencyKey: cancelKey,
       }),
     invalidateKeys: [listKey("orders"), detailKey("orders", id)],
     successTitle: "Order cancelled",
@@ -510,6 +542,7 @@ export function OrderDetailSection({ id }: { id: string }) {
     mutationFn: () =>
       apiRequest<OrderDetailDto>(`/api/v1/admin/orders/${id}/complete`, {
         method: "POST",
+        idempotencyKey: completeKey,
       }),
     invalidateKeys: [listKey("orders"), detailKey("orders", id)],
     successTitle: "Order completed",
@@ -520,6 +553,7 @@ export function OrderDetailSection({ id }: { id: string }) {
     mutationFn: () =>
       apiRequest<InvoiceDto>(`/api/v1/admin/orders/${id}/invoices`, {
         method: "POST",
+        idempotencyKey: invoiceKey,
       }),
     invalidateKeys: [listKey("orders"), detailKey("orders", id)],
     successTitle: "Invoice created",
@@ -531,6 +565,7 @@ export function OrderDetailSection({ id }: { id: string }) {
       apiRequest<InvoiceDto>(`/api/v1/admin/invoices/${invoiceIdToVoid}/void`, {
         method: "POST",
         body: JSON.stringify({}),
+        idempotencyKey: voidKey,
       }),
     invalidateKeys: [listKey("orders"), detailKey("orders", id)],
     successTitle: "Invoice voided",
@@ -826,6 +861,77 @@ export function OrderDetailSection({ id }: { id: string }) {
             </p>
           ) : null}
         </Card>
+        {order.attribution &&
+        (order.attribution.utm_source ??
+          order.attribution.utm_medium ??
+          order.attribution.utm_campaign ??
+          order.attribution.fbp ??
+          order.attribution.fbc ??
+          order.attribution.referrer) ? (
+          <Card title="Attribution">
+            <DetailFacts
+              facts={[
+                { label: "UTM source", value: order.attribution.utm_source ?? "—" },
+                { label: "UTM medium", value: order.attribution.utm_medium ?? "—" },
+                { label: "UTM campaign", value: order.attribution.utm_campaign ?? "—" },
+                { label: "fbp", value: order.attribution.fbp ?? "—" },
+                { label: "fbc", value: order.attribution.fbc ?? "—" },
+                { label: "Referrer", value: order.attribution.referrer ?? "—" },
+              ]}
+            />
+          </Card>
+        ) : null}
+        {order.entitlement_snapshot ? (
+          <Card
+            title={`Entitlement snapshot${order.entitlement_snapshot.version_number != null ? ` (v${order.entitlement_snapshot.version_number})` : ""}`}
+          >
+            {(order.entitlement_snapshot.items ?? []).length === 0 ? (
+              <EmptyState
+                icon={ShoppingCart}
+                title="No entitlements"
+                body="This order granted no entitlement items."
+              />
+            ) : (
+              <div className="sm-table-wrap">
+                <table className="sm-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Feature</th>
+                      <th scope="col">Type</th>
+                      <th scope="col">Value</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(order.entitlement_snapshot.items ?? []).map((it, i) => (
+                      <tr key={it.feature_key ?? i}>
+                        <td>
+                          <span className="sm-mono">{it.feature_key ?? "—"}</span>
+                        </td>
+                        <td>{it.value_type ?? "—"}</td>
+                        <td>
+                          {it.unlimited
+                            ? "Unlimited"
+                            : it.value === null || it.value === undefined
+                              ? "—"
+                              : String(it.value)}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </Card>
+        ) : null}
+        {order.items.some((i) => i.package_name_snapshot === null) ? (
+          <SaveAsPackageCard
+            orderId={order.id}
+            productName={
+              order.items.find((i) => i.package_name_snapshot === null)
+                ?.product_name_snapshot ?? ""
+            }
+          />
+        ) : null}
         <Card title="Payment plan">
           <p className="sm-hint">
             Total{" "}
@@ -1353,6 +1459,108 @@ function InvoiceDetailDialog({
 /* Steps: (1) Customer — existing or inline new (same fields +        */
 /* dedupe as Add Customer); (2) Item — package or custom offer;        */
 /* (3) Payment plan — full / advance+rest / equal installments;        */
+/* ------------------------------------------------------------------ */
+/* Save as package — POST /api/v1/admin/orders/:id/save-as-package     */
+/* (E-08). Custom-offer orders only: the wizard closes on success     */
+/* (it navigates straight to the order), so the reusable-offer form   */
+/* lives here on the detail page instead of a wizard success panel.   */
+/* The custom label is not stored on the order item, so the name is   */
+/* prefilled from the product name and stays editable.                 */
+/* ------------------------------------------------------------------ */
+function SaveAsPackageCard({
+  orderId,
+  productName,
+}: {
+  orderId: string;
+  productName: string;
+}) {
+  const [name, setName] = useState(productName);
+  const [description, setDescription] = useState("");
+  const [saved, setSaved] = useState(false);
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [formError, setFormError] = useState<string | null>(null);
+  // A-04: one key per card instance — a retried save replays.
+  const formKey = useIdempotencyKey();
+
+  const save = useAdminMutation<{ package?: { id?: string } }, Record<string, unknown>>({
+    mutationFn: (body) =>
+      apiRequest<{ package?: { id?: string } }>(
+        `/api/v1/admin/orders/${orderId}/save-as-package`,
+        { method: "POST", body: JSON.stringify(body), idempotencyKey: formKey },
+      ),
+    invalidateKeys: [listKey("packages")],
+    successTitle: "Saved as package",
+    successMessage: "The custom offer is now a reusable package.",
+    onSuccess: () => setSaved(true),
+  });
+
+  const submit = () => {
+    const next: Record<string, string> = {};
+    if (name.trim().length < 2) next.name = "Package name needs at least 2 characters.";
+    else if (name.trim().length > 160) next.name = "Package name must be at most 160 characters.";
+    if (description.trim().length > 1000)
+      next.description = "Description must be at most 1000 characters.";
+    setErrors(next);
+    if (Object.keys(next).length > 0) return;
+    setFormError(null);
+    save.mutate(
+      {
+        name: name.trim(),
+        ...(description.trim() ? { description: description.trim() } : {}),
+      },
+      {
+        onError: (err) => setFormError(err instanceof Error ? err.message : "Request failed"),
+      },
+    );
+  };
+
+  return (
+    <Card title="Save as package">
+      {saved ? (
+        <Alert variant="success">
+          Saved as a package — reuse this offer from the Packages page
+          instead of rebuilding it per order.
+        </Alert>
+      ) : (
+        <>
+          <p className="sm-hint" style={{ marginTop: 0 }}>
+            This order was built as a custom offer. Save it as a reusable
+            package for the next order.
+          </p>
+          {formError ? <Alert variant="danger">{formError}</Alert> : null}
+          <div className="sm-form-grid" style={{ marginTop: 12 }}>
+            <Field label="Package name" required htmlFor="save-pkg-name" error={errors.name ?? ""}>
+              <Input
+                id="save-pkg-name"
+                name="name"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                maxLength={160}
+                aria-invalid={Boolean(errors.name) || undefined}
+              />
+            </Field>
+            <Field label="Description" htmlFor="save-pkg-desc" error={errors.description ?? ""}>
+              <Textarea
+                id="save-pkg-desc"
+                name="description"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                maxLength={1000}
+                rows={2}
+              />
+            </Field>
+          </div>
+          <div style={{ marginTop: 12 }}>
+            <Button variant="accent" loading={save.isPending} onClick={submit}>
+              Save as package
+            </Button>
+          </div>
+        </>
+      )}
+    </Card>
+  );
+}
+
 /* (4) Activation policy + payment method + optional first payment;    */
 /* (5) Review → create.                                                */
 /*                                                                     */
@@ -1442,6 +1650,12 @@ function CreateOrderWizard({
   const [customPriceKind, setCustomPriceKind] = useState<
     "one_time" | "recurring" | "lifetime" | "free"
   >("one_time");
+  // E-08: billing interval for a recurring custom offer
+  // (AdminCreateOrderSchema custom_offer interval_unit/interval_count).
+  const [customIntervalUnit, setCustomIntervalUnit] = useState<
+    "day" | "week" | "month" | "year"
+  >("month");
+  const [customIntervalCount, setCustomIntervalCount] = useState("1");
   const [customFeatures, setCustomFeatures] = useState<
     { featureId: string; value: string; unlimited: boolean }[]
   >([{ featureId: "", value: "", unlimited: false }]);
@@ -1596,6 +1810,12 @@ function CreateOrderWizard({
         if (customLabel.trim().length < 2) next.customLabel = "Label must be at least 2 characters.";
         if (!Number.isInteger(Number(customPrice)) || Number(customPrice) < 0)
           next.customPrice = "Enter the price in minor units (0 or more).";
+        // E-08: a recurring custom offer needs its billing interval.
+        if (customPriceKind === "recurring") {
+          const n = Number(customIntervalCount);
+          if (!Number.isInteger(n) || n < 1)
+            next.customIntervalCount = "Interval must be a whole number of 1 or more.";
+        }
         if (customFeatures.filter((f) => f.featureId).length < 1)
           next.customFeatures = "Pick at least one feature for the custom offer.";
         // Each entitlement value must match its feature's value_type
@@ -1679,14 +1899,19 @@ function CreateOrderWizard({
         next.paymentMethod = "Choose a payment method for the first payment.";
       if (firstAmount > 0 && firstPaymentPhone.trim() !== "" && firstPaymentPhone.trim().length < 6)
         next.firstPaymentPhone = "Phone must be at least 6 characters.";
-      if (firstAmount > 0 && firstPaymentDate.trim() !== "" && !/^\d{2}\/\d{2}\/\d{4}$/.test(firstPaymentDate.trim()))
-        next.firstPaymentDate = "Use DD/MM/YYYY.";
+      // D-06: strict validation — the regex alone accepted 99/99/2026.
+      if (firstAmount > 0 && firstPaymentDate.trim() !== "" && !ddmmyyyyToIso(firstPaymentDate.trim()))
+        next.firstPaymentDate = "Use a valid DD/MM/YYYY date.";
       setStep4Errors(next);
       return Object.keys(next).length === 0;
     }
     return true;
   };
 
+  // A-04: one key per wizard instance for the order create; the
+  // optional first-payment claim gets its own key (separate request).
+  const wizardKey = useIdempotencyKey();
+  const claimKey = useIdempotencyKey();
   const create = async () => {
     if (!validateStep(4)) {
       setStep(4);
@@ -1727,6 +1952,13 @@ function CreateOrderWizard({
               custom_offer: {
                 label: customLabel.trim(),
                 price_kind: customPriceKind,
+                // E-08: billing interval for recurring custom offers.
+                ...(customPriceKind === "recurring"
+                  ? {
+                      interval_unit: customIntervalUnit,
+                      interval_count: Number(customIntervalCount),
+                    }
+                  : {}),
                 unit_amount_minor: Number(customPrice),
                 currency_code: "BDT",
                 activation_limit: 1,
@@ -1789,6 +2021,7 @@ function CreateOrderWizard({
         {
           method: "POST",
           body: JSON.stringify(body),
+          idempotencyKey: wizardKey,
         }
       );
       const createdOrder = created.order;
@@ -1801,6 +2034,7 @@ function CreateOrderWizard({
         try {
           await apiRequest(`/api/v1/admin/orders/${createdOrder.id}/payment-submissions`, {
             method: "POST",
+            idempotencyKey: claimKey,
             body: JSON.stringify({
               payment_method_id: paymentMethodId,
               amount_minor: firstAmount,
@@ -1848,7 +2082,8 @@ function CreateOrderWizard({
     "Customer",
     "Item",
     "Payment plan",
-    "Activation & payment",
+    // E-08: validity + billing terms live on this step too.
+    "Activation, validity & billing terms",
     "Review",
   ];
   // Review step display name for the chosen customer — fetched once
@@ -2134,7 +2369,41 @@ function CreateOrderWizard({
                   <option value="free">Free</option>
                 </Select>
               </Field>
-              <Field
+              {customPriceKind === "recurring" ? (
+                <div className="sm-form-grid">
+                  <Field label="Billing interval" required htmlFor="wiz-custom-interval-count" error={itemErrors.customIntervalCount ?? ""}>
+                    <Input
+                      id="wiz-custom-interval-count"
+                      name="interval_count"
+                      inputMode="numeric"
+                      value={customIntervalCount}
+                      onChange={(e) => {
+                        setCustomIntervalCount(e.target.value);
+                        clearItemError("customIntervalCount");
+                      }}
+                      aria-invalid={Boolean(itemErrors.customIntervalCount) || undefined}
+                    />
+                  </Field>
+                  <Field label="Interval unit" htmlFor="wiz-custom-interval-unit">
+                    <Select
+                      id="wiz-custom-interval-unit"
+                      name="interval_unit"
+                      value={customIntervalUnit}
+                      onChange={(e) =>
+                        setCustomIntervalUnit(
+                          e.target.value as "day" | "week" | "month" | "year",
+                        )
+                      }
+                    >
+                      <option value="day">Day(s)</option>
+                      <option value="week">Week(s)</option>
+                      <option value="month">Month(s)</option>
+                      <option value="year">Year(s)</option>
+                    </Select>
+                  </Field>
+                </div>
+              ) : null}
+              <GroupField
                 label="Features"
                 hint="At least one feature from this product, with its entitlement value (true/false for boolean, a whole number for limit/quota/metered — or tick Unlimited)."
                 error={itemErrors.customFeatures ?? ""}
@@ -2240,7 +2509,7 @@ function CreateOrderWizard({
                     </Button>
                   </div>
                 </div>
-              </Field>
+              </GroupField>
             </>
           )}
           <Field label="Quantity" required htmlFor="wiz-quantity" error={itemErrors.quantity ?? ""}>
@@ -2664,6 +2933,44 @@ function CreateOrderWizard({
                     : activationMode === "on_date"
                       ? `On ${activationDate}`
                       : "On full payment",
+              },
+              {
+                // E-08: billing terms + validity summary, derived from
+                // the price kind (no separate validity field exists on
+                // the order — the schema carries it via price_kind).
+                label: "Billing",
+                value:
+                  itemKind === "package"
+                    ? selectedPrice
+                      ? selectedPrice.price_kind === "recurring" && selectedPrice.interval_unit
+                        ? `Recurring — every ${selectedPrice.interval_count ?? 1} ${selectedPrice.interval_unit}${(selectedPrice.interval_count ?? 1) > 1 ? "s" : ""}`
+                        : selectedPrice.price_kind === "lifetime"
+                          ? "Lifetime"
+                          : selectedPrice.price_kind === "free"
+                            ? "Free"
+                            : "One-time"
+                      : "—"
+                    : customPriceKind === "recurring"
+                      ? `Recurring — every ${customIntervalCount} ${customIntervalUnit}${Number(customIntervalCount) > 1 ? "s" : ""}`
+                      : customPriceKind === "lifetime"
+                        ? "Lifetime"
+                        : customPriceKind === "free"
+                          ? "Free"
+                          : "One-time",
+              },
+              {
+                label: "Validity",
+                value:
+                  (itemKind === "package" ? selectedPrice?.price_kind : customPriceKind) ===
+                  "recurring"
+                    ? "Renews every billing interval until cancelled"
+                    : (itemKind === "package" ? selectedPrice?.price_kind : customPriceKind) ===
+                        "lifetime"
+                      ? "Never expires"
+                      : (itemKind === "package" ? selectedPrice?.price_kind : customPriceKind) ===
+                          "free"
+                        ? "Free access, no expiry"
+                        : "Valid for this order only",
               },
               {
                 label: "First payment",

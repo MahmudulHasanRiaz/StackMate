@@ -26,7 +26,7 @@
  * auto-assigns its customer; picking a subscription or license
  * auto-assigns its customer AND product (the API validates the same).
  */
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, useMemo} from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
 import { LifeBuoy, Plus } from "lucide-react";
@@ -44,6 +44,7 @@ import {
   useAdminList,
   useAdminMutation,
   type ListSearch,
+  useIdempotencyKey,
 } from "../lib/section-kit";
 import {
   Alert,
@@ -196,79 +197,82 @@ export function TicketsSection() {
     },
   });
 
-  const columns: ColumnDef<TicketDto, unknown>[] = [
-    {
-      accessorKey: "ticket_number",
-      header: "Ticket",
-      cell: ({ row }) => (
-        <span className="sm-cell-line">
-          {/* Single-line (tickets density follow-up 2026-11-18): the
-             number is NOT .sm-cell-text — it must never truncate
-             (TKT-50001 stays readable in full); the mono span + copy
-             button are flex:none via the .sm-cell-line rule. */}
-          <span className="sm-mono">{row.original.ticket_number}</span>
-          <CopyButton value={row.original.ticket_number} label="Copy ticket number" />
-        </span>
-      ),
-    },
-    {
-      accessorKey: "title",
-      header: "Title",
-      cell: ({ row }) => (
-        <span className="sm-cell-line">
-          <span className="sm-cell-text">{row.original.title}</span>
-        </span>
-      ),
-    },
-    {
-      accessorKey: "customer",
-      header: "Customer",
-      cell: ({ row }) => {
-        const c = row.original.customer;
-        if (!c) return "—";
-        return (
+  const columns: ColumnDef<TicketDto, unknown>[] = useMemo(
+    () => [
+      {
+        accessorKey: "ticket_number",
+        header: "Ticket",
+        cell: ({ row }) => (
           <span className="sm-cell-line">
-            <span className="sm-cell-text">{c.name}</span>
-            <span className="sm-hint sm-cell-text">{c.customer_number}</span>
+            {/* Single-line (tickets density follow-up 2026-11-18): the
+               number is NOT .sm-cell-text — it must never truncate
+               (TKT-50001 stays readable in full); the mono span + copy
+               button are flex:none via the .sm-cell-line rule. */}
+            <span className="sm-mono">{row.original.ticket_number}</span>
+            <CopyButton value={row.original.ticket_number} label="Copy ticket number" />
           </span>
-        );
+        ),
       },
-    },
-    {
-      accessorKey: "status",
-      header: "Status",
-      cell: ({ row }) => <StatusBadge status={row.original.status} />,
-    },
-    {
-      accessorKey: "priority",
-      header: "Priority",
-      cell: ({ row }) => row.original.priority,
-    },
-    {
-      accessorKey: "assignee_name",
-      header: "Assignee",
-      cell: ({ row }) => (
-        <span className="sm-cell-line">
-          <span className="sm-cell-text">{row.original.assignee_name ?? "Unassigned"}</span>
-        </span>
-      ),
-    },
-    {
-      accessorKey: "updated_at",
-      header: "Updated",
-      cell: ({ row }) => <DateTimeCell value={row.original.updated_at} />,
-    },
-    {
-      id: "actions",
-      header: "",
-      enableSorting: false,
-      cell: ({ row }) => (
-        <Button variant="ghost" size="sm" onClick={() => goTo(`/tickets/${row.original.id}`)}>
-          View
-        </Button>
-      ),
-    },
-  ];
+      {
+        accessorKey: "title",
+        header: "Title",
+        cell: ({ row }) => (
+          <span className="sm-cell-line">
+            <span className="sm-cell-text">{row.original.title}</span>
+          </span>
+        ),
+      },
+      {
+        accessorKey: "customer",
+        header: "Customer",
+        cell: ({ row }) => {
+          const c = row.original.customer;
+          if (!c) return "—";
+          return (
+            <span className="sm-cell-line">
+              <span className="sm-cell-text">{c.name}</span>
+              <span className="sm-hint sm-cell-text">{c.customer_number}</span>
+            </span>
+          );
+        },
+      },
+      {
+        accessorKey: "status",
+        header: "Status",
+        cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      },
+      {
+        accessorKey: "priority",
+        header: "Priority",
+        cell: ({ row }) => row.original.priority,
+      },
+      {
+        accessorKey: "assignee_name",
+        header: "Assignee",
+        cell: ({ row }) => (
+          <span className="sm-cell-line">
+            <span className="sm-cell-text">{row.original.assignee_name ?? "Unassigned"}</span>
+          </span>
+        ),
+      },
+      {
+        accessorKey: "updated_at",
+        header: "Updated",
+        cell: ({ row }) => <DateTimeCell value={row.original.updated_at} />,
+      },
+      {
+        id: "actions",
+        header: "",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <Button variant="ghost" size="sm" onClick={() => goTo(`/tickets/${row.original.id}`)}>
+            View
+          </Button>
+        ),
+      },
+  ],
+    [goTo],
+  )
 
   const filtered = (query.data ?? []).filter((t) => {
     if (statusFilter && t.status !== statusFilter) return false;
@@ -486,10 +490,11 @@ function CreateTicketDialog({
       }
     }
   };
-  const mutation = useAdminMutation<TicketDto, Record<string, unknown>>({
+    const mutationKey = useIdempotencyKey();
+const mutation = useAdminMutation<TicketDto, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<TicketDto>("/api/v1/admin/tickets", {
-        method: "POST",
+        method: "POST", idempotencyKey: mutationKey,
         body: JSON.stringify(body),
       }),
     invalidateKeys: [listKey("tickets")],
@@ -769,28 +774,31 @@ export function TicketDetailSection({ id }: { id: string }) {
   const [transitionNote, setTransitionNote] = useState("");
   const query = useAdminDetail<TicketDetailDto>("tickets", id, `/api/v1/admin/tickets/${id}`);
 
-  const transitionMutation = useAdminMutation<TicketDetailDto, Record<string, unknown>>({
+    const transitionMutationKey = useIdempotencyKey();
+const transitionMutation = useAdminMutation<TicketDetailDto, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<TicketDetailDto>(`/api/v1/admin/tickets/${id}/transition`, {
-        method: "POST",
+        method: "POST", idempotencyKey: transitionMutationKey,
         body: JSON.stringify(body),
       }),
     invalidateKeys: [listKey("tickets"), detailKey("tickets", id)],
     successTitle: "Ticket status updated",
   });
-  const assignMutation = useAdminMutation<TicketDetailDto, Record<string, unknown>>({
+    const assignMutationKey = useIdempotencyKey();
+const assignMutation = useAdminMutation<TicketDetailDto, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<TicketDetailDto>(`/api/v1/admin/tickets/${id}/assign`, {
-        method: "POST",
+        method: "POST", idempotencyKey: assignMutationKey,
         body: JSON.stringify(body),
       }),
     invalidateKeys: [listKey("tickets"), detailKey("tickets", id)],
     successTitle: "Ticket assigned",
   });
-  const commentMutation = useAdminMutation<TicketCommentDto, Record<string, unknown>>({
+    const commentMutationKey = useIdempotencyKey();
+const commentMutation = useAdminMutation<TicketCommentDto, Record<string, unknown>>({
     mutationFn: (body) =>
       apiRequest<TicketCommentDto>(`/api/v1/admin/tickets/${id}/comments`, {
-        method: "POST",
+        method: "POST", idempotencyKey: commentMutationKey,
         body: JSON.stringify(body),
       }),
     invalidateKeys: [detailKey("tickets", id)],

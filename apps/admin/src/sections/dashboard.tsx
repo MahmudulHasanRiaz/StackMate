@@ -27,6 +27,7 @@ import {
   Repeat,
   Send,
   ShieldAlert,
+  Users,
   type LucideIcon,
 } from "lucide-react";
 import { isoDateOnlyInTimeZone } from "../../../../packages/contracts/src/index.ts";
@@ -42,6 +43,7 @@ import {
   type DashboardPreset,
 } from "../lib/dates";
 import { PageHeader } from "../lib/section-kit";
+import { listKey } from "../lib/query";
 import {
   Button,
   Dialog,
@@ -57,14 +59,29 @@ interface AnalyticsOverviewDto {
   total_products: number;
   active_products: number;
   total_customers: number;
-  total_orders: number;
-  paid_orders: number;
-  pending_payment_submissions: number;
+  // F-02: the API nulls these three counts for roles without
+  // payments.read (same canSeeRevenue gate as verified_revenue_minor)
+  // — the cards below are hidden when null, never shown as 0.
+  total_orders: number | null;
+  paid_orders: number | null;
+  pending_payment_submissions: number | null;
   active_subscriptions: number;
   active_licenses: number;
   expired_or_revoked_licenses: number;
   verified_revenue_minor: number | null;
   pending_outbox_events: number;
+  // E-11: rendered when the API sends it (the count is not in the
+  // DTO on older API builds — the card is omitted, never faked).
+  upcoming_renewals?: number | null;
+  // B-06: server-side dashboard panels (overview + the 3 panels'
+  // top-N rows in one response). When present the panel queries
+  // below are skipped and these rows are used; when absent the
+  // existing per-panel queries are the fallback.
+  panels?: {
+    recent_orders?: DashboardOrderRow[];
+    pending_submissions?: DashboardSubmissionRow[];
+    expiring_licenses?: DashboardLicenseRow[];
+  } | null;
   range: { from: string; to: string } | null;
 }
 
@@ -242,56 +259,71 @@ export function DashboardSection() {
   // submissions) and slices the window AFTER sorting, so the loaded
   // set is deterministically the newest 100 rows. The panels still
   // sort/filter client-side over that set (range + status filters).
+  // D-14: panel queries are keyed off the listKey() factory (with a
+  // dashboard suffix), so a mutation elsewhere that invalidates
+  // listKey("orders") / ("payment-submissions") / ("licenses") also
+  // refreshes the dashboard panels instead of leaving them stale
+  // for the 30s staleTime. B-06: when the overview already carries
+  // the panels, these queries stay disabled (fallback only).
+  const panels = query.data?.panels ?? null;
   const ordersQuery = useQuery({
-    queryKey: ["admin", "dashboard", "recent-orders"],
+    queryKey: [...listKey("orders"), "dashboard", "recent-orders"],
     queryFn: async () => {
       const res = await apiRequest<{ items: DashboardOrderRow[] }>(
         "/api/v1/admin/orders?limit=100&sort=created_at:desc",
       );
       return res.items;
     },
+    enabled: !panels?.recent_orders,
   });
   const submissionsQuery = useQuery({
-    queryKey: ["admin", "dashboard", "pending-submissions"],
+    queryKey: [...listKey("payment-submissions"), "dashboard", "pending-submissions"],
     queryFn: async () => {
       const res = await apiRequest<{ items: DashboardSubmissionRow[] }>(
         "/api/v1/admin/payment-submissions?limit=100&sort=submitted_at:desc",
       );
       return res.items;
     },
+    enabled: !panels?.pending_submissions,
   });
   const licensesQuery = useQuery({
-    queryKey: ["admin", "dashboard", "expiring-licenses"],
+    queryKey: [...listKey("licenses"), "dashboard", "expiring-licenses"],
     queryFn: async () => {
+      // D-02: expiry-scoped panel — ask the server for licenses by
+      // expiry (expiring_within_days=30) instead of the newest 100
+      // by creation, which silently omitted old licenses expiring
+      // next week. Unknown params are ignored by older API builds;
+      // the client filter below stays as the fallback.
       const res = await apiRequest<{ items: DashboardLicenseRow[] }>(
-        "/api/v1/admin/licenses?limit=100&sort=created_at:desc",
+        "/api/v1/admin/licenses?limit=100&sort=expires_at:asc&expiring_within_days=30",
       );
       return res.items;
     },
+    enabled: !panels?.expiring_licenses,
   });
 
   // Recent orders: latest first, scoped to the selected range when bounded
   // (same rule as the range-scoped flow KPIs above).
   const recentOrders = useMemo(() => {
-    const items = ordersQuery.data ?? [];
+    const items = panels?.recent_orders ?? ordersQuery.data ?? [];
     return items
       .filter((o) => isInRange(o.created_at, bounds))
       .sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0))
       .slice(0, PANEL_LIMIT);
-  }, [ordersQuery.data, bounds]);
+  }, [panels?.recent_orders, ordersQuery.data, bounds]);
 
   const pendingSubmissions = useMemo(() => {
-    const items = submissionsQuery.data ?? [];
+    const items = panels?.pending_submissions ?? submissionsQuery.data ?? [];
     return items
       .filter((s) => s.status === "submitted" || s.status === "under_review")
       .sort((a, b) => (a.submitted_at < b.submitted_at ? 1 : -1))
       .slice(0, PANEL_LIMIT);
-  }, [submissionsQuery.data]);
+  }, [panels?.pending_submissions, submissionsQuery.data]);
 
   const expiringLicenses = useMemo(() => {
     const nowMs = Date.now();
     const soonMs = nowMs + EXPIRING_SOON_DAYS * 86_400_000;
-    const items = licensesQuery.data ?? [];
+    const items = panels?.expiring_licenses ?? licensesQuery.data ?? [];
     return items
       .filter((l) => {
         if (l.status !== "active" || !l.expires_at) return false;
@@ -300,7 +332,7 @@ export function DashboardSection() {
       })
       .sort((a, b) => (a.expires_at ?? "") < (b.expires_at ?? "") ? -1 : 1)
       .slice(0, PANEL_LIMIT);
-  }, [licensesQuery.data]);
+  }, [panels?.expiring_licenses, licensesQuery.data]);
 
   const openCustom = () => {
     // Pre-fill with the current range (or the last 30 days when All time).
@@ -371,7 +403,7 @@ export function DashboardSection() {
           previous range's numbers would otherwise stay visible. */}
       {query.isPending || query.isFetching ? (
         <div className="sm-kpi-grid">
-          {Array.from({ length: 8 }).map((_, i) => (
+          {Array.from({ length: 10 }).map((_, i) => (
             <div key={i} className="sm-kpi-card">
               <Skeleton height={14} width="60%" />
               <div style={{ marginTop: 10 }}>
@@ -404,15 +436,19 @@ export function DashboardSection() {
                 />
               </KpiCard>
             ) : null}
-            <KpiCard label="Pending payment review" icon={Clock} tone="strong">
-              {query.data.pending_payment_submissions}
-            </KpiCard>
+            {query.data.pending_payment_submissions !== null ? (
+              <KpiCard label="Pending payment review" icon={Clock} tone="strong">
+                {query.data.pending_payment_submissions}
+              </KpiCard>
+            ) : null}
             <KpiCard label="Active products" icon={Package} tone="mid">
               {query.data.active_products} / {query.data.total_products}
             </KpiCard>
-            <KpiCard label="Paid orders" icon={Receipt} tone="soft">
-              {query.data.paid_orders} / {query.data.total_orders}
-            </KpiCard>
+            {query.data.paid_orders !== null && query.data.total_orders !== null ? (
+              <KpiCard label="Paid orders" icon={Receipt} tone="soft">
+                {query.data.paid_orders} / {query.data.total_orders}
+              </KpiCard>
+            ) : null}
             <KpiCard label="Active subscriptions" icon={Repeat} tone="plain">
               {query.data.active_subscriptions}
             </KpiCard>
@@ -425,6 +461,16 @@ export function DashboardSection() {
             <KpiCard label="Pending outbox events" icon={Send} tone="soft">
               {query.data.pending_outbox_events}
             </KpiCard>
+            {/* E-11: total_customers was fetched but never displayed. */}
+            <KpiCard label="Total customers" icon={Users} tone="plain">
+              {query.data.total_customers}
+            </KpiCard>
+            {query.data.upcoming_renewals !== undefined &&
+            query.data.upcoming_renewals !== null ? (
+              <KpiCard label="Upcoming renewals" icon={Repeat} tone="soft">
+                {query.data.upcoming_renewals}
+              </KpiCard>
+            ) : null}
           </div>
           {bounds !== null &&
             query.data.total_orders === 0 &&

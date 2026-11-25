@@ -70,9 +70,17 @@ export async function isSmtpConfigured(db: Db, deps: AuthConfigDeps): Promise<bo
 export async function sendStackMateEmail(
   db: Db,
   deps: EmailDeps,
-  message: Omit<SmtpMessage, "from" | "fromName">
+  message: Omit<SmtpMessage, "from" | "fromName">,
+  /**
+   * B-15: preloaded SMTP config (e.g. loaded ONCE by the cron handler
+   * before the sweep loop). When given, `loadSmtpSettings` is skipped
+   * — a 25-reminder sweep used to re-read + re-decrypt the SMTP row
+   * per reminder. Additive: existing callers pass nothing and behave
+   * exactly as before.
+   */
+  preloadedSmtp?: ResolvedSmtpSettings
 ): Promise<SendResult> {
-  const smtp = await loadSmtpSettings(db, deps);
+  const smtp = preloadedSmtp ?? (await loadSmtpSettings(db, deps));
   if (!smtpConfigured(smtp)) {
     return { sent: false, error: NOT_CONFIGURED };
   }
@@ -102,6 +110,58 @@ export async function sendStackMateEmail(
     if (err instanceof SmtpError) return { sent: false, error: err.message };
     return { sent: false, error: "Email could not be sent." };
   }
+}
+
+export interface BoundedEmailMessage {
+  to: string;
+  subject: string;
+  text: string;
+}
+
+export interface BoundedEmailResult {
+  message: BoundedEmailMessage;
+  result: SendResult;
+}
+
+/**
+ * B-15: send a batch of emails with bounded concurrency (default 4).
+ * Each message resolves to its own SendResult — one failure never
+ * aborts the rest, and the caller marks only the sent ones (sweep
+ * reminders are retried on the next run when not marked). The SMTP
+ * config is loaded ONCE here (or taken from `preloadedSmtp`)
+ * instead of once per message.
+ */
+export async function sendEmailsBounded(
+  db: Db,
+  deps: EmailDeps,
+  messages: BoundedEmailMessage[],
+  options?: { concurrency?: number; preloadedSmtp?: ResolvedSmtpSettings }
+): Promise<BoundedEmailResult[]> {
+  const concurrency = Math.max(1, Math.min(options?.concurrency ?? 4, 10));
+  const smtp = options?.preloadedSmtp ?? (await loadSmtpSettings(db, deps));
+  const results: BoundedEmailResult[] = new Array(messages.length);
+  let next = 0;
+  const workers = Array.from(
+    { length: Math.min(concurrency, messages.length) },
+    async () => {
+      while (next < messages.length) {
+        const idx = next;
+        next += 1;
+        const message = messages[idx]!;
+        results[idx] = {
+          message,
+          result: await sendStackMateEmail(
+            db,
+            deps,
+            { to: message.to, subject: message.subject, text: message.text },
+            smtp
+          ),
+        };
+      }
+    }
+  );
+  await Promise.all(workers);
+  return results;
 }
 
 export function buildPasswordResetEmail(

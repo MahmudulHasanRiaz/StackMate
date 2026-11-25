@@ -463,7 +463,7 @@ Money uses integer minor units and currency code in API contracts. For example, 
 
 Customer identity resolution must be deliberate. Email or phone matches may suggest a possible existing customer; do not automatically merge records on an unverified client claim. Customer is not the same entity as a staff login account.
 
-**Dedupe (ADR-0009 §3, owner rules 2026-11-17):** normalized email and normalized phone each belong to at most ONE customer. Email match → that customer (new phone attaches as secondary); phone match + new email → that customer (email attaches as secondary); neither match → new customer; both match DIFFERENT customers → 409 `CUSTOMER_CONTACT_CONFLICT` naming both customers, admin resolves, never auto-merge. The rule applies to admin create, public checkout, and inline order creation. Secondary contacts live in `customer_contacts` (UNIQUE (kind, normalized_value)). A unique index on the primaries is NOT yet enforced at the DB level — staging holds duplicates from the old checkout path; the resolver enforces the rule on all write paths until a data-cleanup migration adds the indexes. Create validation: name required; AT LEAST ONE of email/phone (422 otherwise; WhatsApp alone does not satisfy it). Phone normalizes to E.164 (Bangladeshi `01…` → `+880…`). WhatsApp has a "same as phone" copy in the UI (still editable after).
+**Dedupe (ADR-0009 §3, owner rules 2026-11-17):** normalized email and normalized phone each belong to at most ONE customer. Email match → that customer (new phone attaches as secondary); phone match + new email → that customer (email attaches as secondary); neither match → new customer; both match DIFFERENT customers → 409 `CUSTOMER_CONTACT_CONFLICT` naming both customers, admin resolves, never auto-merge. The rule applies to admin create, public checkout, and inline order creation. Secondary contacts live in `customer_contacts` (UNIQUE (kind, normalized_value)). Enforcement at the DB level is conditional: the schema declares the partial unique indexes (`db/schema/customers.ts`: `uq_customers_normalized_email`, `uq_customers_normalized_phone`) and migration 0014 creates each one only if no duplicates exist at migration time; migration 0020 (audit C-01) re-attempts each skipped index after data cleanup. Until the indexes exist on a given database, the resolver enforces the rule on all write paths. Whether a given environment actually holds the indexes is data-dependent — check `pg_indexes` (audit LV-02) rather than assuming. Create validation: name required; AT LEAST ONE of email/phone (422 otherwise; WhatsApp alone does not satisfy it). Phone normalizes to E.164 (Bangladeshi `01…` → `+880…`). WhatsApp has a "same as phone" copy in the UI (still editable after).
 
 ### 10.2 Orders
 
@@ -488,10 +488,15 @@ Order amount, discount, tax, and entitlement snapshots are computed/validated se
 |---|---|---|
 | GET | /api/v1/admin/invoices | Invoice list |
 | POST | /api/v1/admin/orders/{orderId}/invoices | Generate invoice from order |
-| GET | /api/v1/admin/invoices/{invoiceId} | Invoice detail/PDF metadata if available |
+| GET | /api/v1/admin/invoices/{invoiceId} | Invoice detail |
 | POST | /api/v1/admin/invoices/{invoiceId}/void | Void through an authorized financial workflow |
 
 Issued invoices are immutable financial documents except for explicit status transitions and correction/credit-note workflows. Do not regenerate historical invoice items from the current package catalogue.
+
+**PDF (audit 2026-11-25 E-26):** no invoice PDF generation exists — the
+earlier "PDF metadata if available" wording is removed. An invoice PDF
+download is a documented follow-up, not part of this endpoint; do not
+claim a PDF is available until it is built.
 
 **Partial payments (ADR-0009 §1, §27 flipped 2026-11-17):** an invoice now moves `open → partially_paid → paid` as verified payments land (`amount_paid_minor` / `amount_due_minor` synced per approval, `paid_at` when fully paid).
 

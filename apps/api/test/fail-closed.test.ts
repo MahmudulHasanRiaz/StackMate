@@ -25,10 +25,19 @@ const PRODUCTION_SECRETS = {
   CHECKOUT_TOKEN_SECRET: "production-checkout-token-secret",
 } as const;
 
-/** Production env with every required secret EXCEPT any Hyperdrive binding. */
+/** Production env with every required secret EXCEPT any Hyperdrive binding.
+ * A-09: resolveRuntimeConfig validates the RESOLVED APP_URL/API_URL/
+ * BETTER_AUTH_URL/TRUSTED_ORIGINS before the Hyperdrive check, and the
+ * defaults are localhost — so the URLs must be set to non-localhost
+ * values here, otherwise the test fails on the URL gate instead of the
+ * Hyperdrive gate it is meant to exercise. */
 function productionEnvWithoutHyperdrive(): Partial<StackMateBindings> {
   return {
     APP_ENV: "production",
+    APP_URL: "https://api.example.com",
+    API_URL: "https://api.example.com",
+    BETTER_AUTH_URL: "https://api.example.com",
+    TRUSTED_ORIGINS: "https://api.example.com",
     ...PRODUCTION_SECRETS,
   };
 }
@@ -57,7 +66,12 @@ describe("fail-closed without Hyperdrive (production)", () => {
         throw new Error("HYPERDRIVE_NO_CACHE connection could not be established.");
       },
     });
-    const req = new Request("http://localhost:8787/api/v1/health");
+    // A-10: /health and /ready answer BEFORE any store resolution, so
+    // they can no longer prove fail-closed. Use a store-requiring
+    // endpoint (/me) — the fetchHandler resolves the store before
+    // routing, so the failing factory still answers 500
+    // STORE_UNAVAILABLE here.
+    const req = new Request("http://localhost:8787/api/v1/admin/me");
     // 2026-11-15: a store-creation failure no longer escapes as a bare
     // Worker exception (Cloudflare 1101, opaque to clients). fetchHandler
     // answers with the standard JSON error envelope instead — still
@@ -65,6 +79,10 @@ describe("fail-closed without Hyperdrive (production)", () => {
     // failure's shape changed from a throw to a retryable 500.
     const res = await app.fetch(req, {
       APP_ENV: "production",
+      APP_URL: "https://api.example.com",
+      API_URL: "https://api.example.com",
+      BETTER_AUTH_URL: "https://api.example.com",
+      TRUSTED_ORIGINS: "https://api.example.com",
       ...PRODUCTION_SECRETS,
       HYPERDRIVE_NO_CACHE: {
         connectionString: "postgresql://postgres:postgres@localhost:5432/stackmate",
@@ -84,7 +102,14 @@ describe("fail-closed without Hyperdrive (production)", () => {
       () =>
         worker.fetch(
           req,
-          { APP_ENV: "staging", ...PRODUCTION_SECRETS },
+          {
+            APP_ENV: "staging",
+            APP_URL: "https://api.example.com",
+            API_URL: "https://api.example.com",
+            BETTER_AUTH_URL: "https://api.example.com",
+            TRUSTED_ORIGINS: "https://api.example.com",
+            ...PRODUCTION_SECRETS,
+          },
           { waitUntil: () => {} }
         ),
       /HYPERDRIVE/

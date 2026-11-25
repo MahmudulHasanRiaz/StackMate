@@ -50,6 +50,9 @@ export const invoices = pgTable(
     index("idx_invoices_customer_issued").on(table.customerId, table.issuedAt.desc()),
     index("idx_invoices_status_due").on(table.status, table.dueAt),
     index("idx_invoices_subscription_issued").on(table.subscriptionId, table.issuedAt.desc()),
+    // Migration 0021 (audit C-02): order detail + invoice void scan
+    // by order_id; renewal reconciliation joins on it.
+    index("idx_invoices_order_id").on(table.orderId),
     check("invoices_invoice_type_check", sql`"invoice_type" IN ('initial', 'renewal', 'adjustment', 'credit_note')`),
     check("invoices_status_check", sql`"status" IN ('draft', 'open', 'paid', 'void', 'uncollectible', 'partially_paid')`),
     check("invoices_subtotal_minor_check", sql`"subtotal_minor" >= 0`),
@@ -80,6 +83,9 @@ export const invoiceItems = pgTable("invoice_items", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 },
 (table) => [
+  // Migration 0021 (audit C-02): invoice detail renders its items by
+  // invoice_id; invoice deletes scan the child table.
+  index("idx_invoice_items_invoice_id").on(table.invoiceId),
   check("invoice_items_quantity_check", sql`"quantity" >= 1`),
   check("invoice_items_unit_amount_minor_check", sql`"unit_amount_minor" >= 0`),
   check("invoice_items_line_amount_minor_check", sql`"line_amount_minor" >= 0`),

@@ -14,6 +14,7 @@ import {
   generateKeyPairSync,
   createPrivateKey,
   createPublicKey,
+  hkdfSync,
   randomBytes,
   scryptSync,
   sign as nodeSign,
@@ -41,18 +42,39 @@ function derive32ByteKey(secret: string): Buffer {
  * The salt is per-install: derived from the master secret itself, so
  * it differs across installs (no cross-install precomputation) while
  * staying inside the 4-part envelope (`v2:<iv>:<tag>:<ct>` has no room
- * for a stored salt). A stored random salt would be stronger — that is
- * a future step, not a silent assumption: see the rotation procedure
- * on decryptSecretAtRest.
+ * for a stored salt). v3 (F-07) removes that limitation: a random
+ * per-envelope salt stored in the 5-part envelope, so two installs
+ * sharing a master secret no longer derive the same key.
  *
  * The derived key is cached per (master secret, version) for the life
  * of the isolate — the secret never changes at runtime, and scrypt
  * (~50ms) must not be paid on every request that decrypts a secret.
  * The cache holds only derived keys, never the master secret itself.
  */
+const ENCRYPTION_KEY_VERSION_V3 = "v3";
 const ENCRYPTION_KEY_VERSION_V2 = "v2";
 const ENCRYPTION_KEY_VERSION_V1 = "v1";
 const derivedEncryptionKeyCache = new Map<string, Buffer>();
+
+/**
+ * v3 key derivation (audit F-07): scrypt with a RANDOM per-envelope
+ * salt (16 bytes, stored in the envelope itself). Unlike v2 — whose
+ * salt is derived from the master secret, so two installs sharing a
+ * secret derive the same key — a v3 salt is fresh per ciphertext, so
+ * even identical plaintexts under the same master secret get unrelated
+ * keys. The derived key is cached per (master secret, salt) for the
+ * life of the isolate; the cache holds only derived keys, never the
+ * master secret itself.
+ */
+function deriveEncryptionKeyV3(masterSecret: string, salt: Buffer): Buffer {
+  const cacheKey = `${sha256Hex(masterSecret)}:${ENCRYPTION_KEY_VERSION_V3}:${salt.toString("hex")}`;
+  const cached = derivedEncryptionKeyCache.get(cacheKey);
+  if (cached) return cached;
+  const key = scryptSync(masterSecret, salt, 32, { N: 16384, r: 8, p: 1 });
+  if (derivedEncryptionKeyCache.size >= 4) derivedEncryptionKeyCache.clear();
+  derivedEncryptionKeyCache.set(cacheKey, key);
+  return key;
+}
 
 function deriveEncryptionKeyV2(masterSecret: string): Buffer {
   const cacheKey = `${sha256Hex(masterSecret)}:${ENCRYPTION_KEY_VERSION_V2}`;
@@ -67,7 +89,9 @@ function deriveEncryptionKeyV2(masterSecret: string): Buffer {
   return key;
 }
 
-/** Key for an envelope version: v2 → scrypt, v1 → legacy SHA-256. */
+/** Key for an envelope version: v2 → scrypt, v1 → legacy SHA-256.
+ * v3 keys need their per-envelope salt — use deriveEncryptionKeyV3
+ * directly; asking here throws instead of silently deriving a wrong key. */
 function deriveEncryptionKey(masterSecret: string, keyVersion: string): Buffer {
   if (keyVersion === ENCRYPTION_KEY_VERSION_V2) return deriveEncryptionKeyV2(masterSecret);
   if (keyVersion === ENCRYPTION_KEY_VERSION_V1) return derive32ByteKey(masterSecret);
@@ -84,8 +108,70 @@ export function isLegacyV1Ciphertext(encodedCiphertext: string): boolean {
   return encodedCiphertext.startsWith(`${ENCRYPTION_KEY_VERSION_V1}:`);
 }
 
+/**
+ * True when a stored ciphertext is not yet on the current (v3) envelope.
+ * Callers that hold a writable row should re-encrypt it via
+ * reEncryptSecretAtRest the next time they write that row.
+ */
+export function needsReEncryption(encodedCiphertext: string): boolean {
+  return !encodedCiphertext.startsWith(`${ENCRYPTION_KEY_VERSION_V3}:`);
+}
+
 export function sha256Hex(input: string | Buffer | Uint8Array): string {
   return createHash("sha256").update(input).digest("hex");
+}
+
+/**
+ * Token hashing (audit F-04): invite / reset / recovery tokens and site
+ * secrets are stored as hashes, never raw. New hashes are HMAC-SHA256
+ * with a server-side pepper — the existing ENCRYPTION_KEY_V1 master
+ * secret, reused as the pepper (no new secret is invented, and the
+ * pepper value itself is never written to a file or a log). Stored as
+ * `peppered:<hex>`. With no pepper available (e.g. a store that was
+ * never given a secret) the legacy bare `sha256Hex` form is used so
+ * existing flows keep working; verifyTokenHash accepts both forms, so
+ * old rows keep verifying until they expire or rotate.
+ */
+export function hashTokenPeppered(rawToken: string, pepper?: string | null): string {
+  const cleanPepper = pepper?.trim() ?? "";
+  if (cleanPepper.length === 0) return sha256Hex(rawToken);
+  return `peppered:${createHmac("sha256", cleanPepper).update(rawToken, "utf8").digest("hex")}`;
+}
+
+/** Constant-time check of a raw token against a stored hash (either form). */
+export function verifyTokenHash(
+  rawToken: string,
+  storedHash: string,
+  pepper?: string | null
+): boolean {
+  const cleanPepper = pepper?.trim() ?? "";
+  let expected: string;
+  if (storedHash.startsWith("peppered:")) {
+    // A peppered row without a pepper fails CLOSED — it must never
+    // silently fall back to the unpeppered hash.
+    if (cleanPepper.length === 0) return false;
+    expected = hashTokenPeppered(rawToken, cleanPepper);
+  } else {
+    expected = sha256Hex(rawToken);
+  }
+  const a = Buffer.from(expected, "utf8");
+  const b = Buffer.from(storedHash, "utf8");
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/**
+ * HKDF-SHA256 key derivation (audit F-07) for HMAC keys that must stay
+ * stable across restarts: license verifiers and checkout tokens. The
+ * salt is a fixed public domain-separation string (HKDF salt is not a
+ * secret); the `purpose` info string keeps the two keys independent
+ * even though they derive from different secrets in practice. This
+ * replaces the single unsalted SHA-256 derivation for NEW keys; the
+ * legacy derivation stays available for verifying keys minted before
+ * the switch (see the v1 fallbacks below).
+ */
+export function deriveHmacKeyV2(secret: string, purpose: string): Buffer {
+  const salt = createHash("sha256").update("stackmate-hkdf-salt-v1", "utf8").digest();
+  return Buffer.from(hkdfSync("sha256", secret, salt, `stackmate-hmac-v2:${purpose}`, 32));
 }
 
 export function randomOpaqueToken(prefix: string, byteLength = 24): string {
@@ -94,20 +180,33 @@ export function randomOpaqueToken(prefix: string, byteLength = 24): string {
 
 /**
  * Encrypts a secret using AES-256-GCM bound to AAD (e.g., "site_credentials:<id>").
- * Format: <version>:<iv_b64url>:<tag_b64url>:<ciphertext_b64url>
+ * Format: v3:<salt_b64url>:<iv_b64url>:<tag_b64url>:<ciphertext_b64url>
+ * (v1/v2 keep the 4-part `<version>:<iv>:<tag>:<ct>` shape).
  *
- * New ciphertexts are v2 (scrypt-derived key) by default. Callers may
- * still pass "v1" explicitly while a rotation is in flight — the
- * envelope version selects the key at decrypt time, so v1 and v2 rows
- * coexist safely. `ACTIVE_ENCRYPTION_KEY_VERSION` (env) is what the
- * auth-config callers pass; setting it to "v2" flips those writers.
+ * New ciphertexts are v3 (scrypt over a random per-envelope salt) by
+ * default. Callers may still pass "v1"/"v2" explicitly while a rotation
+ * is in flight — the envelope version selects the key at decrypt time,
+ * so v1, v2 and v3 rows coexist safely. `ACTIVE_ENCRYPTION_KEY_VERSION`
+ * (env) is what the auth-config callers pass; setting it to "v3" flips
+ * those writers too (its default is still "v2" — flip it once the v3
+ * decrypt path below is live everywhere).
  */
 export function encryptSecretAtRest(
   plaintext: string,
   masterSecret: string,
-  keyVersion = ENCRYPTION_KEY_VERSION_V2,
+  keyVersion = ENCRYPTION_KEY_VERSION_V3,
   aadContext = "stackmate"
 ): string {
+  if (keyVersion === ENCRYPTION_KEY_VERSION_V3) {
+    const salt = randomBytes(16);
+    const key = deriveEncryptionKeyV3(masterSecret, salt);
+    const iv = randomBytes(12);
+    const cipher = createCipheriv("aes-256-gcm", key, iv);
+    cipher.setAAD(Buffer.from(`${keyVersion}:${aadContext}`, "utf8"));
+    const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+    const authTag = cipher.getAuthTag();
+    return `${keyVersion}:${salt.toString("base64url")}:${iv.toString("base64url")}:${authTag.toString("base64url")}:${encrypted.toString("base64url")}`;
+  }
   const key = deriveEncryptionKey(masterSecret, keyVersion);
   const iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", key, iv);
@@ -118,9 +217,29 @@ export function encryptSecretAtRest(
 }
 
 /**
+ * Re-encryption path (audit F-07): decrypt a ciphertext of ANY
+ * version (v1/v2/v3) and re-encrypt it as v3 under the same master
+ * secret. This is the per-row step a migration / cron job runs over
+ * the secret-bearing tables (OAuth secrets, SMTP password, CAPI
+ * tokens, webhook secrets, site credentials, signing-key JWKs):
+ * read each row, call this, persist the new ciphertext. The v1/v2
+ * decrypt paths below must NOT be dropped until a sweep confirms zero
+ * v1/v2 rows remain — rotating ENCRYPTION_KEY_V1 without that sweep
+ * breaks every ciphertext the new secret cannot derive.
+ */
+export function reEncryptSecretAtRest(
+  encodedCiphertext: string,
+  masterSecret: string,
+  aadContext = "stackmate"
+): string {
+  const plaintext = decryptSecretAtRest(encodedCiphertext, masterSecret, aadContext);
+  return encryptSecretAtRest(plaintext, masterSecret, ENCRYPTION_KEY_VERSION_V3, aadContext);
+}
+
+/**
  * Decrypts a secret encrypted with encryptSecretAtRest.
  *
- * KEY ROTATION PROCEDURE (audit M-4):
+ * KEY ROTATION PROCEDURE (audit M-4, updated for v3 / F-07):
  * (1) Introduce the v2 derivation (scrypt, per-install salt) — done
  *     here; new writes default to v2.
  * (2) Dual-decrypt: try the key for the envelope's version first; on
@@ -135,6 +254,15 @@ export function encryptSecretAtRest(
  * (5) Rotate the master secret itself by re-encrypting every row under
  *     the new secret (same procedure, new secret value); the old secret
  *     stays readable until step (4) confirms zero v1 rows remain.
+ * (6) v3 (F-07): new writes default to v3 — scrypt over a RANDOM
+ *     per-envelope salt stored in the envelope (`v3:<salt>:<iv>:<tag>:
+ *     <ct>`), so two installs sharing a master secret no longer derive
+ *     the same key. `reEncryptSecretAtRest` above is the per-row step
+ *     for sweeping v1/v2 rows to v3 (OAuth secrets, SMTP password, CAPI
+ *     tokens, webhook secrets, site credentials, signing-key JWKs);
+ *     run it as a migration/job over those tables, then — and only
+ *     then — drop the v1/v2 decrypt paths. `needsReEncryption` tells a
+ *     sweep which rows are still pre-v3.
  */
 export function decryptSecretAtRest(
   encodedCiphertext: string,
@@ -142,6 +270,28 @@ export function decryptSecretAtRest(
   aadContext = "stackmate"
 ): string {
   const parts = encodedCiphertext.split(":");
+  if (parts.length === 5 && parts[0] === ENCRYPTION_KEY_VERSION_V3) {
+    const [, saltB64, ivB64, tagB64, dataB64] = parts as [
+      string,
+      string,
+      string,
+      string,
+      string,
+    ];
+    const salt = Buffer.from(saltB64, "base64url");
+    const iv = Buffer.from(ivB64, "base64url");
+    const authTag = Buffer.from(tagB64, "base64url");
+    const ciphertext = Buffer.from(dataB64, "base64url");
+    const decipher = createDecipheriv(
+      "aes-256-gcm",
+      deriveEncryptionKeyV3(masterSecret, salt),
+      iv
+    );
+    decipher.setAAD(Buffer.from(`${ENCRYPTION_KEY_VERSION_V3}:${aadContext}`, "utf8"));
+    decipher.setAuthTag(authTag);
+    const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    return decrypted.toString("utf8");
+  }
   if (parts.length !== 4) {
     throw new Error("Invalid encrypted secret format.");
   }
@@ -213,6 +363,42 @@ export function computeLicenseKeyVerifier(rawKey: string, verifierSecret: string
   return `v1:${digest}`;
 }
 
+/**
+ * License verifier, v2 (audit F-07): the HMAC key is HKDF-derived
+ * (deriveHmacKeyV2, purpose "license-verifier") instead of the single
+ * unsalted SHA-256 of v1. NEW licenses should be minted with this
+ * once the licensing lookup switches from equality on
+ * computeLicenseKeyVerifier to verifyLicenseKeyVerifier below — the
+ * lookup is an equality match, so minting v2 before the lookup
+ * understands it would orphan every new license. Until that switch,
+ * computeLicenseKeyVerifier (v1) stays the minter and this verifier
+ * accepts both.
+ */
+export function computeLicenseKeyVerifierV2(rawKey: string, verifierSecret: string): string {
+  const normalized = rawKey.trim().toUpperCase();
+  const digest = createHmac("sha256", deriveHmacKeyV2(verifierSecret, "license-verifier"))
+    .update(`stackmate-license-v2:${normalized}`, "utf8")
+    .digest("hex");
+  return `v2:${digest}`;
+}
+
+/** Constant-time check of a raw license key against a stored verifier (v1 or v2). */
+export function verifyLicenseKeyVerifier(
+  rawKey: string,
+  storedVerifier: string,
+  verifierSecret: string
+): boolean {
+  const expected = storedVerifier.startsWith("v2:")
+    ? computeLicenseKeyVerifierV2(rawKey, verifierSecret)
+    : storedVerifier.startsWith("v1:")
+      ? computeLicenseKeyVerifier(rawKey, verifierSecret)
+      : null;
+  if (expected === null) return false;
+  const a = Buffer.from(expected, "utf8");
+  const b = Buffer.from(storedVerifier, "utf8");
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 export function computeInstallationIdHash(licenseId: string, installationId: string): string {
   return createHash("sha256")
     .update(`${licenseId}:${installationId.trim()}`, "utf8")
@@ -234,10 +420,46 @@ export function issueCheckoutAccessToken(
   secret: string
 ): string {
   const bodyB64 = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
-  const sigB64 = createHmac("sha256", derive32ByteKey(secret))
+  // v2 key (F-07): HKDF-derived; the token format stays `smc_v1.*` so
+  // in-flight tokens and existing clients keep working, and the
+  // verifier below tries the HKDF key first, then the legacy
+  // single-SHA-256 key for tokens minted before this change (2h TTL,
+  // so the legacy fallback is dead once those expire).
+  const sigB64 = createHmac("sha256", deriveHmacKeyV2(secret, "checkout-token"))
     .update(`sm-checkout-v1.${bodyB64}`, "utf8")
     .digest("base64url");
   return `smc_v1.${bodyB64}.${sigB64}`;
+}
+
+/**
+ * Decode a checkout access token's payload WITHOUT verifying it
+ * (A-03 re-issue path: the idempotency record stores the token's
+ * payload — oid/ref/sid/exp, none of it secret — so a replay can
+ * re-issue a fresh token deterministically). NEVER trust the decoded
+ * payload for authorization; callers must verify with
+ * verifyCheckoutAccessToken before acting on it.
+ */
+export function decodeCheckoutAccessToken(token: string): CheckoutTokenPayload {
+  const parts = token.trim().split(".");
+  if (parts.length !== 3 || parts[0] !== "smc_v1") {
+    throw new AppError("CHECKOUT_TOKEN_INVALID", "Invalid checkout access token.", 401);
+  }
+  try {
+    const parsed = JSON.parse(
+      Buffer.from(parts[1]!, "base64url").toString("utf8")
+    ) as CheckoutTokenPayload;
+    if (
+      typeof parsed.oid !== "string" ||
+      typeof parsed.ref !== "string" ||
+      typeof parsed.sid !== "string" ||
+      typeof parsed.exp !== "number"
+    ) {
+      throw new Error("bad payload shape");
+    }
+    return parsed;
+  } catch {
+    throw new AppError("CHECKOUT_TOKEN_INVALID", "Invalid checkout access token.", 401);
+  }
 }
 
 export function verifyCheckoutAccessToken(
@@ -251,13 +473,20 @@ export function verifyCheckoutAccessToken(
   }
   const bodyB64 = parts[1]!;
   const presentedSig = Buffer.from(parts[2]!, "base64url");
-  const expectedSig = createHmac("sha256", derive32ByteKey(secret))
-    .update(`sm-checkout-v1.${bodyB64}`, "utf8")
-    .digest();
-
+  const sigMatches = (key: Buffer): boolean => {
+    const expectedSig = createHmac("sha256", key)
+      .update(`sm-checkout-v1.${bodyB64}`, "utf8")
+      .digest();
+    return (
+      presentedSig.length === expectedSig.length &&
+      timingSafeEqual(presentedSig, expectedSig)
+    );
+  };
+  // HKDF key first (all tokens minted after F-07); legacy SHA-256 key
+  // second (tokens minted before, still inside their 2h TTL).
   if (
-    presentedSig.length !== expectedSig.length ||
-    !timingSafeEqual(presentedSig, expectedSig)
+    !sigMatches(deriveHmacKeyV2(secret, "checkout-token")) &&
+    !sigMatches(derive32ByteKey(secret))
   ) {
     throw new AppError("CHECKOUT_TOKEN_INVALID", "Invalid checkout access token signature.", 401);
   }
@@ -367,11 +596,23 @@ export function verifyEntitlementJws(
     throw new AppError("LICENSE_INVALID", "Malformed JWS entitlement token.", 401);
   }
   const [headerB64, payloadB64, sigB64] = parts as [string, string, string];
-  const header = JSON.parse(Buffer.from(headerB64, "base64url").toString("utf8")) as {
-    alg: string;
-    typ: string;
-    kid: string;
-  };
+  // A-15: both JSON parses are wrapped — a malformed header/payload
+  // is a LICENSE_INVALID (401), never a latent 500 oracle. (Sibling
+  // readEntitlementJwsKid already wrapped its parse; this function did
+  // not, and no route calls it yet — fix before wiring it to a route.)
+  let header: { alg: string; typ: string; kid: string };
+  try {
+    header = JSON.parse(Buffer.from(headerB64, "base64url").toString("utf8")) as {
+      alg: string;
+      typ: string;
+      kid: string;
+    };
+  } catch {
+    throw new AppError("LICENSE_INVALID", "Malformed JWS entitlement token header.", 401);
+  }
+  if (!header || typeof header !== "object" || typeof header.alg !== "string") {
+    throw new AppError("LICENSE_INVALID", "Malformed JWS entitlement token header.", 401);
+  }
   if (header.alg !== "EdDSA") {
     throw new AppError("LICENSE_INVALID", `Unsupported JWS algorithm '${header.alg}'.`, 401);
   }
@@ -390,9 +631,15 @@ export function verifyEntitlementJws(
     throw new AppError("LICENSE_INVALID", "Entitlement JWS signature verification failed.", 401);
   }
 
-  const claims = JSON.parse(
-    Buffer.from(payloadB64, "base64url").toString("utf8")
-  ) as EntitlementTokenClaims;
+  let claims: EntitlementTokenClaims;
+  try {
+    claims = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8")) as EntitlementTokenClaims;
+  } catch {
+    throw new AppError("LICENSE_INVALID", "Malformed JWS entitlement token payload.", 401);
+  }
+  if (!claims || typeof claims !== "object" || typeof claims.exp !== "number" || typeof claims.nbf !== "number") {
+    throw new AppError("LICENSE_INVALID", "Malformed JWS entitlement token payload.", 401);
+  }
 
   const now = options?.nowUnixSeconds ?? Math.floor(Date.now() / 1000);
   const skew = options?.clockSkewSeconds ?? 60;

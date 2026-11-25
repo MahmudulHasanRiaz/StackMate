@@ -10,6 +10,7 @@
  */
 import { randomUUID } from "node:crypto";
 import {
+  ALLOWED_TRACKING_EVENTS,
   ConfigureSiteTrackingSchema,
   CreateTrackingConfigSchema,
   IngestTrackingEventSchema,
@@ -500,4 +501,146 @@ export async function ingestExternalTrackingEvent(
       status: eventRecord.status,
     };
   });
+}
+
+/* ------------------------------------------------------------------ */
+/* E-18: test-event sender (PRD §15.6; API spec §17.5)                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Send a synthetic test event through the NORMAL ingest pipeline
+ * (same dedup, consent, enabled-events, and outbox-enqueue path as a
+ * real external event — never a side channel), with the pixel group's
+ * test code attached so Meta's Test Events tool can verify the
+ * deduplication policy end to end before production traffic.
+ *
+ * The test code rides on the stored tracking event's
+ * `sanitized_payload` (`test_event_code` + `test_event: true`) so the
+ * CAPI drain (Worker B) can forward it to `deliverMetaCapiEvent`.
+ * `Purchase` stays forbidden here exactly as in external ingest: only
+ * server-verified payment approval may emit a Purchase.
+ *
+ * Dual-key note (expense hotfix pattern): the admin client sends
+ * snake_case; a camelCase body is accepted too and normalized here,
+ * so a client that sends both casings never trips the contracts
+ * validator's unknown-key rejection downstream.
+ */
+export async function sendTrackingTestEvent(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  rawInput: unknown,
+  requestId: string
+): Promise<{
+  accepted: boolean;
+  deduplicated: boolean;
+  tracking_event_id: string | null;
+  status: string;
+  pixel_group_id: string;
+  event_name: string;
+  test_event_code: string | null;
+}> {
+  assertStaffPermission(actor, "tracking.manage");
+  const raw = (rawInput ?? {}) as Record<string, unknown>;
+  const pixelGroupId =
+    typeof raw.pixel_group_id === "string"
+      ? raw.pixel_group_id
+      : typeof raw.pixelGroupId === "string"
+        ? raw.pixelGroupId
+        : null;
+  const eventName =
+    typeof raw.event_name === "string"
+      ? raw.event_name
+      : typeof raw.eventName === "string"
+        ? raw.eventName
+        : null;
+  if (!pixelGroupId) {
+    throw new AppError("VALIDATION_ERROR", "pixel_group_id is required.", 422);
+  }
+  if (!eventName || !(ALLOWED_TRACKING_EVENTS as readonly string[]).includes(eventName)) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      `event_name must be one of: ${ALLOWED_TRACKING_EVENTS.join(", ")}.`,
+      422
+    );
+  }
+
+  const group = store.state.tracking_configurations.find((tc) => tc.id === pixelGroupId);
+  if (!group) throw new AppError("NOT_FOUND", "Tracking configuration not found.", 404);
+  if (group.status !== "enabled") {
+    throw new AppError(
+      "CONFLICT",
+      `Pixel group is '${group.status}': enable it before sending a test event.`,
+      409
+    );
+  }
+  if (!group.enabled_events.includes(eventName)) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      `Tracking event '${eventName}' is not enabled for this pixel group.`,
+      422
+    );
+  }
+
+  const site = store.state.integrated_sites.find((s) => s.id === group.integrated_site_id);
+  if (!site) throw new AppError("NOT_FOUND", "Integrated site not found.", 404);
+  if (site.status !== "active") {
+    throw new AppError("CONFLICT", `Integrated site is '${site.status}'.`, 409);
+  }
+  const primaryDomain =
+    site.domains.find((d) => d.is_primary)?.domain ?? site.domains[0]?.domain ?? null;
+  if (!primaryDomain) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "Integrated site has no domain to use as the test event_source_url.",
+      422
+    );
+  }
+
+  // Normal pipeline: ingestExternalTrackingEvent enforces the Purchase
+  // ban, dedup, and outbox enqueue. A random event_id guarantees this
+  // synthetic event is never deduplicated against real traffic.
+  const result = await ingestExternalTrackingEvent(store, site.site_key, {
+    event_name: eventName,
+    event_id: `test_${randomUUID()}`,
+    event_time: new Date().toISOString(),
+    event_source_url: `https://${primaryDomain}`,
+    action_source: "system_generated",
+    consent: { status: "granted", policy_version: "test" },
+  });
+
+  if (result.tracking_event_id) {
+    await store.withTransaction((state) => {
+      const record = state.tracking_events.find((t) => t.id === result.tracking_event_id);
+      if (record) {
+        record.sanitized_payload = {
+          ...record.sanitized_payload,
+          test_event: true,
+          test_event_code: group.test_event_code ?? null,
+        };
+      }
+      appendAuditLog(state, {
+        actor_type: "staff",
+        actor_user_id: actor.user.id,
+        action: "tracking.test_event.sent",
+        resource_type: "tracking_configuration",
+        resource_id: group.id,
+        outcome: "success",
+        request_id: requestId,
+        changes: {
+          site_id: site.id,
+          provider: group.provider,
+          pixel_id: group.pixel_id,
+          event_name: eventName,
+          tracking_event_id: result.tracking_event_id,
+        },
+      });
+    });
+  }
+
+  return {
+    ...result,
+    pixel_group_id: group.id,
+    event_name: eventName,
+    test_event_code: group.test_event_code ?? null,
+  };
 }

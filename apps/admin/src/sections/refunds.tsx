@@ -14,7 +14,7 @@
  *    (server ?q= matches id / payment_transaction_id / reason /
  *    provider_refund_id; pagedCollectionResponse)
  */
-import { useState } from "react";
+import { useState, useMemo} from "react";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
 import type { ColumnDef } from "@tanstack/react-table";
 import { ClipboardCheck } from "lucide-react";
@@ -77,64 +77,67 @@ export function RefundsSection() {
     pageSize: parsed.pageSize,
   });
 
-  const columns: ColumnDef<PaymentRefund, unknown>[] = [
-    {
-      accessorKey: "id",
-      header: "Refund",
-      cell: ({ row }) => (
-        <span>
-          <span className="sm-mono">{shortId(row.original.id)}</span>
-          <CopyButton value={row.original.id} label="Copy refund ID" />
-        </span>
-      ),
-    },
-    {
-      accessorKey: "payment_transaction_id",
-      header: "Transaction",
-      cell: ({ row }) => (
-        <span className="sm-mono">{shortId(row.original.payment_transaction_id)}</span>
-      ),
-    },
-    {
-      accessorKey: "amount_minor",
-      header: "Amount",
-      cell: ({ row }) => (
-        <MoneyCell currency={row.original.currency_code} minor={row.original.amount_minor} />
-      ),
-    },
-    {
-      accessorKey: "status",
-      header: "Status",
-      cell: ({ row }) => <StatusBadge status={row.original.status} />,
-    },
-    {
-      accessorKey: "reason",
-      header: "Reason",
-      cell: ({ row }) => <span className="sm-cell-text">{row.original.reason}</span>,
-    },
-    {
-      accessorKey: "provider_refund_id",
-      header: "Provider ref",
-      cell: ({ row }) => (
-        <span className="sm-mono">{row.original.provider_refund_id ?? "—"}</span>
-      ),
-    },
-    {
-      accessorKey: "created_at",
-      header: "Created",
-      cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
-    },
-    {
-      id: "actions",
-      header: "",
-      enableSorting: false,
-      cell: ({ row }) => (
-        <Button variant="ghost" size="sm" onClick={() => setSelected(row.original)}>
-          View
-        </Button>
-      ),
-    },
-  ];
+  const columns: ColumnDef<PaymentRefund, unknown>[] = useMemo(
+    () => [
+      {
+        accessorKey: "id",
+        header: "Refund",
+        cell: ({ row }) => (
+          <span>
+            <span className="sm-mono">{shortId(row.original.id)}</span>
+            <CopyButton value={row.original.id} label="Copy refund ID" />
+          </span>
+        ),
+      },
+      {
+        accessorKey: "payment_transaction_id",
+        header: "Transaction",
+        cell: ({ row }) => (
+          <span className="sm-mono">{shortId(row.original.payment_transaction_id)}</span>
+        ),
+      },
+      {
+        accessorKey: "amount_minor",
+        header: "Amount",
+        cell: ({ row }) => (
+          <MoneyCell currency={row.original.currency_code} minor={row.original.amount_minor} />
+        ),
+      },
+      {
+        accessorKey: "status",
+        header: "Status",
+        cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      },
+      {
+        accessorKey: "reason",
+        header: "Reason",
+        cell: ({ row }) => <span className="sm-cell-text">{row.original.reason}</span>,
+      },
+      {
+        accessorKey: "provider_refund_id",
+        header: "Provider ref",
+        cell: ({ row }) => (
+          <span className="sm-mono">{row.original.provider_refund_id ?? "—"}</span>
+        ),
+      },
+      {
+        accessorKey: "created_at",
+        header: "Created",
+        cell: ({ row }) => <DateTimeCell value={row.original.created_at} />,
+      },
+      {
+        id: "actions",
+        header: "",
+        enableSorting: false,
+        cell: ({ row }) => (
+          <Button variant="ghost" size="sm" onClick={() => setSelected(row.original)}>
+            View
+          </Button>
+        ),
+      },
+  ],
+    [],
+  )
 
   return (
     <section aria-labelledby="refunds-heading">

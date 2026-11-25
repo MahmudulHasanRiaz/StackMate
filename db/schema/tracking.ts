@@ -96,6 +96,9 @@ export const trackingDeliveries = pgTable("tracking_deliveries", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 },
 (table) => [
+  // Migration 0021 (audit C-02): delivery history is read per
+  // tracking event; event deletes scan the child table.
+  index("idx_tracking_deliveries_event_id").on(table.trackingEventId),
   check("tracking_deliveries_status_check", sql`"status" IN ('pending', 'delivered', 'retrying', 'failed', 'skipped')`),
 ]);
 

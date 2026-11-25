@@ -53,6 +53,7 @@ import {
   TableSkeleton,
   useConfirm,
   useToast,
+  GroupField,
 } from "../components/primitives";
 import { mediaKindIcon } from "../components/media-picker";
 import {
@@ -840,7 +841,7 @@ function UploadDialog({
   return (
     <Dialog open={open} onClose={onClose} title="Upload files" size="md">
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        <Field label="Files">
+        <GroupField label="Files">
           <div
             className={`sm-media-dropzone${dragOver ? " sm-media-dropzone-over" : ""}`}
             role="button"
@@ -886,7 +887,7 @@ function UploadDialog({
               e.target.value = "";
             }}
           />
-        </Field>
+        </GroupField>
         {files.length > 0 ? (
           <ul className="sm-media-upload-list">
             {files.map((file, i) => {
@@ -959,7 +960,7 @@ function UploadDialog({
             />
           ) : null}
         </Field>
-        <Field label="Tags">
+        <GroupField label="Tags">
           {tags.length > 0 ? (
             <span className="sm-media-tag-chips">
               {tags.map((tag) => (
@@ -998,8 +999,8 @@ function UploadDialog({
             autoComplete="off"
             aria-label="Add a tag"
           />
-        </Field>
-        <div className="sm-dialog-footer" style={{ padding: 0, border: 0 }}>
+        </GroupField>
+        <div className="sm-dialog-footer sm-dialog-footer-flush">
           <Button type="button" variant="secondary" onClick={onClose} disabled={uploading}>
             Cancel
           </Button>
@@ -1042,7 +1043,7 @@ function RenameDialog({
         <Field label="Filename" htmlFor="rename-filename">
           <Input id="rename-filename" name="filename" value={name} onChange={(e) => setName(e.target.value)} autoComplete="off" />
         </Field>
-        <div className="sm-dialog-footer" style={{ padding: 0, border: 0 }}>
+        <div className="sm-dialog-footer sm-dialog-footer-flush">
           <Button type="button" variant="secondary" onClick={onClose} disabled={pending}>
             Cancel
           </Button>
@@ -1096,7 +1097,7 @@ function MoveDialog({
             ))}
           </datalist>
         </Field>
-        <div className="sm-dialog-footer" style={{ padding: 0, border: 0 }}>
+        <div className="sm-dialog-footer sm-dialog-footer-flush">
           <Button type="button" variant="secondary" onClick={onClose} disabled={pending}>
             Cancel
           </Button>
@@ -1142,7 +1143,7 @@ function TagsDialog({
             autoComplete="off"
           />
         </Field>
-        <div className="sm-dialog-footer" style={{ padding: 0, border: 0 }}>
+        <div className="sm-dialog-footer sm-dialog-footer-flush">
           <Button type="button" variant="secondary" onClick={onClose} disabled={pending}>
             Cancel
           </Button>
