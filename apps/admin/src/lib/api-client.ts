@@ -483,7 +483,6 @@ export async function createExpenseCategory(
       color: body.color ?? null,
       icon: body.icon ?? null,
       is_active: body.isActive ?? true,
-      isActive: body.isActive ?? true,
     }),
   });
   return normalizeExpenseCategory(res);
@@ -500,7 +499,6 @@ export async function updateExpenseCategory(
   if (body.icon !== undefined) payload.icon = body.icon;
   if (body.isActive !== undefined) {
     payload.is_active = body.isActive;
-    payload.isActive = body.isActive;
   }
   const res = await apiRequest<unknown>(`/api/v1/admin/expense-categories/${id}`, {
     method: "PATCH",
@@ -552,20 +550,17 @@ export async function fetchExpenses(
 function expenseWriteBody(body: ExpenseInput): Record<string, unknown> {
   return {
     amountMinor: body.amountMinor,
-    amount_minor: body.amountMinor,
     expenseDate: body.expenseDate,
-    expense_date: body.expenseDate,
     categoryId: body.categoryId,
-    category_id: body.categoryId,
-    ...(body.productId ? { productId: body.productId, product_id: body.productId } : { productId: null, product_id: null }),
+    ...(body.productId ? { productId: body.productId } : { productId: null }),
     ...(body.paymentMethodId
-      ? { paymentMethodId: body.paymentMethodId, payment_method_id: body.paymentMethodId }
-      : { paymentMethodId: null, payment_method_id: null }),
+      ? { paymentMethodId: body.paymentMethodId }
+      : { paymentMethodId: null }),
     ...(body.vendor !== undefined ? { vendor: body.vendor } : {}),
     ...(body.notes !== undefined ? { notes: body.notes } : {}),
     ...(body.receiptMediaId
-      ? { receiptMediaId: body.receiptMediaId, receipt_media_id: body.receiptMediaId }
-      : { receiptMediaId: null, receipt_media_id: null }),
+      ? { receiptMediaId: body.receiptMediaId }
+      : { receiptMediaId: null }),
   };
 }
 
