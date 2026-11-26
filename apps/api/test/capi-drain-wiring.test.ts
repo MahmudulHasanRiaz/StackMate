@@ -342,7 +342,10 @@ describe("E-01 CAPI drain wiring", () => {
       capiDeliver: capiDeliver(
         mockFetch(calls, {
           status: 400,
-          json: { error: { message: "Invalid OAuth access token", code: 190 } },
+          json: {
+            error: { message: "Invalid OAuth access token", code: 190 },
+            fbtrace_id: "trace-400",
+          },
         })
       ),
     });
@@ -357,7 +360,59 @@ describe("E-01 CAPI drain wiring", () => {
     )!;
     assert.equal(outbox.status as string, "pending");
     assert.equal(outbox.attempt_count, 1);
-    assert.equal(outbox.last_error_code, "CAPI_rejected");
+    // E-01 diagnostic fix: the recorded error must carry Meta's REAL
+    // detail (HTTP status + message + fbtrace), not bare CAPI_rejected.
+    assert.equal(
+      outbox.last_error_code,
+      "CAPI_rejected (HTTP 400: Meta error 190: Invalid OAuth access token) [fbtrace: trace-400]"
+    );
+    const track = store.state.tracking_events.find((t) => t.id === trackId)!;
+    assert.equal(track.status as string, "queued");
+    assert.equal(track.delivered_at, null);
+  });
+
+  it("Meta 2xx but 0 events received → rejected with HTTP status + message + fbtrace", async () => {
+    const site = seedSiteWithDomain("test.example.com");
+    seedMetaGroup(site.id);
+    const trackId = seedTrackingEvent({
+      integrated_site_id: site.id,
+      event_id: "purchase_ORD-10006",
+      sanitized_payload: { currency: "BDT", value_minor: 25000 },
+    });
+    store.state.outbox_events.push(
+      outboxRow({
+        event_type: "tracking.meta_capi.dispatch",
+        payload: { tracking_event_id: trackId },
+      })
+    );
+
+    const calls: CapturedCall[] = [];
+    const result = await processTransactionalOutboxBatch(store, {
+      workerId: "test-capi-zero-events",
+      encryptionKey: TEST_KEY,
+      capiDeliver: capiDeliver(
+        mockFetch(calls, {
+          status: 200,
+          json: { events_received: 0, fbtrace_id: "trace-zero" },
+        })
+      ),
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(result.retrying, 1);
+    assert.equal(result.delivered, 0);
+    const outbox = store.state.outbox_events.find(
+      (e) => e.payload.tracking_event_id === trackId
+    )!;
+    assert.equal(outbox.status as string, "pending");
+    assert.equal(outbox.attempt_count, 1);
+    // E-01 diagnostic fix: a 2xx that took 0 events is a rejection
+    // whose cause must be visible — HTTP 200 + Meta's message +
+    // fbtrace, still prefixed CAPI_rejected.
+    assert.equal(
+      outbox.last_error_code,
+      "CAPI_rejected (HTTP 200: Meta accepted the request but received 0 events.) [fbtrace: trace-zero]"
+    );
     const track = store.state.tracking_events.find((t) => t.id === trackId)!;
     assert.equal(track.status as string, "queued");
     assert.equal(track.delivered_at, null);

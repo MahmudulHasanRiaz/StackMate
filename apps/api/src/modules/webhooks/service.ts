@@ -46,6 +46,7 @@ import { appendAuditLog } from "../audit/service.ts";
 import { assertStaffPermission, type StaffPrincipal } from "../identity/service.ts";
 import {
   deliverMetaCapiEvent,
+  type MetaCapiDeliveryResult,
   type MetaCapiEnv,
   type MetaCapiEventInput,
   type MetaCapiOptions,
@@ -965,12 +966,54 @@ export interface CapiDeliveryResult {
   delivered: boolean;
   status: string;
   diagnostics?: unknown;
+  /**
+   * Sanitized Meta error detail for the outbox `last_error_code`
+   * (HTTP status + Meta's message + fbtrace_id), or null when the
+   * delivery succeeded or was skipped. The adapter already captures
+   * this (no access token, no raw PII); without it a rejection was
+   * recorded as bare `CAPI_rejected` and could not be diagnosed.
+   */
+  error?: string | null;
 }
 
 /** Batch 4 Meta CAPI delivery (modules/tracking/capi.ts). */
 export type CapiDeliverFn = (
   input: CapiDeliveryInput
 ) => Promise<CapiDeliveryResult>;
+
+/**
+ * Format Meta's real error detail for the outbox `last_error_code`.
+ *
+ * The drain used to record only `CAPI_<status>` — the live E-01 probe
+ * failed 5x with bare "CAPI_rejected" and no one could tell whether
+ * Meta refused the token, the pixel, the payload, or took 0 events.
+ * The adapter already captures the real detail, sanitized (no access
+ * token, no raw PII): HTTP status, Meta's error message, fbtrace_id.
+ * This formats it compactly so it fits the 100-char `last_error_code`
+ * column, e.g.:
+ * ` (HTTP 400: Meta error 190: Invalid OAuth access token) [fbtrace: AbC…]`
+ * The fbtrace suffix is reserved first so it survives truncation; the
+ * message part is cut to fit the remaining budget.
+ */
+function formatCapiErrorDetail(
+  result: MetaCapiDeliveryResult,
+  status: string
+): string {
+  const message = result.error ?? result.messages[0] ?? null;
+  const fbtraceSuffix = result.fbtrace_id ? ` [fbtrace: ${result.fbtrace_id}]` : "";
+  const head =
+    result.http_status !== null
+      ? ` (HTTP ${result.http_status}${message ? `: ${message}` : ""})`
+      : message
+        ? ` (${message})`
+        : "";
+  if (!head && !fbtraceSuffix) return "";
+  // `CAPI_<status>` + detail must fit the varchar(100) column.
+  const budget = Math.max(0, 100 - `CAPI_${status}`.length);
+  const headBudget = Math.max(0, budget - fbtraceSuffix.length);
+  const headTruncated = head.length > headBudget ? head.slice(0, headBudget) : head;
+  return `${headTruncated}${fbtraceSuffix}`.slice(0, budget);
+}
 
 /**
  * E-01: build the `capiDeliver` the outbox drain needs — the missing
@@ -1082,6 +1125,10 @@ export function createCapiDeliver(
       delivered: result.delivered,
       status: result.status,
       diagnostics: result.diagnostics,
+      // E-01 diagnostic fix: carry Meta's real error detail so the
+      // drain can record it (HTTP status + message + fbtrace) instead
+      // of a bare `CAPI_<status>` that cannot be diagnosed.
+      error: result.delivered ? null : formatCapiErrorDetail(result, result.status),
     };
   };
 }
@@ -1232,7 +1279,14 @@ export async function processTransactionalOutboxBatch(
           if (result.status === "skipped") {
             capiSkipped = true;
           } else if (!result.delivered) {
-            throw new Error(`CAPI_${result.status}`);
+            // E-01 diagnostic fix: append Meta's real error detail
+            // (HTTP status + message + fbtrace, from
+            // `createCapiDeliver`) so the recorded `last_error_code`
+            // says WHY Meta refused, not just `CAPI_<status>`. The
+            // `CAPI_<status>` prefix is kept so existing error-code
+            // matching still works. Retry/dead-letter behaviour is
+            // unchanged — only the error text changes.
+            throw new Error(`CAPI_${result.status}${result.error ?? ""}`);
           } else {
             capiDelivered = true;
           }
@@ -1398,7 +1452,11 @@ export async function processTransactionalOutboxBatch(
       if (eventSimulated) return "simulated";
       return "delivered";
     } catch (err) {
-      const errorCode = (err as Error).message.slice(0, 80) || "DELIVERY_FAILED";
+      // E-01 diagnostic fix: slice to 100, the `last_error_code`
+      // varchar(100) column width — the old 80-char cap cut off the
+      // Meta error detail the drain now records. `CAPI_<status>` +
+      // detail is formatted to fit 100 chars upstream.
+      const errorCode = (err as Error).message.slice(0, 100) || "DELIVERY_FAILED";
       let deadLettered = false;
       await store.withTransaction((state) => {
         const target = state.outbox_events.find((e) => e.id === ev.id);
