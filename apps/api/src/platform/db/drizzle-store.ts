@@ -828,6 +828,18 @@ export class DrizzleStore extends StackMateDataStore {
    */
   public usesInMemoryBucket = false;
   /**
+   * B-01: true when this store was built by `createTargeted()` — its
+   * `state` holds ONLY the in-memory seed rows (roles, payment
+   * providers) and was never full-loaded. Handlers on such a store
+   * MUST use the targeted methods (`findStaffPrincipalByEmail`,
+   * `findLicenseForValidation`, …) and must never read `store.state`
+   * for database rows. `false` for `create()` stores. See
+   * `isStateFresh` below for why the flag changes reload behaviour,
+   * and `platform/db/targeted-routes.ts` for the allowlist contract
+   * that decides which requests get a targeted store.
+   */
+  public targetedOnly = false;
+  /**
    * True: this store loads + persists staff_invitations (migration 0005
    * wiring). The identity service probes this flag
    * (storePersistsStaffInvitations) and fail-closes with 503 on a
@@ -996,6 +1008,7 @@ export class DrizzleStore extends StackMateDataStore {
     const drizzleDb = drizzle(pgClient, { schema });
     const store = new DrizzleStore(pgClient, drizzleDb);
     try {
+      store.targetedOnly = true;
       store.capabilities = await detectCapabilitiesCached(
         opts.connectionString,
         pgClient
@@ -1015,6 +1028,43 @@ export class DrizzleStore extends StackMateDataStore {
       throw error;
     }
     return store;
+  }
+
+  /**
+   * B-01: a targeted store NEVER reloads full state implicitly.
+   *
+   * `reloadStateIfPossible` (identity service, used by
+   * `resolveStaffPrincipal` in the `authContext` middleware path)
+   * calls `loadState()` whenever `isStateFresh()` is false — and on
+   * a targeted store the base implementation is ALWAYS false
+   * (`loadedAtMs` is set only by `loadStateInternal`, which
+   * `createTargeted` never runs). Without this override, the
+   * principal fallback — a valid session whose user is missing or
+   * suspended, so the targeted fast path (`findStaffPrincipalFast`)
+   * returns null — would silently pay a full ~65-table load on an
+   * allowlisted route, defeating B-01 for exactly the requests the
+   * switch was built for.
+   *
+   * A targeted store reports fresh because its reads ARE fresh by
+   * construction: every targeted method queries Postgres directly,
+   * so there is nothing stale to reload. The post-reload
+   * `store.state` reads in `resolveStaffPrincipal` then see the
+   * (empty) seed state — but the fast path already ran the
+   * authoritative targeted lookup and found nothing, so the outcome
+   * is identical (null principal for a missing/suspended user).
+   *
+   * Consequence, by design: code that NEEDS populated state after
+   * `reloadStateIfPossible` (sign-in, 2FA recovery — both read
+   * `store.state.users` after it) can NEVER run on a targeted store.
+   * That is the allowlist contract in
+   * `platform/db/targeted-routes.ts`: such routes can never earn an
+   * entry. A DIRECT `loadState()` call still performs a full load
+   * (explicit escape hatch, untouched) — only the implicit reload
+   * is suppressed.
+   */
+  public override isStateFresh(_maxAgeMs = 30_000): boolean {
+    if (this.targetedOnly) return true;
+    return super.isStateFresh(_maxAgeMs);
   }
 
   /**

@@ -1188,6 +1188,65 @@ export class StackMateDataStore {
   }
 
   /**
+   * B-01 targeted reads — IN-MEMORY ONLY in this base class: the
+   * record is found by scanning this store's own state (the in-memory
+   * store holds its whole dataset locally, so there is no load to
+   * avoid). DrizzleStore overrides each with the targeted-SQL version,
+   * which runs 1–7 queries and never loads full state. Routes call
+   * these unconditionally, so the same handler is safe on a full
+   * store, a targeted store, and the in-memory store.
+   *
+   * The filters mirror the Drizzle versions exactly:
+   * findLicenseForValidation returns the license row by key hash plus
+   * its product code and underlying subscription status;
+   * findIntegratedSiteByKey returns the site row by site key;
+   * loadPublicCatalog returns active products, all product features,
+   * active packages, published versions, and active prices.
+   *
+   * The license returned here is the LIVE state record (the Drizzle
+   * version returns a detached copy): targeted license validation
+   * uses that to record the activation heartbeat in-memory when no
+   * database client exists.
+   */
+  public async findLicenseForValidation(
+    keyHash: string
+  ): Promise<{
+    license: LicenseRecord;
+    productCode: string;
+    subscriptionStatus: string | null;
+  } | null> {
+    const license = this.state.licenses.find((l) => l.license_key_hash === keyHash);
+    if (!license) return null;
+    const productCode =
+      this.state.products.find((p) => p.id === license.product_id)?.code ?? "";
+    const subscriptionStatus = license.subscription_id
+      ? (this.state.subscriptions.find((s) => s.id === license.subscription_id)?.status ??
+        null)
+      : null;
+    return { license, productCode, subscriptionStatus };
+  }
+
+  public async findIntegratedSiteByKey(siteKey: string): Promise<IntegratedSiteRecord | null> {
+    return this.state.integrated_sites.find((s) => s.site_key === siteKey) ?? null;
+  }
+
+  public async loadPublicCatalog(): Promise<{
+    products: ProductRecord[];
+    product_features: ProductFeatureRecord[];
+    product_packages: ProductPackageRecord[];
+    package_versions: PackageVersionRecord[];
+    package_prices: PackagePriceRecord[];
+  }> {
+    return {
+      products: this.state.products.filter((p) => p.status === "active"),
+      product_features: [...this.state.product_features],
+      product_packages: this.state.product_packages.filter((pkg) => pkg.status === "active"),
+      package_versions: this.state.package_versions.filter((v) => v.status === "published"),
+      package_prices: this.state.package_prices.filter((pr) => pr.status === "active"),
+    };
+  }
+
+  /**
    * Executes an atomic, serialized transaction with snapshot rollback on error.
    * Simulates PostgreSQL transaction isolation & row-level `SELECT ... FOR UPDATE` locking.
    */

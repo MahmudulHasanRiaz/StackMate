@@ -18,13 +18,15 @@
 import { formatDisplayDateDDMMYYYY } from "../../../../../packages/contracts/src/index.ts";
 import { AppError } from "../../shared/errors.ts";
 import { assertStaffPermissionAudited } from "../../modules/identity/service.ts";
+import { listOrders } from "../../modules/orders/list.ts";
 import { saveOrderAsPackage } from "../../modules/catalog/service.ts";
 import { computeOrderPaid, computeOrderRemaining } from "../../modules/customers/service.ts";
 import { cancelOrderByAdmin, completeOrderByAdmin, createOrderByAdmin } from "../../modules/commerce/service.ts";
 import { Hono } from "hono";
 import type { AppEnv } from "../../types/context.ts";
-import { jsonResponse, pagedCollectionResponse, parseListQuery, parseTimestampSort, sortByTimestamp, includesQuery, readJsonBody, readJsonBodyLenient } from "../../shared/http.ts";
+import { collectionResponse, jsonResponse, parseListQuery, parseTimestampSort, readJsonBody, readJsonBodyLenient } from "../../shared/http.ts";
 import { runIdempotentCommand } from "../../shared/idempotency.ts";
+
 export function registerAdminOrdersRoutes(app: Hono<AppEnv>): void {
   app.get("/api/v1/admin/orders", async (c) => {
     const store = c.var.store;
@@ -45,38 +47,32 @@ export function registerAdminOrdersRoutes(app: Hono<AppEnv>): void {
     // order picker. Unknown params are ignored.
     const openOnly = url.searchParams.get("open_only") === "true";
     const { q, limit, page } = parseListQuery(url.searchParams);
-    const filteredOrders = store.state.orders
-      .filter((o) => (!statusFilter ? true : o.payment_status === statusFilter))
-      .filter((o) => (!openOnly ? true : computeOrderRemaining(store.state, o) > 0))
-      .filter(
-        (o) =>
-          includesQuery(o.order_number, q) ||
-          includesQuery(o.public_reference, q) ||
-          includesQuery(
-            store.state.customers.find((c) => c.id === o.customer_id)?.name,
-            q,
-          ),
-      );
-    // Dashboard ordering: sort BEFORE the ?limit=100 window slices,
-    // otherwise the newest rows past 100 never reach the client
-    // (the dashboard panels sort client-side over the loaded set).
-    const items = sortByTimestamp(
-      filteredOrders,
-      "created_at",
-      parseTimestampSort(url.searchParams, "created_at"),
-    ).map((o) => ({
+    const { items, total } = await listOrders(store, {
+      q,
+      limit,
+      page,
+      paymentStatus: statusFilter,
+      openOnly,
+      sort: parseTimestampSort(url.searchParams, "created_at"),
+    });
+    return collectionResponse(
+      c,
+      items.map(({ order: o, customer, paid_amount_minor, remaining_minor }) => ({
         ...o,
-        customer: store.state.customers.find((c) => c.id === o.customer_id) ?? null,
+        customer,
         // Paid/remaining are computed from verified payments
         // (ADR-0009) — never denormalized, so they cannot drift.
-        paid_amount_minor: computeOrderPaid(store.state, o.id),
-        remaining_minor: computeOrderRemaining(store.state, o),
+        paid_amount_minor,
+        remaining_minor,
         created_date_display: formatDisplayDateDDMMYYYY(
           o.created_at,
           env.DEFAULT_TIMEZONE,
         ),
-      }));
-    return pagedCollectionResponse(c, items, limit, page);
+      })),
+      null,
+      200,
+      total,
+    );
   });
   app.post("/api/v1/admin/orders", async (c) => {
     const store = c.var.store;

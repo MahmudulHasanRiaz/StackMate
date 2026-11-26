@@ -303,7 +303,14 @@ export async function ensureRequestStore(
   }
   let store: StackMateDataStore;
   try {
-    store = await factory(env);
+    // B-01: pass the request pathname so the factory can decide
+    // between a full-load store and a targeted store (allowlisted
+    // routes only — `platform/db/targeted-routes.ts`). The factory
+    // decides; this call site never branches on the path itself.
+    // `ctx` is not available here (Hono's execution context is not
+    // forwarded to middleware), so the second arg stays undefined —
+    // the factory type keeps it optional and backward compatible.
+    store = await factory(env, undefined, { path: c.req.path });
   } catch (error) {
     console.error(
       "[stackmate] store creation failed",

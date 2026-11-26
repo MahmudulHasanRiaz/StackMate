@@ -23,6 +23,11 @@ import {
   type StaffPrincipal,
 } from "../../modules/identity/service.ts";
 import {
+  listRenewals,
+  listSubscriptions,
+  type RenewalBucket,
+} from "../../modules/subscriptions/list.ts";
+import {
   generateSubscriptionRenewalInvoice,
   transitionSubscriptionStatus,
 } from "../../modules/subscriptions/service.ts";
@@ -62,63 +67,30 @@ function parseListQuery(query: Record<string, string | undefined>): {
   return { q, limit, page };
 }
 
-function applyListPage<T>(items: T[], limit: number, page: number): T[] {
-  return items.slice((page - 1) * limit, page * limit);
-}
-
-function pagedCollection<T>(
+function pagedCollectionTotal<T>(
   c: Context<AppEnv>,
-  filtered: T[],
-  limit: number,
-  page = 1,
-  nextCursor: string | null = null,
+  pageItems: T[],
+  total: number,
   status = 200
 ): Response {
   return c.json(
     createCollectionEnvelope(
-      applyListPage(filtered, limit, page),
-      nextCursor,
+      pageItems,
+      null,
       c.var.requestId,
-      filtered.length
+      total
     ),
     status as ContentfulStatusCode
   );
 }
 
-const includesQuery = (
-  haystack: string | null | undefined,
-  q: string
-): boolean => (!q ? true : (haystack ?? "").toLowerCase().includes(q));
-
-// E-09/E-11: renewal buckets over subscriptions. Windows are UTC
-// calendar days off the YYYY-MM-DD part of next_renewal_at (all
-// renewal timestamps are stored UTC). Buckets are disjoint:
-// cancelled → cancelled; past_due → failed; renewal date past →
-// overdue; within 7 days → due; within 30 days → upcoming. Rows
-// with no next_renewal_at, or a renewal more than 30 days out,
-// belong to no bucket (they are not actionable yet).
-const RENEWAL_UPCOMING_DAYS = 30;
-const RENEWAL_DUE_DAYS = 7;
-const renewalDayOf = (iso: string | null | undefined): string | null =>
-  typeof iso === "string" && iso.length >= 10 ? iso.slice(0, 10) : null;
-const addDaysIso = (day: string, days: number): string => {
-  const d = new Date(`${day}T00:00:00.000Z`);
-  d.setUTCDate(d.getUTCDate() + days);
-  return d.toISOString().slice(0, 10);
-};
-const renewalBucketOf = (
-  sub: { status: string; next_renewal_at: string | null },
-  todayDay: string
-): "upcoming" | "due" | "overdue" | "failed" | "cancelled" | null => {
-  if (sub.status === "cancelled") return "cancelled";
-  if (sub.status === "past_due") return "failed";
-  const day = renewalDayOf(sub.next_renewal_at);
-  if (day === null) return null;
-  if (day < todayDay) return "overdue";
-  if (day <= addDaysIso(todayDay, RENEWAL_DUE_DAYS)) return "due";
-  if (day <= addDaysIso(todayDay, RENEWAL_UPCOMING_DAYS)) return "upcoming";
-  return null;
-};
+// E-09/E-11: renewal buckets over subscriptions — B-01: the bucket
+// CASE now lives in `modules/subscriptions/list.ts` (`listRenewals`),
+// same definitions as below used to be (disjoint; cancelled →
+// cancelled; past_due → failed; renewal date past → overdue; within
+// 7 days → due; within 30 days → upcoming; no next_renewal_at or a
+// renewal more than 30 days out → no bucket). Windows are UTC
+// calendar days off the YYYY-MM-DD part of next_renewal_at.
 
 export function registerAdminSubscriptionsRoutes(app: Hono<AppEnv>): void {
   // Subscriptions & Licenses
@@ -129,30 +101,29 @@ export function registerAdminSubscriptionsRoutes(app: Hono<AppEnv>): void {
     const requestId = c.var.requestId;
     await assertStaffPermissionAudited(store, principal, "subscriptions.read", requestId);
     const { q, limit, page } = parseListQuery(c.req.query());
-    const items = store.state.subscriptions
-      .filter(
-        (s) =>
-          includesQuery(s.subscription_number, q) ||
-          includesQuery(
-            store.state.customers.find((cu) => cu.id === s.customer_id)?.name,
-            q,
-          ),
-      )
-      .map((s) => ({
+    const { items, total } = await listSubscriptions(store, {
+      q,
+      limit,
+      page,
+    });
+    return pagedCollectionTotal(
+      c,
+      items.map(({ subscription: s, customer, product }) => ({
         ...s,
-        customer: store.state.customers.find((cu) => cu.id === s.customer_id) ?? null,
-        product: store.state.products.find((p) => p.id === s.product_id) ?? null,
+        customer,
+        product,
         next_renewal_display: s.next_renewal_at
           ? formatDisplayDateDDMMYYYY(s.next_renewal_at, env.DEFAULT_TIMEZONE)
           : null,
-      }));
-    return pagedCollection(c, items, limit, page);
+      })),
+      total,
+    );
   });
 
   // E-09: renewals view (PRD §12.5) — the work queue the
   // subscriptions list cannot show: ?bucket=upcoming|due|overdue|
   // failed|cancelled (no bucket = all bucketed rows). Buckets are
-  // the shared renewalBucketOf definitions (disjoint; rows with
+  // the bucket CASE in `modules/subscriptions/list.ts` (disjoint; rows with
   // no next_renewal_at or a renewal >30 days out belong to no
   // bucket). Sorted nearest-renewal-first so the most urgent row
   // is on top; each row carries customer + product like the
@@ -181,45 +152,28 @@ export function registerAdminSubscriptionsRoutes(app: Hono<AppEnv>): void {
       );
     }
     const { q, limit, page } = parseListQuery(query);
-    const todayDay = new Date().toISOString().slice(0, 10);
-    const items = store.state.subscriptions
-      .map((s) => ({
-        subscription: s,
-        bucket: renewalBucketOf(s, todayDay),
-      }))
-      .filter((row) => row.bucket !== null)
-      .filter((row) => (bucketFilter === null ? true : row.bucket === bucketFilter))
-      .filter(
-        (row) =>
-          includesQuery(row.subscription.subscription_number, q) ||
-          includesQuery(
-            store.state.customers.find((cu) => cu.id === row.subscription.customer_id)
-              ?.name,
-            q
-          )
-      )
-      .sort((a, b) => {
-        const aDay = renewalDayOf(a.subscription.next_renewal_at) ?? "9999-12-31";
-        const bDay = renewalDayOf(b.subscription.next_renewal_at) ?? "9999-12-31";
-        if (aDay !== bDay) return aDay < bDay ? -1 : 1;
-        return a.subscription.id.localeCompare(b.subscription.id);
-      })
-      .map((row) => ({
-        ...row.subscription,
-        bucket: row.bucket,
-        customer:
-          store.state.customers.find((cu) => cu.id === row.subscription.customer_id) ??
-          null,
-        product:
-          store.state.products.find((p) => p.id === row.subscription.product_id) ?? null,
-        next_renewal_display: row.subscription.next_renewal_at
+    const { items, total } = await listRenewals(store, {
+      q,
+      limit,
+      page,
+      bucket: bucketFilter,
+    });
+    return pagedCollectionTotal(
+      c,
+      items.map(({ subscription, bucket: rowBucket, customer, product }) => ({
+        ...subscription,
+        bucket: rowBucket,
+        customer,
+        product,
+        next_renewal_display: subscription.next_renewal_at
           ? formatDisplayDateDDMMYYYY(
-              row.subscription.next_renewal_at,
+              subscription.next_renewal_at,
               env.DEFAULT_TIMEZONE
             )
           : null,
-      }));
-    return pagedCollection(c, items, limit, page);
+      })),
+      total,
+    );
   });
 
   // Batch 1: subscription detail.
