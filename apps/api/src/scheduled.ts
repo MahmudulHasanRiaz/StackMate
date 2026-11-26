@@ -15,8 +15,11 @@
  * Jobs (in order — the sweep never blocks the drain):
  * 1. Outbox drain (`processTransactionalOutboxBatch`) with the real
  *    webhook transport (C-2: without it the dispatcher records
- *    "simulated", never "delivered"). Meta CAPI events stay simulated
- *    by design (Batch 4 builds the real Meta client).
+ *    "simulated", never "delivered") and the real Meta CAPI deliverer
+ *    (E-01: `createCapiDeliver(env)` — without it CAPI events stay
+ *    simulated; with it they are really delivered to Meta, and an
+ *    event with no Meta destination is terminal "skipped", C-2
+ *    Option A).
  * 2. Renewal + expiry sweep (`runRenewalExpirySweep`, ADR-0009) with
  *    reminder mail via SMTP (B-15: SMTP settings loaded ONCE per tick).
  *
@@ -38,6 +41,7 @@ import {
   tryAcquireCronLease,
 } from "./platform/cron-lease.ts";
 import {
+  createCapiDeliver,
   createRealWebhookTransport,
   processTransactionalOutboxBatch,
 } from "./modules/webhooks/service.ts";
@@ -112,8 +116,11 @@ export async function runScheduledJobs(
   // Cloudflare metrics) and the outbox never drained on schedule.
   // C-2: the cron passes the real transport — without it the
   // dispatcher runs simulated and records "simulated" (never
-  // "delivered"). Meta CAPI events stay simulated by design
-  // (Batch 4 builds the real Meta client).
+  // "delivered"). E-01: it also passes the real Meta CAPI deliverer
+  // (`createCapiDeliver`) — without it CAPI events stay simulated;
+  // with it they are really delivered to Meta (delivered only on
+  // HTTP 2xx + events_received >= 1), and an event with no Meta
+  // destination is terminal "skipped" (C-2 Option A).
   let drainResult: Awaited<ReturnType<typeof processTransactionalOutboxBatch>> | null =
     null;
   if (await acquireLease(CRON_JOB_OUTBOX_DRAIN)) {
@@ -124,6 +131,7 @@ export async function runScheduledJobs(
         transport: createRealWebhookTransport({
           allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
         }),
+        capiDeliver: createCapiDeliver(env),
       });
     } finally {
       await releaseLease(CRON_JOB_OUTBOX_DRAIN, drainResult ?? { skipped: false });

@@ -44,6 +44,12 @@ import type {
 import { AppError } from "../../shared/errors.ts";
 import { appendAuditLog } from "../audit/service.ts";
 import { assertStaffPermission, type StaffPrincipal } from "../identity/service.ts";
+import {
+  deliverMetaCapiEvent,
+  type MetaCapiEnv,
+  type MetaCapiEventInput,
+  type MetaCapiOptions,
+} from "../tracking/capi.ts";
 
 export async function registerWebhookEndpointByAdmin(
   store: StackMateDataStore,
@@ -915,14 +921,21 @@ export function createRealWebhookTransport(options?: {
  *   `dead_lettered`. CAPI events never take this branch — they are
  *   always simulated (see below).
  * - `tracking.meta_capi.dispatch` events are simulated UNLESS the
- *   caller passes `options.capiDeliver` (Batch 4's
- *   `deliverMetaCapiEvent`, modules/tracking/capi.ts — Worker E
- *   exports it, app.ts wires it in): with it, the tracking event is
- *   really delivered and recorded "processed" with `delivered_at`;
- *   without it the event is marked "simulated" with no delivery
- *   attempt and no `delivered_at` — and so is the outbox row, the
- *   audit row and the result counts, even when a real webhook
- *   transport is configured.
+ *   caller passes `options.capiDeliver` (`createCapiDeliver(env)` in
+ *   this module, wrapping `deliverMetaCapiEvent` from
+ *   modules/tracking/capi.ts; scheduled.ts wires it in on every cron
+ *   tick): with it, the tracking event is really delivered and
+ *   recorded "processed" with `delivered_at`; without it the event
+ *   is marked "simulated" with no delivery attempt and no
+ *   `delivered_at` — and so is the outbox row, the audit row and the
+ *   result counts, even when a real webhook transport is configured.
+ *   A `capiDeliver` result of status "skipped" (no Meta destination
+ *   — site-less event or no enabled Meta pixel group for the site,
+ *   C-2 Option A) is terminal "skipped": the outbox row is
+ *   "skipped", the audit action is
+ *   `webhooks.outbox_event.skipped_no_meta_destination`, and the
+ *   result counts it in `skipped` — never retried, never
+ *   dead-lettered, never recorded delivered.
  * - Every terminal outcome (delivered / simulated / dead-letter) writes
  *   an audit row (M-14); retries write none — the final outcome owns
  *   the row.
@@ -937,6 +950,15 @@ export interface CapiDeliveryInput {
   /** First enabled Meta pixel group for the event's site, or null. */
   pixelGroup: TrackingConfigRecord | null;
   event: TrackingEventRecord;
+  /**
+   * The event's site primary domain (e.g. "test.example.com") when the
+   * tracking event itself carries no `event_source_url` (Purchase
+   * events are recorded with `event_source_url` null —
+   * payments/service.ts). The wrapper turns it into
+   * `https://<domain>` for Meta's `event_source_url` (API spec §17.5
+   * / pixel allowlist: the site's own domain).
+   */
+  siteDomain?: string | null;
 }
 
 export interface CapiDeliveryResult {
@@ -949,6 +971,120 @@ export interface CapiDeliveryResult {
 export type CapiDeliverFn = (
   input: CapiDeliveryInput
 ) => Promise<CapiDeliveryResult>;
+
+/**
+ * E-01: build the `capiDeliver` the outbox drain needs — the missing
+ * wiring between `processTransactionalOutboxBatch` and
+ * `deliverMetaCapiEvent` (modules/tracking/capi.ts). `scheduled.ts`
+ * passes the result on every cron tick.
+ *
+ * C-2 Option A (honest, no fake delivery): pixels are per-site, so an
+ * event with no Meta destination is NEVER sent and NEVER retried —
+ * it returns status "skipped" and the drain marks the outbox row
+ * terminal "skipped". Two cases:
+ * - the tracking event has no integrated site (a site-less Purchase
+ *   must never reach Meta — the enqueue path in payments/service.ts
+ *   already gates on `order.integrated_site_id`; this is the
+ *   defense-in-depth check at the drain);
+ * - no enabled Meta pixel group exists for the event's site
+ *   (`pixelGroup` null — no group at all, all disabled, or a
+ *   TikTok-only site).
+ *
+ * The adapter's contract is unchanged: `delivered` is true only on
+ * HTTP 2xx with `events_received >= 1`; anything else is
+ * failed/rejected and the drain retries it (bounded) — never recorded
+ * delivered.
+ *
+ * Known limitation (not changed here): Purchase events carry no
+ * `user_data` — payments/service.ts records no `user_data_hashes`
+ * for them, so Meta receives an empty `user_data` object and match
+ * quality is low. Enriching Purchase events from the customer record
+ * is a separate, PII-sensitive follow-up, not drain wiring.
+ */
+export function createCapiDeliver(
+  env: MetaCapiEnv,
+  options: MetaCapiOptions = {}
+): CapiDeliverFn {
+  return async ({ pixelGroup, event, siteDomain }) => {
+    if (!event.integrated_site_id) {
+      return {
+        delivered: false,
+        status: "skipped",
+        diagnostics: {
+          reason: "no_integrated_site",
+          event_name: event.event_name,
+          event_id: event.event_id,
+        },
+      };
+    }
+    if (!pixelGroup) {
+      return {
+        delivered: false,
+        status: "skipped",
+        diagnostics: {
+          reason: "no_enabled_meta_pixel_group",
+          event_name: event.event_name,
+          event_id: event.event_id,
+        },
+      };
+    }
+
+    const payload = (event.sanitized_payload ?? {}) as Record<string, unknown>;
+    const userDataHashes = (payload.user_data_hashes ?? {}) as Record<
+      string,
+      string | undefined
+    >;
+    // Only defined hashes are forwarded (exactOptionalPropertyTypes:
+    // an explicit `undefined` is not assignable to `em?: string`).
+    const userData: Record<string, string> = {};
+    if (userDataHashes.em) userData.em = userDataHashes.em;
+    if (userDataHashes.ph) userData.ph = userDataHashes.ph;
+    if (userDataHashes.fbp) userData.fbp = userDataHashes.fbp;
+    if (userDataHashes.fbc) userData.fbc = userDataHashes.fbc;
+    // Purchase events carry order facts at the top level of the
+    // sanitized payload (payments/service.ts), not under custom_data.
+    // Only the money fields Meta needs are forwarded — internal
+    // references (order_reference) are not Meta fields.
+    const customData: Record<string, unknown> = {
+      ...((payload.custom_data ?? {}) as Record<string, unknown>),
+    };
+    if (
+      typeof payload.value_minor === "number" &&
+      customData.value_minor === undefined
+    ) {
+      customData.value_minor = payload.value_minor;
+    }
+    if (
+      typeof payload.currency === "string" &&
+      customData.currency === undefined
+    ) {
+      customData.currency = payload.currency;
+    }
+
+    const input: MetaCapiEventInput = {
+      event_name: event.event_name,
+      event_id: event.event_id,
+      event_time: event.event_time,
+      event_source_url:
+        event.event_source_url ?? (siteDomain ? `https://${siteDomain}` : null),
+      user_data: userData,
+      custom_data: customData,
+      test_event_code:
+        typeof payload.test_event_code === "string" ? payload.test_event_code : null,
+    };
+    // Optional under exactOptionalPropertyTypes: only set when present,
+    // never as an explicit `undefined`.
+    if (typeof payload.action_source === "string") {
+      input.action_source = payload.action_source;
+    }
+    const result = await deliverMetaCapiEvent(env, pixelGroup, input, options);
+    return {
+      delivered: result.delivered,
+      status: result.status,
+      diagnostics: result.diagnostics,
+    };
+  };
+}
 
 export async function processTransactionalOutboxBatch(
   store: StackMateDataStore,
@@ -1054,21 +1190,22 @@ export async function processTransactionalOutboxBatch(
   async function processOne(ev: OutboxEventRecord): Promise<EventOutcome> {
     // D-6: a CAPI dispatch is simulated unless a real CAPI deliver
     // function was injected — even when a real webhook transport is
-    // configured. `capiDelivered` flips only on a real delivery.
+    // configured. `capiDelivered` flips only on a real delivery;
+    // `capiSkipped` flips when the deliverer reports no Meta
+    // destination (E-01, C-2 Option A) — terminal, never retried.
     let capiDelivered = false;
+    let capiSkipped = false;
     let noSubscribers = false;
     const deliveries: DeliveryOutcome[] = [];
     try {
       if (ev.event_type === "tracking.meta_capi.dispatch") {
         if (options.capiDeliver) {
-          // Batch 4 (Worker E): real Meta CAPI delivery. The pixel
-          // group is resolved from the loaded state; the tracking
-          // event row is updated in the terminal transaction below.
-          // TODO (Worker E): modules/tracking/capi.ts must export
-          // deliverMetaCapiEvent(env, pixelGroup, event) -> { delivered,
-          // status, diagnostics }; app.ts passes it as `capiDeliver`.
-          // Until then this branch is unreachable and CAPI stays
-          // simulated (never recorded delivered).
+          // E-01: real Meta CAPI delivery. The pixel group is
+          // resolved from the loaded state; the tracking event row
+          // is updated in the terminal transaction below. A
+          // "skipped" result (no Meta destination — site-less event
+          // or no enabled Meta pixel group for the site) is terminal:
+          // the outbox row is marked "skipped", never retried.
           const track = store.state.tracking_events.find(
             (t) => t.id === ev.payload.tracking_event_id
           );
@@ -1080,11 +1217,25 @@ export async function processTransactionalOutboxBatch(
                 tc.provider === "meta" &&
                 tc.status === "enabled"
             ) ?? null;
-          const result = await options.capiDeliver({ pixelGroup, event: track });
-          if (!result.delivered) {
+          // Site domain for event_source_url when the tracking event
+          // carries none (Purchase events are recorded with
+          // event_source_url null — payments/service.ts). API spec
+          // §17.5 / pixel allowlist wants the site's own domain.
+          const site = store.state.integrated_sites.find(
+            (s) => s.id === track.integrated_site_id
+          );
+          const siteDomain =
+            site?.domains.find((d) => d.is_primary)?.domain ??
+            site?.domains[0]?.domain ??
+            null;
+          const result = await options.capiDeliver({ pixelGroup, event: track, siteDomain });
+          if (result.status === "skipped") {
+            capiSkipped = true;
+          } else if (!result.delivered) {
             throw new Error(`CAPI_${result.status}`);
+          } else {
+            capiDelivered = true;
           }
-          capiDelivered = true;
         }
         // Without capiDeliver: simulated — the terminal transaction
         // below marks the tracking event simulated, no delivery
@@ -1152,7 +1303,9 @@ export async function processTransactionalOutboxBatch(
       // update + terminal outbox status + audit row together (was one
       // transaction per delivery row + one terminal transaction).
       const eventSimulated =
-        ev.event_type === "tracking.meta_capi.dispatch" ? !capiDelivered : simulated;
+        ev.event_type === "tracking.meta_capi.dispatch"
+          ? !capiDelivered && !capiSkipped
+          : simulated;
       await store.withTransaction((state) => {
         if (ev.event_type === "tracking.meta_capi.dispatch") {
           const track = state.tracking_events.find(
@@ -1164,6 +1317,11 @@ export async function processTransactionalOutboxBatch(
               track.delivery_attempts += 1;
               track.delivered_at = new Date().toISOString();
             } else {
+              // Simulated OR skipped: the tracking_events CHECK has
+              // no "skipped" (migration 0015) — "simulated" is the
+              // terminal non-delivered state here ("recorded but
+              // never sent"). The outbox row + audit log below carry
+              // the precise outcome (simulated vs skipped).
               markSimulated(track);
             }
           }
@@ -1203,10 +1361,11 @@ export async function processTransactionalOutboxBatch(
           }
         }
         // Mark outbox event terminal: delivered (real), simulated, or
-        // skipped (no subscribed active endpoints — Q3).
+        // skipped (no subscribed active endpoints — Q3 — or no Meta
+        // destination for a CAPI event — E-01).
         const target = state.outbox_events.find((e) => e.id === ev.id);
         if (target) {
-          if (noSubscribers) target.status = "skipped";
+          if (noSubscribers || capiSkipped) target.status = "skipped";
           else if (eventSimulated) markSimulated(target);
           else target.status = "delivered";
           target.locked_until = null;
@@ -1217,21 +1376,25 @@ export async function processTransactionalOutboxBatch(
         // the dispatcher, not a staff member; the worker id correlates).
         appendAuditLog(state, {
           actor_type: "system",
-          action: noSubscribers
-            ? "webhooks.outbox_event.skipped_no_subscribers"
-            : eventSimulated
-              ? "webhooks.outbox_event.simulated"
-              : "webhooks.outbox_event.delivered",
+          action: capiSkipped
+            ? "webhooks.outbox_event.skipped_no_meta_destination"
+            : noSubscribers
+              ? "webhooks.outbox_event.skipped_no_subscribers"
+              : eventSimulated
+                ? "webhooks.outbox_event.simulated"
+                : "webhooks.outbox_event.delivered",
           resource_type: "outbox_event",
           resource_id: ev.id,
           outcome: "success",
           request_id: `worker:${workerId}`,
-          changes: noSubscribers
-            ? { event_type: ev.event_type, reason: "no_active_subscribers" }
-            : { event_type: ev.event_type },
+          changes: capiSkipped
+            ? { event_type: ev.event_type, reason: "no_meta_destination" }
+            : noSubscribers
+              ? { event_type: ev.event_type, reason: "no_active_subscribers" }
+              : { event_type: ev.event_type },
         });
       });
-      if (noSubscribers) return "skipped";
+      if (noSubscribers || capiSkipped) return "skipped";
       if (eventSimulated) return "simulated";
       return "delivered";
     } catch (err) {
