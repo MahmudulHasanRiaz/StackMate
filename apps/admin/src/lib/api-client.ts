@@ -221,7 +221,10 @@ export async function rawApiRequest<T>(
 /* Contract (API worker builds the endpoints in parallel):             */
 /*  - GET/POST /api/v1/admin/expense-categories[?q=&is_active=&page=   */
 /*    &pageSize=], PATCH/DELETE /expense-categories/:id (409 when      */
-/*    expenses exist); rows carry an expense count.                    */
+/*    expenses exist); rows carry an expense count. Hierarchy:         */
+/*    parent_id on write, GET /expense-categories/tree returns the     */
+/*    nested tree (children, depth, path, childCount); deleting a      */
+/*    category with expenses OR children is a 409.                    */
 /*  - GET/POST /api/v1/admin/expenses[?q=&categoryId=&productId=       */
 /*    &from=&to=&page=&pageSize=], PATCH/DELETE /expenses/:id.         */
 /*  - GET /api/v1/admin/analytics/profit-loss[?from=&to=&productId=].  */
@@ -250,7 +253,46 @@ export interface ExpenseCategory {
   icon: string | null;
   isActive: boolean;
   expenseCount: number;
+  /** Parent category id, null for a top-level category. */
+  parentId: string | null;
+  /** Depth in the tree (0 = top-level). */
+  depth: number;
+  /** Slash-joined path of names from the root, e.g. "Office / Supplies". */
+  path: string | null;
+  /** Number of direct child categories. */
+  childCount: number;
   createdAt: string | null;
+}
+
+/** One node of GET /api/v1/admin/expense-categories/tree — a category
+ *  with its children nested (same fields as ExpenseCategory). */
+export interface ExpenseCategoryTreeNode extends ExpenseCategory {
+  children: ExpenseCategoryTreeNode[];
+}
+
+/** Depth-first flatten of a category tree, keeping depth + path per
+ *  row — shared by the Categories tree list and the indented pickers
+ *  (expense form, parent picker). */
+export function flattenExpenseCategoryTree(
+  nodes: ExpenseCategoryTreeNode[],
+): { node: ExpenseCategoryTreeNode; depth: number; path: string }[] {
+  const out: { node: ExpenseCategoryTreeNode; depth: number; path: string }[] = [];
+  const walk = (list: ExpenseCategoryTreeNode[], depth: number, parentPath: string) => {
+    for (const node of list) {
+      const path = parentPath ? `${parentPath} / ${node.name}` : node.name;
+      out.push({ node, depth, path });
+      if (node.children.length > 0) walk(node.children, depth + 1, path);
+    }
+  };
+  walk(nodes, 0, "");
+  return out;
+}
+
+/** Indented label for a tree row in a select ("— " per depth level).
+ *  Plain text — the SearchableSelect listbox renders labels as text,
+ *  so indentation travels as a prefix, never as layout. */
+export function indentedCategoryName(depth: number, name: string): string {
+  return depth > 0 ? `${"— ".repeat(depth)}${name}` : name;
 }
 
 export interface Expense {
@@ -275,6 +317,8 @@ export interface ProfitLossByCategory {
   categoryName: string;
   color: string | null;
   totalMinor: number;
+  /** Own expenses only (excludes descendants); totalMinor is the roll-up. */
+  ownTotalMinor?: number;
   count: number;
 }
 
@@ -313,6 +357,8 @@ export interface ExpenseCategoryInput {
   color?: string | null | undefined;
   icon?: string | null | undefined;
   isActive?: boolean | undefined;
+  /** Parent category id; null = top-level. Omitted on update = unchanged. */
+  parentId?: string | null | undefined;
 }
 
 export interface ExpenseInput {
@@ -364,8 +410,21 @@ function normalizeExpenseCategory(raw: unknown): ExpenseCategory {
     icon: pickString(r, "icon", "icon"),
     isActive: pickBoolean(r, "isActive", "is_active", true),
     expenseCount: pickNumber(r, "expenseCount", "expense_count"),
+    parentId: pickString(r, "parentId", "parent_id"),
+    depth: pickNumber(r, "depth", "depth"),
+    path: pickString(r, "path", "path"),
+    childCount: pickNumber(r, "childCount", "child_count"),
     createdAt: pickString(r, "createdAt", "created_at"),
   };
+}
+
+/** Recursive normalizer for one tree node (children nested). Accepts
+ *  either casing on read; the tree endpoint returns nested `children`. */
+function normalizeExpenseCategoryTreeNode(raw: unknown): ExpenseCategoryTreeNode {
+  const base = normalizeExpenseCategory(raw);
+  const r = asRecord(raw);
+  const children = Array.isArray(r.children) ? r.children : [];
+  return { ...base, children: children.map(normalizeExpenseCategoryTreeNode) };
 }
 
 function normalizeExpense(raw: unknown): Expense {
@@ -486,17 +545,31 @@ export async function fetchExpenseCategories(
   };
 }
 
+export async function fetchExpenseCategoryTree(): Promise<ExpenseCategoryTreeNode[]> {
+  const res = await apiRequest<unknown>("/api/v1/admin/expense-categories/tree");
+  const items = Array.isArray(res)
+    ? res
+    : Array.isArray(asRecord(res).items)
+      ? (asRecord(res).items as unknown[])
+      : [];
+  return items.map(normalizeExpenseCategoryTreeNode);
+}
+
 export async function createExpenseCategory(
   body: ExpenseCategoryInput,
 ): Promise<ExpenseCategory> {
   const res = await apiRequest<unknown>("/api/v1/admin/expense-categories", {
     method: "POST",
+    // Schema keys ONLY, snake_case (the 2026-11-25 strict-validator
+    // bug: dual camelCase + snake_case keys were rejected) — parent_id
+    // included the same way, null for a top-level category.
     body: JSON.stringify({
       name: body.name,
       description: body.description ?? null,
       color: body.color ?? null,
       icon: body.icon ?? null,
       is_active: body.isActive ?? true,
+      parent_id: body.parentId ?? null,
     }),
   });
   return normalizeExpenseCategory(res);
@@ -514,6 +587,9 @@ export async function updateExpenseCategory(
   if (body.isActive !== undefined) {
     payload.is_active = body.isActive;
   }
+  // parent_id only when the caller set it (null = move to top-level);
+  // omitted = unchanged. Schema key only, never the camelCase twin.
+  if (body.parentId !== undefined) payload.parent_id = body.parentId;
   const res = await apiRequest<unknown>(`/api/v1/admin/expense-categories/${id}`, {
     method: "PATCH",
     body: JSON.stringify(payload),

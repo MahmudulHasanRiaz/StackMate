@@ -51,6 +51,17 @@ export type { ExpenseCategoryRecord, ExpenseRecord };
 export interface ExpenseCategoryDto extends ExpenseCategoryRecord {
   /** Number of expenses referencing this category (0 → deletable). */
   expenseCount: number;
+  /** Number of direct sub-categories (0 → no children to block delete). */
+  childCount: number;
+}
+
+/** One node of the nested category tree (see buildCategoryTree). */
+export interface ExpenseCategoryTreeNode extends ExpenseCategoryDto {
+  /** 0 = top-level; a child's depth is its parent's depth + 1. */
+  depth: number;
+  /** Breadcrumb, e.g. "Office / Stationery". */
+  path: string;
+  children: ExpenseCategoryTreeNode[];
 }
 
 function expenseCollections(state: DatabaseState): {
@@ -66,8 +77,9 @@ function expenseCollections(state: DatabaseState): {
 export function toExpenseCategoryDto(
   category: ExpenseCategoryRecord,
   expenseCount: number,
+  childCount = 0,
 ): ExpenseCategoryDto {
-  return { ...category, expenseCount };
+  return { ...category, expenseCount, childCount };
 }
 
 function countExpensesForCategory(
@@ -76,6 +88,124 @@ function countExpensesForCategory(
 ): number {
   return expenseCollections(state).expenses.filter((e) => e.category_id === categoryId)
     .length;
+}
+
+function countChildrenForCategory(
+  state: DatabaseState,
+  categoryId: string,
+): number {
+  return expenseCollections(state).categories.filter(
+    (c) => c.parent_id === categoryId,
+  ).length;
+}
+
+function toDto(
+  state: DatabaseState,
+  category: ExpenseCategoryRecord,
+): ExpenseCategoryDto {
+  return toExpenseCategoryDto(
+    category,
+    countExpensesForCategory(state, category.id),
+    countChildrenForCategory(state, category.id),
+  );
+}
+
+/**
+ * Parent validation (hierarchy, migration 0026) — create + update.
+ * parent_id given → the parent must exist, must be active, must not
+ * be the category itself, and must not be one of its descendants
+ * (cycle). All four failures are 400 VALIDATION_ERROR: a bad parent
+ * is a bad request body, not a missing resource — the 404 NOT_FOUND
+ * pattern (unknown FK on expense create) does NOT apply here, the
+ * caller named a parent that cannot be used as a parent.
+ *
+ * Cycle check: walk UP from the proposed parent following parent_id
+ * links — if the chain reaches `selfId`, the proposed parent is a
+ * descendant of the category, so accepting it would close a loop.
+ * The `seen` set also stops a walk over already-corrupt data (a
+ * cycle stored before this guard existed) instead of looping forever.
+ */
+function assertValidParent(
+  state: DatabaseState,
+  parentId: string,
+  selfId?: string,
+): void {
+  const parent = expenseCollections(state).categories.find(
+    (c) => c.id === parentId,
+  );
+  if (!parent) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "Parent expense category not found.",
+      400,
+    );
+  }
+  if (!parent.is_active) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "Parent expense category must be active.",
+      400,
+    );
+  }
+  if (selfId !== undefined && parentId === selfId) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "An expense category cannot be its own parent.",
+      400,
+    );
+  }
+  if (selfId !== undefined) {
+    const seen = new Set<string>([parentId]);
+    let current: ExpenseCategoryRecord | undefined = parent;
+    while (current?.parent_id) {
+      if (current.parent_id === selfId) {
+        throw new AppError(
+          "VALIDATION_ERROR",
+          "An expense category cannot use one of its own sub-categories as its parent (cycle).",
+          400,
+        );
+      }
+      if (seen.has(current.parent_id)) break;
+      seen.add(current.parent_id);
+      current = expenseCollections(state).categories.find(
+        (c) => c.id === current!.parent_id,
+      );
+    }
+  }
+}
+
+/**
+ * Build the nested tree from a flat category list: every node gets
+ * `children` (newest-first, same order as listExpenseCategories),
+ * `depth` and a `path` breadcrumb. Orphans (parent_id pointing at a
+ * category absent from the list — e.g. filtered out) become roots so
+ * no category ever disappears from the tree.
+ */
+export function buildCategoryTree(
+  categories: ExpenseCategoryDto[],
+): ExpenseCategoryTreeNode[] {
+  const byId = new Map<string, ExpenseCategoryTreeNode>();
+  for (const c of categories) {
+    byId.set(c.id, { ...c, depth: 0, path: c.name, children: [] });
+  }
+  const roots: ExpenseCategoryTreeNode[] = [];
+  for (const node of byId.values()) {
+    const parent = node.parent_id ? byId.get(node.parent_id) : undefined;
+    if (parent) parent.children.push(node);
+    else roots.push(node);
+  }
+  // Depth + path need a top-down walk: the flat list is newest-first,
+  // so a child can precede its parent in `categories` — assigning
+  // depth while linking would read a parent's depth before it was set.
+  const assign = (node: ExpenseCategoryTreeNode, depth: number, path: string): void => {
+    node.depth = depth;
+    node.path = path;
+    for (const child of node.children) {
+      assign(child, depth + 1, `${path} / ${child.name}`);
+    }
+  };
+  for (const root of roots) assign(root, 0, root.name);
+  return roots;
 }
 
 function assertCategoryNameAvailable(
@@ -170,7 +300,23 @@ export async function listExpenseCategories(
           ? 1
           : -1,
     )
-    .map((c) => toExpenseCategoryDto(c, countExpensesForCategory(store.state, c.id)));
+    .map((c) => toDto(store.state, c));
+}
+
+/**
+ * Nested category tree (GET .../expense-categories/tree): same
+ * filters as listExpenseCategories, returned as roots with nested
+ * `children` (depth + path on every node). No pagination — a tree
+ * cannot be meaningfully page-sliced; the category count is small
+ * and admin-managed.
+ */
+export async function listExpenseCategoryTree(
+  store: StackMateDataStore,
+  actor: StaffPrincipal,
+  options: ListExpenseCategoriesOptions = {},
+): Promise<ExpenseCategoryTreeNode[]> {
+  const flat = await listExpenseCategories(store, actor, options);
+  return buildCategoryTree(flat);
 }
 
 export async function getExpenseCategory(
@@ -180,10 +326,7 @@ export async function getExpenseCategory(
 ): Promise<ExpenseCategoryDto> {
   assertStaffPermission(actor, EXPENSE_PERMISSIONS.read);
   const category = requireCategory(store.state, categoryId);
-  return toExpenseCategoryDto(
-    category,
-    countExpensesForCategory(store.state, category.id),
-  );
+  return toDto(store.state, category);
 }
 
 export async function createExpenseCategory(
@@ -196,6 +339,9 @@ export async function createExpenseCategory(
   const input = CreateExpenseCategorySchema.parse(rawInput);
   return store.withTransaction((state) => {
     assertCategoryNameAvailable(state, input.name);
+    if (input.parent_id !== undefined && input.parent_id !== null) {
+      assertValidParent(state, input.parent_id);
+    }
     const nowIso = new Date().toISOString();
     const category: ExpenseCategoryRecord = {
       id: randomUUID(),
@@ -203,6 +349,7 @@ export async function createExpenseCategory(
       description: input.description ?? null,
       color: input.color ?? "#00E599",
       icon: input.icon ?? null,
+      parent_id: input.parent_id ?? null,
       is_active: input.is_active ?? true,
       created_at: nowIso,
       updated_at: nowIso,
@@ -240,6 +387,14 @@ export async function updateExpenseCategory(
     if (input.description !== undefined) category.description = input.description;
     if (input.color !== undefined) category.color = input.color;
     if (input.icon !== undefined) category.icon = input.icon;
+    if (input.parent_id !== undefined) {
+      // null detaches (back to top-level); a value is validated
+      // against this category itself (self-parent + cycle).
+      if (input.parent_id !== null) {
+        assertValidParent(state, input.parent_id, category.id);
+      }
+      category.parent_id = input.parent_id;
+    }
     if (input.is_active !== undefined) category.is_active = input.is_active;
     category.updated_at = new Date().toISOString();
     appendAuditLog(state, {
@@ -270,6 +425,14 @@ export async function deleteExpenseCategory(
       throw new AppError(
         "CONFLICT",
         `Expense category '${category.name}' cannot be deleted: ${inUse} expense(s) still reference it.`,
+        409,
+      );
+    }
+    const childCount = countChildrenForCategory(state, category.id);
+    if (childCount > 0) {
+      throw new AppError(
+        "CONFLICT",
+        `Expense category '${category.name}' cannot be deleted: ${childCount} sub-categor(ies) still reference it.`,
         409,
       );
     }

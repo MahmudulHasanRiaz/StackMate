@@ -14,7 +14,7 @@
  * /settings (e.g. /settings/websites) with its own detail routes;
  * the settings index redirects to the first category.
  */
-import { BarChart3, BookOpen, CreditCard, Globe, HardDrive, KeyRound, Mail, Settings2, ShieldCheck, Tag, Webhook, type LucideIcon } from "lucide-react";
+import { BarChart3, BookOpen, CreditCard, Globe, HardDrive, KeyRound, Mail, Settings2, ShieldCheck, Webhook, type LucideIcon } from "lucide-react";
 
 export interface SettingsCategory {
   slug: string;
@@ -91,17 +91,6 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
     to: "/settings/payment-methods",
     group: "Commerce",
     permission: "payments.read",
-  },
-  {
-    // Expense Module (2026-11-25): category config for the Finance
-    // pages (expenses.read gates the read; writes need
-    // expense_categories.manage, enforced server-side).
-    slug: "expense-categories",
-    label: "Expense Categories",
-    icon: Tag,
-    to: "/settings/expense-categories",
-    group: "Commerce",
-    permission: "expenses.read",
   },
   {
     slug: "authentication",

@@ -30,7 +30,10 @@ import { Pencil, Plus, Receipt, Trash2 } from "lucide-react";
 import {
   createExpense,
   deleteExpense,
+  fetchExpenseCategoryTree,
   fetchExpenses,
+  flattenExpenseCategoryTree,
+  indentedCategoryName,
   updateExpense,
   type Expense,
   type ExpenseCategory,
@@ -291,12 +294,35 @@ export function DateRangeFilter({
 /* Server-side option loaders (PLAN §29 — ?q= over the full set)       */
 /* ------------------------------------------------------------------ */
 function loadCategoryOptions(q: string, signal: AbortSignal) {
-  return loadListOptions<ExpenseCategory>(
-    "/api/v1/admin/expense-categories",
-    q,
-    (c) => ({ value: c.id, label: c.name }),
-    signal,
-    { extra: { is_active: "true" } },
+  // Hierarchy-aware loader: the tree endpoint returns the FULL set,
+  // so filtering by query client-side still searches everything
+  // (never a filter over a loaded page — PLAN §29). Options carry a
+  // "— " indent per depth level (parent → child). Falls back to the
+  // flat list while the tree endpoint is not live yet.
+  const loadFromTree = async () => {
+    const tree = await fetchExpenseCategoryTree();
+    const needle = q.trim().toLowerCase();
+    const rows = flattenExpenseCategoryTree(tree).filter(
+      ({ node }) =>
+        node.isActive &&
+        (!needle || node.name.toLowerCase().includes(needle)),
+    );
+    return {
+      options: rows.slice(0, 25).map(({ node, depth }) => ({
+        value: node.id,
+        label: indentedCategoryName(depth, node.name),
+      })),
+      capped: rows.length > 25,
+    };
+  };
+  return loadFromTree().catch(() =>
+    loadListOptions<ExpenseCategory>(
+      "/api/v1/admin/expense-categories",
+      q,
+      (c) => ({ value: c.id, label: c.name }),
+      signal,
+      { extra: { is_active: "true" } },
+    ),
   );
 }
 

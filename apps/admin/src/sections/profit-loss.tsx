@@ -242,6 +242,17 @@ export function ProfitLossSection() {
                           <td>
                             <MoneyCell currency={EXPENSE_CURRENCY} minor={row.totalMinor} />
                             <span className="sm-hint"> · {row.count}</span>
+                            {row.ownTotalMinor !== undefined &&
+                              row.ownTotalMinor < row.totalMinor && (
+                                <span className="sm-hint">
+                                  {" "}
+                                  · own{" "}
+                                  <MoneyCell
+                                    currency={EXPENSE_CURRENCY}
+                                    minor={row.ownTotalMinor}
+                                  />
+                                </span>
+                              )}
                           </td>
                           <td>
                             <span style={{ display: "inline-flex", alignItems: "center", gap: 8, width: "100%" }}>

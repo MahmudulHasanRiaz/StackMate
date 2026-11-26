@@ -2746,7 +2746,7 @@ function buildLoadStateQuery(caps: StoreCapabilities): string {
             reason, provider_refund_id, requested_by_user_id, processed_by_user_id,
             created_at, updated_at
        FROM payment_refunds` },
-    { key: "expenseCategories", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, name, description, color, icon, is_active,
+    { key: "expenseCategories", orderBy: "t.created_at ASC, t.id ASC", sql: `SELECT id, name, description, color, icon, parent_id, is_active,
             created_at, updated_at
        FROM expense_categories` },
     { key: "expenses", orderBy: "t.expense_date ASC, t.created_at ASC, t.id ASC", sql: `SELECT id, amount_minor, currency, expense_date, category_id, product_id,
@@ -3769,6 +3769,7 @@ async function loadStateInternalImpl(
     description: str(row, "description"),
     color: reqStr(row, "color", "expense_categories"),
     icon: str(row, "icon"),
+    parent_id: str(row, "parent_id"),
     is_active: bool(row, "is_active"),
     created_at: reqIso(row, "created_at", "expense_categories"),
     updated_at: reqIso(row, "updated_at", "expense_categories"),
@@ -7068,6 +7069,7 @@ async function persistStateDiff(
           "description",
           "color",
           "icon",
+          "parent_id",
           "is_active",
           "created_at",
           "updated_at",
@@ -7078,6 +7080,7 @@ async function persistStateDiff(
           r.description,
           r.color,
           r.icon,
+          r.parent_id,
           r.is_active,
           r.created_at,
           r.updated_at,
@@ -7096,6 +7099,7 @@ async function persistStateDiff(
         "description",
         "color",
         "icon",
+        "parent_id",
         "is_active",
       ];
       await upd(
@@ -7106,6 +7110,7 @@ async function persistStateDiff(
           r.description,
           r.color,
           r.icon,
+          r.parent_id,
           r.is_active,
           r.id,
         ],

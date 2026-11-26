@@ -586,6 +586,22 @@ a:hover {
 .sm-nav-btn svg {
   flex: none;
 }
+/* Sub-menu row (Finance → Expenses → Categories): same 32px row, its
+   label indented under the parent label (10px base pad + 16px icon +
+   8px gap = 34px). The collapsed rail / settings rail rules below
+   re-center the icon like every other row, so the indent only applies
+   expanded (and on hover-peek, where the extra-specific rules keep
+   it). */
+.sm-nav-btn.sm-nav-btn-sub {
+  padding-left: 34px;
+}
+.sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):hover .sm-nav-btn.sm-nav-btn-sub,
+.sm-shell[data-nav-collapsed="true"] .sm-sidebar:not(.sm-peek-off):has(:focus-visible) .sm-nav-btn.sm-nav-btn-sub,
+.sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):hover .sm-nav-btn.sm-nav-btn-sub,
+.sm-settings-shell[data-nav-collapsed="true"] .sm-main-rail:not(.sm-peek-off):has(:focus-visible) .sm-nav-btn.sm-nav-btn-sub,
+.sm-settings-shell[data-nav-collapsed="false"] .sm-main-rail .sm-nav-btn.sm-nav-btn-sub {
+  padding-left: 34px;
+}
 /* Label fade (PLAN §35): labels fade in sync with the column
    transition instead of popping instantly. `display`/`visibility`
    flip with `allow-discrete` — at the START of the transition when

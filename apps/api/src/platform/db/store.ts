@@ -515,6 +515,8 @@ export interface ExpenseCategoryRecord {
   description: string | null;
   color: string;
   icon: string | null;
+  /** Hierarchy (migration 0026): parent category id, null = top-level. */
+  parent_id: string | null;
   is_active: boolean;
   created_at: string;
   updated_at: string;

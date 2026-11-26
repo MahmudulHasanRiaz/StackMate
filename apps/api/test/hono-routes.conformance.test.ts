@@ -10,6 +10,9 @@
  *   3. no duplicate (method, path) on the Hono app;
  *   4. the OpenAPI baseline itself is intact (103 paths / 145 operations
  *      at feat e382d65 — plan §1/§4: Phase 1 must preserve them).
+ *      Updated 2026-11-26: 182 paths / 232 operations — the one
+ *      additive route is GET /api/v1/admin/expense-categories/tree
+ *      (expense hierarchy, migration 0026).
  *
  * The test is DB-free: the Hono app is created with
  * `createHonoApp({ env: resolveRuntimeConfig(), storeFactory })` where
@@ -51,8 +54,8 @@ const HONO_APP_SPECIFIER = "../src/hono-app.ts";
  * (see the integration note in the migration plan §4). Any future
  * change to these numbers must be a deliberate, reviewed API change.
  */
-const BASELINE_PATHS = 181;
-const BASELINE_OPERATIONS = 231;
+const BASELINE_PATHS = 182;
+const BASELINE_OPERATIONS = 232;
 
 /**
  * The ONE allowed extra Hono route: the additive GraphQL endpoint
@@ -226,7 +229,7 @@ beforeAll(async () => {
 });
 
 describe("Hono route conformance (OpenAPI gate, migration plan §4)", () => {
-  it("OpenAPI baseline is intact: 181 paths / 231 operations", () => {
+  it("OpenAPI baseline is intact: 182 paths / 232 operations", () => {
     const paths = Object.keys(openApi.paths).length;
     const operations = Object.values(openApi.paths).reduce(
       (n, ops) => n + Object.keys(ops).length,

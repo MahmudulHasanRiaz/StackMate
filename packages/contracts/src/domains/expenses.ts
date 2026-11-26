@@ -40,6 +40,9 @@ export const CreateExpenseCategorySchema = v.object({
   description: v.string().trim().max(2000).nullable().optional(),
   color: HexColorSchema.optional().default("#00E599"),
   icon: v.string().trim().max(60).nullable().optional(),
+  // Hierarchy (migration 0026): parent category id, null/omitted =
+  // top-level. Strict validator — only schema keys are sent.
+  parent_id: v.string().uuid().nullable().optional(),
   is_active: v.boolean().optional().default(true),
 });
 
@@ -48,6 +51,8 @@ export const UpdateExpenseCategorySchema = v.object({
   description: v.string().trim().max(2000).nullable().optional(),
   color: HexColorSchema.optional(),
   icon: v.string().trim().max(60).nullable().optional(),
+  // null detaches (moves the category back to top-level).
+  parent_id: v.string().uuid().nullable().optional(),
   is_active: v.boolean().optional(),
 });
 
