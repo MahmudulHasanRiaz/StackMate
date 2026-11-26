@@ -1932,14 +1932,38 @@ export function Alert({
 }
 
 /* ------------------------------------------------------------------ */
-/* Toasts — success/info auto-dismiss (5s); errors stay                */
+/* Toasts — EVERY toast auto-dismisses (no sticky toasts):            */
+/* success / info / warning 4s, errors (danger) 6s. The old rule      */
+/* ("danger stays") left error toasts on screen until manually        */
+/* dismissed. Hover pauses the timer; the X button always dismisses.  */
+/* Max 4 visible — a new toast drops the oldest. Exit is a 200ms      */
+/* opacity + translateY fade (inline style: no leaving class exists   */
+/* in tokens.css, and this file owns the toast markup). Entrance uses  */
+/* the existing sm-dialog-in animation in tokens.css (200ms,          */
+/* transform + opacity only). Stacking is the existing column flex    */
+/* with gap in .sm-toast-viewport; newest toast goes at the bottom.    */
 /* ------------------------------------------------------------------ */
+const TOAST_MAX_VISIBLE = 4;
+const TOAST_EXIT_MS = 200;
+const TOAST_DURATIONS_MS: Record<AlertVariant, number> = {
+  success: 4000,
+  info: 4000,
+  warning: 4000,
+  danger: 6000,
+};
+
+/** Error-like titles with no explicit variant read as errors. Every
+ *  error call site today already passes variant "danger" explicitly;
+ *  this is only a safety net for a bare toast({ title: "…failed" }) call. */
+const TOAST_ERROR_TITLE =
+  /\b(fail|failed|failure|error|could not|unable|invalid|wrong|denied)\b/i;
+
 interface ToastItem {
   id: number;
   title: string;
   message?: string;
   variant: AlertVariant;
-  sticky: boolean;
+  leaving: boolean;
 }
 
 const ToastContext = createContext<{
@@ -1954,35 +1978,139 @@ let toastSeq = 0;
 
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<ToastItem[]>([]);
-  const dismiss = useCallback((id: number) => {
+  /* Per-toast timers, keyed by toast id. `remaining` tracks the ms left
+   * so a hover-pause can resume instead of restarting the timer. */
+  const timersRef = useRef(new Map<number, number>());
+  const remainingRef = useRef(new Map<number, number>());
+  const startedAtRef = useRef(new Map<number, number>());
+  const leavingRef = useRef(new Set<number>());
+
+  const clearTimer = useCallback((id: number) => {
+    const timer = timersRef.current.get(id);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      timersRef.current.delete(id);
+    }
+  }, []);
+
+  const removeToast = useCallback((id: number) => {
+    leavingRef.current.delete(id);
+    remainingRef.current.delete(id);
+    startedAtRef.current.delete(id);
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
+
+  /* Start the 200ms exit fade, then remove the toast. */
+  const startLeaving = useCallback(
+    (id: number) => {
+      if (leavingRef.current.has(id)) return;
+      leavingRef.current.add(id);
+      clearTimer(id);
+      setToasts((prev) => prev.map((t) => (t.id === id ? { ...t, leaving: true } : t)));
+      timersRef.current.set(
+        id,
+        window.setTimeout(() => removeToast(id), TOAST_EXIT_MS),
+      );
+    },
+    [clearTimer, removeToast],
+  );
+
+  const scheduleDismiss = useCallback(
+    (id: number, delay: number) => {
+      clearTimer(id);
+      remainingRef.current.set(id, delay);
+      startedAtRef.current.set(id, Date.now());
+      timersRef.current.set(id, window.setTimeout(() => startLeaving(id), delay));
+    },
+    [clearTimer, startLeaving],
+  );
+
+  /* Hover pauses the countdown; leaving resumes it with the time left. */
+  const pauseToast = useCallback(
+    (id: number) => {
+      if (leavingRef.current.has(id)) return;
+      const startedAt = startedAtRef.current.get(id);
+      const remaining = remainingRef.current.get(id);
+      if (startedAt === undefined || remaining === undefined) return;
+      clearTimer(id);
+      remainingRef.current.set(id, Math.max(0, remaining - (Date.now() - startedAt)));
+    },
+    [clearTimer],
+  );
+
+  const resumeToast = useCallback(
+    (id: number) => {
+      if (leavingRef.current.has(id)) return;
+      const remaining = remainingRef.current.get(id);
+      if (remaining === undefined) return;
+      if (remaining <= 0) {
+        startLeaving(id);
+        return;
+      }
+      scheduleDismiss(id, remaining);
+    },
+    [scheduleDismiss, startLeaving],
+  );
+
+  /* Manual dismiss (X button) — plays the same 200ms exit fade. */
+  const dismiss = useCallback((id: number) => startLeaving(id), [startLeaving]);
+
   const toast = useCallback(
     ({
       title,
       message,
-      variant = "success",
+      variant,
     }: {
       title: string;
       message?: string;
       variant?: AlertVariant;
     }) => {
+      /* Call-site API unchanged: no variant → success, unless the title
+       * itself reads as an error (see TOAST_ERROR_TITLE). */
+      const effectiveVariant =
+        variant ?? (TOAST_ERROR_TITLE.test(title) ? "danger" : "success");
       const id = ++toastSeq;
-      const sticky = variant === "danger";
       const item: ToastItem = {
         id,
         title,
-        variant,
-        sticky,
+        variant: effectiveVariant,
+        leaving: false,
         ...(message ? { message } : {}),
       };
-      setToasts((prev) => [...prev, item]);
-      if (!sticky) {
-        window.setTimeout(() => dismiss(id), 5000);
-      }
+      setToasts((prev) => {
+        const next = [...prev, item];
+        /* Cap: drop the oldest first. The cleanup calls below are
+         * idempotent (clearing an already-cleared timer is a no-op),
+         * so a double-invoked updater in StrictMode dev is harmless. */
+        while (next.length > TOAST_MAX_VISIBLE) {
+          const dropped = next.shift();
+          if (dropped) {
+            const droppedTimer = timersRef.current.get(dropped.id);
+            if (droppedTimer !== undefined) {
+              window.clearTimeout(droppedTimer);
+              timersRef.current.delete(dropped.id);
+            }
+            leavingRef.current.delete(dropped.id);
+            remainingRef.current.delete(dropped.id);
+            startedAtRef.current.delete(dropped.id);
+          }
+        }
+        return next;
+      });
+      scheduleDismiss(id, TOAST_DURATIONS_MS[effectiveVariant]);
     },
-    [dismiss],
+    [scheduleDismiss],
   );
+
+  /* Unmount: never leave a pending timer behind. */
+  useEffect(
+    () => () => {
+      for (const timer of timersRef.current.values()) window.clearTimeout(timer);
+      timersRef.current.clear();
+    },
+    [],
+  );
+
   const value = useMemo(() => ({ toast }), [toast]);
   return (
     <ToastContext.Provider value={value}>
@@ -1995,6 +2123,18 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               key={t.id}
               className="sm-toast"
               role={t.variant === "danger" ? "alert" : "status"}
+              onMouseEnter={() => pauseToast(t.id)}
+              onMouseLeave={() => resumeToast(t.id)}
+              style={
+                t.leaving
+                  ? {
+                      opacity: 0,
+                      transform: "translateY(4px)",
+                      transition:
+                        "opacity 200ms cubic-bezier(0.16, 1, 0.3, 1), transform 200ms cubic-bezier(0.16, 1, 0.3, 1)",
+                    }
+                  : undefined
+              }
             >
               <Icon size={16} strokeWidth={2} className="sm-toast-icon" />
               <div className="sm-flex-1">

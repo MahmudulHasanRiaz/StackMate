@@ -27,6 +27,7 @@
  */
 import {
   createContext,
+  Fragment,
   lazy,
   Suspense,
   useCallback,
@@ -72,6 +73,7 @@ import {
   ShieldCheck,
   ShoppingCart,
   SunMoon,
+  Tag,
   Tags,
   TrendingUp,
   Undo2,
@@ -193,6 +195,11 @@ export interface NavItem {
   label: string;
   icon: LucideIcon;
   permission?: string;
+  /** Sub-menu items, rendered indented under the parent (Finance →
+   *  Expenses → Categories). The sidebar has no other sub-menu, so
+   *  this is the first use of the pattern: same 32px row, extra left
+   *  indent, icon kept so the collapsed rail still shows it. */
+  children?: ReadonlyArray<NavItem>;
 }
 
 export const NAVIGATION_GROUPS: ReadonlyArray<{
@@ -226,9 +233,17 @@ export const NAVIGATION_GROUPS: ReadonlyArray<{
     group: "Finance",
     items: [
       // Expense Module (2026-11-25): operational finance pages.
-      // Expense categories are config, so they live in Settings
-      // (/settings/expense-categories), not here.
-      { to: "/expenses", label: "Expenses", icon: Receipt, permission: "expenses.read" },
+      // Categories moved out of Settings (2026-11-26) — they live
+      // under Expenses as its sub-menu, not in Settings.
+      {
+        to: "/expenses",
+        label: "Expenses",
+        icon: Receipt,
+        permission: "expenses.read",
+        children: [
+          { to: "/expenses/categories", label: "Categories", icon: Tag, permission: "expenses.read" },
+        ],
+      },
       { to: "/analytics/profit-loss", label: "Profit & Loss", icon: TrendingUp, permission: "expenses.read" },
     ],
   },
@@ -511,16 +526,31 @@ function MainNav({
             {i > 0 ? <div className="sm-nav-divider" aria-hidden="true" /> : null}
             <div className="sm-nav-group-label">{group.group}</div>
             {group.items.map((item) => (
-              <Link
-                key={item.to}
-                to={item.to}
-                className="sm-nav-btn"
-                activeProps={{ "aria-current": "page" }}
-                title={item.label}
-              >
-                <item.icon size={16} strokeWidth={2} />
-                <span className="sm-nav-label">{item.label}</span>
-              </Link>
+              <Fragment key={item.to}>
+                <Link
+                  to={item.to}
+                  className="sm-nav-btn"
+                  activeProps={{ "aria-current": "page" }}
+                  title={item.label}
+                >
+                  <item.icon size={16} strokeWidth={2} />
+                  <span className="sm-nav-label">{item.label}</span>
+                </Link>
+                {(item.children ?? [])
+                  .filter((child) => can(child.permission))
+                  .map((child) => (
+                    <Link
+                      key={child.to}
+                      to={child.to}
+                      className="sm-nav-btn sm-nav-btn-sub"
+                      activeProps={{ "aria-current": "page" }}
+                      title={child.label}
+                    >
+                      <child.icon size={16} strokeWidth={2} />
+                      <span className="sm-nav-label">{child.label}</span>
+                    </Link>
+                  ))}
+              </Fragment>
             ))}
           </div>
         ))}
@@ -608,6 +638,11 @@ function QuickNav() {
       for (const item of group.items) {
         if (can(item.permission)) {
           list.push({ to: item.to, label: item.label, group: group.group, icon: item.icon });
+          for (const child of item.children ?? []) {
+            if (can(child.permission)) {
+              list.push({ to: child.to, label: child.label, group: group.group, icon: child.icon });
+            }
+          }
         }
       }
     }

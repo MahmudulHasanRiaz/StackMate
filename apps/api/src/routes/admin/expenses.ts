@@ -30,6 +30,7 @@ import {
   getExpense,
   getExpenseCategory,
   listExpenseCategories,
+  listExpenseCategoryTree,
   listExpenses,
   updateExpense,
   updateExpenseCategory,
@@ -194,6 +195,26 @@ export function registerAdminExpensesRoutes(app: Hono<AppEnv>): void {
     const body = await readJsonBody(c);
     const created = await createExpenseCategory(store, principal, body, requestId);
     return ok(c, created, 201);
+  });
+
+  // Nested category tree (hierarchy, migration 0026). Registered
+  // BEFORE /:categoryId so "tree" is never captured as a category id.
+  // Success envelope (not a paginated collection — a tree cannot be
+  // page-sliced); RBAC expenses.read, same as the flat list.
+  app.get("/api/v1/admin/expense-categories/tree", async (c) => {
+    const store = c.var.store;
+    const principal = requirePrincipal(c);
+    const requestId = c.var.requestId;
+    await assertStaffPermissionAudited(store, principal, "expenses.read", requestId);
+    const query = c.req.query();
+    const isActiveRaw = query.is_active;
+    const isActive =
+      isActiveRaw === "true" ? true : isActiveRaw === "false" ? false : null;
+    const tree = await listExpenseCategoryTree(store, principal, {
+      q: query.q?.trim().toLowerCase() ?? "",
+      isActive,
+    });
+    return ok(c, tree);
   });
 
   app.get("/api/v1/admin/expense-categories/:categoryId", async (c) => {

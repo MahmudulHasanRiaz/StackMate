@@ -10,6 +10,7 @@ import {
   timestamp,
   index,
   check,
+  type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { products } from "./catalog.ts";
 import { paymentMethods } from "./payments.ts";
@@ -37,16 +38,31 @@ import { mediaAssets } from "./media.ts";
  * `text("recorded_by").references(() => users.id, { onDelete:
  * "set null" })` in a forward migration.
  */
-export const expenseCategories = pgTable("expense_categories", {
-  id: uuid("id").primaryKey().defaultRandom(),
-  name: varchar("name", { length: 120 }).notNull().unique(),
-  description: text("description"),
-  color: varchar("color", { length: 7 }).default("#00E599"),
-  icon: varchar("icon", { length: 60 }),
-  isActive: boolean("is_active").notNull().default(true),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+export const expenseCategories = pgTable(
+  "expense_categories",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    name: varchar("name", { length: 120 }).notNull().unique(),
+    description: text("description"),
+    color: varchar("color", { length: 7 }).default("#00E599"),
+    icon: varchar("icon", { length: 60 }),
+    // Hierarchy (migration 0026): nullable self-reference, NULL =
+    // top-level. ON DELETE RESTRICT — a parent with children cannot
+    // be deleted (the API layer enforces the same 409 first). Cycle
+    // prevention lives in the service layer (a CHECK cannot walk a
+    // chain); the FK alone only guarantees the parent exists.
+    // The `: AnyPgColumn` return annotation on the references
+    // callback breaks tsc's circular inference on this
+    // self-reference (without it: TS7022/TS7024).
+    parentId: uuid("parent_id").references((): AnyPgColumn => expenseCategories.id, {
+      onDelete: "restrict",
+    }),
+    isActive: boolean("is_active").notNull().default(true),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index("idx_expense_categories_parent").on(table.parentId)],
+);
 
 export const expenses = pgTable(
   "expenses",

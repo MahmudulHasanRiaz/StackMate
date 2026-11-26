@@ -53,7 +53,19 @@ import {
 export interface ProfitLossByCategory {
   categoryId: string;
   categoryName: string;
+  /**
+   * ROLL-UP total (hierarchy, migration 0026): this category's own
+   * expenses PLUS every descendant's expenses. A parent row therefore
+   * already contains its children's spend — the global expenses total
+   * is NOT the sum of this column (that would double-count); it is
+   * computed once from the expense list itself (expenses.totalMinor).
+   * `ownTotalMinor` is this category's own expenses only; a child row
+   * still appears separately as detail, with its own roll-up.
+   */
   totalMinor: number;
+  /** This category's own expenses only (excludes descendants). */
+  ownTotalMinor: number;
+  /** This category's own expense count (excludes descendants). */
   count: number;
 }
 
@@ -223,19 +235,52 @@ export function computeProfitLoss(
   );
   const expensesMinor = scopedExpenses.reduce((s, e) => s + e.amount_minor, 0);
 
-  // -- byCategory -------------------------------------------------------------
-  const byCategoryMap = new Map<string, { totalMinor: number; count: number }>();
+  // -- byCategory (roll-up, hierarchy migration 0026) -----------------------
+  // Each expense counts once in its own category (ownTotalMinor /
+  // count) and is additionally folded into every ANCESTOR's
+  // totalMinor, so a parent row reads own + all descendants. The
+  // global expenses.totalMinor above is a separate single pass over
+  // the expense list, so nothing is double-counted there. The
+  // ancestor walk is cycle-guarded (seen set) so corrupt stored data
+  // can never loop the report.
+  const ancestorIds = (categoryId: string): string[] => {
+    const out: string[] = [];
+    const seen = new Set<string>([categoryId]);
+    let current = categories.find((c) => c.id === categoryId);
+    while (current?.parent_id) {
+      if (seen.has(current.parent_id)) break;
+      seen.add(current.parent_id);
+      out.push(current.parent_id);
+      current = categories.find((c) => c.id === current!.parent_id);
+    }
+    return out;
+  };
+  const byCategoryMap = new Map<
+    string,
+    { ownTotalMinor: number; totalMinor: number; count: number }
+  >();
+  const ensureRow = (categoryId: string) =>
+    byCategoryMap.get(categoryId) ??
+    byCategoryMap.set(categoryId, {
+      ownTotalMinor: 0,
+      totalMinor: 0,
+      count: 0,
+    }).get(categoryId)!;
   for (const e of scopedExpenses) {
-    const row = byCategoryMap.get(e.category_id) ?? { totalMinor: 0, count: 0 };
-    row.totalMinor += e.amount_minor;
-    row.count += 1;
-    byCategoryMap.set(e.category_id, row);
+    const own = ensureRow(e.category_id);
+    own.ownTotalMinor += e.amount_minor;
+    own.totalMinor += e.amount_minor;
+    own.count += 1;
+    for (const ancestorId of ancestorIds(e.category_id)) {
+      ensureRow(ancestorId).totalMinor += e.amount_minor;
+    }
   }
   const byCategory: ProfitLossByCategory[] = [...byCategoryMap.entries()]
     .map(([categoryId, row]) => ({
       categoryId,
       categoryName: categoryName(categoryId),
       totalMinor: row.totalMinor,
+      ownTotalMinor: row.ownTotalMinor,
       count: row.count,
     }))
     .sort((a, b) => b.totalMinor - a.totalMinor || a.categoryName.localeCompare(b.categoryName));

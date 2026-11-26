@@ -183,6 +183,13 @@
       "when": 1795621805000,
       "tag": "0025_sent_reminders_reference_index",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "8",
+      "when": 1795621806000,
+      "tag": "0026_expense_category_hierarchy",
+      "breakpoints": true
     }
   ]
 }

@@ -472,9 +472,11 @@ const paymentSubmissionDetailRoute = makeDetailRoute("/payment-review/$submissio
 // (D-4), on its own Commerce nav entry.
 const refundsRoute = makeListRoute("/refunds", RefundsSection);
 // Expense Module (2026-11-25): Finance group — operational expense
-// list + P&L analytics. Categories are config, so they live under
-// /settings/* (see the settings routes below).
+// list + P&L analytics. Categories moved out of Settings
+// (2026-11-26): /expenses/categories lives under Expenses in the
+// Finance group, as its sub-menu.
 const expensesRoute = makeListRoute("/expenses", ExpensesSection);
+const expenseCategoriesRoute = makeListRoute("/expenses/categories", ExpenseCategoriesSection);
 const profitLossRoute = makeListRoute("/analytics/profit-loss", ProfitLossSection);
 const subscriptionsRoute = makeListRoute("/subscriptions", SubscriptionsSection);
 const subscriptionDetailRoute = makeDetailRoute("/subscriptions/$subscriptionId", "subscriptionId", SubscriptionDetailSection);
@@ -560,10 +562,6 @@ const settingsPaymentMethodsRoute = makeSettingsListRoute(
   "/payment-methods",
   PaymentMethodsSection,
 );
-const settingsExpenseCategoriesRoute = makeSettingsListRoute(
-  "/expense-categories",
-  ExpenseCategoriesSection,
-);
 const settingsPaymentMethodDetailRoute = makeSettingsDetailRoute(
   "/payment-methods/$methodId",
   "methodId",
@@ -612,6 +610,7 @@ const routeTree = rootRoute.addChildren([
     paymentSubmissionDetailRoute,
     refundsRoute,
     expensesRoute,
+    expenseCategoriesRoute,
     profitLossRoute,
     subscriptionsRoute,
     subscriptionDetailRoute,
@@ -637,7 +636,6 @@ const routeTree = rootRoute.addChildren([
     settingsWebsiteDetailRoute,
     settingsPaymentMethodsRoute,
     settingsPaymentMethodDetailRoute,
-    settingsExpenseCategoriesRoute,
     settingsWebhooksRoute,
     settingsWebhookDetailRoute,
     settingsTrackingRoute,
