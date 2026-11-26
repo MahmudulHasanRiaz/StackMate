@@ -182,6 +182,66 @@ describe.skipIf(!DATABASE_URL)("scheduled (cron) handler — live-path repro", (
     };
   }
 
+  /** Seed a real site + tracking event (tracking_events has a NOT NULL
+   * FK to integrated_sites, so the site row must exist first). No
+   * tracking_configurations row is seeded on purpose — the site has
+   * no enabled Meta pixel group, so the wired CAPI drain has no
+   * destination for the event. */
+  async function seedSiteAndTrackingEvent(siteId: string, trackId: string): Promise<void> {
+    const { DrizzleStore } = await import("../src/platform/db/drizzle-store.ts");
+    const seedStore = await DrizzleStore.create({
+      connectionString: dbUrl,
+      encryptionSecret: HEX64,
+      appEnv: "staging",
+    });
+    try {
+      const now = new Date().toISOString();
+      await seedStore.withTransaction((state) => {
+        state.integrated_sites.push({
+          id: siteId,
+          site_key: `site_test_${siteId.slice(0, 8)}`,
+          name: "Test Site",
+          environment: "staging",
+          status: "active",
+          api_version: "v1",
+          allowed_capabilities: ["tracking.events.write"],
+          product_ids: [],
+          domains: [
+            {
+              id: randomUUID(),
+              domain: "test.example.com",
+              verification_method: "manual_review",
+              verification_challenge: "",
+              verification_status: "verified",
+              verified_at: now,
+              is_primary: true,
+            },
+          ],
+          created_at: now,
+          updated_at: now,
+        });
+        state.tracking_events.push({
+          id: trackId,
+          integrated_site_id: siteId,
+          event_name: "Purchase",
+          event_id: `purchase_${trackId.slice(0, 8)}`,
+          event_time: now,
+          event_source_url: null,
+          order_id: null,
+          consent_state: "granted",
+          consent_policy_version: "server-verified-v1",
+          sanitized_payload: { currency: "BDT", value_minor: 50000 },
+          status: "queued",
+          delivery_attempts: 0,
+          delivered_at: null,
+          created_at: now,
+        });
+      });
+    } finally {
+      await seedStore.close();
+    }
+  }
+
   it("empty outbox: scheduled resolves (no throw) and claims nothing", async () => {
     const result = await app.scheduled({}, envStaging, { waitUntil: () => {} });
     assert.deepEqual(
@@ -214,16 +274,24 @@ describe.skipIf(!DATABASE_URL)("scheduled (cron) handler — live-path repro", (
     assert.equal((await readOutboxStatus(id)).status, "skipped");
   }, 60_000);
 
-  it("Meta CAPI dispatch event: simulated, no throw", async () => {
+  it("Meta CAPI dispatch event with no Meta pixel group: skipped, no throw", async () => {
+    // E-01: the cron now wires createCapiDeliver — with no enabled
+    // Meta pixel group for the site there is no destination, so the
+    // event is terminal "skipped" (never sent, never retried), not
+    // simulated. No network call happens on this path.
+    const siteId = randomUUID();
+    const trackId = randomUUID();
+    await seedSiteAndTrackingEvent(siteId, trackId);
     const id = await seedOutboxEvent({
       event_type: "tracking.meta_capi.dispatch",
-      payload: { tracking_event_id: randomUUID() },
+      payload: { tracking_event_id: trackId },
     });
     const result = await app.scheduled({}, envStaging, { waitUntil: () => {} });
     assert.equal(result.claimed, 1, JSON.stringify(result));
     assert.equal(result.delivered, 0, JSON.stringify(result));
-    assert.equal(result.simulated, 1, JSON.stringify(result));
-    assert.equal((await readOutboxStatus(id)).status, "simulated");
+    assert.equal(result.simulated, 0, JSON.stringify(result));
+    assert.equal(result.skipped, 1, JSON.stringify(result));
+    assert.equal((await readOutboxStatus(id)).status, "skipped");
   }, 60_000);
 
   it("poison event (endpoint URL fails SSRF validation): retried, NOT thrown", async () => {

@@ -29,11 +29,12 @@
  *   attempts, HTTP status, `events_received`, `fbtrace_id`, Meta's
  *   messages, truncated error text). No token, no raw PII.
  *
- * Wiring note: the outbox drain loop (`processTransactionalOutboxBatch`
- * in `modules/webhooks/service.ts`) is owned by Worker B — it calls this
- * adapter for `tracking.meta_capi.dispatch` events and maps the result
- * onto the tracking event / outbox row. This module performs the HTTP
- * delivery only; it writes no rows.
+ * Wiring note (E-01): the outbox drain loop (`processTransactionalOutboxBatch`
+ * in `modules/webhooks/service.ts`) calls this adapter through
+ * `createCapiDeliver(env)` in that same module, which `scheduled.ts`
+ * passes as `capiDeliver` on every cron tick. The drain maps the
+ * result onto the tracking event / outbox row. This module performs
+ * the HTTP delivery only; it writes no rows.
  */
 import { decryptSecretAtRest, sha256Hex } from "../../platform/crypto/index.ts";
 import { AppError } from "../../shared/errors.ts";
