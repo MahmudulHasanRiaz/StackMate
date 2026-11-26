@@ -17,10 +17,22 @@
 
 import { AppError } from "../../shared/errors.ts";
 import { assertStaffPermissionAudited } from "../../modules/identity/service.ts";
-import { computeOrderPaid, computeOrderRemaining, createCustomerAddressByAdmin, createCustomerReportByAdmin, deleteCustomerAddressByAdmin, listCustomerAddresses, listCustomerReports, splitCustomerContactByAdmin, updateCustomerAddressByAdmin } from "../../modules/customers/service.ts";
+import { createCustomerAddressByAdmin, createCustomerReportByAdmin, deleteCustomerAddressByAdmin, splitCustomerContactByAdmin, updateCustomerAddressByAdmin } from "../../modules/customers/service.ts";
+import {
+  customerExists,
+  listCustomerActivity,
+  listCustomerAddressesTargeted,
+  listCustomerReportsTargeted,
+  listCustomerTickets,
+} from "../../modules/customers/list.ts";
+import { listOrders } from "../../modules/orders/list.ts";
+import { listSubscriptions } from "../../modules/subscriptions/list.ts";
+import { listCustomerInstallations, listLicenses } from "./licenses.ts";
+import { listCustomerPayments } from "../../modules/payments/list.ts";
 import { Hono } from "hono";
 import type { AppEnv } from "../../types/context.ts";
-import { jsonResponse, pagedCollectionResponse, parseListQuery, readJsonBody } from "../../shared/http.ts";
+import { collectionResponse, jsonResponse, parseListQuery, readJsonBody } from "../../shared/http.ts";
+
 export function registerCustomerDetailRoutes(app: Hono<AppEnv>): void {
   app.get("/api/v1/admin/customers/:customerId/orders", async (c) => {
     const store = c.var.store;
@@ -35,20 +47,28 @@ export function registerCustomerDetailRoutes(app: Hono<AppEnv>): void {
       throw new AppError("UNAUTHORIZED", "Valid staff authentication session required.", 401);
     }
     await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
-    const customer = store.state.customers.find(
-      (cust) => cust.id === c.req.param("customerId")
-    );
-    if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
+    const customerId = c.req.param("customerId");
+    if (!(await customerExists(store, customerId))) {
+      throw new AppError("NOT_FOUND", "Customer not found.", 404);
+    }
     const { limit, page } = parseListQuery(url.searchParams);
-    return pagedCollectionResponse(c, 
-      store.state.orders
-        .filter((o) => o.customer_id === customer.id)
-        .map((o) => ({
-          ...o,
-          paid_amount_minor: computeOrderPaid(store.state, o.id),
-          remaining_minor: computeOrderRemaining(store.state, o),
-        })),
-      limit, page
+    const { items, total } = await listOrders(store, {
+      q: "",
+      limit,
+      page,
+      customerId,
+      sort: "asc",
+    });
+    return collectionResponse(
+      c,
+      items.map(({ order: o, paid_amount_minor, remaining_minor }) => ({
+        ...o,
+        paid_amount_minor,
+        remaining_minor,
+      })),
+      null,
+      200,
+      total,
     );
   });
   app.get("/api/v1/admin/customers/:customerId/subscriptions", async (c) => {
@@ -64,14 +84,23 @@ export function registerCustomerDetailRoutes(app: Hono<AppEnv>): void {
       throw new AppError("UNAUTHORIZED", "Valid staff authentication session required.", 401);
     }
     await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
-    const customer = store.state.customers.find(
-      (cust) => cust.id === c.req.param("customerId")
-    );
-    if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
+    const customerId = c.req.param("customerId");
+    if (!(await customerExists(store, customerId))) {
+      throw new AppError("NOT_FOUND", "Customer not found.", 404);
+    }
     const { limit, page } = parseListQuery(url.searchParams);
-    return pagedCollectionResponse(c, 
-      store.state.subscriptions.filter((s) => s.customer_id === customer.id),
-      limit, page
+    const { items, total } = await listSubscriptions(store, {
+      q: "",
+      limit,
+      page,
+      customerId,
+    });
+    return collectionResponse(
+      c,
+      items.map(({ subscription }) => subscription),
+      null,
+      200,
+      total,
     );
   });
   app.get("/api/v1/admin/customers/:customerId/licenses", async (c) => {
@@ -87,17 +116,19 @@ export function registerCustomerDetailRoutes(app: Hono<AppEnv>): void {
       throw new AppError("UNAUTHORIZED", "Valid staff authentication session required.", 401);
     }
     await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
-    const customer = store.state.customers.find(
-      (cust) => cust.id === c.req.param("customerId")
-    );
-    if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
+    const customerId = c.req.param("customerId");
+    if (!(await customerExists(store, customerId))) {
+      throw new AppError("NOT_FOUND", "Customer not found.", 404);
+    }
     const { limit, page } = parseListQuery(url.searchParams);
-    return pagedCollectionResponse(c, 
-      store.state.licenses
-        .filter((l) => l.customer_id === customer.id)
-        .map(({ license_key_hash: _h, issued_raw_key_once: _r, ...safe }) => safe),
-      limit, page
-    );
+    const { items, total } = await listLicenses(store, {
+      q: "",
+      limit,
+      page,
+      sort: "asc",
+      customerId,
+    });
+    return collectionResponse(c, items, null, 200, total);
   });
   app.get("/api/v1/admin/customers/:customerId/addresses", async (c) => {
     const store = c.var.store;
@@ -112,10 +143,18 @@ export function registerCustomerDetailRoutes(app: Hono<AppEnv>): void {
       throw new AppError("UNAUTHORIZED", "Valid staff authentication session required.", 401);
     }
     await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
+    const customerId = c.req.param("customerId")!;
+    if (!(await customerExists(store, customerId))) {
+      throw new AppError("NOT_FOUND", "Customer not found.", 404);
+    }
     const { limit, page } = parseListQuery(url.searchParams);
-    return pagedCollectionResponse(c, 
-      await listCustomerAddresses(store, principal, c.req.param("customerId")!),
-      limit, page
+    const addresses = await listCustomerAddressesTargeted(store, customerId);
+    return collectionResponse(
+      c,
+      addresses.slice((page - 1) * limit, page * limit),
+      null,
+      200,
+      addresses.length,
     );
   });
   app.post("/api/v1/admin/customers/:customerId/addresses", async (c) => {
@@ -206,10 +245,18 @@ export function registerCustomerDetailRoutes(app: Hono<AppEnv>): void {
       throw new AppError("UNAUTHORIZED", "Valid staff authentication session required.", 401);
     }
     await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
+    const customerId = c.req.param("customerId")!;
+    if (!(await customerExists(store, customerId))) {
+      throw new AppError("NOT_FOUND", "Customer not found.", 404);
+    }
     const { limit, page } = parseListQuery(url.searchParams);
-    return pagedCollectionResponse(c, 
-      await listCustomerReports(store, principal, c.req.param("customerId")!),
-      limit, page
+    const reports = await listCustomerReportsTargeted(store, customerId);
+    return collectionResponse(
+      c,
+      reports.slice((page - 1) * limit, page * limit),
+      null,
+      200,
+      reports.length,
     );
   });
   app.post("/api/v1/admin/customers/:customerId/reports", async (c) => {
@@ -275,26 +322,11 @@ export function registerCustomerDetailRoutes(app: Hono<AppEnv>): void {
       throw new AppError("UNAUTHORIZED", "Valid staff authentication session required.", 401);
     }
     await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
-    const customer = store.state.customers.find(
-      (cust) => cust.id === c.req.param("customerId")
-    );
-    if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
-    const orderIds = new Set(
-      store.state.orders
-        .filter((o) => o.customer_id === customer.id)
-        .map((o) => o.id)
-    );
-    const submissions = store.state.payment_submissions.filter((s) =>
-      orderIds.has(s.order_id)
-    );
-    const submissionIds = new Set(submissions.map((s) => s.id));
-    return jsonResponse(c, {
-      submissions,
-      transactions: store.state.payment_transactions.filter((t) =>
-        t.payment_submission_id !== null &&
-        submissionIds.has(t.payment_submission_id)
-      ),
-    });
+    const customerId = c.req.param("customerId");
+    if (!(await customerExists(store, customerId))) {
+      throw new AppError("NOT_FOUND", "Customer not found.", 404);
+    }
+    return jsonResponse(c, await listCustomerPayments(store, customerId));
   });
   app.get("/api/v1/admin/customers/:customerId/installations", async (c) => {
     const store = c.var.store;
@@ -310,18 +342,12 @@ export function registerCustomerDetailRoutes(app: Hono<AppEnv>): void {
     }
     await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
     const { limit, page } = parseListQuery(url.searchParams);
-    return pagedCollectionResponse(c, 
-      store.state.licenses
-        .filter((l) => l.customer_id === c.req.param("customerId"))
-        .flatMap((l) =>
-          l.activations.map((a) => ({
-            ...a,
-            license_number: l.license_number,
-            product_id: l.product_id,
-          }))
-        ),
-      limit, page
+    const { items, total } = await listCustomerInstallations(
+      store,
+      c.req.param("customerId"),
+      { limit, page },
     );
+    return collectionResponse(c, items, null, 200, total);
   });
   app.get("/api/v1/admin/customers/:customerId/activity", async (c) => {
     const store = c.var.store;
@@ -336,39 +362,13 @@ export function registerCustomerDetailRoutes(app: Hono<AppEnv>): void {
       throw new AppError("UNAUTHORIZED", "Valid staff authentication session required.", 401);
     }
     await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
-    const customer = store.state.customers.find(
-      (cust) => cust.id === c.req.param("customerId")
-    );
-    if (!customer) throw new AppError("NOT_FOUND", "Customer not found.", 404);
-    const orderIds = new Set(
-      store.state.orders
-        .filter((o) => o.customer_id === customer.id)
-        .map((o) => o.id)
-    );
-    const subIds = new Set(
-      store.state.subscriptions
-        .filter((s) => s.customer_id === customer.id)
-        .map((s) => s.id)
-    );
-    const licenseIds = new Set(
-      store.state.licenses
-        .filter((l) => l.customer_id === customer.id)
-        .map((l) => l.id)
-    );
+    const customerId = c.req.param("customerId");
+    if (!(await customerExists(store, customerId))) {
+      throw new AppError("NOT_FOUND", "Customer not found.", 404);
+    }
     const { limit, page } = parseListQuery(url.searchParams);
-    return pagedCollectionResponse(c, 
-      store.state.audit_logs
-        .filter(
-          (a) =>
-            a.resource_id === customer.id ||
-            (a.resource_type === "order" && orderIds.has(a.resource_id)) ||
-            (a.resource_type === "subscription" && subIds.has(a.resource_id)) ||
-            (a.resource_type === "license" && licenseIds.has(a.resource_id))
-        )
-        .slice(-100)
-        .reverse(),
-      limit, page
-    );
+    const { items, total } = await listCustomerActivity(store, customerId, { limit, page });
+    return collectionResponse(c, items, null, 200, total);
   });
   app.get("/api/v1/admin/customers/:customerId/tickets", async (c) => {
     const store = c.var.store;
@@ -384,11 +384,10 @@ export function registerCustomerDetailRoutes(app: Hono<AppEnv>): void {
     }
     await assertStaffPermissionAudited(store, principal, "tickets.view", requestId);
     const { limit, page } = parseListQuery(url.searchParams);
-    return pagedCollectionResponse(c, 
-      store.state.support_tickets.filter(
-        (t) => t.customer_id === c.req.param("customerId")
-      ),
-      limit, page
-    );
+    const { items, total } = await listCustomerTickets(store, c.req.param("customerId"), {
+      limit,
+      page,
+    });
+    return collectionResponse(c, items, null, 200, total);
   });
 }

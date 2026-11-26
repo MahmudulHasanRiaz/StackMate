@@ -18,10 +18,12 @@
 import { formatDisplayDateDDMMYYYY } from "../../../../../packages/contracts/src/index.ts";
 import { AppError } from "../../shared/errors.ts";
 import { assertStaffPermissionAudited } from "../../modules/identity/service.ts";
+import { listProducts } from "../../modules/products/list.ts";
 import { createProduct, updateProductMetadata, updateProductStatus } from "../../modules/catalog/service.ts";
 import { Hono } from "hono";
 import type { AppEnv } from "../../types/context.ts";
-import { jsonResponse, pagedCollectionResponse, parseListQuery, includesQuery, readJsonBody } from "../../shared/http.ts";
+import { collectionResponse, jsonResponse, parseListQuery, readJsonBody } from "../../shared/http.ts";
+
 export function registerAdminProductsRoutes(app: Hono<AppEnv>): void {
   app.get("/api/v1/admin/products", async (c) => {
     const store = c.var.store;
@@ -37,24 +39,20 @@ export function registerAdminProductsRoutes(app: Hono<AppEnv>): void {
     }
     await assertStaffPermissionAudited(store, principal, "products.read", requestId);
     const { q, limit, page } = parseListQuery(url.searchParams);
-    const items = store.state.products
-      .filter(
-        (p) => includesQuery(p.name, q) || includesQuery(p.code, q),
-      )
-      .map((p) => ({
+    const { items, total } = await listProducts(store, { q, limit, page });
+    return collectionResponse(
+      c,
+      items.map((p) => ({
         ...p,
-        features_count: store.state.product_features.filter(
-          (f) => f.product_id === p.id,
-        ).length,
-        packages_count: store.state.product_packages.filter(
-          (pkg) => pkg.product_id === p.id,
-        ).length,
         created_date_display: formatDisplayDateDDMMYYYY(
           p.created_at,
           env.DEFAULT_TIMEZONE,
         ),
-      }));
-    return pagedCollectionResponse(c, items, limit, page);
+      })),
+      null,
+      200,
+      total,
+    );
   });
   app.post("/api/v1/admin/products", async (c) => {
     const store = c.var.store;

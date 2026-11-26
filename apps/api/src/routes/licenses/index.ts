@@ -17,7 +17,7 @@
 
 import { and } from "drizzle-orm";
 import { AppError } from "../../shared/errors.ts";
-import { activateLicenseInstallation, deactivateLicenseInstallation, validateLicenseInstallation } from "../../modules/licensing/service.ts";
+import { activateLicenseInstallation, deactivateLicenseInstallation, validateLicenseInstallationTargeted } from "../../modules/licensing/service.ts";
 import { Hono } from "hono";
 import type { AppEnv } from "../../types/context.ts";
 import { jsonResponse, readJsonBody, getClientIp } from "../../shared/http.ts";
@@ -101,7 +101,12 @@ export function registerLicensesRoutes(app: Hono<AppEnv>): void {
     const pathname = url.pathname.replace(/\/+$/, "") || "/";
     const clientIp = getClientIp(request);
     const body = await readJsonBody(c);
-    const result = await validateLicenseInstallation(store, body, {
+    // B-01: targeted validate — lookup + checks run on
+    // findLicenseForValidation (no full-state load), safe on a
+    // createTargeted store. Activate/deactivate stay on the legacy
+    // transactional path: seat changes + audit rows need a
+    // transaction, and no targeted mutation exists for them.
+    const result = await validateLicenseInstallationTargeted(store, body, {
       verifierSecret: env.LICENSE_VERIFIER_SECRET,
       issuerUrl: env.API_URL,
     });

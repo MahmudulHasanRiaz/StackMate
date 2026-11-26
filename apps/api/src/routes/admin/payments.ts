@@ -29,6 +29,11 @@ import {
   type DriverDeps,
 } from "../../platform/storage/driver.ts";
 import {
+  listPaymentMethods,
+  listPaymentProviders,
+  listPaymentRefunds,
+} from "../../modules/payments/list.ts";
+import {
   createPaymentMethodByAdmin,
   createPaymentProviderByAdmin,
   deletePaymentMethodByAdmin,
@@ -74,33 +79,22 @@ function parseListQuery(query: Record<string, string | undefined>): {
   return { q, limit, page };
 }
 
-function applyListPage<T>(items: T[], limit: number, page: number): T[] {
-  return items.slice((page - 1) * limit, page * limit);
-}
-
-function pagedCollection<T>(
+function pagedCollectionTotal<T>(
   c: Context<AppEnv>,
-  filtered: T[],
-  limit: number,
-  page = 1,
-  nextCursor: string | null = null,
+  pageItems: T[],
+  total: number,
   status = 200
 ): Response {
   return c.json(
     createCollectionEnvelope(
-      applyListPage(filtered, limit, page),
-      nextCursor,
+      pageItems,
+      null,
       c.var.requestId,
-      filtered.length
+      total
     ),
     status as ContentfulStatusCode
   );
 }
-
-const includesQuery = (
-  haystack: string | null | undefined,
-  q: string
-): boolean => (!q ? true : (haystack ?? "").toLowerCase().includes(q));
 
 const MAX_REQUEST_BODY_BYTES = 6 * 1024 * 1024;
 
@@ -253,12 +247,12 @@ export function registerAdminPaymentsRoutes(app: Hono<AppEnv>): void {
     const requestId = c.var.requestId;
     await assertStaffPermissionAudited(store, principal, "payments.read", requestId);
     const { q, limit, page } = parseListQuery(c.req.query());
-    return pagedCollection(
-      c,
-      store.state.payment_providers.filter((p) => includesQuery(p.display_name, q)),
+    const { items, total } = await listPaymentProviders(store, {
+      q,
       limit,
-      page
-    );
+      page,
+    });
+    return pagedCollectionTotal(c, items, total);
   });
 
 
@@ -274,14 +268,13 @@ export function registerAdminPaymentsRoutes(app: Hono<AppEnv>): void {
     const enabledFilter =
       isEnabledParam === "true" ? true : isEnabledParam === "false" ? false : null;
     const { q, limit, page } = parseListQuery(query);
-    return pagedCollection(
-      c,
-      store.state.payment_methods
-        .filter((m) => (enabledFilter === null ? true : m.is_enabled === enabledFilter))
-        .filter((m) => includesQuery(m.display_name, q)),
+    const { items, total } = await listPaymentMethods(store, {
+      q,
       limit,
-      page
-    );
+      page,
+      isEnabled: enabledFilter,
+    });
+    return pagedCollectionTotal(c, items, total);
   });
 
 
@@ -445,14 +438,12 @@ export function registerAdminPaymentsRoutes(app: Hono<AppEnv>): void {
     const requestId = c.var.requestId;
     await assertStaffPermissionAudited(store, principal, "payments.read", requestId);
     const { q, limit, page } = parseListQuery(c.req.query());
-    const items = store.state.payment_refunds.filter(
-      (r) =>
-        includesQuery(r.id, q) ||
-        includesQuery(r.payment_transaction_id, q) ||
-        includesQuery(r.reason, q) ||
-        includesQuery(r.provider_refund_id, q),
-    );
-    return pagedCollection(c, items, limit, page);
+    const { items, total } = await listPaymentRefunds(store, {
+      q,
+      limit,
+      page,
+    });
+    return pagedCollectionTotal(c, items, total);
   });
 
 

@@ -18,11 +18,13 @@
 import { formatDisplayDateDDMMYYYY } from "../../../../../packages/contracts/src/index.ts";
 import { AppError } from "../../shared/errors.ts";
 import { assertStaffPermissionAudited } from "../../modules/identity/service.ts";
+import { listCustomers } from "../../modules/customers/list.ts";
 import { computeCustomerFinancials, computeOrderPaid, computeOrderRemaining, createCustomerByAdmin, toCustomerAddressDto, updateCustomerByAdmin } from "../../modules/customers/service.ts";
 import { searchGlobal } from "../../modules/search/service.ts";
 import { Hono } from "hono";
 import type { AppEnv } from "../../types/context.ts";
-import { jsonResponse, pagedCollectionResponse, parseListQuery, includesQuery, matchesPhoneQuery, readJsonBody } from "../../shared/http.ts";
+import { collectionResponse, jsonResponse, parseListQuery, readJsonBody } from "../../shared/http.ts";
+
 export function registerAdminCustomersRoutes(app: Hono<AppEnv>): void {
   app.get("/api/v1/admin/search", async (c) => {
     const store = c.var.store;
@@ -59,31 +61,20 @@ export function registerAdminCustomersRoutes(app: Hono<AppEnv>): void {
     }
     await assertStaffPermissionAudited(store, principal, "customers.read", requestId);
     const { q, limit, page } = parseListQuery(url.searchParams);
-    const items = store.state.customers
-      .filter(
-        (c) =>
-          includesQuery(c.name, q) ||
-          includesQuery(c.email, q) ||
-          includesQuery(c.customer_number, q) ||
-          includesQuery(c.company_name, q) ||
-          matchesPhoneQuery(c.phone, c.normalized_phone, q),
-      )
-      .map((c) => ({
+    const { items, total } = await listCustomers(store, { q, limit, page });
+    return collectionResponse(
+      c,
+      items.map((c) => ({
         ...c,
-        // Staff-report flag (ADR-0009): a warning badge when a concern
-        // report exists; the count lets the list row show it plainly.
-        report_count: store.state.customer_reports.filter(
-          (r) => r.customer_id === c.id,
-        ).length,
-        has_concern_report: store.state.customer_reports.some(
-          (r) => r.customer_id === c.id && r.type === "concern",
-        ),
         created_date_display: formatDisplayDateDDMMYYYY(
           c.created_at,
           env.DEFAULT_TIMEZONE,
         ),
-      }));
-    return pagedCollectionResponse(c, items, limit, page);
+      })),
+      null,
+      200,
+      total,
+    );
   });
   app.post("/api/v1/admin/customers", async (c) => {
     const store = c.var.store;

@@ -18,11 +18,14 @@
 import { formatDisplayDateDDMMYYYY } from "../../../../../packages/contracts/src/index.ts";
 import { AppError } from "../../shared/errors.ts";
 import { assertStaffPermissionAudited } from "../../modules/identity/service.ts";
+import { listInvoices, listOrderInstallments } from "../../modules/invoices/list.ts";
+import { orderExists } from "../../modules/orders/list.ts";
 import { createInvoiceForOrderByAdmin, voidInvoiceByAdmin } from "../../modules/commerce/service.ts";
 import { updateInstallmentByAdmin } from "../../modules/payments/service.ts";
 import { Hono } from "hono";
 import type { AppEnv } from "../../types/context.ts";
-import { jsonResponse, pagedCollectionResponse, parseListQuery, readJsonBody, readJsonBodyLenient } from "../../shared/http.ts";
+import { collectionResponse, jsonResponse, parseListQuery, readJsonBody, readJsonBodyLenient } from "../../shared/http.ts";
+
 export function registerAdminInvoicesRoutes(app: Hono<AppEnv>): void {
   app.get("/api/v1/admin/invoices", async (c) => {
     const store = c.var.store;
@@ -37,8 +40,9 @@ export function registerAdminInvoicesRoutes(app: Hono<AppEnv>): void {
       throw new AppError("UNAUTHORIZED", "Valid staff authentication session required.", 401);
     }
     await assertStaffPermissionAudited(store, principal, "orders.read", requestId);
-    const { limit, page } = parseListQuery(url.searchParams);
-    return pagedCollectionResponse(c, store.state.invoices, limit, page);
+    const { q, limit, page } = parseListQuery(url.searchParams);
+    const { items, total } = await listInvoices(store, { q, limit, page });
+    return collectionResponse(c, items, null, 200, total);
   });
   app.get("/api/v1/admin/orders/:orderId/invoices", async (c) => {
     const store = c.var.store;
@@ -53,15 +57,13 @@ export function registerAdminInvoicesRoutes(app: Hono<AppEnv>): void {
       throw new AppError("UNAUTHORIZED", "Valid staff authentication session required.", 401);
     }
     await assertStaffPermissionAudited(store, principal, "orders.read", requestId);
-    const order = store.state.orders.find(
-      (o) => o.id === c.req.param("orderId")
-    );
-    if (!order) throw new AppError("NOT_FOUND", "Order not found.", 404);
-    const { limit, page } = parseListQuery(url.searchParams);
-    return pagedCollectionResponse(c, 
-      store.state.invoices.filter((i) => i.order_id === order.id),
-      limit, page
-    );
+    const orderId = c.req.param("orderId");
+    if (!(await orderExists(store, orderId))) {
+      throw new AppError("NOT_FOUND", "Order not found.", 404);
+    }
+    const { q, limit, page } = parseListQuery(url.searchParams);
+    const { items, total } = await listInvoices(store, { q, limit, page, orderId });
+    return collectionResponse(c, items, null, 200, total);
   });
   app.post("/api/v1/admin/orders/:orderId/invoices", async (c) => {
     const store = c.var.store;
@@ -99,23 +101,24 @@ export function registerAdminInvoicesRoutes(app: Hono<AppEnv>): void {
       throw new AppError("UNAUTHORIZED", "Valid staff authentication session required.", 401);
     }
     await assertStaffPermissionAudited(store, principal, "orders.read", requestId);
-    const order = store.state.orders.find(
-      (o) => o.id === c.req.param("orderId")
-    );
-    if (!order) throw new AppError("NOT_FOUND", "Order not found.", 404);
+    const orderId = c.req.param("orderId");
+    if (!(await orderExists(store, orderId))) {
+      throw new AppError("NOT_FOUND", "Order not found.", 404);
+    }
     const { limit, page } = parseListQuery(url.searchParams);
-    return pagedCollectionResponse(c, 
-      store.state.order_installments
-        .filter((i) => i.order_id === order.id)
-        .sort((a, b) => a.installment_number - b.installment_number)
-        .map((i) => ({
-          ...i,
-          due_date_display: formatDisplayDateDDMMYYYY(
-            `${i.due_date}T00:00:00.000Z`,
-            env.DEFAULT_TIMEZONE
-          ),
-        })),
-      limit, page
+    const { items, total } = await listOrderInstallments(store, orderId, { limit, page });
+    return collectionResponse(
+      c,
+      items.map((i) => ({
+        ...i,
+        due_date_display: formatDisplayDateDDMMYYYY(
+          `${i.due_date}T00:00:00.000Z`,
+          env.DEFAULT_TIMEZONE
+        ),
+      })),
+      null,
+      200,
+      total,
     );
   });
   app.patch("/api/v1/admin/orders/:orderId/installments/:installmentId", async (c) => {

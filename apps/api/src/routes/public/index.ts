@@ -43,17 +43,17 @@ export function registerPublicRoutes(app: Hono<AppEnv>): void {
     if (siteKeyHeader && siteKeyHeader !== siteKey) {
       throw new AppError("FORBIDDEN", "X-StackMate-Site-Key mismatch.", 403);
     }
-    const site = store.state.integrated_sites.find(
-      (s) => s.site_key === siteKey && s.status === "active"
-    );
-    if (!site) throw new AppError("UNAUTHORIZED", "Invalid or inactive site key.", 401);
+    // B-01: targeted reads only — site by key + public catalog, no
+    // full-state load. Safe on a createTargeted store.
+    const site = await store.findIntegratedSiteByKey(siteKey);
+    if (!site || site.status !== "active") throw new AppError("UNAUTHORIZED", "Invalid or inactive site key.", 401);
 
     // B-11: the old `store.queryMetrics.cachedQueries += 1` here
-    // was false — the data comes from the uncached full-state
-    // load (HYPERDRIVE_NO_CACHE), never a cached read path, so
-    // the counter over-reported cached reads. Removed; OD-04
-    // (wire real HYPERDRIVE_CACHED or delete it) is still open.
-    const allowedProducts = store.state.products
+    // was false — the data comes from targeted reads, never a cached
+    // read path, so the counter over-reported cached reads. Removed;
+    // OD-04 (wire real HYPERDRIVE_CACHED or delete it) is still open.
+    const catalog = await store.loadPublicCatalog();
+    const allowedProducts = catalog.products
       .filter((p) => p.status === "active" && site.product_ids.includes(p.id))
       .map((p) => ({
         slug: p.slug,
@@ -82,25 +82,25 @@ export function registerPublicRoutes(app: Hono<AppEnv>): void {
     };
     const siteKey = c.req.param("siteKey")!;
     const productSlug = c.req.param("productSlug")!;
-    const site = store.state.integrated_sites.find(
-      (s) => s.site_key === siteKey && s.status === "active"
-    );
-    if (!site) throw new AppError("UNAUTHORIZED", "Invalid or inactive site key.", 401);
-    const product = store.state.products.find(
+    // B-01: targeted reads only (see the products-list handler).
+    const site = await store.findIntegratedSiteByKey(siteKey);
+    if (!site || site.status !== "active") throw new AppError("UNAUTHORIZED", "Invalid or inactive site key.", 401);
+    const catalog = await store.loadPublicCatalog();
+    const product = catalog.products.find(
       (p) => p.slug === productSlug && p.status === "active"
     );
     if (!product || !site.product_ids.includes(product.id)) {
       throw new AppError("NOT_FOUND", "Published product not found for this site.", 404);
     }
 
-    const packages = store.state.product_packages
+    const packages = catalog.product_packages
       .filter((pkg) => pkg.product_id === product.id && pkg.status === "active")
       .map((pkg) => {
-        const publishedVer = store.state.package_versions.find(
+        const publishedVer = catalog.package_versions.find(
           (v) => v.id === pkg.current_version_id && v.status === "published"
         );
         if (!publishedVer) return null;
-        const prices = store.state.package_prices
+        const prices = catalog.package_prices
           .filter(
             (pr) => pr.package_version_id === publishedVer.id && pr.status === "active"
           )
@@ -153,20 +153,20 @@ export function registerPublicRoutes(app: Hono<AppEnv>): void {
     if (siteKeyHeader && siteKeyHeader !== siteKey) {
       throw new AppError("FORBIDDEN", "X-StackMate-Site-Key mismatch.", 403);
     }
-    const site = store.state.integrated_sites.find(
-      (s) => s.site_key === siteKey && s.status === "active"
-    );
-    if (!site) throw new AppError("UNAUTHORIZED", "Invalid or inactive site key.", 401);
-    const product = store.state.products.find(
+    // B-01: targeted reads only (see the products-list handler).
+    const site = await store.findIntegratedSiteByKey(siteKey);
+    if (!site || site.status !== "active") throw new AppError("UNAUTHORIZED", "Invalid or inactive site key.", 401);
+    const catalog = await store.loadPublicCatalog();
+    const product = catalog.products.find(
       (p) => p.slug === productSlug && p.status === "active"
     );
     if (!product || !site.product_ids.includes(product.id)) {
       throw new AppError("NOT_FOUND", "Published product not found for this site.", 404);
     }
-    const packages = store.state.product_packages
+    const packages = catalog.product_packages
       .filter((pkg) => pkg.product_id === product.id && pkg.status === "active")
       .map((pkg) => {
-        const publishedVer = store.state.package_versions.find(
+        const publishedVer = catalog.package_versions.find(
           (v) => v.id === pkg.current_version_id && v.status === "published"
         );
         if (!publishedVer) return null;
@@ -182,7 +182,7 @@ export function registerPublicRoutes(app: Hono<AppEnv>): void {
             entitlement_value: f.entitlement_value,
             unit: f.unit_snapshot,
           })),
-          prices: store.state.package_prices
+          prices: catalog.package_prices
             .filter(
               (pr) => pr.package_version_id === publishedVer.id && pr.status === "active"
             )
@@ -208,7 +208,7 @@ export function registerPublicRoutes(app: Hono<AppEnv>): void {
       product_type: product.product_type,
       website_url: product.website_url,
       documentation_url: product.documentation_url,
-      features: store.state.product_features
+      features: catalog.product_features
         .filter((f) => f.product_id === product.id && f.status === "active")
         .map((f) => ({
           feature_key: f.feature_key,
@@ -239,19 +239,19 @@ export function registerPublicRoutes(app: Hono<AppEnv>): void {
     if (siteKeyHeader && siteKeyHeader !== siteKey) {
       throw new AppError("FORBIDDEN", "X-StackMate-Site-Key mismatch.", 403);
     }
-    const site = store.state.integrated_sites.find(
-      (s) => s.site_key === siteKey && s.status === "active"
-    );
-    if (!site) throw new AppError("UNAUTHORIZED", "Invalid or inactive site key.", 401);
-    const version = store.state.package_versions.find(
+    // B-01: targeted reads only (see the products-list handler).
+    const site = await store.findIntegratedSiteByKey(siteKey);
+    if (!site || site.status !== "active") throw new AppError("UNAUTHORIZED", "Invalid or inactive site key.", 401);
+    const catalog = await store.loadPublicCatalog();
+    const version = catalog.package_versions.find(
       (v) => v.id === packageVersionId && v.status === "published"
     );
     if (!version) throw new AppError("NOT_FOUND", "Published package version not found.", 404);
-    const pkg = store.state.product_packages.find(
+    const pkg = catalog.product_packages.find(
       (p) => p.id === version.package_id && p.status === "active"
     );
     if (!pkg) throw new AppError("NOT_FOUND", "Published package version not found.", 404);
-    const product = store.state.products.find(
+    const product = catalog.products.find(
       (p) => p.id === pkg.product_id && p.status === "active"
     );
     if (!product || !site.product_ids.includes(product.id)) {
@@ -271,7 +271,7 @@ export function registerPublicRoutes(app: Hono<AppEnv>): void {
         entitlement_value: f.entitlement_value,
         unit: f.unit_snapshot,
       })),
-      prices: store.state.package_prices
+      prices: catalog.package_prices
         .filter((pr) => pr.package_version_id === version.id && pr.status === "active")
         .map((pr) => ({
           id: pr.id,

@@ -20,11 +20,13 @@ import {
 } from "../../../../../packages/contracts/src/index.ts";
 import {
   computeInstallationIdHash,
+  computeLicenseKeyVerifier,
   computeLicenseKeyVerifierV2,
   generateFormattedLicenseKey,
   signEntitlementJws,
   verifyLicenseKeyVerifier,
 } from "../../platform/crypto/index.ts";
+import type { Client as PgClient } from "pg";
 import type {
   DatabaseState,
   LicenseActivationRecord,
@@ -484,6 +486,153 @@ export async function validateLicenseInstallation(
       next_validation_after: signed.next_validation_after,
     };
   });
+}
+
+/**
+ * B-01 targeted license validation: the same contract as
+ * validateLicenseInstallation, but the lookup + checks run on the
+ * targeted reads (findLicenseForValidation) instead of the full
+ * in-transaction state — safe on a createTargeted store, whose state
+ * holds only seed rows. The candidate hashes are computed here (v2
+ * first, then v1) instead of scanning every license row through
+ * verifyLicenseKeyVerifier — the same dual-version acceptance the
+ * scan provides, as an equality match per hash. The usability checks
+ * below mirror assertLicenseIsUsable check-for-check (same codes,
+ * messages, statuses, and order), fed by the targeted method's
+ * productCode + subscriptionStatus instead of state lookups.
+ *
+ * The one write on this path is the activation heartbeat
+ * (last_seen_at): a single-row targeted UPDATE through the store's
+ * database client when one exists, or an in-place touch of the live
+ * record on the in-memory store (see touchActivationLastSeen). No
+ * transaction, no full load. The expired-status flip the legacy path
+ * performs is deliberately NOT reproduced: it runs immediately
+ * before the LICENSE_EXPIRED throw, so the legacy transaction rolls
+ * it back and it never persisted — the response is identical either
+ * way. Validation writes no license_validation_logs row (the legacy
+ * path never did either).
+ */
+export async function validateLicenseInstallationTargeted(
+  store: StackMateDataStore,
+  rawInput: unknown,
+  config: { verifierSecret: string; issuerUrl: string }
+): Promise<{
+  valid: true;
+  license_number: string;
+  license_status: string;
+  entitlement_version: number;
+  entitlement_token: string;
+  entitlement_expires_at: string;
+  next_validation_after: string;
+}> {
+  const input = ValidateLicenseRequestSchema.parse(rawInput);
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+
+  const candidateHashes = [
+    computeLicenseKeyVerifierV2(input.license_key, config.verifierSecret),
+    computeLicenseKeyVerifier(input.license_key, config.verifierSecret),
+  ];
+  let found: Awaited<ReturnType<typeof store.findLicenseForValidation>> = null;
+  for (const keyHash of candidateHashes) {
+    found = await store.findLicenseForValidation(keyHash);
+    if (found) break;
+  }
+  if (!found) {
+    throw new AppError("LICENSE_INVALID", "Invalid license key.", 401);
+  }
+  const { license, productCode, subscriptionStatus } = found;
+
+  if (
+    !productCode ||
+    productCode.toUpperCase() !== input.product_code.trim().toUpperCase()
+  ) {
+    throw new AppError(
+      "PRODUCT_MISMATCH",
+      `License does not belong to product '${input.product_code}'.`,
+      403
+    );
+  }
+  if (license.status === "revoked") {
+    throw new AppError("LICENSE_REVOKED", "This license has been revoked.", 403);
+  }
+  if (license.status === "suspended") {
+    throw new AppError("LICENSE_SUSPENDED", "This license is currently suspended.", 403);
+  }
+  if (new Date(license.valid_from).getTime() > nowMs) {
+    throw new AppError("LICENSE_NOT_YET_VALID", "This license is not yet valid.", 403);
+  }
+  if (license.expires_at) {
+    const expMs = new Date(license.expires_at).getTime();
+    const graceMs = license.grace_until ? new Date(license.grace_until).getTime() : expMs;
+    if (nowMs > graceMs) {
+      throw new AppError("LICENSE_EXPIRED", "This license and its grace period have expired.", 403);
+    }
+  }
+  if (
+    license.subscription_id &&
+    subscriptionStatus !== null &&
+    (subscriptionStatus === "cancelled" || subscriptionStatus === "expired")
+  ) {
+    const graceMs = license.grace_until ? new Date(license.grace_until).getTime() : 0;
+    if (nowMs > graceMs) {
+      throw new AppError("SUBSCRIPTION_NOT_ACTIVE", "Underlying subscription is not active.", 403);
+    }
+  }
+
+  const installHash = computeInstallationIdHash(license.id, input.installation_id);
+  const activation = license.activations.find(
+    (a) => a.installation_id_hash === installHash && a.status === "active"
+  );
+  if (!activation) {
+    throw new AppError(
+      "INSTALLATION_NOT_ACTIVE",
+      "Installation is not active for this license. Call /api/v1/licenses/activate first.",
+      403
+    );
+  }
+
+  await touchActivationLastSeen(store, activation, nowIso);
+  const signed = buildSignedEntitlementToken(store, license, productCode, config.issuerUrl);
+
+  return {
+    valid: true,
+    license_number: license.license_number,
+    license_status: license.status,
+    entitlement_version: signed.claims.entitlement_version,
+    entitlement_token: signed.entitlement_token,
+    entitlement_expires_at: signed.entitlement_expires_at,
+    next_validation_after: signed.next_validation_after,
+  };
+}
+
+/**
+ * Single-row activation heartbeat for the targeted validate path.
+ * When the store carries a database client (DrizzleStore), the touch
+ * is one indexed UPDATE by activation id — the same class of
+ * targeted single-row write as a validation-log insert, no state
+ * load, no transaction. When there is no client (in-memory store),
+ * the activation record is the live state object, so the in-place
+ * touch is the persist. A failed heartbeat fails the validation
+ * (fail closed), exactly as a failed legacy transaction would.
+ */
+async function touchActivationLastSeen(
+  store: StackMateDataStore,
+  activation: LicenseActivationRecord,
+  nowIso: string
+): Promise<void> {
+  const withDb = store as unknown as {
+    drizzleDb?: { $client: PgClient };
+  };
+  const client = withDb.drizzleDb?.$client;
+  if (client && typeof client.query === "function") {
+    await client.query(
+      `UPDATE license_activations SET last_seen_at = $1 WHERE id = $2`,
+      [nowIso, activation.id]
+    );
+    return;
+  }
+  activation.last_seen_at = nowIso;
 }
 
 export async function deactivateLicenseInstallation(

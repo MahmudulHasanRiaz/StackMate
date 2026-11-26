@@ -49,10 +49,28 @@ import { runScheduledJobs, type ScheduledJobResult } from "./scheduled.ts";
  * Per-request store factory: builds (or returns) the store for one request
  * from the already-resolved env. Used by the Worker entrypoint so every
  * request gets a fresh DrizzleStore instead of a module-level shared store.
+ *
+ * B-01: the factory MAY receive the request pathname in `opts.path`
+ * (`ensureRequestStore`, `middleware/shared.ts`, passes `c.req.path`).
+ * The Worker entrypoint's factory (`apps/api/src/index.ts`
+ * `createRequestStore`) uses it to decide between a full-load store
+ * (`DrizzleStore.create`) and a targeted store
+ * (`DrizzleStore.createTargeted`) for allowlisted routes (see
+ * `platform/db/targeted-routes.ts`). The third arg is optional and
+ * backward compatible — existing factories (tests, injected-store
+ * wrappers) that ignore it keep working unchanged, and callers that
+ * have no request path (cron: `handleScheduled` below) simply omit it
+ * and always get a full-load store.
  */
+export interface StackMateStoreFactoryOptions {
+  /** The request pathname (e.g. "/api/v1/public/catalog"), when known. */
+  path?: string;
+}
+
 export type StackMateStoreFactory = (
   env: StackMateBindings,
-  ctx?: WorkerExecutionContext
+  ctx?: WorkerExecutionContext,
+  opts?: StackMateStoreFactoryOptions
 ) => Promise<StackMateDataStore>;
 
 export interface StackMateAppInstance {

@@ -5,6 +5,7 @@ import {
   type WorkerExecutionContext,
 } from "./env.ts";
 import { DrizzleStore } from "./platform/db/drizzle-store.ts";
+import { isTargetedOnlyRoute } from "./platform/db/targeted-routes.ts";
 import type { StackMateDataStore } from "./platform/db/store.ts";
 
 /**
@@ -47,7 +48,32 @@ import type { StackMateDataStore } from "./platform/db/store.ts";
  * This restores compliance with hyperdrive.ts §2.1 ("Never holds a
  * module-scoped TCP connection across Worker requests").
  */
-async function createRequestStore(env: StackMateBindings): Promise<StackMateDataStore> {
+/**
+ * B-01: `path` is the request pathname, forwarded by the factory
+ * (`ensureRequestStore` → factory third arg). When the path is
+ * allowlisted (`platform/db/targeted-routes.ts`), the request gets a
+ * targeted store — `DrizzleStore.createTargeted`, which connects
+ * WITHOUT the combined full-state load (state holds only seed rows;
+ * handlers must use targeted methods). `loadSigningKey` comes from
+ * the allowlist entry (license validation needs the signing key to
+ * sign entitlement tokens; a principal lookup does not).
+ *
+ * Every other path gets `DrizzleStore.create(opts)` EXACTLY as
+ * before, including the connection-error retry below — no behaviour
+ * change for non-allowlisted routes. The targeted branch has no
+ * outer retry: `createTargeted` already retries the connect itself
+ * (`connectWithRetry`) and there is no load phase after connect
+ * whose failure the retry would cover (capability/table checks and
+ * signing-key resolution are deterministic boot failures).
+ *
+ * Exported for tests (`test/b01-foundation.test.ts` drives the
+ * factory decision directly); the Worker entrypoint uses it via the
+ * `storeFactory` below.
+ */
+export async function createRequestStore(
+  env: StackMateBindings,
+  path?: string
+): Promise<StackMateDataStore> {
   const connectionString = env.HYPERDRIVE_NO_CACHE.connectionString;
   const opts = {
     connectionString,
@@ -58,6 +84,13 @@ async function createRequestStore(env: StackMateBindings): Promise<StackMateData
     encryptionSecret: env.ENCRYPTION_KEY_V1,
     appEnv: env.APP_ENV,
   };
+  const targeted = path ? isTargetedOnlyRoute(path) : null;
+  if (targeted) {
+    return DrizzleStore.createTargeted({
+      ...opts,
+      loadSigningKey: targeted.loadSigningKey,
+    });
+  }
   try {
     return await DrizzleStore.create(opts);
   } catch (error) {
@@ -123,7 +156,12 @@ function isConnectionError(error: unknown): boolean {
 
 function createRequestApp() {
   return createStackMateApp({
-    storeFactory: async (factoryEnv) => createRequestStore(factoryEnv),
+    // B-01: forward the request path the factory receives as its
+    // third arg (`StackMateStoreFactoryOptions.path`, set by
+    // `ensureRequestStore`) so `createRequestStore` can decide
+    // targeted vs full-load per route.
+    storeFactory: async (factoryEnv, _ctx, factoryOpts) =>
+      createRequestStore(factoryEnv, factoryOpts?.path),
   });
 }
 

@@ -70,34 +70,6 @@ function parseListQuery(query: Record<string, string | undefined>): {
   return { q, limit, page };
 }
 
-function applyListPage<T>(items: T[], limit: number, page: number): T[] {
-  return items.slice((page - 1) * limit, page * limit);
-}
-
-function pagedCollection<T>(
-  c: Context<AppEnv>,
-  filtered: T[],
-  limit: number,
-  page = 1,
-  nextCursor: string | null = null,
-  status = 200
-): Response {
-  return c.json(
-    createCollectionEnvelope(
-      applyListPage(filtered, limit, page),
-      nextCursor,
-      c.var.requestId,
-      filtered.length
-    ),
-    status as ContentfulStatusCode
-  );
-}
-
-const includesQuery = (
-  haystack: string | null | undefined,
-  q: string
-): boolean => (!q ? true : (haystack ?? "").toLowerCase().includes(q));
-
 function parseTimestampSort(
   query: Record<string, string | undefined>,
   field: string
@@ -105,15 +77,66 @@ function parseTimestampSort(
   return query.sort === `${field}:asc` ? "asc" : "desc";
 }
 
+// --- B-01 targeted license lists -------------------------------------------
+// The license list (+ activations + customer installations) runs
+// targeted Drizzle queries against `store.drizzleDb` — never
+// `store.state` — so it is safe on a `createTargeted()` store. Rows
+// are mapped to the same snake_case record shapes the in-memory list
+// returned (Drizzle rows are camelCase + Date). `listLicenses` is
+// exported for the customer-detail licenses list (same assembly, no
+// list-only reference fields).
+
+import { and, asc, desc, eq, ilike, inArray, or, sql, type SQL } from "drizzle-orm";
+import type { NodePgDatabase } from "drizzle-orm/node-postgres";
+import * as schema from "../../../../../db/schema/index.ts";
+import {
+  licenseActivations,
+  licenseEntitlementSnapshotItems,
+  licenseEntitlementSnapshots,
+  licenses,
+} from "../../../../../db/schema/licenses.ts";
+import { customers } from "../../../../../db/schema/customers.ts";
+import { products } from "../../../../../db/schema/catalog.ts";
+import type {
+  DatabaseState,
+  LicenseActivationRecord,
+  LicenseEntitlementSnapshotRecord,
+  LicenseRecord,
+  StackMateDataStore,
+} from "../../platform/db/store.ts";
+
+export type LicenseListDb = NodePgDatabase<typeof schema>;
+
+/**
+ * First argument accepted by the list functions in this file.
+ *
+ * Routes pass the request store; `b01-lists.test.ts` passes a raw
+ * Drizzle db. A store WITH `drizzleDb` (targeted / full DrizzleStore)
+ * takes the targeted SQL path; a plain in-memory store (state only)
+ * takes the in-memory fallback; a raw db is used directly.
+ */
+export type ListSource = StackMateDataStore | LicenseListDb;
+
+function drizzleDbOf(source: ListSource): LicenseListDb | null {
+  const maybe = source as { drizzleDb?: LicenseListDb; state?: DatabaseState };
+  if (maybe.drizzleDb) return maybe.drizzleDb;
+  if (maybe.state) return null;
+  return source as LicenseListDb;
+}
+
+/** Substring match; `q` arrives lowercased from parseListQuery. */
+function includesQuery(haystack: string | null | undefined, q: string): boolean {
+  return !q ? true : (haystack ?? "").toLowerCase().includes(q);
+}
+
+/** Timestamp sort with an id ASC tiebreak (shared/http.ts, verbatim). */
 function sortByTimestamp<T extends { id: string }>(
   items: T[],
   field: string,
-  direction: "desc" | "asc"
+  direction: "desc" | "asc",
 ): T[] {
   const timeOf = (row: T): number => {
-    const n = new Date(
-      String((row as Record<string, unknown>)[field] ?? "")
-    ).getTime();
+    const n = new Date(String((row as Record<string, unknown>)[field] ?? "")).getTime();
     return Number.isFinite(n) ? n : 0;
   };
   return [...items].sort((a, b) => {
@@ -121,6 +144,470 @@ function sortByTimestamp<T extends { id: string }>(
     if (byTime !== 0) return direction === "desc" ? -byTime : byTime;
     return a.id.localeCompare(b.id);
   });
+}
+
+function applyPage<T>(items: T[], limit: number, page: number): T[] {
+  return items.slice((page - 1) * limit, page * limit);
+}
+
+export type SafeLicenseRecord = Omit<LicenseRecord, "license_key_hash" | "issued_raw_key_once">;
+
+export interface LicenseListRef {
+  customer_name: string | null;
+  product_code: string | null;
+  product_name: string | null;
+  active_activations_count: number;
+}
+
+export interface LicenseListResult {
+  items: SafeLicenseRecord[];
+  total: number;
+  refs: Map<string, LicenseListRef>;
+}
+
+function escapeLikePattern(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+}
+
+const isoOrNull = (d: Date | null): string | null => (d ? d.toISOString() : null);
+
+function licenseActivationOf(
+  row: typeof licenseActivations.$inferSelect,
+): LicenseActivationRecord {
+  return {
+    id: row.id,
+    license_id: row.licenseId,
+    installation_id_hash: row.installationIdHash,
+    domain_normalized: row.domainNormalized,
+    environment: row.environment as LicenseActivationRecord["environment"],
+    status: row.status as LicenseActivationRecord["status"],
+    activated_at: row.activatedAt.toISOString(),
+    last_seen_at: row.lastSeenAt
+      ? row.lastSeenAt.toISOString()
+      : row.activatedAt.toISOString(),
+    deactivated_at: isoOrNull(row.deactivatedAt),
+    metadata:
+      row.metadata !== null && typeof row.metadata === "object" && !Array.isArray(row.metadata)
+        ? (row.metadata as Record<string, unknown>)
+        : {},
+    created_at: row.createdAt.toISOString(),
+  };
+}
+
+function safeLicenseOf(
+  row: typeof licenses.$inferSelect,
+  snapshots: LicenseEntitlementSnapshotRecord[],
+  activations: LicenseActivationRecord[],
+): SafeLicenseRecord {
+  return {
+    id: row.id,
+    license_number: row.licenseNumber,
+    product_id: row.productId,
+    customer_id: row.customerId,
+    source_order_item_id: row.sourceOrderItemId,
+    subscription_id: row.subscriptionId,
+    license_key_hint: row.licenseKeyHint,
+    status: row.status as SafeLicenseRecord["status"],
+    activation_limit: row.activationLimit,
+    valid_from: row.validFrom.toISOString(),
+    expires_at: isoOrNull(row.expiresAt),
+    grace_until: isoOrNull(row.graceUntil),
+    current_entitlement_snapshot_id:
+      row.currentEntitlementSnapshotId ?? snapshots[0]?.id ?? "",
+    snapshots,
+    activations,
+    issued_at: row.issuedAt ? row.issuedAt.toISOString() : row.createdAt.toISOString(),
+    created_at: row.createdAt.toISOString(),
+    updated_at: row.updatedAt.toISOString(),
+  };
+}
+
+export async function listLicenses(
+  source: ListSource,
+  params: {
+    q: string;
+    limit: number;
+    page: number;
+    sort?: "asc" | "desc";
+    customerId?: string | null;
+  },
+): Promise<LicenseListResult> {
+  const db = drizzleDbOf(source);
+  if (db) return listLicensesTargeted(db, params);
+  return listLicensesInMemory((source as StackMateDataStore).state, params);
+}
+
+/**
+ * In-memory fallback — the pre-B-01 route logic, reproduced exactly:
+ * license_number / customer-name / product-code substring filter,
+ * sort by created_at (default desc) with id ASC tiebreak, safe
+ * records (no license_key_hash / issued_raw_key_once), refs
+ * (customer_name, product_code, product_name,
+ * active_activations_count) for the page rows, total = full filtered
+ * count, page sliced after sorting.
+ */
+function listLicensesInMemory(
+  state: DatabaseState,
+  params: {
+    q: string;
+    limit: number;
+    page: number;
+    sort?: "asc" | "desc";
+    customerId?: string | null;
+  },
+): LicenseListResult {
+  const { q, limit, page, sort = "desc", customerId } = params;
+  const needle = q.toLowerCase();
+  const filtered = state.licenses
+    .filter((l) => (customerId ? l.customer_id === customerId : true))
+    .filter(
+      (l) =>
+        includesQuery(l.license_number, needle) ||
+        includesQuery(
+          state.customers.find((cu) => cu.id === l.customer_id)?.name,
+          needle,
+        ) ||
+        includesQuery(
+          state.products.find((p) => p.id === l.product_id)?.code,
+          needle,
+        ),
+    );
+  const sorted = sortByTimestamp(filtered, "created_at", sort);
+  const pageItems = applyPage(sorted, limit, page);
+  const refs = new Map<string, LicenseListRef>();
+  const items = pageItems.map((l) => {
+    const { license_key_hash: _h, issued_raw_key_once: _r, ...safe } = l;
+    const customer = state.customers.find((cu) => cu.id === l.customer_id);
+    const product = state.products.find((p) => p.id === l.product_id);
+    refs.set(l.id, {
+      customer_name: customer?.name ?? null,
+      product_code: product?.code ?? null,
+      product_name: product?.name ?? null,
+      active_activations_count: l.activations.filter((a) => a.status === "active").length,
+    });
+    return safe;
+  });
+  return { items, total: filtered.length, refs };
+}
+
+async function listLicensesTargeted(
+  db: LicenseListDb,
+  params: {
+    q: string;
+    limit: number;
+    page: number;
+    sort?: "asc" | "desc";
+    customerId?: string | null;
+  },
+): Promise<LicenseListResult> {
+  const { q, limit, page, sort = "desc", customerId } = params;
+  const conditions: SQL[] = [];
+  if (customerId) conditions.push(eq(licenses.customerId, customerId));
+  if (q !== "") {
+    const like = `%${escapeLikePattern(q)}%`;
+    const match = or(
+      ilike(licenses.licenseNumber, like),
+      sql`EXISTS (SELECT 1 FROM "customers" WHERE "customers"."id" = "licenses"."customer_id" AND "customers"."name" ILIKE ${like})`,
+      sql`EXISTS (SELECT 1 FROM "products" WHERE "products"."id" = "licenses"."product_id" AND "products"."code" ILIKE ${like})`,
+    );
+    if (match) conditions.push(match);
+  }
+  const where = conditions.length === 0 ? undefined : and(...conditions);
+
+  const totalRows = await db
+    .select({ value: sql<number>`count(*)` })
+    .from(licenses)
+    .where(where);
+  const total = Number(totalRows[0]?.value ?? 0);
+
+  const orderBy =
+    sort === "asc"
+      ? [asc(licenses.createdAt), asc(licenses.id)]
+      : [desc(licenses.createdAt), asc(licenses.id)];
+  const rows = await db
+    .select()
+    .from(licenses)
+    .where(where)
+    .orderBy(...orderBy)
+    .limit(limit)
+    .offset((page - 1) * limit);
+
+  const ids = rows.map((r) => r.id);
+  const snapshotsByLicense = new Map<string, LicenseEntitlementSnapshotRecord[]>();
+  const activationsByLicense = new Map<string, LicenseActivationRecord[]>();
+  const refs = new Map<string, LicenseListRef>();
+  if (ids.length > 0) {
+    const snapshotRows = await db
+      .select()
+      .from(licenseEntitlementSnapshots)
+      .where(inArray(licenseEntitlementSnapshots.licenseId, ids))
+      .orderBy(
+        asc(licenseEntitlementSnapshots.licenseId),
+        asc(licenseEntitlementSnapshots.versionNumber),
+      );
+    const snapshotIds = snapshotRows.map((r) => r.id);
+    const snapshotItemsBySnapshot = new Map<
+      string,
+      LicenseEntitlementSnapshotRecord["items"]
+    >();
+    if (snapshotIds.length > 0) {
+      const snapshotItemRows = await db
+        .select()
+        .from(licenseEntitlementSnapshotItems)
+        .where(inArray(licenseEntitlementSnapshotItems.snapshotId, snapshotIds))
+        .orderBy(
+          asc(licenseEntitlementSnapshotItems.snapshotId),
+          asc(licenseEntitlementSnapshotItems.featureKeySnapshot),
+        );
+      for (const it of snapshotItemRows) {
+        const list = snapshotItemsBySnapshot.get(it.snapshotId) ?? [];
+        list.push({
+          feature_key_snapshot: it.featureKeySnapshot,
+          value_type_snapshot:
+            it.valueTypeSnapshot as LicenseEntitlementSnapshotRecord["items"][number]["value_type_snapshot"],
+          entitlement_value: it.entitlementValue ?? null,
+          unit_snapshot: it.unitSnapshot,
+        });
+        snapshotItemsBySnapshot.set(it.snapshotId, list);
+      }
+    }
+    for (const s of snapshotRows) {
+      const list = snapshotsByLicense.get(s.licenseId) ?? [];
+      list.push({
+        id: s.id,
+        license_id: s.licenseId,
+        version_number: s.versionNumber,
+        source_type: s.sourceType as LicenseEntitlementSnapshotRecord["source_type"],
+        effective_at: s.effectiveAt.toISOString(),
+        reason: s.reason,
+        snapshot_hash: s.snapshotHash,
+        items: snapshotItemsBySnapshot.get(s.id) ?? [],
+        created_by_user_id: s.createdByUserId,
+        created_at: s.createdAt.toISOString(),
+      });
+      snapshotsByLicense.set(s.licenseId, list);
+    }
+    const activationRows = await db
+      .select()
+      .from(licenseActivations)
+      .where(inArray(licenseActivations.licenseId, ids))
+      .orderBy(
+        asc(licenseActivations.licenseId),
+        asc(licenseActivations.activatedAt),
+        asc(licenseActivations.id),
+      );
+    for (const a of activationRows) {
+      const list = activationsByLicense.get(a.licenseId) ?? [];
+      list.push(licenseActivationOf(a));
+      activationsByLicense.set(a.licenseId, list);
+    }
+    const customerRows = await db
+      .select()
+      .from(customers)
+      .where(
+        inArray(
+          customers.id,
+          [...new Set(rows.map((r) => r.customerId))],
+        ),
+      );
+    const customersById = new Map(customerRows.map((cu) => [cu.id, cu]));
+    const productRows = await db
+      .select()
+      .from(products)
+      .where(
+        inArray(
+          products.id,
+          [...new Set(rows.map((r) => r.productId))],
+        ),
+      );
+    const productsById = new Map(productRows.map((p) => [p.id, p]));
+    for (const row of rows) {
+      const customer = customersById.get(row.customerId);
+      const product = productsById.get(row.productId);
+      const activations = activationsByLicense.get(row.id) ?? [];
+      refs.set(row.id, {
+        customer_name: customer?.name ?? null,
+        product_code: product?.code ?? null,
+        product_name: product?.name ?? null,
+        active_activations_count: activations.filter((a) => a.status === "active").length,
+      });
+    }
+  }
+
+  return {
+    items: rows.map((row) =>
+      safeLicenseOf(
+        row,
+        snapshotsByLicense.get(row.id) ?? [],
+        activationsByLicense.get(row.id) ?? [],
+      ),
+    ),
+    total,
+    refs,
+  };
+}
+
+/** One license's activations, load order (activated_at ASC, id ASC). */
+export async function listLicenseActivations(
+  source: ListSource,
+  licenseId: string,
+  params: { limit: number; page: number },
+): Promise<{ items: LicenseActivationRecord[]; total: number }> {
+  const db = drizzleDbOf(source);
+  if (!db) {
+    // Pre-B-01 route logic, verbatim: the license's activations in
+    // stored order, page-sliced; total = full count. (The route's
+    // existence check 404s on a missing license first.)
+    const { limit, page } = params;
+    const state = (source as StackMateDataStore).state;
+    const lic = state.licenses.find((l) => l.id === licenseId);
+    const activations = lic ? lic.activations : [];
+    return {
+      items: activations.slice((page - 1) * limit, page * limit),
+      total: activations.length,
+    };
+  }
+  return listLicenseActivationsTargeted(db, licenseId, params);
+}
+
+async function listLicenseActivationsTargeted(
+  db: LicenseListDb,
+  licenseId: string,
+  params: { limit: number; page: number },
+): Promise<{ items: LicenseActivationRecord[]; total: number }> {
+  const { limit, page } = params;
+  const where = eq(licenseActivations.licenseId, licenseId);
+  const totalRows = await db
+    .select({ value: sql<number>`count(*)` })
+    .from(licenseActivations)
+    .where(where);
+  const total = Number(totalRows[0]?.value ?? 0);
+  const rows = await db
+    .select()
+    .from(licenseActivations)
+    .where(where)
+    .orderBy(asc(licenseActivations.activatedAt), asc(licenseActivations.id))
+    .limit(limit)
+    .offset((page - 1) * limit);
+  return { items: rows.map(licenseActivationOf), total };
+}
+
+export interface InstallationListItem extends LicenseActivationRecord {
+  license_number: string;
+  product_id: string;
+}
+
+/**
+ * Customer installations: the customer's licenses' activations,
+ * flattened in license load order (created_at ASC, id ASC), each
+ * carrying its license_number + product_id. Customer-scoped, so the
+ * flatten + page slice run over the customer's rows only.
+ */
+export async function listCustomerInstallations(
+  source: ListSource,
+  customerId: string,
+  params: { limit: number; page: number },
+): Promise<{ items: InstallationListItem[]; total: number }> {
+  const db = drizzleDbOf(source);
+  if (!db) {
+    // Pre-B-01 route logic, verbatim: the customer's licenses'
+    // activations flattened in license state order, each carrying its
+    // license_number + product_id, page-sliced after flattening.
+    const { limit, page } = params;
+    const state = (source as StackMateDataStore).state;
+    const all: InstallationListItem[] = state.licenses
+      .filter((l) => l.customer_id === customerId)
+      .flatMap((l) =>
+        l.activations.map((a) => ({
+          ...a,
+          license_number: l.license_number,
+          product_id: l.product_id,
+        })),
+      );
+    return {
+      items: all.slice((page - 1) * limit, page * limit),
+      total: all.length,
+    };
+  }
+  return listCustomerInstallationsTargeted(db, customerId, params);
+}
+
+async function listCustomerInstallationsTargeted(
+  db: LicenseListDb,
+  customerId: string,
+  params: { limit: number; page: number },
+): Promise<{ items: InstallationListItem[]; total: number }> {
+  const { limit, page } = params;
+  const licenseRows = await db
+    .select({
+      id: licenses.id,
+      licenseNumber: licenses.licenseNumber,
+      productId: licenses.productId,
+    })
+    .from(licenses)
+    .where(eq(licenses.customerId, customerId))
+    .orderBy(asc(licenses.createdAt), asc(licenses.id));
+  if (licenseRows.length === 0) return { items: [], total: 0 };
+  const activationRows = await db
+    .select()
+    .from(licenseActivations)
+    .where(
+      inArray(
+        licenseActivations.licenseId,
+        licenseRows.map((r) => r.id),
+      ),
+    )
+    .orderBy(asc(licenseActivations.activatedAt), asc(licenseActivations.id));
+  const byLicense = new Map(licenseRows.map((r) => [r.id, r]));
+  const activationsByLicense = new Map<string, LicenseActivationRecord[]>();
+  for (const a of activationRows) {
+    const list = activationsByLicense.get(a.licenseId) ?? [];
+    list.push(licenseActivationOf(a));
+    activationsByLicense.set(a.licenseId, list);
+  }
+  const all: InstallationListItem[] = [];
+  for (const lic of licenseRows) {
+    const licRow = byLicense.get(lic.id)!;
+    for (const a of activationsByLicense.get(lic.id) ?? []) {
+      all.push({
+        ...a,
+        license_number: licRow.licenseNumber,
+        product_id: licRow.productId,
+      });
+    }
+  }
+  return {
+    items: all.slice((page - 1) * limit, page * limit),
+    total: all.length,
+  };
+}
+
+/** Targeted existence check (for list routes that 404 on a missing parent). */
+export async function licenseExists(source: ListSource, id: string): Promise<boolean> {
+  const db = drizzleDbOf(source);
+  if (!db) return (source as StackMateDataStore).state.licenses.some((l) => l.id === id);
+  return licenseExistsTargeted(db, id);
+}
+
+async function licenseExistsTargeted(db: LicenseListDb, id: string): Promise<boolean> {
+  const rows = await db
+    .select({ id: licenses.id })
+    .from(licenses)
+    .where(eq(licenses.id, id))
+    .limit(1);
+  return rows.length > 0;
+}
+
+function pagedCollectionTotal<T>(
+  c: Context<AppEnv>,
+  pageItems: T[],
+  total: number,
+  status = 200,
+): Response {
+  return c.json(
+    createCollectionEnvelope(pageItems, null, c.var.requestId, total),
+    status as ContentfulStatusCode,
+  );
 }
 
 const MAX_REQUEST_BODY_BYTES = 6 * 1024 * 1024;
@@ -198,41 +685,34 @@ export function registerAdminLicensesRoutes(app: Hono<AppEnv>): void {
     // Never expose license_key_hash or raw keys in list responses (API Spec §12.3)
     const query = c.req.query();
     const { q, limit, page } = parseListQuery(query);
-    const filteredLicenses = store.state.licenses.filter(
-      (l) =>
-        includesQuery(l.license_number, q) ||
-        includesQuery(
-          store.state.customers.find((cu) => cu.id === l.customer_id)?.name,
-          q,
-        ) ||
-        includesQuery(
-          store.state.products.find((p) => p.id === l.product_id)?.code,
-          q,
-        ),
-    );
-    // Dashboard ordering: sort BEFORE the ?limit=100 window slices
-    // (same gap as orders — the expiring-licenses panel sorts
-    // client-side over the loaded set).
-    const items = sortByTimestamp(
-      filteredLicenses,
-      "created_at",
-      parseTimestampSort(query, "created_at"),
-    ).map((l) => {
-    const { license_key_hash: _h, issued_raw_key_once: _r, ...safe } = l;
-    const customer = store.state.customers.find((cu) => cu.id === l.customer_id);
-    const product = store.state.products.find((p) => p.id === l.product_id);
-    return {
-      ...safe,
-      customer_name: customer?.name ?? null,
-      product_code: product?.code ?? null,
-      product_name: product?.name ?? null,
-      active_activations_count: l.activations.filter((a) => a.status === "active").length,
-      expires_date_display: l.expires_at
-        ? formatDisplayDateDDMMYYYY(l.expires_at, env.DEFAULT_TIMEZONE)
-        : "Lifetime",
-      };
+    const { items, total, refs } = await listLicenses(store, {
+      q,
+      limit,
+      page,
+      sort: parseTimestampSort(query, "created_at"),
     });
-    return pagedCollection(c, items, limit, page);
+    return pagedCollectionTotal(
+      c,
+      items.map((l) => {
+        const ref = refs.get(l.id) ?? {
+          customer_name: null,
+          product_code: null,
+          product_name: null,
+          active_activations_count: 0,
+        };
+        return {
+          ...l,
+          customer_name: ref.customer_name,
+          product_code: ref.product_code,
+          product_name: ref.product_name,
+          active_activations_count: ref.active_activations_count,
+          expires_date_display: l.expires_at
+            ? formatDisplayDateDDMMYYYY(l.expires_at, env.DEFAULT_TIMEZONE)
+            : "Lifetime",
+        };
+      }),
+      total,
+    );
   });
 
   app.post("/api/v1/admin/licenses/manual-grants", async (c) => {
@@ -384,12 +864,13 @@ export function registerAdminLicensesRoutes(app: Hono<AppEnv>): void {
     const principal = requirePrincipal(c);
     const requestId = c.var.requestId;
     await assertStaffPermissionAudited(store, principal, "licenses.read", requestId);
-    const lic = store.state.licenses.find(
-      (l) => l.id === c.req.param("licenseId")
-    );
-    if (!lic) throw new AppError("NOT_FOUND", "License not found.", 404);
+    const licenseId = c.req.param("licenseId");
+    if (!(await licenseExists(store, licenseId))) {
+      throw new AppError("NOT_FOUND", "License not found.", 404);
+    }
     const { limit, page } = parseListQuery(c.req.query());
-    return pagedCollection(c, lic.activations, limit, page);
+    const { items, total } = await listLicenseActivations(store, licenseId, { limit, page });
+    return pagedCollectionTotal(c, items, total);
   });
 
   app.post("/api/v1/admin/licenses/:licenseId/activations/:activationId/deactivate", async (c) => {
