@@ -34,6 +34,17 @@
  *    below). Cost: ~2 extra RTTs/request vs the singleton (caps +
  *    tables re-checked only on a cold cache); predicted ~1.75s/request
  *    on staging at ~250ms RTT.
+ *    B-01 REUSE (2026-11-27): the revert above is kept — but the
+ *    TCP connection itself is now reused across requests through
+ *    `platform/db/connection-cache.ts`: ONE idle client per
+ *    connection string, claimed by a synchronous boolean lease
+ *    (busy → fresh client, exactly as before). The cache holds NO
+ *    promise at module scope — only the Client object + booleans —
+ *    so the cross-request-promise failure cannot recur: every query
+ *    promise is created and awaited inside the one request holding
+ *    the lease. The store itself stays per-request; only the
+ *    connection is shared. See connection-cache.ts for the full
+ *    safety argument (lease, dead detection, one leased retry).
  *    `SELECT pg_advisory_xact_lock(727271)` serializes writers across
  *    SEPARATE store instances / processes hitting the same database
  *    (mirrors the in-memory mutex semantics). Within ONE store
@@ -157,6 +168,13 @@ import {
   type Ed25519KeyMaterial,
 } from "../crypto/index.ts";
 import { AppError } from "../../shared/errors.ts";
+import {
+  discardCachedClient,
+  isConnectionError,
+  parkCachedClient,
+  releaseCachedClient,
+  tryAcquireCachedClient,
+} from "./connection-cache.ts";
 import {
   StackMateDataStore,
   type AuditLogRecord,
@@ -850,6 +868,16 @@ export class DrizzleStore extends StackMateDataStore {
 
   private closed = false;
   /**
+   * B-01 reuse: true when this store's client came from the
+   * connection cache (`connection-cache.ts`) instead of a fresh
+   * connect. `close()` releases the lease instead of ending the
+   * client; `cacheConnectionString` is the cache key the client was
+   * acquired/parked under. A fresh-client store parks its client on
+   * close() instead of ending it when the slot is free.
+   */
+  private leasedConnection = false;
+  private cacheConnectionString: string | null = null;
+  /**
    * Instance-level serialization chain for THIS store's client (see
    * header note 1). Deliberately NOT module-level: a chain stored at
    * module scope (the deleted `clientQueues`) is what the Cloudflare
@@ -859,7 +887,11 @@ export class DrizzleStore extends StackMateDataStore {
    * request. A store shared across requests (tests, scripts) still
    * gets correct serialization; that is the tested contract
    * (concurrent payment-verification / activation races in
-   * business-workflows.integration.test.ts).
+   * business-workflows.integration.test.ts). Across DIFFERENT stores
+   * sharing one leased client (B-01 reuse), serialization is the
+   * connection-cache lease, not this chain: only one store holds the
+   * client at a time, so two stores' chains can never interleave
+   * queries on it.
    */
   private storeQueue: Promise<void> = Promise.resolve();
   private capabilities: StoreCapabilities = NO_MIGRATION_0002;
@@ -923,25 +955,34 @@ export class DrizzleStore extends StackMateDataStore {
         "DrizzleStore.create: connectionString is empty. Pass the PostgreSQL connection string (in production, HYPERDRIVE_NO_CACHE.connectionString)."
       );
     }
-    // Request-scoped client (header note 1): every create() opens its
-    // own fresh client and owns it — close() ends it. Nothing is ever
-    // shared across requests or stored at module scope.
+    // B-01 reuse: lease the idle cached client when one is free for
+    // this connection string, else connect fresh exactly as before.
+    // The lease (connection-cache.ts) guarantees no other request is
+    // using the client; every query promise below is created and
+    // awaited inside this request.
+    const leasedClient = tryAcquireCachedClient(opts.connectionString);
     let pgClient: Client;
-    try {
-      pgClient = await DrizzleStore.connectWithRetry(opts.connectionString);
-    } catch (error) {
-      const wrapped = new Error(
-        `DrizzleStore.create: could not connect to PostgreSQL: ${(error as Error).message}`
-      );
-      // Preserve the pg error code so the entrypoint's isConnectionError
-      // check (apps/api/src/index.ts) can still match it.
-      (wrapped as { code?: unknown }).code = (
-        error as { code?: unknown }
-      )?.code;
-      throw wrapped;
+    if (leasedClient) {
+      pgClient = leasedClient;
+    } else {
+      try {
+        pgClient = await DrizzleStore.connectWithRetry(opts.connectionString);
+      } catch (error) {
+        const wrapped = new Error(
+          `DrizzleStore.create: could not connect to PostgreSQL: ${(error as Error).message}`
+        );
+        // Preserve the pg error code so the entrypoint's isConnectionError
+        // check (apps/api/src/index.ts) can still match it.
+        (wrapped as { code?: unknown }).code = (
+          error as { code?: unknown }
+        )?.code;
+        throw wrapped;
+      }
     }
     const drizzleDb = drizzle(pgClient, { schema });
     const store = new DrizzleStore(pgClient, drizzleDb);
+    store.leasedConnection = leasedClient !== null;
+    store.cacheConnectionString = opts.connectionString;
     try {
       store.capabilities = await detectCapabilitiesCached(
         opts.connectionString,
@@ -961,7 +1002,21 @@ export class DrizzleStore extends StackMateDataStore {
         store.usesInMemoryBucket = true;
       }
     } catch (error) {
-      await pgClient.end().catch(() => {});
+      // B-01 reuse: a leased client that fails the creation phase with
+      // a connection error was dead without an `error` event yet —
+      // discard it and retry ONCE on a fresh client (the retry's
+      // acquire finds the entry gone, so it cannot re-lease the same
+      // client and cannot loop). Any other failure releases a healthy
+      // leased client back to the cache instead of ending it.
+      if (store.leasedConnection) {
+        if (isConnectionError(error)) {
+          discardCachedClient(pgClient);
+          return DrizzleStore.create(opts);
+        }
+        releaseCachedClient(pgClient);
+      } else {
+        await pgClient.end().catch(() => {});
+      }
       throw error;
     }
     return store;
@@ -979,11 +1034,13 @@ export class DrizzleStore extends StackMateDataStore {
    * (which reloads inside the transaction) are unchanged, so any route
    * not yet migrated keeps working exactly as before.
    *
-   * No store/client is shared across requests (OD-03): like
-   * `create()`, this opens a fresh request-scoped client owned by the
-   * returned store — `close()` ends it. Signing keys are loaded only
-   * when `loadSigningKey` is set (license validation needs them to
-   * sign entitlement tokens; a principal lookup does not).
+   * No store is shared across requests (OD-03): like `create()`,
+   * this opens a fresh request-scoped client owned by the returned
+   * store — `close()` releases the cached lease, or parks the fresh
+   * client for the next request (see connection-cache.ts). Signing
+   * keys are loaded only when `loadSigningKey` is set (license
+   * validation needs them to sign entitlement tokens; a principal
+   * lookup does not).
    */
   public static async createTargeted(
     opts: DrizzleStoreCreateOptions & { loadSigningKey?: boolean }
@@ -993,20 +1050,28 @@ export class DrizzleStore extends StackMateDataStore {
         "DrizzleStore.createTargeted: connectionString is empty. Pass the PostgreSQL connection string (in production, HYPERDRIVE_NO_CACHE.connectionString)."
       );
     }
+    // B-01 reuse: same lease-or-fresh-connect as create() (above).
+    const leasedClient = tryAcquireCachedClient(opts.connectionString);
     let pgClient: Client;
-    try {
-      pgClient = await DrizzleStore.connectWithRetry(opts.connectionString);
-    } catch (error) {
-      const wrapped = new Error(
-        `DrizzleStore.createTargeted: could not connect to PostgreSQL: ${(error as Error).message}`
-      );
-      (wrapped as { code?: unknown }).code = (
-        error as { code?: unknown }
-      )?.code;
-      throw wrapped;
+    if (leasedClient) {
+      pgClient = leasedClient;
+    } else {
+      try {
+        pgClient = await DrizzleStore.connectWithRetry(opts.connectionString);
+      } catch (error) {
+        const wrapped = new Error(
+          `DrizzleStore.createTargeted: could not connect to PostgreSQL: ${(error as Error).message}`
+        );
+        (wrapped as { code?: unknown }).code = (
+          error as { code?: unknown }
+        )?.code;
+        throw wrapped;
+      }
     }
     const drizzleDb = drizzle(pgClient, { schema });
     const store = new DrizzleStore(pgClient, drizzleDb);
+    store.leasedConnection = leasedClient !== null;
+    store.cacheConnectionString = opts.connectionString;
     try {
       store.targetedOnly = true;
       store.capabilities = await detectCapabilitiesCached(
@@ -1024,7 +1089,18 @@ export class DrizzleStore extends StackMateDataStore {
         store.usesInMemoryBucket = true;
       }
     } catch (error) {
-      await pgClient.end().catch(() => {});
+      // B-01 reuse: same leased-client handling as create() — a dead
+      // leased client retries once on a fresh client; a healthy one
+      // is released back to the cache.
+      if (store.leasedConnection) {
+        if (isConnectionError(error)) {
+          discardCachedClient(pgClient);
+          return DrizzleStore.createTargeted(opts);
+        }
+        releaseCachedClient(pgClient);
+      } else {
+        await pgClient.end().catch(() => {});
+      }
       throw error;
     }
     return store;
@@ -2535,15 +2611,29 @@ export class DrizzleStore extends StackMateDataStore {
   }
 
   /**
-   * End this store's pg client. Idempotent; the store must not be used
-   * afterwards. Every store owns its client (request-scoped, header
-   * note 1), so close() always ends it — the Worker entrypoint calls
+   * End this store's pg client — or, under B-01 reuse, return it to
+   * the connection cache. Idempotent; the store must not be used
+   * afterwards. A leased client is released synchronously (the lease
+   * flag flips before any await, while this request still owns it);
+   * a fresh client is parked as the idle entry when the slot is free,
+   * otherwise ended exactly as before. The Worker entrypoint calls
    * this when the request finishes (see apps/api/src/app.ts
    * closeRequestStore).
    */
   public async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    if (this.leasedConnection) {
+      this.leasedConnection = false;
+      releaseCachedClient(this.pgClient);
+      return;
+    }
+    if (
+      this.cacheConnectionString !== null &&
+      parkCachedClient(this.cacheConnectionString, this.pgClient)
+    ) {
+      return;
+    }
     await this.pgClient.end().catch(() => {});
   }
 

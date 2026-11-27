@@ -10,6 +10,12 @@
  * 2. Request-scoped `node-postgres` (`pg.Client`) lifecycle (`pg >= 8.16.3`) with `nodejs_compat`:
  *    - Never holds a module-scoped TCP connection across Worker requests.
  *    - Automatically closes connections via `ctx.waitUntil(client.end())` after response completion.
+ *    Narrow B-01 exception (2026-11-27): `platform/db/connection-cache.ts`
+ *    parks ONE idle client per connection string behind a synchronous
+ *    boolean lease (busy → fresh client). It holds no promise at module
+ *    scope — the failure mode this section guards against was the
+ *    2026-11-15 promise-queue singleton, not the socket itself — and a
+ *    dead client is discarded, never re-leased. See that file.
  * 3. Interactive transactions (`BEGIN ... SELECT ... FOR UPDATE ... COMMIT / ROLLBACK`) on the
  *    pinned `HYPERDRIVE_NO_CACHE` connection.
  */

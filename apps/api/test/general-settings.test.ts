@@ -15,6 +15,7 @@ import path from "node:path";
 import { Client } from "pg";
 import { createStackMateApp } from "../src/app.ts";
 import { resolveRuntimeConfig } from "../src/env.ts";
+import { drainConnectionCache } from "../src/platform/db/connection-cache.ts";
 
 const DATABASE_URL = process.env.DATABASE_URL!;
 const DB_NAME = "stackmate_test_general_settings";
@@ -113,6 +114,10 @@ describe.skipIf(!DATABASE_URL)("General Settings (Postgres)", () => {
   afterAll(async () => {
     await store.close();
     await adminClient.end();
+    // B-01 reuse: close() parks the store's client in the connection
+    // cache instead of ending it — drain it or DROP DATABASE refuses
+    // while the backend is still attached.
+    drainConnectionCache();
     const maintenanceUrl = new URL(DATABASE_URL);
     maintenanceUrl.pathname = "/postgres";
     const maintenance = new Client({ connectionString: maintenanceUrl.toString() });

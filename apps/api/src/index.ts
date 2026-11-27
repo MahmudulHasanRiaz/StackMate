@@ -27,11 +27,18 @@ import type { StackMateDataStore } from "./platform/db/store.ts";
  * at boot (see DrizzleStore.resolveEncryptionSecret).
  *
  * Store creation is REQUEST-SCOPED (revert, 2026-11-15 evening — the
- * ADR-0005 pre-recorded revert path): every request creates a fresh pg
- * Client, connects, runs the combined single-statement load, and the
- * store is closed when the request finishes (see
- * apps/api/src/app.ts closeRequestStore). NOTHING is stored at module
- * scope — no shared client, no promise queue, no cached promise.
+ * ADR-0005 pre-recorded revert path): every request creates a fresh
+ * DrizzleStore, and the store is closed when the request finishes (see
+ * apps/api/src/app.ts closeRequestStore). The STORE is never shared
+ * across requests. B-01 REUSE (2026-11-27): the underlying pg Client
+ * MAY be reused across requests through
+ * `platform/db/connection-cache.ts` — one idle client per connection
+ * string, claimed by a synchronous boolean lease (busy → fresh
+ * client). The cache holds no promise at module scope, so the
+ * cross-request promise failure that killed the 2026-11-15 singleton
+ * cannot recur; see that file for the safety argument. `close()` on a
+ * store releases the lease (leased client) or parks the fresh client
+ * as the idle entry instead of ending it.
  *
  * Why the revert: the Batch 0 perf fix held ONE pg Client per isolate
  * as a module-level singleton and serialized all statements through a

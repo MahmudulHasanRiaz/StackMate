@@ -24,15 +24,21 @@
  *     (per-table row counts + exact seeded rows).
  *  3. Concurrent withTransactions on SEPARATE stores (own clients) do
  *     not corrupt each other (the advisory lock serializes writers).
- *  4. close() ends the store's OWN client; other stores keep working.
+ *  4. close() parks the store's client in the per-isolate connection
+ *     cache for the next store instead of ending it (B-01 reuse,
+ *     2026-11-27) — the closed STORE still refuses further use, and
+ *     the next store leases the parked client. What must never return
+ *     is the 2026-11-15 failure: a module-level promise queue shared
+ *     across requests.
  *  5. App-level GET /api/v1/health + GET /api/v1/setup-status stay
  *     cheap in pg queries per request (was 55 + 51 before Batch 0;
  *     ~10 with the singleton). A-10 (2026-11-25) moved both endpoints
  *     BEFORE any store resolution: health answers with no database at
  *     all, setup-status with one SELECT EXISTS on a lightweight
  *     throwaway client — so neither calls the request-scoped
- *     storeFactory at all (0 store creations). The fresh-client-per-
- *     request property for store-backed requests is pinned by tests
+ *     storeFactory at all (0 store creations). The lease property for
+ *     store-backed requests (one request per client at a time;
+ *     concurrent stores hold distinct clients) is pinned by tests
  *     3 and 4 instead.
  *
  * Requires DATABASE_URL (same convention as the other Postgres suites);
@@ -89,17 +95,6 @@ function makeCustomer(tag: string): CustomerRecord {
     created_at: now,
     updated_at: now,
   };
-}
-
-/**
- * Assert a query on the given client fails (ended clients reject;
- * pg may also throw synchronously, so wrap in a promise first).
- */
-async function queryMustReject(client: Client, why: string): Promise<void> {
-  await assert.rejects(
-    Promise.resolve().then(() => client.query("SELECT 1")),
-    why
-  );
 }
 
 /**
@@ -335,17 +330,22 @@ describe.skipIf(!DATABASE_URL)("perf regression (Postgres)", () => {
     }
   }, 60_000);
 
-  it("close() ends the store's OWN client and other stores keep working", async () => {
+  it("close() parks the store's client for reuse; the closed store refuses further use", async () => {
     const doomed = await freshStore();
     const doomedClient = doomed.pgClient;
     await doomed.close();
-    // The store's own client is ended: queries on it reject.
-    await queryMustReject(doomedClient, "ended client must reject queries");
-    // And the closed store itself refuses further use.
+    // B-01 reuse (2026-11-27): close() parks the client in the
+    // per-isolate connection cache instead of ending it — the next
+    // store leases the SAME client object, so no new connect happens.
+    // The closed STORE itself still refuses further use.
     await assert.rejects(doomed.loadState(), /closed/);
-    // Other stores on the same database are unaffected.
-    const survivor = await freshStore();
-    const state = await survivor.loadState();
+    const next = await freshStore();
+    assert.equal(
+      next.pgClient,
+      doomedClient,
+      "next store must lease the parked client"
+    );
+    const state = await next.loadState();
     assert.ok(Array.isArray(state.customers));
   }, 60_000);
 

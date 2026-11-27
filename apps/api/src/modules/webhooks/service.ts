@@ -18,6 +18,16 @@
  * it the tracking event is marked "simulated" with no delivery
  * attempt and no `delivered_at`.
  *
+ * Notifications v1 (OD-08): `email.notification.dispatch` outbox
+ * events are handled by the same drain, BEFORE the webhook fan-out
+ * (a `*`-subscribed endpoint never receives an email payload). The
+ * code-defined template is rendered from the event payload and sent
+ * via the existing SMTP path; without a deliverer (no drizzle DB and
+ * no injected `emailDeliver`) the event is recorded "simulated",
+ * never "delivered". A failed send retries with the normal backoff
+ * and dead-letters after `maxAttempts` (replayable from the admin
+ * outbox UI). See modules/notifications/service.ts.
+ *
  * NOTE (migration remainder): "simulated" is not yet in the
  * `tracking_events` / `outbox_events` / `webhook_deliveries` status
  * CHECKs nor in the store's status unions — migration 0014 must add
@@ -51,6 +61,13 @@ import {
   type MetaCapiEventInput,
   type MetaCapiOptions,
 } from "../tracking/capi.ts";
+import {
+  createDefaultEmailDeliver,
+  EMAIL_NOTIFICATION_EVENT_TYPE,
+  parseNotificationEmailPayload,
+  renderNotificationEmail,
+  type EmailDeliverFn,
+} from "../notifications/service.ts";
 
 export async function registerWebhookEndpointByAdmin(
   store: StackMateDataStore,
@@ -1143,6 +1160,16 @@ export async function processTransactionalOutboxBatch(
     transport?: WebhookTransportFn;
     /** Batch 4 Meta CAPI delivery; omitted → CAPI stays simulated. */
     capiDeliver?: CapiDeliverFn;
+    /**
+     * Notifications v1 (OD-08): email deliverer for
+     * `email.notification.dispatch` events. Omitted → the default
+     * SMTP deliverer is built from the store's drizzle DB +
+     * `encryptionKey` when one can be built; with neither, the event
+     * is recorded "simulated" (never "delivered").
+     */
+    emailDeliver?: EmailDeliverFn;
+    /** Key version for the default email deliverer; default "v3" (env default). */
+    encryptionKeyVersion?: string;
     /** Bounded concurrency for delivery attempts (B-02, default 5). */
     concurrency?: number;
   }
@@ -1229,6 +1256,70 @@ export async function processTransactionalOutboxBatch(
     httpStatus: number;
   }
 
+  // Notifications v1 (OD-08): one `email.notification.dispatch`
+  // event → one rendered template email to the customer, via the
+  // existing SMTP path. Runs BEFORE the webhook fan-out (see
+  // processOne) so no webhook endpoint ever receives the email
+  // payload. A malformed payload or a failed send throws into
+  // processOne's shared catch — bounded retry, then dead-letter
+  // (replayable from the admin outbox UI once SMTP is fixed).
+  async function processEmailNotification(ev: OutboxEventRecord): Promise<EventOutcome> {
+    const parsed = parseNotificationEmailPayload(ev.payload);
+    const deliver =
+      options.emailDeliver ??
+      createDefaultEmailDeliver(store, {
+        encryptionKey: options.encryptionKey,
+        keyVersion: options.encryptionKeyVersion ?? "v3",
+      });
+    if (!deliver) {
+      // No drizzle DB (in-memory/test store) and no injected
+      // deliverer: nothing can send — honest "simulated", never
+      // "delivered" (D-6, same as the webhook no-transport path).
+      await store.withTransaction((state) => {
+        const target = state.outbox_events.find((e) => e.id === ev.id);
+        if (target) {
+          markSimulated(target);
+          target.locked_until = null;
+          target.locked_by = null;
+          target.processed_at = new Date().toISOString();
+        }
+        appendAuditLog(state, {
+          actor_type: "system",
+          action: "notifications.email.simulated",
+          resource_type: "outbox_event",
+          resource_id: ev.id,
+          outcome: "success",
+          request_id: `worker:${workerId}`,
+          changes: { event_type: ev.event_type, reason: "no_email_deliverer" },
+        });
+      });
+      return "simulated";
+    }
+    const result = await deliver(renderNotificationEmail(parsed));
+    if (!result.sent) {
+      throw new Error(result.error ?? "EMAIL_DELIVERY_FAILED");
+    }
+    await store.withTransaction((state) => {
+      const target = state.outbox_events.find((e) => e.id === ev.id);
+      if (target) {
+        target.status = "delivered";
+        target.locked_until = null;
+        target.locked_by = null;
+        target.processed_at = new Date().toISOString();
+      }
+      appendAuditLog(state, {
+        actor_type: "system",
+        action: "notifications.email.delivered",
+        resource_type: "outbox_event",
+        resource_id: ev.id,
+        outcome: "success",
+        request_id: `worker:${workerId}`,
+        changes: { event_type: ev.event_type, template: parsed.template },
+      });
+    });
+    return "delivered";
+  }
+
   // Step 2: process remote side effects OUTSIDE the database
   // transaction, with bounded concurrency (B-02). Each event returns
   // its outcome; counters are aggregated after the pool drains, so no
@@ -1244,6 +1335,9 @@ export async function processTransactionalOutboxBatch(
     let noSubscribers = false;
     const deliveries: DeliveryOutcome[] = [];
     try {
+      if (ev.event_type === EMAIL_NOTIFICATION_EVENT_TYPE) {
+        return await processEmailNotification(ev);
+      }
       if (ev.event_type === "tracking.meta_capi.dispatch") {
         if (options.capiDeliver) {
           // E-01: real Meta CAPI delivery. The pixel group is

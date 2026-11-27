@@ -16,8 +16,14 @@
  *
  * The fix (ADR-0005 evening amendment — the pre-recorded revert path)
  * is REQUEST-SCOPED clients: one fresh pg Client per create(), closed
- * when the request finishes; no module-level client, no promise queue,
- * no module-scope promise. This file pins the reverted behavior:
+ * when the request finishes; no module-level promise queue, no
+ * module-scope promise. B-01 REUSE (2026-11-27) keeps the store
+ * request-scoped but lets the underlying TCP connection be reused
+ * across requests through `platform/db/connection-cache.ts`: ONE idle
+ * client per connection string, claimed by a synchronous boolean
+ * lease (busy → fresh client). The cache holds NO promise at module
+ * scope, so the cross-request-promise failure above cannot recur —
+ * that is what this file now pins. This file pins the behavior:
  *  1. Concurrent /me through the REAL Worker entrypoint stays clean
  *     against local Postgres.
  *  2. A first connection rejected with PostgreSQL 53300
@@ -27,12 +33,14 @@
  *     later handshakes to the real database; the request must still
  *     answer 401 (unauthenticated), never throw.
  *  3. Structural: two sequential requests through the real entrypoint
- *     open TWO distinct pg connections (handshake count via a
- *     counting proxy) — a shared client would open one.
+ *     open ONE pg connection (handshake count via a counting proxy)
+ *     — the second request leases the parked client. A cross-request
+ *     promise failure would 500/throw instead of answering 401.
  *  4. Structural: concurrent requests each hold their own backend
- *     (pg_stat_activity shows >= 2 distinct backends mid-flight) and
- *     no backend lingers after the requests settle (stores closed per
- *     request).
+ *     (pg_stat_activity shows >= 2 distinct backends mid-flight —
+ *     the lease never shares a client between concurrent requests)
+ *     and exactly ONE idle backend lingers after the requests settle
+ *     (the parked lease client, never in a transaction).
  *
  * Requires DATABASE_URL (same convention as the other Postgres suites).
  */
@@ -44,6 +52,7 @@ import net from "node:net";
 import path from "node:path";
 import { Client } from "pg";
 import { resolveRuntimeConfig } from "../src/env.ts";
+import { drainConnectionCache } from "../src/platform/db/connection-cache.ts";
 import worker from "../src/index.ts";
 
 const DATABASE_URL = process.env.DATABASE_URL ?? "";
@@ -84,10 +93,10 @@ describe.skipIf(!DATABASE_URL)("worker 1101 repro (Postgres)", () => {
   }, 120_000);
 
   afterAll(async () => {
-    // Stores are request-scoped now and the entrypoint closes each one
-    // after its request, so no Worker backend should linger — but a
-    // test that failed mid-flight could still hold one; terminate the
-    // repro DB's backends first or DROP DATABASE waits forever.
+    // Stores are request-scoped and the entrypoint closes each one
+    // after its request; B-01 reuse parks the last client instead of
+    // ending it, so ONE idle backend may linger — terminate the repro
+    // DB's backends first or DROP DATABASE waits forever.
     const maintenance = new Client({ connectionString: MAINTENANCE_URL });
     await maintenance.connect();
     await maintenance
@@ -209,13 +218,15 @@ describe.skipIf(!DATABASE_URL)("worker 1101 repro (Postgres)", () => {
     }
   }, 120_000);
 
-  it("two sequential requests open two distinct pg connections (counting proxy)", async () => {
-    // Structural proof of request-scoped clients through the REAL
+  it("two sequential requests open ONE pg connection (counting proxy)", async () => {
+    // Structural proof of B-01 connection reuse through the REAL
     // entrypoint: a plain TCP proxy counts handshakes. Two sequential
-    // /me requests must produce >= 2 handshakes — a shared client
-    // would produce exactly 1. (The Cloudflare cross-request promise
-    // flag cannot be reproduced under Node, so the handshake count is
-    // the observable property: fresh client per request.)
+    // /me requests must produce EXACTLY 1 handshake — the second
+    // request leases the parked client instead of connecting fresh.
+    // (The Cloudflare cross-request promise flag cannot be reproduced
+    // under Node, so the observable properties are the handshake count
+    // AND that both requests still answer 401: a cross-request
+    // promise failure would throw/500 instead.)
     const proxy = net.createServer();
     let handshakes = 0;
     const liveSockets = new Set<net.Socket>();
@@ -253,10 +264,11 @@ describe.skipIf(!DATABASE_URL)("worker 1101 repro (Postgres)", () => {
         const body = await res.text();
         assert.equal(res.status, 401, `request ${i + 1}: expected 401, got ${res.status}: ${body.slice(0, 200)}`);
       }
-      console.log(`[1101-repro] sequential-fresh-client test: ${handshakes} handshake(s) for 2 requests`);
-      assert.ok(
-        handshakes >= 2,
-        `expected >= 2 pg handshakes for 2 sequential requests (fresh client per request), saw ${handshakes}`
+      console.log(`[1101-repro] sequential-reuse test: ${handshakes} handshake(s) for 2 requests`);
+      assert.equal(
+        handshakes,
+        1,
+        `expected exactly 1 pg handshake for 2 sequential requests (second leases the parked client), saw ${handshakes}`
       );
     } finally {
       for (const s of liveSockets) s.destroy();
@@ -264,12 +276,15 @@ describe.skipIf(!DATABASE_URL)("worker 1101 repro (Postgres)", () => {
     }
   }, 120_000);
 
-  it("concurrent requests hold distinct backends and none lingers (pg_stat_activity)", async () => {
+  it("concurrent requests hold distinct backends; exactly one idle backend lingers (pg_stat_activity)", async () => {
     // Black-box proof through the real entrypoint: while 20 /me
     // requests are in flight, pg_stat_activity must show >= 2 distinct
-    // backends for the repro DB (a shared client could never show 2),
-    // and after they settle, none may linger (stores closed per
-    // request — a leaked/shared client would leave 1 behind).
+    // backends for the repro DB (the lease never shares one client
+    // between concurrent requests), and after they settle exactly ONE
+    // backend lingers — the parked lease client, idle (never inside
+    // a transaction). Earlier tests in this file park clients too, so
+    // drain the cache first for a hermetic pre-state.
+    drainConnectionCache();
     const activity = new Client({ connectionString: MAINTENANCE_URL });
     await activity.connect();
     const countBackends = async (): Promise<number> => {
@@ -278,6 +293,13 @@ describe.skipIf(!DATABASE_URL)("worker 1101 repro (Postgres)", () => {
         [REPRO_DB_NAME]
       );
       return r.rowCount ?? 0;
+    };
+    const lingeringStates = async (): Promise<string[]> => {
+      const r = await activity.query(
+        `SELECT state FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
+        [REPRO_DB_NAME]
+      );
+      return r.rows.map((row) => String((row as { state: unknown }).state));
     };
     try {
       assert.equal(await countBackends(), 0, "no Worker backend should exist before the requests");
@@ -307,16 +329,24 @@ describe.skipIf(!DATABASE_URL)("worker 1101 repro (Postgres)", () => {
         maxDistinct >= 2,
         `expected >= 2 distinct backends mid-flight (fresh client per request), saw max ${maxDistinct}`
       );
-      // Settle: no lingering backends once the requests are done.
+      // Settle: exactly ONE idle backend lingers once the requests
+      // are done — the parked lease client. More than one would mean
+      // closes are leaking clients; a non-idle one would mean a
+      // client was parked mid-transaction.
       let lingering = await countBackends();
-      for (let i = 0; i < 40 && lingering > 0; i++) {
+      for (let i = 0; i < 40 && lingering !== 1; i++) {
         await new Promise((r) => setTimeout(r, 50));
         lingering = await countBackends();
       }
       assert.equal(
         lingering,
-        0,
-        `request-scoped clients must be closed after the request; ${lingering} backend(s) still linger`
+        1,
+        `exactly one parked backend must linger after the requests; saw ${lingering}`
+      );
+      assert.deepEqual(
+        await lingeringStates(),
+        ["idle"],
+        "the lingering backend must be idle, never mid-transaction"
       );
     } finally {
       await activity.end().catch(() => {});
