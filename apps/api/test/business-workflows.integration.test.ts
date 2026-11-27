@@ -1421,6 +1421,15 @@ describe.skipIf(!DATABASE_URL)("Business workflows (Postgres)", () => {
             { status: 200, headers: { "Content-Type": "application/json" } },
           );
         }
+        if (href.startsWith("https://graph.facebook.com/")) {
+          // E-01: manual dispatch now delivers CAPI for real — answer
+          // with a valid Meta success body (events_received >= 1) so
+          // the event is recorded delivered, not simulated/queued.
+          return new Response(
+            JSON.stringify({ events_received: 1, fbtrace_id: "test-fbtrace-biz-19" }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
         return new Response("ok", { status: 200 });
       },
     );
@@ -1466,16 +1475,19 @@ describe.skipIf(!DATABASE_URL)("Business workflows (Postgres)", () => {
     assert.equal(purchase.consent_policy_version, "server-verified-v1");
     assert.equal(purchase.sanitized_payload.currency, "BDT");
     assert.equal(purchase.sanitized_payload.value_minor, 499900);
-    // The outbox dispatch (test 18) marked the Meta event simulated
-    // (C-2/D-6: CAPI is a known stub — no delivery attempt, no
-    // delivered_at; real CAPI is a future batch).
-    assert.equal(purchase.status, "simulated");
-    assert.equal(purchase.delivered_at, null);
+    // The outbox dispatch (test 18) delivered the Meta event for real
+    // (E-01, live since 2026-11-27; manual dispatch passes capiDeliver
+    // just like the cron drain) — the stubbed Meta answer above carries
+    // events_received: 1, so the event is "processed" with delivered_at
+    // set, and the outbox row is "delivered". (Before E-01 the same
+    // dispatch marked it "simulated" — CAPI was a stub then.)
+    assert.equal(purchase.status, "processed");
+    assert.ok(purchase.delivered_at !== null, "delivered_at must be set");
     const metaOutbox = await one(
       "SELECT * FROM outbox_events WHERE event_type = $1 AND payload->>'order_reference' = $2",
       ["tracking.meta_capi.dispatch", publicReference]
     );
-    assert.equal(metaOutbox.status, "simulated");
+    assert.equal(metaOutbox.status, "delivered");
     // The renewal order was admin-sourced (no site), so it produced no second Purchase.
     assert.equal(
       await countWhere("tracking_events", "event_name = $1", ["Purchase"]),
