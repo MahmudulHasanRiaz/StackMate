@@ -49,6 +49,10 @@ import {
 } from "../activation/service.ts";
 import { appendAuditLog } from "../audit/service.ts";
 import {
+  enqueuePaymentApprovedNotificationInTx,
+  enqueuePaymentRejectedNotificationInTx,
+} from "../notifications/service.ts";
+import {
   computeOrderPaid,
   computeOrderRemaining,
   normalizePhoneE164,
@@ -960,6 +964,21 @@ export async function approvePaymentSubmissionByStaff(
       processed_at: null,
     });
 
+    // Notifications v1 (OD-08): the customer gets the payment-approved
+    // email. A separate `email.notification.dispatch` outbox event —
+    // the cron drain sends it via SMTP; the webhook `payment.approved`
+    // event above is untouched. Skipped when the customer has no email
+    // address; the approval itself never fails for a missing address.
+    enqueuePaymentApprovedNotificationInTx(state, {
+      submissionId: submission.id,
+      orderReference: order.public_reference,
+      customerName: customer.name,
+      customerEmail: customer.email,
+      amountMinor: transaction.amount_minor,
+      currencyCode: order.currency_code,
+      paymentStatus: order.payment_status === "paid" ? "paid" : "partially_paid",
+    });
+
     if (order.integrated_site_id) {
       const purchaseEventId = `purchase_${order.public_reference}`;
       const existingTrack = state.tracking_events.find(
@@ -1138,6 +1157,22 @@ export async function rejectPaymentSubmissionByStaff(
       last_error_code: null,
       created_at: nowIso,
       processed_at: null,
+    });
+
+    // Notifications v1 (OD-08): the customer gets the payment-rejected
+    // email with the staff-written reason. Same separate outbox event
+    // as the approved path; skipped when the customer has no email
+    // address (or no customer row — the rejection itself never fails
+    // for that). The webhook `payment.rejected` event above is
+    // untouched.
+    const rejectedCustomer = state.customers.find((c) => c.id === order.customer_id);
+    enqueuePaymentRejectedNotificationInTx(state, {
+      submissionId: submission.id,
+      orderReference: order.public_reference,
+      customerName: rejectedCustomer?.name ?? "Customer",
+      customerEmail: rejectedCustomer?.email ?? null,
+      reasonCode: input.reason_code,
+      customerMessage: input.customer_message,
     });
 
     appendAuditLog(state, {
