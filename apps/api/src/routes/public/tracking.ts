@@ -39,6 +39,14 @@ export function registerPublicTrackingRoutes(app: Hono<AppEnv>): void {
     // `checkRateLimit` calls that used to live here counted every
     // ingest twice against the same buckets. Removed.
     const rawBody = await readJsonBody(c);
+    // OD-15 (owner decision, 2026-11-28): tracking ingestion is
+    // INTENTIONALLY NOT audit-logged. Tracking events are high-volume and
+    // already stored in `tracking_events` (the authoritative record, 90-day
+    // retention per OD-01); writing an `audit_logs` row per event would
+    // double write volume with no compliance benefit. Audit logging is for
+    // admin/auth/payment actions, not per-event tracking ingestion. This is
+    // a deliberate decision, not an omission — do not "fix" it by adding
+    // audit writes here.
     const result = await ingestExternalTrackingEvent(store, siteKey, rawBody);
     return jsonResponse(c, result, 202);
   });

@@ -55,6 +55,18 @@ export interface RequestHyperdriveSession {
   /**
    * Acquires the request-scoped cached read client (`HYPERDRIVE_CACHED`),
    * strictly for staleness-tolerant read-only queries.
+   *
+   * OD-04 (2026-11-27): this THROWS when no real cached binding
+   * exists — the binding is unconfigured, or its connection string
+   * is identical to HYPERDRIVE_NO_CACHE's (env.ts aliases CACHED to
+   * NO_CACHE when unconfigured). The old code silently fell back to
+   * the uncached client here, so a caller asking for a cached read
+   * got an uncached one with no signal — the counter then
+   * over-reported cached reads (B-11). A caller that can fall back
+   * must do so explicitly via getUncachedClient() and must not count
+   * the read as cached. (The in-transaction branch below is the one
+   * deliberate exception: a request that already started a write
+   * transaction must never read cached data.)
    */
   getCachedReadClient(): Promise<SqlDriverClient>;
   /**
@@ -101,9 +113,27 @@ export function createRequestHyperdriveSession(
       return getUncachedClient();
     }
     if (!cachedClientPromise) {
-      const connStr =
-        env.HYPERDRIVE_CACHED?.connectionString || env.HYPERDRIVE_NO_CACHE.connectionString;
-      cachedClientPromise = openClient(connStr);
+      // OD-04 (2026-11-27): no silent aliasing. A cached client is
+      // only real when the CACHED binding is configured with a
+      // connection string of its own — env.ts defaults an unconfigured
+      // HYPERDRIVE_CACHED to the NO_CACHE connection string, so
+      // "same string as NO_CACHE" means "no real cached binding".
+      // Fail loudly instead of returning the uncached client and
+      // letting the caller believe it read cached (B-11).
+      const cachedConnStr = env.HYPERDRIVE_CACHED?.connectionString;
+      const uncachedConnStr = env.HYPERDRIVE_NO_CACHE?.connectionString;
+      if (
+        !cachedConnStr ||
+        (uncachedConnStr !== undefined && cachedConnStr === uncachedConnStr)
+      ) {
+        throw new Error(
+          "HYPERDRIVE_CACHED is not a real cached binding in this environment " +
+            "(missing, or aliased to HYPERDRIVE_NO_CACHE): no cached read client " +
+            "is available. Fall back to getUncachedClient() explicitly and do not " +
+            "count the read as cached (OD-04 / B-11)."
+        );
+      }
+      cachedClientPromise = openClient(cachedConnStr);
     }
     return cachedClientPromise;
   };

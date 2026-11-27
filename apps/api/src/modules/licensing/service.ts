@@ -501,6 +501,17 @@ export async function validateLicenseInstallation(
  * messages, statuses, and order), fed by the targeted method's
  * productCode + subscriptionStatus instead of state lookups.
  *
+ * B-01 Track A (2026-11-27) — the lookup is ONE statement, not a
+ * sequential v2-then-v1 loop: on a DrizzleStore both candidate
+ * hashes go in a single findLicenseForValidation([v2, v1]) call,
+ * which also returns the signing-key fingerprint in the same
+ * statement; ensureSigningKeys(fingerprint) then resolves the keys
+ * just before signing (warm path: zero extra queries — see
+ * DrizzleStore.ensureSigningKeys). The in-memory store has neither
+ * method, so it keeps the sequential loop and its in-memory keys —
+ * same results, same errors. The signing keys are therefore always
+ * validated (M-16 fingerprint) before any token is signed.
+ *
  * The one write on this path is the activation heartbeat
  * (last_seen_at): a single-row targeted UPDATE through the store's
  * database client when one exists, or an in-place touch of the live
@@ -533,10 +544,44 @@ export async function validateLicenseInstallationTargeted(
     computeLicenseKeyVerifierV2(input.license_key, config.verifierSecret),
     computeLicenseKeyVerifier(input.license_key, config.verifierSecret),
   ];
+  // B-01 Track A: a DrizzleStore resolves BOTH candidate hashes in
+  // ONE statement and returns the signing-key fingerprint in the same
+  // statement (see DrizzleStore.findLicenseForValidation). The
+  // in-memory store exposes neither merged method, so it keeps the
+  // sequential loop below — same results, same errors.
+  const drizzle = store as unknown as {
+    findLicenseForValidation?: (
+      keyHashes: string[],
+      opts?: { includeSigningKeyFingerprint?: boolean }
+    ) => Promise<
+      | (Awaited<ReturnType<typeof store.findLicenseForValidation>> & {
+          signingKeyFingerprint: string | null;
+        })
+      | null
+    >;
+    ensureSigningKeys?: (fingerprint: string | null) => Promise<void>;
+  };
   let found: Awaited<ReturnType<typeof store.findLicenseForValidation>> = null;
-  for (const keyHash of candidateHashes) {
-    found = await store.findLicenseForValidation(keyHash);
-    if (found) break;
+  let signingKeyFingerprint: string | null = null;
+  // True when the merged Drizzle lookup ran: the keys are then
+  // resolved via drizzle.ensureSigningKeys just before signing
+  // (called as a method on the store, so `this` stays bound).
+  let mergedLookup = false;
+  if (
+    typeof drizzle.findLicenseForValidation === "function" &&
+    typeof drizzle.ensureSigningKeys === "function"
+  ) {
+    const merged = await drizzle.findLicenseForValidation(candidateHashes, {
+      includeSigningKeyFingerprint: true,
+    });
+    found = merged;
+    signingKeyFingerprint = merged?.signingKeyFingerprint ?? null;
+    mergedLookup = true;
+  } else {
+    for (const keyHash of candidateHashes) {
+      found = await store.findLicenseForValidation(keyHash);
+      if (found) break;
+    }
   }
   if (!found) {
     throw new AppError("LICENSE_INVALID", "Invalid license key.", 401);
@@ -593,6 +638,15 @@ export async function validateLicenseInstallationTargeted(
   }
 
   await touchActivationLastSeen(store, activation, nowIso);
+  // B-01 Track A: resolve the signing keys NOW, against the
+  // fingerprint the lookup statement computed — warm path costs no
+  // extra query; a rotation/cold cache reloads here, before any
+  // token is signed (and fails closed on a corrupt row). In-memory
+  // stores skip this: their keys are already in memory from
+  // construction. Never signs before this line on a DrizzleStore.
+  if (mergedLookup) {
+    await drizzle.ensureSigningKeys!(signingKeyFingerprint);
+  }
   const signed = buildSignedEntitlementToken(store, license, productCode, config.issuerUrl);
 
   return {
