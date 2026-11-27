@@ -51,7 +51,9 @@ import { appendAuditLog } from "../audit/service.ts";
 import {
   computeOrderPaid,
   computeOrderRemaining,
+  normalizePhoneE164,
 } from "../customers/service.ts";
+import { sha256Hex } from "../../platform/crypto/index.ts";
 import { assertStaffPermission, type StaffPrincipal } from "../identity/service.ts";
 
 export interface PublicPaymentMethodDto {
@@ -967,6 +969,27 @@ export async function approvePaymentSubmissionByStaff(
           te.event_id === purchaseEventId
       );
       if (!existingTrack) {
+        // E-01: Meta rejects a Purchase event with empty user_data
+        // (HTTP 400, error 100 "Invalid parameter"). Hash the order
+        // customer's email/phone server-side, exactly like the
+        // website-ingested path (modules/tracking/service.ts):
+        // em = sha256(trimmed + lowercased email), ph = sha256
+        // (digits of the E.164-normalized phone). Only fields the
+        // customer actually has are included — never an invented
+        // value, never a hash of an empty string — and raw PII is
+        // never stored here or sent to Meta. The drain
+        // (createCapiDeliver) forwards these hashes as user_data.
+        const purchaseUserDataHashes: Record<string, string> = {};
+        const customerEmail = customer.email?.trim();
+        if (customerEmail) {
+          purchaseUserDataHashes.em = sha256Hex(customerEmail.toLowerCase());
+        }
+        if (customer.phone) {
+          const phoneDigits = (normalizePhoneE164(customer.phone) ?? "").replace(/\D/g, "");
+          if (phoneDigits) {
+            purchaseUserDataHashes.ph = sha256Hex(phoneDigits);
+          }
+        }
         const trackId = randomUUID();
         state.tracking_events.push({
           id: trackId,
@@ -982,6 +1005,7 @@ export async function approvePaymentSubmissionByStaff(
             order_reference: order.public_reference,
             currency: order.currency_code,
             value_minor: order.total_minor,
+            user_data_hashes: purchaseUserDataHashes,
           },
           status: "queued",
           delivery_attempts: 0,
