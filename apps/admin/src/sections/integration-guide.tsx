@@ -68,12 +68,9 @@ export function IntegrationGuideSection() {
         </p>
         <ul>
           <li>
-            <strong>Base URL:</strong> the StackMate API the product was
-            registered against (for staging:{" "}
-            <span className="sm-mono">
-              https://stackmate-api-staging.ad-dawah.workers.dev
-            </span>
-            ).
+            <strong>Base URL:</strong> the StackMate API this deployment
+            serves — the same origin as this admin page:{" "}
+            <span className="sm-mono">{window.location.origin}</span>.
           </li>
           <li>
             <strong>Auth:</strong> license calls need no staff login —

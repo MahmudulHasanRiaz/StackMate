@@ -26,6 +26,7 @@ import {
   type StaffPrincipal,
 } from "../../modules/identity/service.ts";
 import {
+  createCapiDeliver,
   createRealWebhookTransport,
   deleteWebhookEndpointByAdmin,
   processTransactionalOutboxBatch,
@@ -411,12 +412,15 @@ export function registerAdminWebhooksRoutes(app: Hono<AppEnv>): void {
     await assertStaffPermissionAudited(store, principal, "integrations.manage", requestId);
     // C-2: pass the real transport — without it the dispatcher
     // runs simulated and records "simulated" (never "delivered").
+    // E-01: pass capiDeliver too — without it Meta CAPI events stay
+    // simulated even on a manual dispatch (same as the cron drain).
     const summary = await processTransactionalOutboxBatch(store, {
       encryptionKey: env.ENCRYPTION_KEY_V1,
       allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
       transport: createRealWebhookTransport({
         allowHttpLocal: env.APP_ENV === "local" || env.APP_ENV === "test",
       }),
+      capiDeliver: createCapiDeliver(env),
     });
     return ok(c, summary);
   });

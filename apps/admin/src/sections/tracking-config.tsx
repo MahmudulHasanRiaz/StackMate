@@ -12,8 +12,8 @@
  *   DELETE /api/v1/admin/integrated-sites/:siteId/tracking/:configId
  *   POST   /api/v1/admin/tracking/test-event { pixel_group_id,
  *     event_name? } — "Send test event" per pixel group (E-18).
- *     Until Batch 4 lands real CAPI delivery the result is honest
- *     about being recorded/simulated, never "delivered".
+ *     The event is recorded and then delivered to Meta by the outbox
+ *     drain (E-01, live); the result reports the recorded status.
  *
  * A pixel group is one (provider, pixel_id) configuration for one
  * site (migration 0006). Several groups per provider are allowed —
@@ -22,11 +22,11 @@
  * read endpoint, so the edit form leaves the token blank and only
  * re-encrypts when a new token is supplied.
  *
- * HONESTY NOTE — Meta CAPI delivery is a STUB in the current API:
- * events are recorded locally, no call to Meta is made (Batch 4).
- * TikTok has no delivery at all yet — its groups only store
- * configuration. This page never claims a delivery reached its
- * destination.
+ * Meta CAPI delivery is LIVE (E-01, verified 2026-11-27 against Meta
+ * Events Manager): events are sent to Meta via the outbox drain
+ * (cron + manual dispatch). TikTok has no delivery yet — its groups
+ * only store configuration. This page never claims a delivery reached
+ * its destination without the drain's success.
  */
 import { useState, type FormEvent } from "react";
 import { useNavigate } from "@tanstack/react-router";
@@ -102,12 +102,6 @@ export function TrackingConfigSection() {
         title="Tracking"
         help="Pixel groups — Meta Pixel + Conversions API, TikTok, and more"
       />
-      <Alert variant="warning">
-        Meta delivery is not live yet. An event marked “Processed
-        (recorded)” was recorded locally — no call to Meta has been made.
-        Real Meta CAPI delivery is Batch 4. TikTok has no delivery yet;
-        its groups only store configuration.
-      </Alert>
       {sitesQuery.isPending ? (
         <TableSkeleton rows={3} />
       ) : sitesQuery.isError ? (
@@ -450,8 +444,8 @@ function SendTestEventDialog({
         </Select>
       </Field>
       <p className="sm-hint">
-        Until Batch 4 lands real CAPI delivery this only records the event
-        locally — the result says so instead of claiming a delivery.
+        The event is recorded, then delivered to Meta by the outbox
+        drain — the result reports the recorded status.
       </p>
     </Dialog>
   );

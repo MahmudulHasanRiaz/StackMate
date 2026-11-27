@@ -13,13 +13,14 @@
  *   GET /api/v1/admin/tracking/events
  *   GET /api/v1/admin/integrated-sites (site names for the Site column)
  *
- * HONESTY NOTE — Meta CAPI delivery is a STUB in the current API:
- * the outbox dispatcher marks a tracking event "simulated" without
- * ever calling graph.facebook.com (apps/api/src/modules/webhooks/
- * service.ts, `tracking.meta_capi.dispatch`). This UI therefore shows
- * the event and its RECORDED status only, and says plainly that no
- * Meta delivery has happened. It never claims an event reached Meta.
- * Real Meta delivery is Batch 4.
+ * Meta CAPI delivery is LIVE (E-01, verified 2026-11-27 against Meta
+ * Events Manager): the outbox drain sends events to
+ * graph.facebook.com (cron tick + manual dispatch); a delivered event
+ * shows "Processed (recorded)" with delivered_at. Events with no Meta
+ * destination (no site / no enabled pixel group) are honestly
+ * "skipped" (C-2 Option A), never faked as delivered. This UI shows
+ * the recorded status and delivered_at; it never claims an event
+ * reached Meta without the drain's success.
  */
 import { useMemo, useState } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
@@ -32,7 +33,6 @@ import {
   useAdminList,
 } from "../lib/section-kit";
 import {
-  Alert,
   Button,
   Chip,
   CopyButton,
@@ -235,11 +235,6 @@ export function TrackingSection() {
         title="Tracking Events"
         help="Events received from integrated sites"
       />
-      <Alert variant="warning">
-        Meta delivery is not live yet. An event marked “Processed (recorded)”
-        was recorded locally — no call to Meta has been made. Real Meta CAPI
-        delivery is Batch 4.
-      </Alert>
       <Toolbar>
         {STATUS_FILTERS.map((f) => (
           <Chip
