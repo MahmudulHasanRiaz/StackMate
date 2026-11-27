@@ -1038,11 +1038,10 @@ function formatCapiErrorDetail(
  * failed/rejected and the drain retries it (bounded) — never recorded
  * delivered.
  *
- * Known limitation (not changed here): Purchase events carry no
- * `user_data` — payments/service.ts records no `user_data_hashes`
- * for them, so Meta receives an empty `user_data` object and match
- * quality is low. Enriching Purchase events from the customer record
- * is a separate, PII-sensitive follow-up, not drain wiring.
+ * Purchase events carry hashed `user_data` — payments/service.ts
+ * records `user_data_hashes` (SHA-256 of the order customer's email /
+ * phone) on the Purchase tracking event, so Meta receives `user_data`
+ * with `em`/`ph` hashes. Raw email/phone is never stored or sent.
  */
 export function createCapiDeliver(
   env: MetaCapiEnv,
