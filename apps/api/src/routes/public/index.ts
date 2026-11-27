@@ -48,11 +48,18 @@ export function registerPublicRoutes(app: Hono<AppEnv>): void {
     const site = await store.findIntegratedSiteByKey(siteKey);
     if (!site || site.status !== "active") throw new AppError("UNAUTHORIZED", "Invalid or inactive site key.", 401);
 
-    // B-11: the old `store.queryMetrics.cachedQueries += 1` here
-    // was false — the data comes from targeted reads, never a cached
-    // read path, so the counter over-reported cached reads. Removed;
-    // OD-04 (wire real HYPERDRIVE_CACHED or delete it) is still open.
-    const catalog = await store.loadPublicCatalog();
+    // OD-04: the public catalog is the ONE read wired to
+    // HYPERDRIVE_CACHED (ADR-0005 §2, 60s staleness). The route passes
+    // env.HYPERDRIVE_CACHED; DrizzleStore runs the identical query on
+    // the cached client and counts it in cachedQueries only when the
+    // binding is real — a missing, aliased, or different-database
+    // binding falls back to the authoritative connection, counted
+    // uncached. (B-11: the old `cachedQueries += 1` here was false
+    // and removed — the data came from targeted reads, never a
+    // cached read path.)
+    const catalog = await store.loadPublicCatalog({
+      cachedConnectionString: env.HYPERDRIVE_CACHED?.connectionString,
+    });
     const allowedProducts = catalog.products
       .filter((p) => p.status === "active" && site.product_ids.includes(p.id))
       .map((p) => ({
@@ -85,7 +92,12 @@ export function registerPublicRoutes(app: Hono<AppEnv>): void {
     // B-01: targeted reads only (see the products-list handler).
     const site = await store.findIntegratedSiteByKey(siteKey);
     if (!site || site.status !== "active") throw new AppError("UNAUTHORIZED", "Invalid or inactive site key.", 401);
-    const catalog = await store.loadPublicCatalog();
+    // OD-04: public catalog via HYPERDRIVE_CACHED when the binding
+    // is real (see the products-list handler); falls back to the
+    // authoritative connection, counted uncached, otherwise.
+    const catalog = await store.loadPublicCatalog({
+      cachedConnectionString: env.HYPERDRIVE_CACHED?.connectionString,
+    });
     const product = catalog.products.find(
       (p) => p.slug === productSlug && p.status === "active"
     );
@@ -156,7 +168,12 @@ export function registerPublicRoutes(app: Hono<AppEnv>): void {
     // B-01: targeted reads only (see the products-list handler).
     const site = await store.findIntegratedSiteByKey(siteKey);
     if (!site || site.status !== "active") throw new AppError("UNAUTHORIZED", "Invalid or inactive site key.", 401);
-    const catalog = await store.loadPublicCatalog();
+    // OD-04: public catalog via HYPERDRIVE_CACHED when the binding
+    // is real (see the products-list handler); falls back to the
+    // authoritative connection, counted uncached, otherwise.
+    const catalog = await store.loadPublicCatalog({
+      cachedConnectionString: env.HYPERDRIVE_CACHED?.connectionString,
+    });
     const product = catalog.products.find(
       (p) => p.slug === productSlug && p.status === "active"
     );
@@ -242,7 +259,12 @@ export function registerPublicRoutes(app: Hono<AppEnv>): void {
     // B-01: targeted reads only (see the products-list handler).
     const site = await store.findIntegratedSiteByKey(siteKey);
     if (!site || site.status !== "active") throw new AppError("UNAUTHORIZED", "Invalid or inactive site key.", 401);
-    const catalog = await store.loadPublicCatalog();
+    // OD-04: public catalog via HYPERDRIVE_CACHED when the binding
+    // is real (see the products-list handler); falls back to the
+    // authoritative connection, counted uncached, otherwise.
+    const catalog = await store.loadPublicCatalog({
+      cachedConnectionString: env.HYPERDRIVE_CACHED?.connectionString,
+    });
     const version = catalog.package_versions.find(
       (v) => v.id === packageVersionId && v.status === "published"
     );

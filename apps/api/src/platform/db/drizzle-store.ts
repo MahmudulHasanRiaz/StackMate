@@ -227,6 +227,7 @@ import {
   type UploadedAssetRecord,
   type UserRecord,
   type WebhookEndpointRecord,
+  type LoadPublicCatalogOptions,
 } from "./store.ts";
 
 export const DEFAULT_SIGNING_KEY_ID = "sm-ed25519-2026-11";
@@ -395,6 +396,28 @@ async function execSql(
   values: unknown[] = []
 ): Promise<void> {
   await client.query(text, values);
+}
+
+/**
+ * OD-04: true when two Postgres connection strings name the same
+ * database (URL pathname). The public route passes
+ * env.HYPERDRIVE_CACHED, but the store may have been built against
+ * a different database — tests build scratch databases while env
+ * still points at the shared test database — and a cached read must
+ * never cross databases. Both Hyperdrive bindings target the same
+ * underlying database in a real deployment, so equal database names
+ * is the right guard; anything unparseable (or an empty name) is
+ * treated as "not the same database" and falls back to the
+ * authoritative connection.
+ */
+function sameDatabaseName(a: string, b: string): boolean {
+  try {
+    const dbA = new URL(a).pathname.replace(/^\//, "");
+    const dbB = new URL(b).pathname.replace(/^\//, "");
+    return dbA.length > 0 && dbA === dbB;
+  } catch {
+    return false;
+  }
 }
 
 function str(row: Row, key: string): string | null {
@@ -878,6 +901,18 @@ export class DrizzleStore extends StackMateDataStore {
   private leasedConnection = false;
   private cacheConnectionString: string | null = null;
   /**
+   * OD-04: lazily-acquired client for the HYPERDRIVE_CACHED binding,
+   * used ONLY by loadPublicCatalog (the one staleness-tolerant read).
+   * Acquired on the first cached catalog read — leased from the
+   * connection cache for its connection string when one is parked,
+   * else freshly connected — and released/parked by close() under
+   * the same lease rules as the main client. Never used by auth,
+   * finance, license, or any other targeted method.
+   */
+  private cachedPgClient: Client | null = null;
+  private cachedLeasedConnection = false;
+  private cachedConnectionString: string | null = null;
+  /**
    * Instance-level serialization chain for THIS store's client (see
    * header note 1). Deliberately NOT module-level: a chain stored at
    * module scope (the deleted `clientQueues`) is what the Cloudflare
@@ -906,6 +941,13 @@ export class DrizzleStore extends StackMateDataStore {
    * so a store can never sign with the constructor's per-process key.
    */
   private signingKeysDurable = false;
+  /**
+   * B-01 Track A: createTargeted(loadSigningKey) options kept for
+   * deferred signing-key resolution (see ensureSigningKeys). Null
+   * unless this store was created targeted with loadSigningKey —
+   * create() resolves eagerly and never sets this.
+   */
+  private deferredSigningKeyOpts: DrizzleStoreCreateOptions | null = null;
 
   private constructor(
     pgClient: Client,
@@ -1080,7 +1122,24 @@ export class DrizzleStore extends StackMateDataStore {
       );
       await assertRequiredTablesCached(opts.connectionString, pgClient);
       if (opts.loadSigningKey) {
-        await store.resolveSigningKey(opts);
+        // B-01 Track A: DEFER — do NOT resolve the signing keys here.
+        // Eager resolution pays a fingerprint round trip on EVERY
+        // request (warm cache) or a 5-round-trip reload (cold cache)
+        // at store creation, before the handler even runs. The
+        // fingerprint instead rides inside the validate lookup
+        // statement (findLicenseForValidation,
+        // includeSigningKeyFingerprint), and the service calls
+        // ensureSigningKeys(fingerprint) just before signing — so a
+        // warm validate pays no extra round trip at all, and an
+        // invalid-key request pays no signing-key query at all (it
+        // never signs). The M-16 invariant is unchanged: the cache
+        // is still validated against a fingerprint before ANY key
+        // material is trusted, and a mismatch/cold cache still runs
+        // the full advisory-locked reload (at signing time instead
+        // of creation time). Only the license-validate route passes
+        // loadSigningKey (targeted-routes.ts), so no other route is
+        // affected; create() still resolves eagerly.
+        store.deferredSigningKeyOpts = opts;
       }
       if (opts.r2Bucket !== undefined && opts.r2Bucket !== null) {
         store.r2Bucket = opts.r2Bucket;
@@ -1219,7 +1278,14 @@ export class DrizzleStore extends StackMateDataStore {
    * private material cannot be decrypted.
    */
   private async resolveSigningKey(
-    opts: DrizzleStoreCreateOptions
+    opts: DrizzleStoreCreateOptions,
+    /**
+     * B-01 Track A: a fingerprint computed by the caller (the
+     * validate lookup statement), so the warm-cache check costs no
+     * extra query. `undefined` (default) queries it here, as before;
+     * `null` skips the cache check and reloads directly.
+     */
+    precomputedFingerprint?: string | null
   ): Promise<void> {
     const secret = this.resolveEncryptionSecret(opts);
     this.encryptionSecret = secret;
@@ -1250,12 +1316,11 @@ export class DrizzleStore extends StackMateDataStore {
       // ciphertext hashes) before trusting it; any change falls
       // through to the full reload below, which decrypts and fails
       // closed on a corrupt/undecryptable row.
-      const fingerprint = await this.signingKeysFingerprint(client);
-      if (fingerprint === cached.fingerprint) {
-        this.signingKeys.clear();
-        for (const [keyId, material] of cached.keys) this.signingKeys.set(keyId, material);
-        this.activeSigningKeyId = cached.activeKeyId;
-        this.signingKeysDurable = true;
+      const fingerprint =
+        precomputedFingerprint === undefined
+          ? await this.signingKeysFingerprint(client)
+          : precomputedFingerprint;
+      if (fingerprint !== null && this.applyCachedSigningKeys(cacheKey, fingerprint)) {
         return;
       }
     }
@@ -1315,6 +1380,73 @@ export class DrizzleStore extends StackMateDataStore {
       await client.query("ROLLBACK").catch(() => {});
       throw error;
     }
+  }
+
+  /**
+   * M-16 warm-cache validation, shared by resolveSigningKey (which
+   * queries its own fingerprint) and ensureSigningKeys (which is
+   * handed the fingerprint the validate lookup statement computed).
+   * Adopts the cached material ONLY on an exact fingerprint match
+   * inside the TTL; anything else returns false and the caller falls
+   * through to the full reload, which decrypts and fails closed.
+   * Returns true when the keys are now durable on this store.
+   */
+  private applyCachedSigningKeys(cacheKey: string, fingerprint: string): boolean {
+    const cached = signingKeyCache.get(cacheKey);
+    if (!cached || Date.now() - cached.cachedAtMs >= SIGNING_KEY_CACHE_TTL_MS) {
+      return false;
+    }
+    if (fingerprint !== cached.fingerprint) return false;
+    this.signingKeys.clear();
+    for (const [keyId, material] of cached.keys) this.signingKeys.set(keyId, material);
+    this.activeSigningKeyId = cached.activeKeyId;
+    this.signingKeysDurable = true;
+    return true;
+  }
+
+  /**
+   * B-01 Track A — deferred signing-key resolution for a
+   * createTargeted(loadSigningKey) store. Call after the license
+   * lookup, just before signing, with the fingerprint the lookup
+   * statement returned (findLicenseForValidation,
+   * includeSigningKeyFingerprint). Warm path: the fingerprint
+   * validates the M-16 cache — ZERO extra queries. Cold/mismatch
+   * path (first request after a rotation, TTL expiry, or a null
+   * fingerprint): the full advisory-locked reload, exactly like
+   * resolveSigningKey — decrypting and failing closed on a
+   * corrupt/undecryptable row. A store whose keys are already
+   * durable (create(), or an earlier ensure on this instance) is a
+   * no-op. Throws when called on a store that never deferred
+   * resolution — sign with a create()/createTargeted(loadSigningKey)
+   * store instead; the constructor's per-process key is never used.
+   */
+  public async ensureSigningKeys(fingerprint: string | null): Promise<void> {
+    if (this.signingKeysDurable) return;
+    const opts = this.deferredSigningKeyOpts;
+    if (!opts) {
+      throw new Error(
+        "DrizzleStore: ensureSigningKeys called on a store that never deferred signing-key resolution (no loadSigningKey). Use a create() store or createTargeted({ loadSigningKey: true }) instead."
+      );
+    }
+    const secret = this.resolveEncryptionSecret(opts);
+    this.encryptionSecret = secret;
+    if (!this.capabilities.signingKeys) {
+      throw new Error(
+        "DrizzleStore: signing_keys table is missing. Apply migration 0004 (db/migrations/0004_signing_keys.sql) before starting the API — license signing keys are durable-only and a per-process key is no longer generated."
+      );
+    }
+    const cacheKey = signingKeyCacheKey(
+      opts.connectionString,
+      secret,
+      opts.signingKeyId?.trim() ?? "",
+      opts.signingPrivateJwk
+        ? createHash("sha256").update(opts.signingPrivateJwk).digest("hex")
+        : "",
+    );
+    if (fingerprint !== null && this.applyCachedSigningKeys(cacheKey, fingerprint)) {
+      return;
+    }
+    await this.resolveSigningKey(opts, fingerprint);
   }
 
   /**
@@ -1866,6 +1998,104 @@ export class DrizzleStore extends StackMateDataStore {
     }
   }
 
+  /**
+   * OD-04: the catalog's transport. Runs `text` against the
+   * HYPERDRIVE_CACHED client when `cachedConnectionString` names a
+   * REAL cached binding — non-empty, different from this store's own
+   * (uncached) connection string, and the same database — and counts
+   * the completed read in `queryMetrics.cachedQueries` (exactly once,
+   * only after the query succeeds). Every other case — no string,
+   * aliased to the uncached string (env.ts default when the binding
+   * is unconfigured), a different database, or a dead/unreachable
+   * cached binding — runs the IDENTICAL query on the authoritative
+   * client and counts it as uncached. A failed cached attempt is
+   * never counted as cached: the counter reads real cached reads
+   * only (B-11). The fallback keeps the public catalog available
+   * when the cached binding is down; it serves the same data, just
+   * without the edge cache.
+   */
+  private async catalogRows(
+    text: string,
+    cachedConnectionString?: string
+  ): Promise<Row[]> {
+    this.assertOpen();
+    const release = await this.acquireStoreLock();
+    try {
+      const useCached =
+        typeof cachedConnectionString === "string" &&
+        cachedConnectionString.trim().length > 0 &&
+        this.cacheConnectionString !== null &&
+        cachedConnectionString !== this.cacheConnectionString &&
+        sameDatabaseName(cachedConnectionString, this.cacheConnectionString);
+      if (useCached) {
+        try {
+          const client = await this.acquireCachedClient(cachedConnectionString);
+          const rows = await queryRows(client, text);
+          this.queryMetrics.cachedQueries += 1;
+          return rows;
+        } catch (error) {
+          if (!isConnectionError(error)) throw error;
+          this.dropCachedClient();
+          const rows = await queryRows(this.pgClient, text);
+          this.queryMetrics.uncachedQueries += 1;
+          return rows;
+        }
+      }
+      const rows = await queryRows(this.pgClient, text);
+      this.queryMetrics.uncachedQueries += 1;
+      return rows;
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * OD-04: lease the parked cached client for `connectionString`
+   * when one is idle, else connect fresh (one retry, as
+   * connectWithRetry). Called only from catalogRows, which already
+   * holds the store lock.
+   */
+  private async acquireCachedClient(connectionString: string): Promise<Client> {
+    if (this.cachedPgClient) {
+      // The parked client belongs to a different cached binding —
+      // never serve a read from the wrong connection string.
+      if (this.cachedConnectionString === connectionString) {
+        return this.cachedPgClient;
+      }
+      this.dropCachedClient();
+    }
+    const leasedClient = tryAcquireCachedClient(connectionString);
+    let client: Client;
+    if (leasedClient) {
+      client = leasedClient;
+    } else {
+      client = await DrizzleStore.connectWithRetry(connectionString);
+    }
+    this.cachedPgClient = client;
+    this.cachedLeasedConnection = leasedClient !== null;
+    this.cachedConnectionString = connectionString;
+    return client;
+  }
+
+  /**
+   * OD-04: discard the cached client after a connection failure so
+   * the next catalog read re-acquires (a leased entry is removed
+   * from the cache; a fresh client is ended). The in-flight read
+   * has already fallen back to the uncached client in catalogRows.
+   */
+  private dropCachedClient(): void {
+    const client = this.cachedPgClient;
+    if (!client) return;
+    this.cachedPgClient = null;
+    this.cachedConnectionString = null;
+    if (this.cachedLeasedConnection) {
+      this.cachedLeasedConnection = false;
+      discardCachedClient(client);
+    } else {
+      client.end().catch(() => {});
+    }
+  }
+
   private mapUserRow(row: Row): UserRecord {
     return {
       id: reqStr(row, "id", "users"),
@@ -1974,12 +2204,39 @@ export class DrizzleStore extends StackMateDataStore {
    * loadStateInternalImpl. The mutation half of validate/activate
    * (last_seen_at, seat changes) still goes through withTransaction —
    * this read fast path is for the lookup + checks.
+   *
+   * B-01 Track A (2026-11-27) — single-statement merges. A single
+   * pg Client executes queries strictly in call order, so Promise.all
+   * over one store's client saves ZERO round trips (proven locally:
+   * 2x pg_sleep(0.25) takes ~600ms sequential AND under Promise.all
+   * on one client, ~300ms on two clients). The RTT win therefore
+   * comes from merging, not fan-out:
+   *  - `keyHashes` takes BOTH candidate hashes (v2 then v1) in one
+   *    statement (`= ANY($1)` + `array_position` preference) instead
+   *    of the service's sequential v2-then-v1 loop: invalid-key and
+   *    legacy-v1 validations drop from 2 lookup RTTs to 1. A single
+   *    string still works (back-compat for existing callers/tests).
+   *  - `includeSigningKeyFingerprint` appends the M-16 signing-key
+   *    fingerprint as a column of the SAME statement (string_agg over
+   *    signing_keys, byte-identical to signingKeysFingerprint), so
+   *    the validate path pays no separate fingerprint RTT at store
+   *    creation — see ensureSigningKeys + the createTargeted
+   *    deferral. Default off: other callers pay nothing for it.
    */
-  public async findLicenseForValidation(keyHash: string): Promise<{
+  public async findLicenseForValidation(
+    keyHashes: string | string[],
+    opts?: { includeSigningKeyFingerprint?: boolean }
+  ): Promise<{
     license: LicenseRecord;
     productCode: string;
     subscriptionStatus: string | null;
+    /**
+     * The M-16 signing-key fingerprint, only when
+     * `includeSigningKeyFingerprint` was set; null otherwise.
+     */
+    signingKeyFingerprint: string | null;
   } | null> {
+    const hashes = Array.isArray(keyHashes) ? keyHashes : [keyHashes];
     const licenseRows = await this.targetedRows(
       `SELECT l.id, l.license_number, l.product_id, l.customer_id, l.source_order_item_id,
               l.subscription_id, l.license_key_hash, l.license_key_hint, l.status,
@@ -1997,12 +2254,21 @@ export class DrizzleStore extends StackMateDataStore {
               ) sn), '[]'::json) AS snapshots,
               COALESCE((SELECT json_agg(a ORDER BY a.activated_at ASC, a.id ASC)
                           FROM license_activations a
-                         WHERE a.license_id = l.id), '[]'::json) AS activations
+                         WHERE a.license_id = l.id), '[]'::json) AS activations${
+        opts?.includeSigningKeyFingerprint
+          ? `,
+              COALESCE((SELECT string_agg(k.key_id || ':' || k.status || ':' || k.ct_hash, '|' ORDER BY k.key_id ASC)
+                          FROM (SELECT key_id, status, md5(COALESCE(encrypted_private_jwk, '')) AS ct_hash
+                                  FROM signing_keys WHERE status <> 'revoked') k), '') AS signing_key_fingerprint`
+          : ""
+      }
          FROM licenses l
          LEFT JOIN products p ON p.id = l.product_id
          LEFT JOIN subscriptions s ON s.id = l.subscription_id
-        WHERE l.license_key_hash = $1 LIMIT 1`,
-      [keyHash]
+        WHERE l.license_key_hash = ANY($1::text[])
+        ORDER BY array_position($1::text[], l.license_key_hash)
+        LIMIT 1`,
+      [hashes]
     );
     const licenseRow = licenseRows[0];
     if (!licenseRow) return null;
@@ -2094,6 +2360,7 @@ export class DrizzleStore extends StackMateDataStore {
       license,
       productCode: str(licenseRow, "product_code") ?? "",
       subscriptionStatus: str(licenseRow, "subscription_status"),
+      signingKeyFingerprint: str(licenseRow, "signing_key_fingerprint"),
     };
   }
 
@@ -2165,18 +2432,25 @@ export class DrizzleStore extends StackMateDataStore {
    * features, active packages, published versions (+ feature grants),
    * active prices — ONE statement (was 7 serialized queries). Only
    * the rows a public catalog / checkout read ever needs — no orders,
-   * customers, audit, outbox, sessions, or any other table. Route
-   * wiring (app.ts) is a follow-up; until then the full load remains
-   * the fallback.
+   * customers, audit, outbox, sessions, or any other table.
+   *
+   * OD-04: the catalog is the ONE read wired to HYPERDRIVE_CACHED
+   * (ADR-0005 §2 — public, read-heavy, 60s-staleness-tolerant).
+   * `opts.cachedConnectionString` (passed by the public routes from
+   * env.HYPERDRIVE_CACHED) routes the identical SQL through the
+   * cached client; see catalogRows for the fallback rules and the
+   * honest `cachedQueries` accounting. The SQL and the row mapping
+   * below are unchanged — only the transport varies. Auth, finance,
+   * and license reads never come here and stay uncached.
    */
-  public async loadPublicCatalog(): Promise<{
+  public async loadPublicCatalog(opts?: LoadPublicCatalogOptions): Promise<{
     products: ProductRecord[];
     product_features: ProductFeatureRecord[];
     product_packages: ProductPackageRecord[];
     package_versions: PackageVersionRecord[];
     package_prices: PackagePriceRecord[];
   }> {
-    const rows = await this.targetedRows(
+    const rows = await this.catalogRows(
       `SELECT
          COALESCE((SELECT json_agg(t) FROM (SELECT product_id, channel_key FROM product_distribution_channels) t), '[]'::json) AS channels,
          COALESCE((SELECT json_agg(t ORDER BY t.created_at ASC, t.id ASC) FROM (
@@ -2214,7 +2488,8 @@ export class DrizzleStore extends StackMateDataStore {
                    setup_fee_minor, status, created_at
                    ${this.capabilities.packagePricesUsedInOrders ? ", used_in_orders" : ""}
               FROM package_prices WHERE status = 'active'
-         ) t), '[]'::json) AS prices`
+         ) t), '[]'::json) AS prices`,
+      opts?.cachedConnectionString
     );
     const row = rows[0];
     if (!row) {
@@ -2623,6 +2898,27 @@ export class DrizzleStore extends StackMateDataStore {
   public async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    // OD-04: release/park the cached catalog client first, under the
+    // same lease rules as the main client (leased → release, fresh →
+    // park when the slot is free, else end). Must run before the
+    // early returns of the main-client handling below.
+    const cached = this.cachedPgClient;
+    if (cached) {
+      const cachedConnStr = this.cachedConnectionString;
+      this.cachedPgClient = null;
+      this.cachedConnectionString = null;
+      if (this.cachedLeasedConnection) {
+        this.cachedLeasedConnection = false;
+        releaseCachedClient(cached);
+      } else if (
+        cachedConnStr !== null &&
+        parkCachedClient(cachedConnStr, cached)
+      ) {
+        // Parked for the next catalog read; do not end.
+      } else {
+        await cached.end().catch(() => {});
+      }
+    }
     if (this.leasedConnection) {
       this.leasedConnection = false;
       releaseCachedClient(this.pgClient);

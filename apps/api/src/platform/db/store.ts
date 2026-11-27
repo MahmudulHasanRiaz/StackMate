@@ -972,6 +972,23 @@ export interface IdempotentCommandOptions<T> {
   reissueBody?: (stored: unknown) => T;
 }
 
+/**
+ * OD-04: options for `loadPublicCatalog`. `cachedConnectionString`
+ * is the connection string of the HYPERDRIVE_CACHED binding: the
+ * public catalog is the ONE staleness-tolerant read (ADR-0005 §2,
+ * 60s) allowed through it. Honored ONLY by DrizzleStore — the
+ * in-memory store has no database client and ignores it, and the
+ * Drizzle version falls back to the authoritative connection
+ * (counted as uncached) when the string is missing, identical to
+ * its own connection string (env.ts aliases CACHED to NO_CACHE
+ * when the binding is unconfigured), or names a different
+ * database. Auth, finance, and license reads never take this
+ * option and always stay on the uncached connection.
+ */
+export interface LoadPublicCatalogOptions {
+  cachedConnectionString?: string | undefined;
+}
+
 export class StackMateDataStore {
   public state: DatabaseState;
   /**
@@ -1230,7 +1247,14 @@ export class StackMateDataStore {
     return this.state.integrated_sites.find((s) => s.site_key === siteKey) ?? null;
   }
 
-  public async loadPublicCatalog(): Promise<{
+  /**
+   * OD-04: `_opts` is ignored here (in-memory store: no database
+   * client, nothing to route through a cached binding). DrizzleStore
+   * honors `cachedConnectionString` — see LoadPublicCatalogOptions.
+   */
+  public async loadPublicCatalog(
+    _opts?: LoadPublicCatalogOptions
+  ): Promise<{
     products: ProductRecord[];
     product_features: ProductFeatureRecord[];
     product_packages: ProductPackageRecord[];
