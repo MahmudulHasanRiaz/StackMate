@@ -973,7 +973,7 @@ export class DrizzleStore extends StackMateDataStore {
    * rows — services must NOT read `store.state` from it. Use the
    * targeted lookup methods instead (`findStaffPrincipalByEmail`,
    * `findLicenseForValidation`, `findIntegratedSiteByKey`,
-   * `loadPublicCatalog`, `claimOutboxEvents`); each runs 1–6 targeted
+   * `loadPublicCatalog`, `claimOutboxEvents`); each runs 1–3 targeted
    * SQL queries and never touches the other ~60 tables. The FULL LOAD
    * REMAINS the fallback: plain `create()` and `withTransaction`
    * (which reloads inside the transaction) are unchanged, so any route
@@ -1760,13 +1760,24 @@ export class DrizzleStore extends StackMateDataStore {
   }
 
   // -- B-01 targeted reads (fast paths) --------------------------------------
-  // Each method below runs 1–7 targeted SQL queries for ONE route's
+  // Each method below runs 1–3 targeted SQL queries for ONE route's
   // data and never runs the combined full-state load. They are safe on
   // a `createTargeted()` store (whose `state` is empty) AND on a
   // regular `create()` store. All mappings mirror
   // loadStateInternalImpl / buildLoadStateQuery column-for-column —
   // if a column list changes there, change it here too. Serialized
   // through the instance lock like every other client use.
+  //
+  // B-01 batching (2026-11-26): a single pg Client executes queries in
+  // call order and cannot parallelize them, so the Promise.all
+  // fan-outs these methods used to have were SERIALIZED round-trips
+  // (~250ms each Hyperdrive→Neon on staging). The multi-table methods
+  // therefore fetch everything in ONE statement, with per-table
+  // json_agg columns — the same pattern as the combined full-state
+  // load (buildLoadStateQuery): ORDER BY lives inside the json_agg
+  // call, where it is guaranteed, and rows arrive as parsed JSON
+  // values the existing row-mapping helpers already accept (numbers
+  // stay numbers, timestamptz arrives as an ISO string — see iso()).
 
   private async targetedRows(text: string, values: unknown[] = []): Promise<Row[]> {
     this.assertOpen();
@@ -1882,10 +1893,11 @@ export class DrizzleStore extends StackMateDataStore {
   /**
    * License validation hot path: the license row by key hash + its
    * entitlement snapshots (+ items), activations, product code, and
-   * underlying subscription status (6 queries). Mirrors the license
-   * mapping in loadStateInternalImpl. The mutation half of
-   * validate/activate (last_seen_at, seat changes) still goes through
-   * withTransaction — this read fast path is for the lookup + checks.
+   * underlying subscription status — ONE statement (was 1 + 5
+   * serialized lookups). Mirrors the license mapping in
+   * loadStateInternalImpl. The mutation half of validate/activate
+   * (last_seen_at, seat changes) still goes through withTransaction —
+   * this read fast path is for the lookup + checks.
    */
   public async findLicenseForValidation(keyHash: string): Promise<{
     license: LicenseRecord;
@@ -1893,51 +1905,35 @@ export class DrizzleStore extends StackMateDataStore {
     subscriptionStatus: string | null;
   } | null> {
     const licenseRows = await this.targetedRows(
-      `SELECT id, license_number, product_id, customer_id, source_order_item_id,
-              subscription_id, license_key_hash, license_key_hint, status,
-              activation_limit, valid_from, expires_at, grace_until,
-              current_entitlement_snapshot_id, issued_at, created_at, updated_at
-         FROM licenses WHERE license_key_hash = $1 LIMIT 1`,
+      `SELECT l.id, l.license_number, l.product_id, l.customer_id, l.source_order_item_id,
+              l.subscription_id, l.license_key_hash, l.license_key_hint, l.status,
+              l.activation_limit, l.valid_from, l.expires_at, l.grace_until,
+              l.current_entitlement_snapshot_id, l.issued_at, l.created_at, l.updated_at,
+              p.code AS product_code,
+              s.status AS subscription_status,
+              COALESCE((SELECT json_agg(sn ORDER BY sn.version_number ASC) FROM (
+                 SELECT sn2.*,
+                        COALESCE((SELECT json_agg(it ORDER BY it.feature_key_snapshot)
+                                    FROM license_entitlement_snapshot_items it
+                                   WHERE it.snapshot_id = sn2.id), '[]'::json) AS items
+                   FROM license_entitlement_snapshots sn2
+                  WHERE sn2.license_id = l.id
+              ) sn), '[]'::json) AS snapshots,
+              COALESCE((SELECT json_agg(a ORDER BY a.activated_at ASC, a.id ASC)
+                          FROM license_activations a
+                         WHERE a.license_id = l.id), '[]'::json) AS activations
+         FROM licenses l
+         LEFT JOIN products p ON p.id = l.product_id
+         LEFT JOIN subscriptions s ON s.id = l.subscription_id
+        WHERE l.license_key_hash = $1 LIMIT 1`,
       [keyHash]
     );
     const licenseRow = licenseRows[0];
     if (!licenseRow) return null;
     const licenseId = reqStr(licenseRow, "id", "licenses");
+    const snapshotRows = asJsonArray<Row>(licenseRow, "snapshots");
+    const activationRows = asJsonArray<Row>(licenseRow, "activations");
 
-    const [snapshotRows, snapshotItemRows, activationRows, productRows, subscriptionRows] =
-      await Promise.all([
-        this.targetedRows(
-          `SELECT id, license_id, version_number, source_type, effective_at,
-                  reason, snapshot_hash, created_by_user_id, created_at
-             FROM license_entitlement_snapshots
-            WHERE license_id = $1 ORDER BY version_number ASC`,
-          [licenseId]
-        ),
-        this.targetedRows(
-          `SELECT id, snapshot_id, feature_key_snapshot, value_type_snapshot,
-                  entitlement_value, unit_snapshot
-             FROM license_entitlement_snapshot_items
-            WHERE snapshot_id IN (SELECT id FROM license_entitlement_snapshots WHERE license_id = $1)
-            ORDER BY snapshot_id, feature_key_snapshot`,
-          [licenseId]
-        ),
-        this.targetedRows(
-          `SELECT id, license_id, installation_id_hash, domain_normalized,
-                  environment, status, activated_at, last_seen_at, deactivated_at,
-                  metadata, created_at
-             FROM license_activations
-            WHERE license_id = $1 ORDER BY activated_at ASC, id ASC`,
-          [licenseId]
-        ),
-        this.targetedRows(`SELECT code FROM products WHERE id = $1 LIMIT 1`, [
-          reqStr(licenseRow, "product_id", "licenses"),
-        ]),
-        this.targetedRows(`SELECT status FROM subscriptions WHERE id = $1 LIMIT 1`, [
-          str(licenseRow, "subscription_id"),
-        ]),
-      ]);
-
-    const itemsBySnapshot = groupBy(snapshotItemRows, (r) => String(r["snapshot_id"]));
     const snapshots: LicenseEntitlementSnapshotRecord[] = snapshotRows.map((s) => {
       const snapId = reqStr(s, "id", "license_entitlement_snapshots");
       return {
@@ -1952,7 +1948,7 @@ export class DrizzleStore extends StackMateDataStore {
         effective_at: reqIso(s, "effective_at", "license_entitlement_snapshots"),
         reason: str(s, "reason"),
         snapshot_hash: reqStr(s, "snapshot_hash", "license_entitlement_snapshots"),
-        items: (itemsBySnapshot.get(snapId) ?? []).map((it) => ({
+        items: asJsonArray<Row>(s, "items").map((it) => ({
           feature_key_snapshot: reqStr(
             it,
             "feature_key_snapshot",
@@ -2020,36 +2016,35 @@ export class DrizzleStore extends StackMateDataStore {
     };
     return {
       license,
-      productCode: productRows[0] ? reqStr(productRows[0], "code", "products") : "",
-      subscriptionStatus: subscriptionRows[0]
-        ? str(subscriptionRows[0], "status")
-        : null,
+      productCode: str(licenseRow, "product_code") ?? "",
+      subscriptionStatus: str(licenseRow, "subscription_status"),
     };
   }
 
-  /** One integrated site by site key, with domains + product ids (3 queries). */
+  /**
+   * One integrated site by site key, with domains + product ids — ONE
+   * statement (was 1 + 2 serialized lookups). The product-ids column
+   * keeps the old query's unspecified order (callers only use
+   * `.includes()`); domains keep `created_at ASC, id ASC`.
+   */
   public async findIntegratedSiteByKey(siteKey: string): Promise<IntegratedSiteRecord | null> {
     const siteRows = await this.targetedRows(
-      `SELECT id, site_key, name, environment, status, api_version,
-              allowed_capabilities, created_at, updated_at
-         FROM integrated_sites WHERE site_key = $1 LIMIT 1`,
+      `SELECT s.id, s.site_key, s.name, s.environment, s.status, s.api_version,
+              s.allowed_capabilities, s.created_at, s.updated_at,
+              COALESCE((SELECT json_agg(sp)
+                          FROM site_products sp
+                         WHERE sp.integrated_site_id = s.id), '[]'::json) AS product_ids,
+              COALESCE((SELECT json_agg(d ORDER BY d.created_at ASC, d.id ASC)
+                          FROM site_domains d
+                         WHERE d.integrated_site_id = s.id), '[]'::json) AS domains
+         FROM integrated_sites s WHERE s.site_key = $1 LIMIT 1`,
       [siteKey]
     );
     const siteRow = siteRows[0];
     if (!siteRow) return null;
     const siteId = reqStr(siteRow, "id", "integrated_sites");
-    const [productRows, domainRows] = await Promise.all([
-      this.targetedRows(
-        `SELECT product_id FROM site_products WHERE integrated_site_id = $1`,
-        [siteId]
-      ),
-      this.targetedRows(
-        `SELECT id, integrated_site_id, domain, verification_method,
-                verification_challenge, verification_status, verified_at, is_primary, created_at
-           FROM site_domains WHERE integrated_site_id = $1 ORDER BY created_at ASC, id ASC`,
-        [siteId]
-      ),
-    ]);
+    const productRows = asJsonArray<Row>(siteRow, "product_ids");
+    const domainRows = asJsonArray<Row>(siteRow, "domains");
     return {
       id: siteId,
       site_key: reqStr(siteRow, "site_key", "integrated_sites"),
@@ -2092,10 +2087,11 @@ export class DrizzleStore extends StackMateDataStore {
   /**
    * Public catalog hot path: active products (+ channels), product
    * features, active packages, published versions (+ feature grants),
-   * active prices (7 queries). Only the rows a public catalog /
-   * checkout read ever needs — no orders, customers, audit, outbox,
-   * sessions, or any other table. Route wiring (app.ts) is a follow-up;
-   * until then the full load remains the fallback.
+   * active prices — ONE statement (was 7 serialized queries). Only
+   * the rows a public catalog / checkout read ever needs — no orders,
+   * customers, audit, outbox, sessions, or any other table. Route
+   * wiring (app.ts) is a follow-up; until then the full load remains
+   * the fallback.
    */
   public async loadPublicCatalog(): Promise<{
     products: ProductRecord[];
@@ -2104,46 +2100,63 @@ export class DrizzleStore extends StackMateDataStore {
     package_versions: PackageVersionRecord[];
     package_prices: PackagePriceRecord[];
   }> {
-    const [channelRows, productRows, featureRows, packageRows, versionRows, grantRows, priceRows] =
-      await Promise.all([
-        this.targetedRows(`SELECT product_id, channel_key FROM product_distribution_channels`),
-        this.targetedRows(
-          `SELECT id, code, slug, name, description, product_type, fulfillment_type,
-                  status, website_url, documentation_url, logo_asset_id, created_by_user_id,
-                  created_at, updated_at
-                  ${this.capabilities.productsDefaults ? ", default_activation_limit, offline_grace_hours" : ""}
-             FROM products WHERE status = 'active' ORDER BY created_at ASC, id ASC`
-        ),
-        this.targetedRows(
-          `SELECT id, product_id, feature_key, name, description, value_type, unit,
-                  default_value, status, created_at, updated_at
-             FROM product_features ORDER BY created_at ASC, id ASC`
-        ),
-        this.targetedRows(
-          `SELECT id, product_id, package_key, name, description, status,
-                  created_at, updated_at
-                  ${this.capabilities.packagesCurrentVersion ? ", current_version_id" : ""}
-             FROM product_packages WHERE status = 'active' ORDER BY created_at ASC, id ASC`
-        ),
-        this.targetedRows(
-          `SELECT id, package_id, product_id, version_number, status,
-                  change_summary, published_at, created_at
-             FROM package_versions WHERE status = 'published' ORDER BY created_at ASC, id ASC`
-        ),
-        this.targetedRows(
-          `SELECT id, package_version_id, product_id, product_feature_id,
-                  feature_key_snapshot, value_type_snapshot, entitlement_value
-                  ${this.capabilities.packageVersionFeaturesUnit ? ", unit_snapshot" : ""}
-             FROM package_version_features ORDER BY package_version_id, feature_key_snapshot`
-        ),
-        this.targetedRows(
-          `SELECT id, package_version_id, price_key, price_kind, amount_minor,
-                  currency_code, interval_unit, interval_count, trial_days,
-                  setup_fee_minor, status, created_at
-                  ${this.capabilities.packagePricesUsedInOrders ? ", used_in_orders" : ""}
-             FROM package_prices WHERE status = 'active' ORDER BY created_at ASC, id ASC`
-        ),
-      ]);
+    const rows = await this.targetedRows(
+      `SELECT
+         COALESCE((SELECT json_agg(t) FROM (SELECT product_id, channel_key FROM product_distribution_channels) t), '[]'::json) AS channels,
+         COALESCE((SELECT json_agg(t ORDER BY t.created_at ASC, t.id ASC) FROM (
+            SELECT id, code, slug, name, description, product_type, fulfillment_type,
+                   status, website_url, documentation_url, logo_asset_id, created_by_user_id,
+                   created_at, updated_at
+                   ${this.capabilities.productsDefaults ? ", default_activation_limit, offline_grace_hours" : ""}
+              FROM products WHERE status = 'active'
+         ) t), '[]'::json) AS products,
+         COALESCE((SELECT json_agg(t ORDER BY t.created_at ASC, t.id ASC) FROM (
+            SELECT id, product_id, feature_key, name, description, value_type, unit,
+                   default_value, status, created_at, updated_at
+              FROM product_features
+         ) t), '[]'::json) AS features,
+         COALESCE((SELECT json_agg(t ORDER BY t.created_at ASC, t.id ASC) FROM (
+            SELECT id, product_id, package_key, name, description, status,
+                   created_at, updated_at
+                   ${this.capabilities.packagesCurrentVersion ? ", current_version_id" : ""}
+              FROM product_packages WHERE status = 'active'
+         ) t), '[]'::json) AS packages,
+         COALESCE((SELECT json_agg(t ORDER BY t.created_at ASC, t.id ASC) FROM (
+            SELECT id, package_id, product_id, version_number, status,
+                   change_summary, published_at, created_at
+              FROM package_versions WHERE status = 'published'
+         ) t), '[]'::json) AS versions,
+         COALESCE((SELECT json_agg(t ORDER BY t.package_version_id, t.feature_key_snapshot) FROM (
+            SELECT id, package_version_id, product_id, product_feature_id,
+                   feature_key_snapshot, value_type_snapshot, entitlement_value
+                   ${this.capabilities.packageVersionFeaturesUnit ? ", unit_snapshot" : ""}
+              FROM package_version_features
+         ) t), '[]'::json) AS grants,
+         COALESCE((SELECT json_agg(t ORDER BY t.created_at ASC, t.id ASC) FROM (
+            SELECT id, package_version_id, price_key, price_kind, amount_minor,
+                   currency_code, interval_unit, interval_count, trial_days,
+                   setup_fee_minor, status, created_at
+                   ${this.capabilities.packagePricesUsedInOrders ? ", used_in_orders" : ""}
+              FROM package_prices WHERE status = 'active'
+         ) t), '[]'::json) AS prices`
+    );
+    const row = rows[0];
+    if (!row) {
+      return {
+        products: [],
+        product_features: [],
+        product_packages: [],
+        package_versions: [],
+        package_prices: [],
+      };
+    }
+    const channelRows = asJsonArray<Row>(row, "channels");
+    const productRows = asJsonArray<Row>(row, "products");
+    const featureRows = asJsonArray<Row>(row, "features");
+    const packageRows = asJsonArray<Row>(row, "packages");
+    const versionRows = asJsonArray<Row>(row, "versions");
+    const grantRows = asJsonArray<Row>(row, "grants");
+    const priceRows = asJsonArray<Row>(row, "prices");
     const channelsByProduct = groupBy(channelRows, (r) => String(r["product_id"]));
     const products: ProductRecord[] = productRows.map((row) => {
       const id = reqStr(row, "id", "products");

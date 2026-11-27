@@ -5,9 +5,11 @@
  * GET /api/v1/public/sites/:siteKey/... catalog routes) return the CORRECT
  * responses when the request store is a `DrizzleStore.createTargeted`
  * store whose state holds only seed rows — i.e. they never touch the
- * full-state load. Each HTTP test runs inside a json_agg query counter:
- * the combined full-state load is the only query that uses json_agg, so
- * a zero count proves no full load happened on that request.
+ * full-state load. Each HTTP test runs inside a full-load query counter:
+ * the combined full-state load is a single SELECT carrying the per-table
+ * json_agg aliases (`AS "audit"`, `AS "users"`), so a zero count proves
+ * no full load happened on that request. A bare json_agg match would NOT
+ * prove it: the batched targeted reads use json_agg too.
  *
  * Runs on its own fresh database (stackmate_test_b01) via setupTestDb;
  * the shared stackmate_test database is never touched and no rows are
@@ -44,22 +46,30 @@ import type { AppEnv } from "../src/types/context.ts";
 const INSTALLATION_ID = "b01-installation-1";
 const SEED_LAST_SEEN = new Date(Date.now() - 3_600_000).toISOString();
 
-/** Count pg queries while patched; returns json_agg (full-load) hits. */
-function countJsonAggQueries() {
+/**
+ * Count pg queries while patched; returns full-state-load hits. The
+ * combined full-state load is a single SELECT whose columns are the
+ * per-table json_agg aliases (`AS "audit"`, `AS "users"`, …) — match
+ * that fingerprint, not the json_agg function name: the batched
+ * targeted reads (findLicenseForValidation, loadPublicCatalog,
+ * findIntegratedSiteByKey) use json_agg too. Same fingerprint as
+ * b01-measure.test.ts.
+ */
+function countFullLoadQueries() {
   let total = 0;
-  let jsonAgg = 0;
+  let fullLoad = 0;
   const orig = Client.prototype.query as (...args: unknown[]) => unknown;
   const patched = function (this: unknown, ...args: unknown[]) {
     total += 1;
     const sql = String(
       (args[0] as { text?: unknown } | undefined)?.text ?? args[0] ?? ""
     );
-    if (sql.toLowerCase().includes("json_agg")) jsonAgg += 1;
+    if (sql.includes('AS "audit"') && sql.includes('AS "users"')) fullLoad += 1;
     return (orig as (...a: unknown[]) => unknown).apply(this, args);
   };
   Client.prototype.query = patched as never;
   return {
-    counts: () => ({ total, jsonAgg }),
+    counts: () => ({ total, fullLoad }),
     restore: () => {
       Client.prototype.query = orig as never;
     },
@@ -281,7 +291,7 @@ describe("B-01 wiring — license validate + public catalog on a targeted store"
   });
 
   it("license validate (v2 key): 200 + entitlement token, no full-state load, heartbeat persisted", async () => {
-    const counter = countJsonAggQueries();
+    const counter = countFullLoadQueries();
     let res: Awaited<ReturnType<typeof apiRequest>>;
     try {
       res = await apiRequest("/api/v1/licenses/validate", {
@@ -293,10 +303,11 @@ describe("B-01 wiring — license validate + public catalog on a targeted store"
         },
       });
     } finally {
-      const { total, jsonAgg } = counter.counts();
+      const { total, fullLoad } = counter.counts();
       counter.restore();
-      assert.equal(jsonAgg, 0, "validate ran the combined full-state load");
-      assert.ok(total > 0 && total <= 12, `validate took ${total} queries`);
+      assert.equal(fullLoad, 0, "validate ran the combined full-state load");
+      // B-01 batching: 1 batched license lookup + 1 heartbeat UPDATE.
+      assert.ok(total > 0 && total <= 4, `validate took ${total} queries`);
     }
     assert.equal(res.status, 200, JSON.stringify(res.body));
     assert.equal(res.body.data.valid, true);
@@ -373,16 +384,18 @@ describe("B-01 wiring — license validate + public catalog on a targeted store"
   });
 
   it("public catalog: products list is site-scoped, cacheable, no full-state load", async () => {
-    const counter = countJsonAggQueries();
+    const counter = countFullLoadQueries();
     let res: Awaited<ReturnType<typeof apiRequest>>;
     try {
       res = await apiRequest(`/api/v1/public/sites/${siteKey}/products`, {
         headers: { "X-StackMate-Site-Key": siteKey },
       });
     } finally {
-      const { jsonAgg } = counter.counts();
+      const { total, fullLoad } = counter.counts();
       counter.restore();
-      assert.equal(jsonAgg, 0, "catalog list ran the combined full-state load");
+      assert.equal(fullLoad, 0, "catalog list ran the combined full-state load");
+      // B-01 batching: 1 batched site lookup + 1 batched catalog load.
+      assert.ok(total > 0 && total <= 4, `catalog list took ${total} queries`);
     }
     assert.equal(res.status, 200, JSON.stringify(res.body));
     assert.equal(

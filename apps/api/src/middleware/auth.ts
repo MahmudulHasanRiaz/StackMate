@@ -105,13 +105,30 @@ export function authContext(
     const env = resolveRequestEnv(c);
     const store = await ensureRequestStore(c, storeFactory, env);
     try {
-      const auth = storeSupportsBetterAuth(store)
-        ? await buildBetterAuth(env, store)
-        : null;
+      // B-01 gate: build the Better Auth instance ONLY when a session
+      // credential could exist. resolveStaffPrincipal uses `auth`
+      // solely (a) to verify a `better-auth.session_token` cookie and
+      // (b) to look up a Bearer / stackmate-session token — with NO
+      // Cookie AND NO Authorization header both branches return null
+      // without touching `auth`, so constructing it (per-request
+      // loadAuthConfig + createBetterAuth) is pure overhead on every
+      // credential-less request — i.e. every public/license call. A
+      // request carrying ANY Cookie or Authorization header still
+      // builds it (conservative: an unrelated cookie may sit next to
+      // a session cookie, and a malformed Bearer still takes the same
+      // null-principal path as before).
+      const cookieHeader = c.req.header("Cookie") ?? null;
+      const bearerToken = extractBearerToken(c.req.header("Authorization") ?? null);
+      const auth =
+        cookieHeader === null && bearerToken === null
+          ? null
+          : storeSupportsBetterAuth(store)
+            ? await buildBetterAuth(env, store)
+            : null;
       const principal: StaffPrincipal | null = await resolveStaffPrincipal(store, {
         auth,
-        cookieHeader: c.req.header("Cookie") ?? null,
-        bearerToken: extractBearerToken(c.req.header("Authorization") ?? null),
+        cookieHeader,
+        bearerToken,
       });
       c.set("principal", principal);
       await next();

@@ -6,7 +6,7 @@
  * per-request factory (`apps/api/src/index.ts` `createRequestStore`)
  * creates a full store for every path. `DrizzleStore.createTargeted()`
  * connects WITHOUT that load — the store's `state` holds only the
- * in-memory seed rows — and targeted methods run 1–6 queries each.
+ * in-memory seed rows — and targeted methods run 1–3 queries each.
  *
  * This file is the switch. `createRequestStore` consults
  * `isTargetedOnlyRoute(c.req.path)` (via `ensureRequestStore`,

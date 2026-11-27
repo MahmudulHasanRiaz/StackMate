@@ -634,22 +634,29 @@ import {
 
 const PG_DB_NAME = "stackmate_test_batch_b";
 
-/** Count pg queries while patched; returns json_agg (full-load) hits. */
-function countJsonAggQueries() {
+/**
+ * Count pg queries while patched; returns full-state-load hits. The
+ * combined full-state load is a single SELECT whose columns are the
+ * per-table json_agg aliases (`AS "audit"`, `AS "users"`, …) — match
+ * that fingerprint, not the json_agg function name: the batched
+ * targeted reads (findLicenseForValidation, loadPublicCatalog) use
+ * json_agg too. Same fingerprint as b01-measure.test.ts.
+ */
+function countFullLoadQueries() {
   let total = 0;
-  let jsonAgg = 0;
+  let fullLoad = 0;
   const orig = Client.prototype.query as (...args: unknown[]) => unknown;
   const patched = function (this: unknown, ...args: unknown[]) {
     total += 1;
     const sql = String(
       (args[0] as { text?: unknown } | undefined)?.text ?? args[0] ?? ""
     );
-    if (sql.toLowerCase().includes("json_agg")) jsonAgg += 1;
+    if (sql.includes('AS "audit"') && sql.includes('AS "users"')) fullLoad += 1;
     return (orig as (...a: unknown[]) => unknown).apply(this, args);
   };
   Client.prototype.query = patched as never;
   return {
-    counts: () => ({ total, jsonAgg }),
+    counts: () => ({ total, fullLoad }),
     restore: () => {
       Client.prototype.query = orig as never;
     },
@@ -713,7 +720,7 @@ describe.skipIf(!DATABASE_URL)("audit batch B — postgres (targeted/claim/clean
       connectionString: dbUrl,
     });
     try {
-      const counter = countJsonAggQueries();
+      const counter = countFullLoadQueries();
       let principal: Awaited<ReturnType<typeof targeted.findStaffPrincipalByEmail>>;
       let license: Awaited<ReturnType<typeof targeted.findLicenseForValidation>>;
       let catalog: Awaited<ReturnType<typeof targeted.loadPublicCatalog>>;
@@ -722,10 +729,11 @@ describe.skipIf(!DATABASE_URL)("audit batch B — postgres (targeted/claim/clean
         license = await targeted.findLicenseForValidation(licenseKeyHash);
         catalog = await targeted.loadPublicCatalog();
       } finally {
-        const { total, jsonAgg } = counter.counts();
+        const { total, fullLoad } = counter.counts();
         counter.restore();
-        assert.equal(jsonAgg, 0, "a targeted lookup ran the combined full-state load");
-        assert.ok(total <= 30, `targeted lookups took ${total} queries`);
+        assert.equal(fullLoad, 0, "a targeted lookup ran the combined full-state load");
+        // B-01 batching: 3 (principal) + 1 (license) + 1 (catalog).
+        assert.ok(total <= 10, `targeted lookups took ${total} queries`);
       }
       assert.ok(principal);
       assert.equal(principal.user.email, SUPER_ACTOR.user.email);
