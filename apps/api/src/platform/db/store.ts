@@ -1192,7 +1192,7 @@ export class StackMateDataStore {
    * record is found by scanning this store's own state (the in-memory
    * store holds its whole dataset locally, so there is no load to
    * avoid). DrizzleStore overrides each with the targeted-SQL version,
-   * which runs 1–7 queries and never loads full state. Routes call
+   * which runs 1–3 queries and never loads full state. Routes call
    * these unconditionally, so the same handler is safe on a full
    * store, a targeted store, and the in-memory store.
    *
