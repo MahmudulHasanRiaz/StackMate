@@ -174,6 +174,14 @@ export interface StaffPrincipal {
      * success but Gravatar stayed after save + reload).
      */
     avatar_url: string | null;
+    /**
+     * Whether the staff email is verified (OD-06). Admin-created
+     * staff start unverified and cannot sign in until they click the
+     * verification link; bootstrap + invitation-accepted staff start
+     * verified. Mirrors users.email_verified (the Better Auth user
+     * row and the staff record are the same row).
+     */
+    email_verified: boolean;
   };
   session_id: string;
   roles: string[];
@@ -407,7 +415,12 @@ export async function createStaffUserByAdmin(
       id: randomUUID(),
       name: valid.name,
       email: emailNormalized,
-      email_verified: true,
+      // OD-06: admin-created staff start UNVERIFIED — they cannot sign
+      // in until they click the verification link (requireEmail-
+      // Verification: true in better-auth.ts). The creating route is
+      // responsible for sending that link (requestVerificationEmail);
+      // until it does, the account exists but cannot sign in.
+      email_verified: false,
       two_factor_enabled: false,
       password_hash: hashPasswordScrypt(valid.password),
       status: "active",
@@ -536,6 +549,7 @@ function buildPrincipal(state: DatabaseState, user: UserRecord): StaffPrincipal 
       email: user.email,
       status: user.status,
       avatar_url: user.avatar_url ?? null,
+      email_verified: user.email_verified,
     },
     session_id: "",
     roles,
@@ -613,6 +627,26 @@ export async function signInStaffSession(
   return signInStaffSessionTestAdapter(store, input);
 }
 
+/**
+ * OD-06: read the error `code` out of a Better Auth `asResponse: true`
+ * failure Response without consuming it (clone). With asResponse the
+ * dispatch returns APIError as HTTP + JSON `{ code, message }`
+ * (better-call dist/to-response.mjs: toResponse(APIError) serializes
+ * data.body, and @better-auth/core builds that body as { message,
+ * code }); status comes from the APIError's statusCode (403 for
+ * FORBIDDEN / EMAIL_NOT_VERIFIED). Returns null for a null response,
+ * a non-JSON body, or a body without a string code.
+ */
+async function readBetterAuthErrorCode(response: Response | null): Promise<string | null> {
+  if (!response) return null;
+  try {
+    const data = (await response.clone().json()) as { code?: unknown };
+    return typeof data.code === "string" ? data.code : null;
+  } catch {
+    return null;
+  }
+}
+
 async function signInStaffSessionViaBetterAuth(
   store: StackMateDataStore,
   input: {
@@ -650,6 +684,31 @@ async function signInStaffSessionViaBetterAuth(
       .catch(() => {});
     throw new AppError("UNAUTHORIZED", "Invalid email or password.", 401);
   };
+  // OD-06: the password was proven right but the email is unverified
+  // — a distinct 403 (not the generic 401), audited under its own
+  // action so unverified denials are distinguishable from bad
+  // passwords in the audit log.
+  const denyUnverified = async (): Promise<never> => {
+    await store
+      .withTransaction((state) => {
+        appendAuditLog(state, {
+          actor_type: "staff",
+          actor_user_id: user?.id ?? null,
+          action: "identity.auth.sign_in_denied_unverified",
+          resource_type: "session",
+          resource_id: emailNormalized,
+          outcome: "denied",
+          request_id: input.requestId,
+          changes: { reason: "email_not_verified" },
+        });
+      })
+      .catch(() => {});
+    throw new AppError(
+      "EMAIL_NOT_VERIFIED",
+      "Email is not verified. Check your inbox for the verification link.",
+      403
+    );
+  };
   if (!user) await deny("unknown_email");
   if (user!.status !== "active") {
     throw new AppError("FORBIDDEN", "Staff account is suspended.", 403);
@@ -670,6 +729,15 @@ async function signInStaffSessionViaBetterAuth(
   // arrives here as a non-OK Response, not an exception. Both shapes
   // must funnel into the lazy-migration attempt below.
   let response = (await callSignIn().catch(() => null)) as Response | null;
+  // OD-06: capture the first failure's error code BEFORE the lazy-
+  // migration retry below — the retry replaces `response`, and an
+  // unverified first failure must not be masked by whatever the
+  // retry returns (e.g. null on an adapter error). In practice the
+  // retry cannot mask it (an unverified failure proves a credential
+  // exists, so the retry is skipped), but the capture costs nothing.
+  const firstErrorCode = !response?.ok
+    ? await readBetterAuthErrorCode(response)
+    : null;
   if (!response || !response.ok) {
     // No Better Auth credential yet? Migrate the legacy scrypt hash once.
     // A wrong password must never provision a credential.
@@ -685,6 +753,17 @@ async function signInStaffSessionViaBetterAuth(
       response = (await callSignIn().catch(() => null)) as Response | null;
     }
     if (!response || !response.ok) {
+      // OD-06: Better Auth checks the password BEFORE the verification
+      // check (dist/api/routes/sign-in.mjs), so a 403 with code
+      // EMAIL_NOT_VERIFIED proves the password was right — answer the
+      // distinct 403, not the generic 401. This covers the retried
+      // sign-in too: a lazily-migrated unverified user fails the retry
+      // with the same code.
+      const errorCode =
+        (await readBetterAuthErrorCode(response)) ?? firstErrorCode;
+      if (errorCode === "EMAIL_NOT_VERIFIED") {
+        await denyUnverified();
+      }
       await deny(hasCredential ? "bad_password" : "bad_password_no_identity");
     }
   }
@@ -799,6 +878,26 @@ async function signInStaffSessionTestAdapter(
     if (user.status !== "active") {
       throw new AppError("FORBIDDEN", "Staff account is suspended.", 403);
     }
+    // OD-06 (test-adapter mirror of the Better Auth path): the
+    // password was proven right above, so an unverified user gets the
+    // distinct 403 + its own audit action, not the generic 401.
+    if (!user.email_verified) {
+      appendAuditLog(state, {
+        actor_type: "staff",
+        actor_user_id: user.id,
+        action: "identity.auth.sign_in_denied_unverified",
+        resource_type: "session",
+        resource_id: emailNormalized,
+        outcome: "denied",
+        request_id: input.requestId,
+        changes: { reason: "email_not_verified" },
+      });
+      throw new AppError(
+        "EMAIL_NOT_VERIFIED",
+        "Email is not verified. Check your inbox for the verification link.",
+        403
+      );
+    }
 
     const sessionToken = `smsess_${randomBytes(32).toString("base64url")}`;
     const expiresAt = new Date(Date.now() + 12 * 3600 * 1000).toISOString();
@@ -884,6 +983,7 @@ async function findStaffPrincipalFast(
       email: found.user.email,
       status: found.user.status,
       avatar_url: found.user.avatar_url ?? null,
+      email_verified: found.user.email_verified,
     },
     session_id: sessionId,
     roles: found.roles,
@@ -1023,6 +1123,19 @@ const BETTER_AUTH_FALLBACK_PUBLIC_PATHS: ReadonlySet<string> = new Set([
   "/api/auth/two-factor/verify-totp",
   "/api/auth/two-factor/verify-backup-code",
   "/api/auth/two-factor/verify-otp",
+  // OD-06: the email-verification endpoints are public by design —
+  // the verification link is clicked from the inbox, where NO session
+  // exists yet (the user is unverified precisely because they have
+  // not signed in). Gating them behind a session would 404 the
+  // verification itself and make the flow dead on arrival. They are
+  // safe as public: GET /verify-email only flips emailVerified for
+  // the holder of a JWT signed with BETTER_AUTH_SECRET, and POST
+  // /send-verification-email answers { status: true } even for
+  // unknown / already-verified addresses (anti-enumeration, with a
+  // 500ms floor — see email-verification.mjs), so neither reveals
+  // account existence.
+  "/api/auth/verify-email",
+  "/api/auth/send-verification-email",
   // Better Auth's built-in health endpoint ({ ok: true }, no session,
   // no user data, no state change). The M-10 gate as written 404'd it
   // because it is in neither the public nor the session set — see
@@ -2011,6 +2124,11 @@ export async function acceptStaffInvitation(
       id: randomUUID(),
       name: input.name.trim(),
       email: invitation.email,
+      // OD-06: stays verified — the invite token email IS the
+      // verification step. The single-use invitation token was
+      // delivered to this inbox and acceptance requires presenting
+      // it, which proves control of the address; a second
+      // verification email would be redundant friction.
       email_verified: true,
       two_factor_enabled: false,
       password_hash: hashPasswordScrypt(input.password),

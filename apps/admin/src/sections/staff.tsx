@@ -29,6 +29,17 @@
  * 503 on the DrizzleStore until the Batch 1 staff_invitations wiring patch
  * lands (they work on the in-memory store). The server's message is shown
  * via the mutation error toast; the invitations list itself still loads.
+ *
+ * Email verification (OD-06): staff users whose `email_verified` is
+ * false show an "Unverified" badge (list + detail) and an admin
+ * "Resend verification" button (POST
+ * /api/v1/admin/users/:userId/resend-verification; 200 = sent, 409 =
+ * already verified, 404 = unknown user). The field is OPTIONAL on
+ * StaffUser — the users list/detail endpoints do not return it yet
+ * (API gap, Worker 1: add `email_verified` to the mapped rows in
+ * apps/api/src/routes/admin/users.ts, list ~line 44 and detail
+ * ~line 218). Until then it is undefined and the UI shows NO
+ * verification state rather than inventing one.
  */
 import { useCallback, useMemo, useState } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
@@ -93,6 +104,11 @@ interface StaffUser {
   roles: string[];
   created_at: string;
   created_date_display?: string;
+  // OD-06: true once the user clicked the verification link. Optional
+  // (see the header note) — undefined means the API did not say, and
+  // the UI must render no verification state for it. Only an explicit
+  // `false` shows the "Unverified" badge / resend button.
+  email_verified?: boolean;
 }
 
 interface Role {
@@ -476,6 +492,25 @@ const revokeInvitation = useAdminMutation<
     successMessage: "The change takes effect immediately.",
   });
 
+  // OD-06 (admin resend): POST /api/v1/admin/users/:id/resend-verification.
+  // 200 = sent; 409 = already verified; 404 = unknown user — the
+  // mutation toast surfaces the server's answer honestly either way.
+  // No invalidation: a resend changes no listed data (the badge clears
+  // only when the user clicks the link and the list reloads).
+  const resendVerification = useAdminMutation<
+    { sent: boolean },
+    { id: string; email: string }
+  >({
+    mutationFn: (body) =>
+      apiRequest<{ sent: boolean }>(
+        `/api/v1/admin/users/${body.id}/resend-verification`,
+        { method: "POST" },
+      ),
+    invalidateKeys: [],
+    successTitle: "Verification email sent",
+    successMessage: "The user can use the link in the email to verify their address.",
+  });
+
   const onToggleSuspend = useCallback(
     async (user: StaffUser) => {
       const suspending = user.status !== "suspended";
@@ -529,7 +564,18 @@ const revokeInvitation = useAdminMutation<
           </Button>
         ),
       },
-      { accessorKey: "email", header: "Email" },
+      { accessorKey: "email", header: "Email",
+        cell: ({ row }: { row: { original: StaffUser } }) => (
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+            {row.original.email}
+            {/* OD-06: only an explicit false shows the badge — an
+                undefined field (API gap) renders no verification state. */}
+            {row.original.email_verified === false ? (
+              <StatusBadge status="pending_verification" label="Unverified" />
+            ) : null}
+          </span>
+        ),
+      },
       {
         accessorKey: "roles",
         header: "Roles",
@@ -570,6 +616,22 @@ const revokeInvitation = useAdminMutation<
             >
               View
             </Button>
+            {/* OD-06: only for explicitly-unverified users. */}
+            {row.original.email_verified === false ? (
+              <Button
+                variant="secondary"
+                size="sm"
+                loading={resendVerification.isPending}
+                onClick={() =>
+                  resendVerification.mutate({
+                    id: row.original.id,
+                    email: row.original.email,
+                  })
+                }
+              >
+                Resend
+              </Button>
+            ) : null}
             <Button
               variant={row.original.status === "suspended" ? "accent" : "danger-ghost"}
               size="sm"
@@ -582,7 +644,7 @@ const revokeInvitation = useAdminMutation<
         ),
       },
     ],
-    [navigate, onToggleSuspend, suspendUser.isPending],
+    [navigate, onToggleSuspend, suspendUser.isPending, resendVerification],
   );
 
   const roleColumns = useMemo(
@@ -1200,6 +1262,22 @@ export function StaffUserDetailSection({ id }: { id: string }) {
     successMessage: "The change takes effect immediately.",
   });
 
+  // OD-06 (admin resend, detail): same endpoint as the list — see
+  // the note above the list's resendVerification mutation.
+  const resendDetailVerification = useAdminMutation<
+    { sent: boolean },
+    { id: string; email: string }
+  >({
+    mutationFn: (body) =>
+      apiRequest<{ sent: boolean }>(
+        `/api/v1/admin/users/${body.id}/resend-verification`,
+        { method: "POST" },
+      ),
+    invalidateKeys: [],
+    successTitle: "Verification email sent",
+    successMessage: "The user can use the link in the email to verify their address.",
+  });
+
   const onToggleSuspendDetail = async () => {
     if (!user) return;
     const suspending = user.status !== "suspended";
@@ -1276,13 +1354,27 @@ export function StaffUserDetailSection({ id }: { id: string }) {
         help="Staff user detail"
         action={
           user ? (
-            <Button
-              variant={user.status === "suspended" ? "accent" : "danger-ghost"}
-              loading={suspendDetailUser.isPending}
-              onClick={() => void onToggleSuspendDetail()}
-            >
-              {user.status === "suspended" ? "Unsuspend" : "Suspend"}
-            </Button>
+            <span style={{ display: "inline-flex", gap: 8 }}>
+              {/* OD-06: only for explicitly-unverified users. */}
+              {user.email_verified === false ? (
+                <Button
+                  variant="secondary"
+                  loading={resendDetailVerification.isPending}
+                  onClick={() =>
+                    resendDetailVerification.mutate({ id: user.id, email: user.email })
+                  }
+                >
+                  Resend verification
+                </Button>
+              ) : null}
+              <Button
+                variant={user.status === "suspended" ? "accent" : "danger-ghost"}
+                loading={suspendDetailUser.isPending}
+                onClick={() => void onToggleSuspendDetail()}
+              >
+                {user.status === "suspended" ? "Unsuspend" : "Suspend"}
+              </Button>
+            </span>
           ) : undefined
         }
       />
@@ -1308,6 +1400,23 @@ export function StaffUserDetailSection({ id }: { id: string }) {
           facts={[
             { label: "Name", value: user.name },
             { label: "Email", value: user.email },
+            // OD-06: shown only when the API actually reported the
+            // state — an undefined field renders no row at all.
+            ...(user.email_verified === undefined
+              ? []
+              : [
+                  {
+                    label: "Email verification",
+                    value: (
+                      <StatusBadge
+                        status={
+                          user.email_verified ? "verified" : "pending_verification"
+                        }
+                        label={user.email_verified ? "Verified" : "Unverified"}
+                      />
+                    ),
+                  },
+                ]),
             {
               label: "Status",
               value: <StatusBadge status={user.status} />,

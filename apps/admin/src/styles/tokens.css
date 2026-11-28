@@ -2942,18 +2942,65 @@ a:hover {
 }
 .sm-auth-card {
   width: 100%;
-  max-width: 400px;
+  max-width: 360px;
   background: var(--sm-surface);
   border: 1px solid var(--sm-border);
-  border-radius: var(--sm-radius-xl);
+  border-radius: var(--sm-radius-md);
   box-shadow: var(--sm-shadow-md);
-  padding: var(--sm-space-6);
+  padding: var(--sm-space-5);
 }
 .sm-auth-card .sm-auth-form {
   display: flex;
   flex-direction: column;
-  gap: var(--sm-space-4);
-  margin-top: var(--sm-space-5);
+  gap: var(--sm-space-3);
+  margin-top: var(--sm-space-4);
+}
+/* Centered brand row at the top of the card (class contract with
+   auth.tsx): reuses .sm-brand-mark + the app name, quiet and small. */
+.sm-auth-brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sm-space-2);
+  margin-bottom: var(--sm-space-4);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 20px;
+  color: var(--sm-text);
+}
+.sm-auth-brand .sm-brand-mark {
+  display: inline-flex;
+  color: var(--sm-accent);
+}
+/* Centered card title — same size/weight as .sm-page-title. */
+.sm-auth-heading {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 32px;
+  letter-spacing: -0.01em;
+  text-align: center;
+}
+/* Centered muted description under the heading. */
+.sm-auth-tagline {
+  margin: var(--sm-space-2) 0 0;
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--sm-text-muted);
+  text-align: center;
+}
+/* Quiet social-sign-in stack (class contract with auth.tsx): the
+   buttons themselves are the shared .sm-btn secondary primitive
+   (already 4px radius, 30px height) — scoped here only to full width
+   with a small gap between them. No global Button change. */
+.sm-auth-social {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sm-space-2);
+  margin-top: var(--sm-space-4);
+}
+.sm-auth-social .sm-btn {
+  width: 100%;
 }
 /* Auth + Email batch: link-style buttons on the sign-in page (forgot
    password, backup-code switch, back links) + the OAuth divider. */

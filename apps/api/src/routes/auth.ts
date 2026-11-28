@@ -16,15 +16,57 @@
  */
 
 import { createHash } from "node:crypto";
+import { createErrorEnvelope, createSuccessEnvelope } from "../../../../packages/contracts/src/index.ts";
 import { sha256Hex, verifyTokenHash } from "../platform/crypto/index.ts";
 import { and } from "drizzle-orm";
+import type { StackMateBindings } from "../env.ts";
 import { AppError } from "../shared/errors.ts";
 import { acceptStaffInvitation, bootstrapInitialSuperAdmin, ensureBetterAuthIdentity, resolveStaffPrincipal, resolveTokenPepper, signInStaffSession, signOutStaffSession, storeSupportsBetterAuth } from "../modules/identity/service.ts";
+import { requestVerificationEmail, type VerificationEmailResult } from "../modules/identity/email-verification.ts";
+import type { StackMateDataStore } from "../platform/db/store.ts";
 import { appendAuditLog } from "../modules/audit/service.ts";
 import { Hono } from "hono";
 import type { AppEnv } from "../types/context.ts";
 import { jsonResponse, jsonResponseWithCookies, readJsonBody, getClientIp, extractBearerToken, setupTokenMatches, assertSameSiteCookieMutation, getBetterAuth } from "../shared/http.ts";
 import { capTokenAttempts } from "../shared/idempotency.ts";
+
+/**
+ * OD-06: best-effort verification-email send (twin of the helper in
+ * routes/admin/users.ts — route modules stay self-contained; hoisting
+ * to shared/http.ts is a later cleanup, not this slice). Never throws:
+ * without a Drizzle-backed store (the in-memory test adapter) there
+ * is no SMTP / Better Auth to send through, so the honest answer is
+ * "not configured". The public resend caller answers 200 either way.
+ */
+async function sendVerificationEmailBestEffort(
+  store: StackMateDataStore,
+  env: StackMateBindings,
+  email: string
+): Promise<VerificationEmailResult> {
+  try {
+    const db = (
+      store as unknown as {
+        drizzleDb?: Parameters<typeof requestVerificationEmail>[0]["db"];
+      }
+    ).drizzleDb;
+    if (!db || !storeSupportsBetterAuth(store)) {
+      return {
+        sent: false,
+        error: "Email is not configured. Set up SMTP in Settings → Email.",
+      };
+    }
+    const auth = await getBetterAuth(env, store);
+    return await requestVerificationEmail({ db, env, auth, email });
+  } catch (err) {
+    return {
+      sent: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : "Verification email could not be sent.",
+    };
+  }
+}
 export function registerAuthRoutes(app: Hono<AppEnv>): void {
   // NOTE (wiring): the block-level auth rate limit (app.ts §2, 60/min
   // per IP) is applied ONCE by the chain `rateLimit` middleware
@@ -145,26 +187,18 @@ export function registerAuthRoutes(app: Hono<AppEnv>): void {
     if (!body.email || !body.password) {
       throw new AppError("VALIDATION_ERROR", "email and password are required.", 422);
     }
-    // C-1: per-account lockout — 10 failed sign-ins in 15 minutes
-    // lock the account's sign-in (429). The probe runs BEFORE the
-    // password check so a locked account never burns a bcrypt
+    // C-1: per-(account, IP) lockout — 10 failed sign-ins in 15 minutes
+    // lock the (account, IP) pair's sign-in (429). The probe runs BEFORE the
+    // password check so a locked pair never burns a bcrypt
     // hash; failures increment afterwards, a success clears the
-    // bucket. Keyed by email hash (never the raw email) so the
-    // bucket key leaks nothing. Unknown emails accumulate too,
+    // bucket. Keyed by email hash + IP hash (never the raw email or
+    // IP) so the bucket key leaks nothing. Unknown emails accumulate too,
     // so a 429 reveals nothing about whether the account exists.
-    // F-08 / OD-12 (owner decision pending — behaviour
-    // deliberately UNCHANGED here): per-account lockout is also
-    // an account-lockout DoS — anyone who knows a staff email
-    // can lock that account for 15 minutes at will, repeatedly,
-    // and the per-IP bucket does not stop it because the lockout
-    // key is per-email. Options for the owner: accept the
-    // trade-off (documented), add a CAPTCHA / proof-of-work /
-    // IP-reputation step before counting failures toward the
-    // lockout, or lock out per (account, IP) instead of per
-    // account alone. Do not "fix" this unilaterally — it
-    // changes the sign-in security posture.
+    // OD-12 (2026-11-28): lockout is per (account, IP), not per account —
+    // an attacker from one IP only locks that IP's attempts; the real user
+    // from a different IP can still sign in.
     const normalizedSignInEmail = body.email.trim().toLowerCase();
-    const signInLockoutKey = `signin-fail:${createHash("sha256").update(normalizedSignInEmail, "utf8").digest("hex")}`;
+    const signInLockoutKey = `signin-fail:${createHash("sha256").update(normalizedSignInEmail, "utf8").digest("hex")}:${createHash("sha256").update(clientIp, "utf8").digest("hex")}`;
     if (await store.isRateLimited(signInLockoutKey, 10, 15 * 60_000)) {
       throw new AppError(
         "RATE_LIMIT_EXCEEDED",
@@ -230,6 +264,150 @@ export function registerAuthRoutes(app: Hono<AppEnv>): void {
     const cookieName = isProd ? "__Host-stackmate_session" : "stackmate_session";
     const cookieValue = `${cookieName}=${signedIn.session_token}; Path=/; HttpOnly; SameSite=Lax${isProd ? "; Secure" : ""}`;
     return jsonResponse(c, payload, 200, { "Set-Cookie": cookieValue });
+  });
+  app.post("/api/auth/resend-verification", async (c) => {
+    const store = c.var.store;
+    const env = c.var.env;
+    const requestId = c.var.requestId;
+    const request = c.req.raw;
+    const url = new URL(c.req.url);
+    const method = c.req.method;
+    const pathname = url.pathname.replace(/\/+$/, "") || "/";
+    const clientIp = getClientIp(request);
+    const body = (await readJsonBody(c)) as { email?: unknown };
+    // Input validation only (422) — never enumeration: every other
+    // outcome answers the same generic 200 below, whether the address
+    // is unknown, already verified, or suspended.
+    if (!body || typeof body !== "object" || typeof body.email !== "string") {
+      throw new AppError("VALIDATION_ERROR", "email must be a valid email address.", 422);
+    }
+    const email = body.email.trim().toLowerCase();
+    if (
+      email.length === 0 ||
+      email.length > 320 ||
+      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+    ) {
+      throw new AppError("VALIDATION_ERROR", "email must be a valid email address.", 422);
+    }
+    // OD-06: per-IP + per-email-hash buckets (sign-in lockout key
+    // style — sha256 of the normalized email, never the raw email).
+    // A tripped bucket NEVER changes the outward answer: the send is
+    // silently skipped and the endpoint still returns 200 { ok: true },
+    // so a 429 can never leak whether the address exists or was
+    // recently requested. The per-email bucket is counted only when
+    // a send is actually attempted, so a prober cannot burn a
+    // victim's resend budget with unknown-address requests.
+    const emailBucketKey = `resend-verification-email:${createHash("sha256").update(email, "utf8").digest("hex")}`;
+    const ipBucketKey = `resend-verification-ip:${clientIp}`;
+    const limited =
+      (await store.isRateLimited(emailBucketKey, 1, 60_000)) ||
+      (await store.isRateLimited(ipBucketKey, 10, 60_000));
+    if (!limited) {
+      const user = store.state.users.find((u) => u.email === email);
+      if (user && !user.email_verified && user.status === "active") {
+        // Best-effort: a send failure is invisible here by design.
+        await sendVerificationEmailBestEffort(store, env, email).catch(() => ({
+          sent: false,
+        }));
+        await store.checkRateLimit(emailBucketKey, 1, 60_000).catch(() => {});
+      }
+      await store.checkRateLimit(ipBucketKey, 10, 60_000).catch(() => {});
+    }
+    return jsonResponse(c, { ok: true });
+  });
+  app.get("/api/auth/verify-email", async (c) => {
+    const store = c.var.store;
+    const env = c.var.env;
+    const requestId = c.var.requestId;
+    const request = c.req.raw;
+    const url = new URL(c.req.url);
+    const method = c.req.method;
+    const pathname = url.pathname.replace(/\/+$/, "") || "/";
+    const clientIp = getClientIp(request);
+    // OD-06: GET /api/auth/verify-email MUST reach Better Auth.
+    // The /api/auth/* fallback's M-10 gate
+    // (checkBetterAuthFallbackAccess) 404s every path that is neither
+    // public nor a known session path, and verify-email is in neither
+    // set — so without this explicit route the verification link in
+    // the email would 404. This route registers before the fallback
+    // (registerAuthRoutes runs first in routes/index.ts), so it wins.
+    // JSON bodies are re-emitted in the StackMate envelope exactly
+    // like the fallback does; non-JSON responses (the 302 to the
+    // callbackURL on success, the redirect with ?error= on a bad
+    // token) pass through untouched.
+    const auth = await getBetterAuth(env, store);
+    const response = await auth.handler(request);
+    const contentType = response.headers.get("Content-Type") ?? "";
+    if (!contentType.includes("application/json")) {
+      return response;
+    }
+    const text = await response.text();
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return response;
+    }
+    const headers = new Headers();
+    const cookies =
+      typeof response.headers.getSetCookie === "function"
+        ? response.headers.getSetCookie()
+        : [];
+    for (const cookie of cookies) headers.append("Set-Cookie", cookie);
+    if (response.ok) {
+      return new Response(
+        JSON.stringify(createSuccessEnvelope(parsed, requestId)),
+        { status: response.status, headers }
+      );
+    }
+    const flat = parsed as { code?: unknown; message?: unknown } | null;
+    const flatCode = typeof flat?.code === "string" ? flat.code : "";
+    const flatMessage = typeof flat?.message === "string" ? flat.message : "";
+    const knownCodes = new Set([
+      "VALIDATION_ERROR",
+      "BAD_REQUEST",
+      "UNAUTHORIZED",
+      "FORBIDDEN",
+      "NOT_FOUND",
+      "GONE",
+      "CONFLICT",
+      "RATE_LIMIT_EXCEEDED",
+      "INTERNAL_ERROR",
+    ]);
+    const mappedCode = knownCodes.has(flatCode)
+      ? (flatCode as
+          | "VALIDATION_ERROR"
+          | "BAD_REQUEST"
+          | "UNAUTHORIZED"
+          | "FORBIDDEN"
+          | "NOT_FOUND"
+          | "GONE"
+          | "CONFLICT"
+          | "RATE_LIMIT_EXCEEDED"
+          | "INTERNAL_ERROR")
+      : response.status === 401
+        ? "UNAUTHORIZED"
+        : response.status === 403
+          ? "FORBIDDEN"
+          : response.status === 404
+            ? "NOT_FOUND"
+            : response.status === 429
+              ? "RATE_LIMIT_EXCEEDED"
+              : response.status === 400 ||
+                  response.status === 422
+                ? "VALIDATION_ERROR"
+                : "INTERNAL_ERROR";
+    return new Response(
+      JSON.stringify(
+        createErrorEnvelope(
+          mappedCode,
+          flatMessage || `Better Auth request failed with status ${response.status}.`,
+          requestId,
+          flatCode && flatCode !== mappedCode ? { better_auth_code: flatCode } : null
+        )
+      ),
+      { status: response.status, headers }
+    );
   });
   app.post("/api/auth/sign-out", async (c) => {
     const store = c.var.store;

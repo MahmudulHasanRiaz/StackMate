@@ -231,6 +231,14 @@ describe("Staff invitations (Batch 1, in-memory)", () => {
       },
     });
     assert.equal(staff.status, 201, JSON.stringify(staff.body));
+    // OD-06: admin-created users are unverified until they click the
+    // verification link, so they cannot sign in as created. These
+    // in-memory fixtures have no SMTP to click through — mark the row
+    // verified directly (the test-only equivalent of clicking the
+    // link) so the fixture can sign in like it did pre-OD-06.
+    const staffRow = store.state.users.find((u) => u.id === staff.body.data.user.id);
+    assert.ok(staffRow, "created user must exist in store state");
+    staffRow.email_verified = true;
     const staffSignIn = await apiRequest("/api/auth/sign-in", {
       method: "POST",
       body: { email: "support@stackmate.local", password: "SupportPass123!" },

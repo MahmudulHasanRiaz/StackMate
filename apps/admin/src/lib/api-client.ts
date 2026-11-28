@@ -216,6 +216,29 @@ export async function rawApiRequest<T>(
 }
 
 /* ------------------------------------------------------------------ */
+/* Email verification (OD-06).                                         */
+/*                                                                     */
+/* Contract (API worker builds the endpoints in parallel):             */
+/*  - POST /api/auth/resend-verification { email } → always 200        */
+/*    { data: { ok: true } } (generic: never reveals whether the       */
+/*    address belongs to an account).                                  */
+/*  - POST /api/v1/admin/users/:userId/resend-verification → 200       */
+/*    { data: { sent: true } } on success, 409 if already verified,   */
+/*    404 for an unknown user.                                         */
+/*                                                                     */
+/* The public resend is used by the sign-in screen (unverified sign-   */
+/* in) and by the signed-in user's own Profile dialog; the admin       */
+/* resend is called directly from Staff & Roles (staff.tsx) so its     */
+/* mutation can surface the 409/404 honestly.                          */
+/* ------------------------------------------------------------------ */
+export async function resendVerificationEmail(email: string): Promise<{ ok: boolean }> {
+  return apiRequest<{ ok: boolean }>("/api/auth/resend-verification", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
+}
+
+/* ------------------------------------------------------------------ */
 /* Expense module (admin UI, 2026-11-25).                              */
 /*                                                                     */
 /* Contract (API worker builds the endpoints in parallel):             */

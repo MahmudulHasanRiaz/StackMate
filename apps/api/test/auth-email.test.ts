@@ -215,6 +215,15 @@ describe.skipIf(!DATABASE_URL)("Auth + Email batch (Postgres)", () => {
     });
     assert.equal(created.status, 201, JSON.stringify(created.body));
     testUserId = created.body.data.user.id as string;
+    // OD-06: admin-created staff start UNVERIFIED and cannot sign in
+    // until they verify. This suite exercises 2FA policy, not
+    // verification, so the fixture marks the row verified directly
+    // (the test-only equivalent of clicking the link). The Better Auth
+    // sign-in path reads emailVerified from this DB row, so the SQL
+    // flip is enough even if the store's in-memory state is stale.
+    await adminClient.query("UPDATE users SET email_verified = true WHERE id = $1", [
+      testUserId,
+    ]);
   }, 120_000);
 
   afterAll(async () => {
@@ -367,6 +376,141 @@ describe.skipIf(!DATABASE_URL)("Auth + Email batch (Postgres)", () => {
     assert.equal(disabled.body.data.has_client_secret, true, "disabling keeps the stored secret");
     const pub2 = await apiRequest("/api/v1/auth-config");
     assert.deepEqual(pub2.body.data.oauth_providers, []);
+  });
+
+  it("OAuth sign-in gate (e): disabled provider cannot start social sign-in; enabled provider redirects to the provider; secret is v3-encrypted at rest", async () => {
+    // POST /api/auth/sign-in/social is the login page's OAuth entry
+    // point (auth.tsx handleOAuth). Better Auth builds its instance
+    // per request from the Settings config, so a provider that is not
+    // enabled + fully configured must fail here — not just hide its
+    // button. A success is a redirect to the provider (302 Location,
+    // or a 200 whose body carries the provider URL).
+    const social = (provider: string) =>
+      apiRequest("/api/auth/sign-in/social", {
+        method: "POST",
+        body: { provider, callbackURL: "http://localhost:8787/" },
+        origin: "http://localhost:8787",
+      });
+    const redirectTarget = (res: { status: number; headers: Headers; body: any }): string | null =>
+      res.headers.get("Location") ??
+      res.headers.get("location") ??
+      (typeof res.body?.data?.url === "string" ? res.body.data.url : null) ??
+      (typeof res.body?.url === "string" ? res.body.url : null);
+    const assertSocialBlocked = async (provider: string) => {
+      const res = await social(provider);
+      assert.ok(res.status >= 400, `${provider} disabled must not start sign-in (got ${res.status}): ${JSON.stringify(res.body)}`);
+      assert.equal(redirectTarget(res), null, `${provider} disabled must not redirect anywhere`);
+    };
+    const assertSocialRedirects = async (provider: string, host: string) => {
+      const res = await social(provider);
+      const target = redirectTarget(res);
+      assert.ok(target, `${provider} enabled must redirect (got ${res.status}): ${JSON.stringify(res.body)}`);
+      assert.ok(
+        target!.includes(host),
+        `${provider} must redirect to ${host} (got ${target})`
+      );
+    };
+
+    // Entry state: the previous test left google disabled (secret
+    // kept); github was never configured. Both must be blocked.
+    await assertSocialBlocked("google");
+    await assertSocialBlocked("github");
+
+    // Enable google with a fresh secret; the stored value must be a
+    // v3 envelope (AES-256-GCM, scrypt over a random per-envelope
+    // salt), never the plaintext, and the row must record v3.
+    const googleSecret = "google-secret-E2E-TEST-ONLY";
+    const savedGoogle = await apiRequest("/api/v1/admin/auth-config/oauth", {
+      method: "PUT",
+      body: {
+        provider: "google",
+        enabled: true,
+        client_id: "google-client-id-e2e",
+        client_secret: googleSecret,
+      },
+      cookie: superCookie,
+    });
+    assert.equal(savedGoogle.status, 200, JSON.stringify(savedGoogle.body));
+    assert.equal(savedGoogle.body.data.has_client_secret, true);
+    assert.ok(
+      !JSON.stringify(savedGoogle.body).includes(googleSecret),
+      "the PUT response must never return the secret"
+    );
+    const googleRow = await adminClient.query(
+      "SELECT client_secret_ciphertext, encryption_key_version FROM auth_oauth_providers WHERE provider = 'google'"
+    );
+    assert.equal(googleRow.rows.length, 1);
+    assert.equal(googleRow.rows[0].encryption_key_version, "v3");
+    assert.ok(
+      String(googleRow.rows[0].client_secret_ciphertext).startsWith("v3:"),
+      "stored secret must be a v3 envelope"
+    );
+    assert.ok(
+      !String(googleRow.rows[0].client_secret_ciphertext).includes(googleSecret),
+      "stored ciphertext must not contain the plaintext secret"
+    );
+
+    // Public list shows google only, and leaks neither the client id
+    // nor the secret; the admin view shows the client id + flag, but
+    // still never the secret.
+    const pubGoogle = await apiRequest("/api/v1/auth-config");
+    assert.deepEqual(pubGoogle.body.data.oauth_providers, ["google"]);
+    assert.ok(!JSON.stringify(pubGoogle.body).includes("google-client-id-e2e"), "public config must not leak client ids");
+    assert.ok(!JSON.stringify(pubGoogle.body).includes(googleSecret), "public config must not leak secrets");
+    const adminView = await apiRequest("/api/v1/admin/auth-config", { cookie: superCookie });
+    const googleView = (adminView.body.data.oauth as Array<Record<string, unknown>>).find(
+      (p) => p.provider === "google"
+    );
+    assert.equal(googleView?.client_id, "google-client-id-e2e");
+    assert.equal(googleView?.has_client_secret, true);
+    assert.ok(!JSON.stringify(adminView.body).includes(googleSecret), "admin config must never return the secret");
+
+    // Enabled google redirects to Google; disabled github stays blocked.
+    await assertSocialRedirects("google", "accounts.google.com");
+    await assertSocialBlocked("github");
+
+    // Enable github too: both redirect, public list shows both in
+    // OAUTH_PROVIDERS order (google, github).
+    const githubSecret = "github-secret-E2E-TEST-ONLY";
+    const savedGithub = await apiRequest("/api/v1/admin/auth-config/oauth", {
+      method: "PUT",
+      body: {
+        provider: "github",
+        enabled: true,
+        client_id: "github-client-id-e2e",
+        client_secret: githubSecret,
+      },
+      cookie: superCookie,
+    });
+    assert.equal(savedGithub.status, 200, JSON.stringify(savedGithub.body));
+    const pubBoth = await apiRequest("/api/v1/auth-config");
+    assert.deepEqual(pubBoth.body.data.oauth_providers, ["google", "github"]);
+    await assertSocialRedirects("github", "github.com/login/oauth/authorize");
+
+    // Disable google (secret omitted — the stored secret is kept):
+    // google sign-in is blocked again immediately, github still works,
+    // and the public list drops google.
+    const disabledGoogle = await apiRequest("/api/v1/admin/auth-config/oauth", {
+      method: "PUT",
+      body: { provider: "google", enabled: false, client_id: "google-client-id-e2e" },
+      cookie: superCookie,
+    });
+    assert.equal(disabledGoogle.status, 200, JSON.stringify(disabledGoogle.body));
+    assert.equal(disabledGoogle.body.data.has_client_secret, true, "disabling keeps the stored secret");
+    await assertSocialBlocked("google");
+    await assertSocialRedirects("github", "github.com/login/oauth/authorize");
+    const pubGithubOnly = await apiRequest("/api/v1/auth-config");
+    assert.deepEqual(pubGithubOnly.body.data.oauth_providers, ["github"]);
+
+    // Clean up: disable github so later tests start from a clean slate.
+    const disabledGithub = await apiRequest("/api/v1/admin/auth-config/oauth", {
+      method: "PUT",
+      body: { provider: "github", enabled: false, client_id: "github-client-id-e2e" },
+      cookie: superCookie,
+    });
+    assert.equal(disabledGithub.status, 200, JSON.stringify(disabledGithub.body));
+    const pubNone = await apiRequest("/api/v1/auth-config");
+    assert.deepEqual(pubNone.body.data.oauth_providers, []);
   });
 
   it("forgot / reset: SMTP off mints no token, SMTP on mints one; generic 200 either way; reset works once, expiry + reuse fail", async () => {

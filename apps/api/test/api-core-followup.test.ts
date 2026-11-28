@@ -97,6 +97,14 @@ describe("API-core follow-up: M-10 fallback gate + H-3 suspend routes", () => {
     });
     assert.equal(target.status, 201, JSON.stringify(target.body));
     targetUserId = target.body.data.user.id;
+    // OD-06: admin-created users are unverified until they click the
+    // verification link, so they cannot sign in as created. This
+    // in-memory fixture has no SMTP to click through — mark the row
+    // verified directly (the test-only equivalent of clicking the
+    // link) so the H-3 test below can sign in as this user.
+    const targetRow = store.state.users.find((u) => u.id === targetUserId);
+    assert.ok(targetRow, "created target user must exist in store state");
+    targetRow.email_verified = true;
   });
 
   it("M-10: GET /api/auth/get-session without a session is 401 from the gate", async () => {

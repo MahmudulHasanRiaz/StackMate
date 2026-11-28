@@ -18,11 +18,56 @@
 import { formatDisplayDateDDMMYYYY } from "../../../../../packages/contracts/src/index.ts";
 import { and } from "drizzle-orm";
 import { buildInvitationEmail } from "../../modules/email/service.ts";
+import { appendAuditLog } from "../../modules/audit/service.ts";
+import type { StackMateBindings } from "../../env.ts";
 import { AppError } from "../../shared/errors.ts";
 import { assertStaffPermissionAudited, createStaffInvitationByAdmin, createStaffUserByAdmin, ensureBetterAuthIdentity, revokeStaffInvitationByAdmin, storeSupportsBetterAuth, suspendStaffUser, unsuspendStaffUser, updateStaffUserRoles } from "../../modules/identity/service.ts";
+import { requestVerificationEmail, type VerificationEmailResult } from "../../modules/identity/email-verification.ts";
+import type { StackMateDataStore } from "../../platform/db/store.ts";
 import { Hono } from "hono";
 import type { AppEnv } from "../../types/context.ts";
-import { jsonResponse, pagedCollectionResponse, parseListQuery, includesQuery, readJsonBody, sendEmailViaSmtp } from "../../shared/http.ts";
+import { jsonResponse, pagedCollectionResponse, parseListQuery, includesQuery, readJsonBody, sendEmailViaSmtp, getBetterAuth } from "../../shared/http.ts";
+
+/**
+ * OD-06: best-effort verification-email send for the admin flows.
+ * Never throws: without a Drizzle-backed store (the in-memory test
+ * adapter) there is no SMTP / Better Auth to send through, so the
+ * honest answer is "not configured". Delivery failures are reported
+ * via the returned `{ sent, error }` — never by throwing — so a
+ * failed send can never fail the admin mutation it follows.
+ * (The public resend route in routes/auth.ts carries a twin of this
+ * helper; hoisting it to shared/http.ts is a later cleanup, not
+ * this slice.)
+ */
+async function sendVerificationEmailBestEffort(
+  store: StackMateDataStore,
+  env: StackMateBindings,
+  email: string
+): Promise<VerificationEmailResult> {
+  try {
+    const db = (
+      store as unknown as {
+        drizzleDb?: Parameters<typeof requestVerificationEmail>[0]["db"];
+      }
+    ).drizzleDb;
+    if (!db || !storeSupportsBetterAuth(store)) {
+      return {
+        sent: false,
+        error: "Email is not configured. Set up SMTP in Settings → Email.",
+      };
+    }
+    const auth = await getBetterAuth(env, store);
+    return await requestVerificationEmail({ db, env, auth, email });
+  } catch (err) {
+    return {
+      sent: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : "Verification email could not be sent.",
+    };
+  }
+}
 export function registerAdminUsersRoutes(app: Hono<AppEnv>): void {
   app.get("/api/v1/admin/users", async (c) => {
     const store = c.var.store;
@@ -56,6 +101,7 @@ export function registerAdminUsersRoutes(app: Hono<AppEnv>): void {
             id: u.id,
             name: u.name,
             email: u.email,
+            email_verified: u.email_verified,
             status: u.status,
             roles: roleKeys,
             created_at: u.created_at,
@@ -98,7 +144,71 @@ export function registerAdminUsersRoutes(app: Hono<AppEnv>): void {
         password: body.password,
       }).catch(() => {});
     }
-    return jsonResponse(c, created, 201);
+    // OD-06: verification email, best-effort — a failed send never
+    // fails the creation; the honest result rides in the response so
+    // the admin UI can show "created, verification email sent" or
+    // "created, email failed — resend available".
+    const verificationEmail = await sendVerificationEmailBestEffort(
+      store,
+      env,
+      created.user.email
+    );
+    return jsonResponse(c, { ...created, verification_email: verificationEmail }, 201);
+  });
+  app.post("/api/v1/admin/users/:userId/resend-verification", async (c) => {
+    const store = c.var.store;
+    const env = c.var.env;
+    const requestId = c.var.requestId;
+    const request = c.req.raw;
+    const url = new URL(c.req.url);
+    const method = c.req.method;
+    const pathname = url.pathname.replace(/\/+$/, "") || "/";
+    const principal = c.var.principal;
+    if (!principal) {
+      throw new AppError("UNAUTHORIZED", "Valid staff authentication session required.", 401);
+    }
+    // M-9: the mutation maps to its write permission at the
+    // dispatcher (audited variant, so a denial is recorded).
+    await assertStaffPermissionAudited(store, principal, "users.manage", requestId);
+    const userId = c.req.param("userId")!;
+    const user = store.state.users.find((u) => u.id === userId);
+    if (!user) throw new AppError("NOT_FOUND", "User not found.", 404);
+    if (user.email_verified) {
+      throw new AppError("CONFLICT", "Email is already verified.", 409);
+    }
+    // OD-06: 1/min per user — probe first so a limited resend never
+    // mints a token, then count the attempt once it has been made.
+    const resendBucketKey = `resend-verification:${userId}`;
+    if (await store.isRateLimited(resendBucketKey, 1, 60_000)) {
+      throw new AppError(
+        "RATE_LIMIT_EXCEEDED",
+        "A verification email was already sent for this user recently. Try again in a minute.",
+        429
+      );
+    }
+    const result = await sendVerificationEmailBestEffort(store, env, user.email);
+    await store.checkRateLimit(resendBucketKey, 1, 60_000).catch(() => {});
+    // Audit the resend like the other user mutations (outcome
+    // follows the honest send result; a failed audit write must not
+    // rewrite it).
+    await store
+      .withTransaction((state) => {
+        appendAuditLog(state, {
+          actor_type: "staff",
+          actor_user_id: principal.user.id,
+          action: "identity.user.verification_email_resent",
+          resource_type: "user",
+          resource_id: user.id,
+          outcome: result.sent ? "success" : "failed",
+          request_id: requestId,
+          changes: { email: user.email },
+        });
+      })
+      .catch(() => {});
+    return jsonResponse(c, {
+      sent: result.sent,
+      ...(result.error ? { error: result.error } : {}),
+    });
   });
   app.put("/api/v1/admin/users/:userId/roles", async (c) => {
     const store = c.var.store;
@@ -240,6 +350,7 @@ export function registerAdminUsersRoutes(app: Hono<AppEnv>): void {
       id: user.id,
       name: user.name,
       email: user.email,
+      email_verified: user.email_verified,
       status: user.status,
       roles: roleKeys,
       created_at: user.created_at,

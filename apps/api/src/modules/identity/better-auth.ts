@@ -22,8 +22,10 @@
  *  - `user.create.before` ALWAYS returns false. Better Auth never
  *    creates users in StackMate: every staff user is provisioned by
  *    bootstrap / an administrator / invitation acceptance, and OAuth
- *    LINKS to the existing row (by email — staff rows already carry
- *    `email_verified = true`, which the linking rules require). A
+ *    LINKS to the existing row (by email — the linking rules require
+ *    a verified email, so bootstrap / invitation-accepted staff, who
+ *    start verified, can link; admin-created staff start UNVERIFIED
+ *    under OD-06 and must verify via the emailed link first). A
  *    non-staff Google/GitHub login therefore can never mint a user.
  *  - `session.create.before` returns false when the user's staff record
  *    is suspended. This is the OAuth equivalent of the suspension check
@@ -53,7 +55,6 @@
 import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "@better-auth/drizzle-adapter";
 import { twoFactor } from "better-auth/plugins/two-factor";
-import { github, google } from "better-auth/social-providers";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 import type { StackMateBindings, WorkerExecutionContext } from "../../env.ts";
 import * as schema from "../../../../../db/schema/index.ts";
@@ -68,6 +69,10 @@ import {
   findStaffStatusByUserId,
   type ResolvedAuthConfig,
 } from "../auth-config/service.ts";
+import {
+  buildVerificationEmail,
+  sendStackMateEmail,
+} from "../email/service.ts";
 
 export interface BetterAuthWorkerConfig {
   appName: string;
@@ -103,13 +108,23 @@ export function createBetterAuth(
   // provider is registered ONLY when enabled AND fully configured
   // (client ID + decrypted secret); a half-configured row registers
   // nothing, so the login page never offers a broken button.
+  //
+  // RAW OPTIONS, NOT FACTORY RESULTS (OAuth fix, 2026-11-28): pass
+  // `{ clientId, clientSecret }` directly. Better Auth calls the
+  // factory itself (dist/context/create-context.mjs:
+  // `socialProviders[key](config)`), so passing `google({...})` here
+  // double-invokes it: the factory result (a provider object with no
+  // `clientId` field) becomes `config`, `config.clientId` reads
+  // undefined, and sign-in dies with CLIENT_ID_AND_SECRET_REQUIRED
+  // 500. The `SocialProviders` type says the same (each value is the
+  // factory's options object, optionally a function returning it).
   const socialProviders: Record<string, unknown> = {};
   for (const p of authConfig?.oauth ?? []) {
     if (!p.enabled || !p.clientId || !p.clientSecret) continue;
     if (p.provider === "google") {
-      socialProviders.google = google({ clientId: p.clientId, clientSecret: p.clientSecret });
+      socialProviders.google = { clientId: p.clientId, clientSecret: p.clientSecret };
     } else if (p.provider === "github") {
-      socialProviders.github = github({ clientId: p.clientId, clientSecret: p.clientSecret });
+      socialProviders.github = { clientId: p.clientId, clientSecret: p.clientSecret };
     }
   }
   return betterAuth({
@@ -127,7 +142,82 @@ export function createBetterAuth(
     // user — never signUpEmail, which would duplicate the `users` row).
     // A Better Auth user without a StackMate staff record has no roles
     // and cannot pass any admin authorization check anyway.
-    emailAndPassword: { enabled: true, requireEmailVerification: false },
+    //
+    // OD-06: requireEmailVerification is TRUE. Admin-created staff
+    // start unverified (createStaffUserByAdmin sets email_verified:
+    // false) and cannot sign in until they click the verification
+    // link; bootstrap + invitation acceptance still start verified
+    // (see service.ts). Better Auth enforces this inside signInEmail
+    // — verified against better-auth 1.7.23
+    // dist/api/routes/sign-in.mjs: the credential password is verified
+    // FIRST, and only then `requireEmailVerification &&
+    // !user.emailVerified` throws APIError FORBIDDEN with code
+    // EMAIL_NOT_VERIFIED ("Email not verified"). With asResponse:
+    // true that arrives as HTTP 403 + JSON { code:
+    // "EMAIL_NOT_VERIFIED", message: "Email not verified" } — the
+    // shape signInStaffSessionViaBetterAuth translates into the
+    // AppError 403 (service.ts). Because the password check runs
+    // first, the 403 proves the password was right, so it leaks no
+    // more than a wrong-password 401 would.
+    emailAndPassword: { enabled: true, requireEmailVerification: true },
+    // OD-06: Better Auth's BUILT-IN email verification (verified
+    // against better-auth 1.7.23 dist/api/routes/email-verification.mjs
+    // + @better-auth/core dist/types/init-options.d.mts):
+    //  - The token is a STATELESS JWT signed with BETTER_AUTH_SECRET
+    //    (createEmailVerificationToken → signJWT, payload { email,
+    //    userId }, expiresIn seconds) — NOT a `verifications`-table
+    //    row. That table is never read or written by this flow, so
+    //    there is no row to clean up and no expiry sweep; a resend
+    //    simply mints a fresh JWT and the old one lapses on expiry.
+    //  - GET /api/auth/verify-email?token=...&callbackURL=... flips
+    //    users.emailVerified to true (updateUserByEmail) and, with a
+    //    callbackURL, 302-redirects to it — the plain callbackURL, so
+    //    `?verified=1` must already be part of it (see
+    //    buildVerificationCallbackUrl in email-verification.ts). On an
+    //    invalid/expired token it redirects to callbackURL with
+    //    ?error=INVALID_TOKEN / TOKEN_EXPIRED, or throws UNAUTHORIZED
+    //    with that code when no callbackURL was given. An already-
+    //    verified user is redirected (or answered { status: true,
+    //    user: null }) without error.
+    //  - POST /api/auth/send-verification-email { email, callbackURL? }
+    //    answers { status: true } even for an unknown or already-
+    //    verified address (anti-enumeration, with a 500ms floor);
+    //    requestVerificationEmail (email-verification.ts) does its own
+    //    honest pre-checks instead and is the route-facing helper.
+    //  - sendOnSignUp is false: Better Auth never creates users here
+    //    (user.create.before returns false below). sendOnSignIn is
+    //    left at its default (false): a failed sign-in must NOT
+    //    silently re-mail a link — resends go through the explicit
+    //    requestVerificationEmail path only. autoSignInAfter-
+    //    Verification is false: verification only flips the flag; the
+    //    user signs in afterwards with the password, through the
+    //    normal (2FA-aware) sign-in path.
+    emailVerification: {
+      sendVerificationEmail: async ({ user, url }) => {
+        const db = drizzleDb as unknown as NodePgDatabase<typeof schema>;
+        const result = await sendStackMateEmail(
+          db,
+          {
+            encryptionKey: env.ENCRYPTION_KEY_V1,
+            keyVersion: env.ACTIVE_ENCRYPTION_KEY_VERSION,
+            appUrl: env.APP_URL,
+          },
+          { to: user.email, ...buildVerificationEmail(url) }
+        );
+        if (!result.sent) {
+          // Throw, do NOT swallow: the caller — requestVerificationEmail
+          // (modules/identity/email-verification.ts) — catches this and
+          // reports { sent: false, error } honestly. Swallowing would
+          // make auth.api.sendVerificationEmail return { status: true }
+          // for an email that never left the server, and the raw HTTP
+          // endpoint would 200-claim a send that never happened.
+          throw new Error(result.error ?? "Email could not be sent.");
+        }
+      },
+      sendOnSignUp: false,
+      expiresIn: 3600,
+      autoSignInAfterVerification: false,
+    },
     socialProviders,
     plugins: [
       // TOTP (authenticator app) + backup codes. Backup codes MUST be

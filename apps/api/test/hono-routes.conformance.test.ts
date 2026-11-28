@@ -13,6 +13,15 @@
  *      Updated 2026-11-26: 182 paths / 232 operations — the one
  *      additive route is GET /api/v1/admin/expense-categories/tree
  *      (expense hierarchy, migration 0026).
+ *      Updated 2026-11-28 (OD-06, Worker 2): 185 paths / 235
+ *      operations — +3: POST /api/auth/resend-verification,
+ *      GET /api/auth/verify-email,
+ *      POST /api/v1/admin/users/{userId}/resend-verification.
+ *      Updated 2026-11-28 (OD-13 + OD-07): 188 paths / 239
+ *      operations — +2 paths / +3 ops OD-13 (GET+POST
+ *      /api/v1/admin/api-tokens, POST
+ *      /api/v1/admin/api-tokens/{id}/revoke) and +1 path / +1 op
+ *      OD-07 (GET /api/v1/admin/analytics/dashboard).
  *
  * The test is DB-free: the Hono app is created with
  * `createHonoApp({ env: resolveRuntimeConfig(), storeFactory })` where
@@ -54,8 +63,8 @@ const HONO_APP_SPECIFIER = "../src/hono-app.ts";
  * (see the integration note in the migration plan §4). Any future
  * change to these numbers must be a deliberate, reviewed API change.
  */
-const BASELINE_PATHS = 182;
-const BASELINE_OPERATIONS = 232;
+const BASELINE_PATHS = 188;
+const BASELINE_OPERATIONS = 239;
 
 /**
  * The ONE allowed extra Hono route: the additive GraphQL endpoint
@@ -229,7 +238,7 @@ beforeAll(async () => {
 });
 
 describe("Hono route conformance (OpenAPI gate, migration plan §4)", () => {
-  it("OpenAPI baseline is intact: 182 paths / 232 operations", () => {
+  it("OpenAPI baseline is intact: 188 paths / 239 operations", () => {
     const paths = Object.keys(openApi.paths).length;
     const operations = Object.values(openApi.paths).reduce(
       (n, ops) => n + Object.keys(ops).length,

@@ -106,6 +106,14 @@ describe("Audit Batch A1 — Auth + Security (in-memory)", () => {
       body: { name, email, password, role_keys: roleKeys },
     });
     assert.equal(res.status, 201, `create user ${email}: ${JSON.stringify(res.body)}`);
+    // OD-06: admin-created users are unverified until they click the
+    // verification link, so they cannot sign in as created. These
+    // in-memory fixtures have no SMTP to click through — mark the row
+    // verified directly (the test-only equivalent of clicking the
+    // link) so the fixture can sign in like it did pre-OD-06.
+    const row = store.state.users.find((u) => u.id === res.body.data.user.id);
+    assert.ok(row, "created user must exist in store state");
+    row.email_verified = true;
     return res.body.data.user.id;
   }
 

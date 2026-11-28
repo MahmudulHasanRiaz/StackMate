@@ -242,6 +242,57 @@
         }
       }
     },
+    "/api/auth/resend-verification": {
+      "post": {
+        "operationId": "post_auth_resend_verification",
+        "summary": "POST /api/auth/resend-verification",
+        "description": "Contract: see `packages/contracts/` (valibot schemas) and `docs/plan/API & Integration Specification.md`. List endpoints accept `?q=`, `?limit=` (1–100, default 25) and `?page=`; responses use the standard success/error envelopes.",
+        "tags": [
+          "Auth"
+        ],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Success (envelope).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RequestBody"
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/auth/reset-password": {
       "post": {
         "operationId": "post_auth_reset_password",
@@ -538,6 +589,93 @@
         }
       }
     },
+    "/api/auth/verify-email": {
+      "get": {
+        "operationId": "get_auth_verify_email",
+        "summary": "GET /api/auth/verify-email",
+        "description": "Contract: see `packages/contracts/` (valibot schemas) and `docs/plan/API & Integration Specification.md`. List endpoints accept `?q=`, `?limit=` (1–100, default 25) and `?page=`; responses use the standard success/error envelopes.",
+        "tags": [
+          "Auth"
+        ],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Success (envelope).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/api/v1/admin/analytics/dashboard": {
+      "get": {
+        "operationId": "get_v1_admin_analytics_dashboard",
+        "summary": "GET /api/v1/admin/analytics/dashboard",
+        "description": "Contract: see `packages/contracts/` (valibot schemas) and `docs/plan/API & Integration Specification.md`. List endpoints accept `?q=`, `?limit=` (1–100, default 25) and `?page=`; responses use the standard success/error envelopes.",
+        "tags": [
+          "Admin · analytics"
+        ],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Success (envelope).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        },
+        "security": [
+          {
+            "StaffSession": []
+          }
+        ]
+      }
+    },
     "/api/v1/admin/analytics/overview": {
       "get": {
         "operationId": "get_v1_admin_analytics_overview",
@@ -621,6 +759,172 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          }
+        },
+        "security": [
+          {
+            "StaffSession": []
+          }
+        ]
+      }
+    },
+    "/api/v1/admin/api-tokens": {
+      "get": {
+        "operationId": "get_v1_admin_api_tokens",
+        "summary": "GET /api/v1/admin/api-tokens",
+        "description": "Contract: see `packages/contracts/` (valibot schemas) and `docs/plan/API & Integration Specification.md`. List endpoints accept `?q=`, `?limit=` (1–100, default 25) and `?page=`; responses use the standard success/error envelopes.",
+        "tags": [
+          "Admin · api-tokens"
+        ],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Success (envelope).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        },
+        "security": [
+          {
+            "StaffSession": []
+          }
+        ]
+      },
+      "post": {
+        "operationId": "post_v1_admin_api_tokens",
+        "summary": "POST /api/v1/admin/api-tokens",
+        "description": "Contract: see `packages/contracts/` (valibot schemas) and `docs/plan/API & Integration Specification.md`. List endpoints accept `?q=`, `?limit=` (1–100, default 25) and `?page=`; responses use the standard success/error envelopes.",
+        "tags": [
+          "Admin · api-tokens"
+        ],
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "Success (envelope).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RequestBody"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "StaffSession": []
+          }
+        ]
+      }
+    },
+    "/api/v1/admin/api-tokens/{id}/revoke": {
+      "post": {
+        "operationId": "post_v1_admin_api_tokens_id_revoke",
+        "summary": "POST /api/v1/admin/api-tokens/{id}/revoke",
+        "description": "Contract: see `packages/contracts/` (valibot schemas) and `docs/plan/API & Integration Specification.md`. List endpoints accept `?q=`, `?limit=` (1–100, default 25) and `?page=`; responses use the standard success/error envelopes.",
+        "tags": [
+          "Admin · api-tokens"
+        ],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Path parameter `id`."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success (envelope).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RequestBody"
+              }
+            }
           }
         },
         "security": [
@@ -11053,6 +11357,72 @@
           },
           "500": {
             "$ref": "#/components/responses/InternalError"
+          }
+        },
+        "security": [
+          {
+            "StaffSession": []
+          }
+        ]
+      }
+    },
+    "/api/v1/admin/users/{userId}/resend-verification": {
+      "post": {
+        "operationId": "post_v1_admin_users_userId_resend_verification",
+        "summary": "POST /api/v1/admin/users/{userId}/resend-verification",
+        "description": "Contract: see `packages/contracts/` (valibot schemas) and `docs/plan/API & Integration Specification.md`. List endpoints accept `?q=`, `?limit=` (1–100, default 25) and `?page=`; responses use the standard success/error envelopes.",
+        "tags": [
+          "Admin · users"
+        ],
+        "parameters": [
+          {
+            "name": "userId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Path parameter `userId`."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success (envelope).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuccessEnvelope"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationError"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RequestBody"
+              }
+            }
           }
         },
         "security": [

@@ -164,6 +164,26 @@ export async function sendEmailsBounded(
   return results;
 }
 
+export function buildVerificationEmail(
+  url: string
+): { subject: string; text: string; html: string } {
+  return {
+    subject: "Verify your StackMate email",
+    text: [
+      "You were given access to StackMate as a staff member.",
+      "",
+      `Verify your email here (valid for 1 hour): ${url}`,
+      "",
+      "If you were not expecting this, ignore this email — your account stays unverified and cannot sign in.",
+    ].join("\n"),
+    html: [
+      "<p>You were given access to StackMate as a staff member.</p>",
+      `<p><a href="${url}">Verify your email</a> (valid for 1 hour).</p>`,
+      "<p>If you were not expecting this, ignore this email — your account stays unverified and cannot sign in.</p>",
+    ].join("\n"),
+  };
+}
+
 export function buildPasswordResetEmail(
   appUrl: string,
   token: string

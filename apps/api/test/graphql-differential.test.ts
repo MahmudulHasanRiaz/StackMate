@@ -284,6 +284,7 @@ describe.skipIf(!DATABASE_URL)("GraphQL differential — REST vs GraphQL", () =>
         email: SUPER_ACTOR.user.email,
         status: "active",
         avatar_url: null,
+        email_verified: true,
       },
       session_id: "test-session-no-perm",
       roles: [],

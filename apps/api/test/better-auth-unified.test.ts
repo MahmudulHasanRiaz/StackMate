@@ -511,6 +511,13 @@ describe.skipIf(!DATABASE_URL)("Better Auth unified staff auth (Postgres)", () =
     });
     assert.equal(created.status, 201, JSON.stringify(created.body));
     const staffUserId = created.body.data.user.id as string;
+    // OD-06: admin-created staff start UNVERIFIED and cannot sign in
+    // until they verify. This test exercises role-change revocation,
+    // not verification, so the fixture marks the row verified directly
+    // (the test-only equivalent of clicking the link).
+    await adminClient.query("UPDATE users SET email_verified = true WHERE id = $1", [
+      staffUserId,
+    ]);
 
     const staffSession = await signIn(staffEmail, "RolePass12345!");
     const meBefore = await apiRequest("/api/v1/admin/me", { cookie: staffSession.cookie });

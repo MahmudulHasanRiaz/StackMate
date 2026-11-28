@@ -270,6 +270,17 @@ describe("StackMate End-to-End Domain, Security, Concurrency & Hyperdrive Test S
     );
     assert.equal(financeCreateRes.status, 201);
 
+    // OD-06: admin-created users are unverified until they click the
+    // verification link, so they cannot sign in as created. These
+    // in-memory fixtures have no SMTP to click through — mark the row
+    // verified directly (the test-only equivalent of clicking the
+    // link) so the fixture can sign in like it did pre-OD-06.
+    const financeRow = store.state.users.find(
+      (u) => u.email === "finance@stackmate.local"
+    );
+    assert.ok(financeRow, "created user must exist in store state");
+    financeRow.email_verified = true;
+
     const financeSignIn = await apiRequest("/api/auth/sign-in", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

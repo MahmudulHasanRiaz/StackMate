@@ -100,11 +100,25 @@ describe("Audit identity/auth fixes (in-memory)", () => {
   async function createUserViaApp(
     body: unknown
   ): Promise<{ status: number; body: any }> {
-    return apiRequest(app, env, "/api/v1/admin/users", {
+    const res = await apiRequest(app, env, "/api/v1/admin/users", {
       method: "POST",
       body,
       cookie: superCookie,
     });
+    // OD-06: admin-created users are unverified until they click the
+    // verification link, so they cannot sign in as created. These
+    // in-memory fixtures have no SMTP to click through — mark the row
+    // verified directly on a 201 (the test-only equivalent of clicking
+    // the link) so fixtures can sign in like they did pre-OD-06. The
+    // already-serialized response is untouched, so the H-4 creation
+    // assertions still see exactly what the API returned.
+    if (res.status === 201) {
+      const row = store.state.users.find(
+        (u) => u.id === res.body?.data?.user?.id
+      );
+      if (row) row.email_verified = true;
+    }
+    return res;
   }
 
   // -- H-4: staff creation validation ------------------------------------

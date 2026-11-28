@@ -27,9 +27,22 @@
  *    password was right but TOTP is on — the TOTP prompt replaces the
  *    sign-in form (code, or a backup code). Verify calls the Better
  *    Auth two-factor endpoints, then loads /me to finish sign-in.
+ *  - Email verification (OD-06): a correct password with an
+ *    unverified email is a 403 EMAIL_NOT_VERIFIED — NOT a wrong
+ *    password. The sign-in screen shows a resend panel for that email
+ *    (POST /api/auth/resend-verification, always 200). A verification
+ *    link lands back here with ?verified=1 and shows a success banner.
+ *
+ * Clerk-like compact redesign: a small centered card — brand row
+ *  (.sm-auth-brand reusing the shell's .sm-brand-mark + app name),
+ *  centered title and tagline, quiet text-only social buttons above
+ *  the divider, and a single white primary submit per form. Flows,
+ *  handlers, and all user-visible error/success wording are unchanged;
+ *  only JSX structure, classNames, and layout copy were touched.
  */
 import { useEffect, useState, type FormEvent } from "react";
-import { apiRequest, rawApiRequest, ApiClientError } from "../lib/api-client";
+import { Package } from "lucide-react";
+import { apiRequest, rawApiRequest, ApiClientError, resendVerificationEmail } from "../lib/api-client";
 import { useGeneralConfig } from "../lib/general-config";
 import { recordSessionStart } from "../lib/session";
 import { Alert, Button, Field, Input, Skeleton } from "./primitives";
@@ -90,6 +103,14 @@ export function AuthScreen({
   const [useBackupCode, setUseBackupCode] = useState(false);
   const [verifying, setVerifying] = useState(false);
 
+  // Email verification (OD-06): the email of a sign-in that failed
+  // with 403 EMAIL_NOT_VERIFIED, plus the resend request state.
+  // null = no unverified failure (a 401 wrong password never sets it).
+  const [unverifiedEmail, setUnverifiedEmail] = useState<string | null>(null);
+  const [resendBusy, setResendBusy] = useState(false);
+  const [resendSent, setResendSent] = useState(false);
+  const [resendError, setResendError] = useState<string | null>(null);
+
   useEffect(() => {
     let cancelled = false;
     apiRequest<{ setup_required: boolean }>("/api/v1/setup-status")
@@ -127,6 +148,17 @@ export function AuthScreen({
       const next = `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ""}`;
       window.history.replaceState(null, "", next);
     }
+    // OD-06: a verification link lands back here with ?verified=1 —
+    // show the success banner once, then clear it from the URL so a
+    // refresh does not repeat it. The root route renders AuthScreen
+    // for signed-out users and the query string survives the router
+    // gating, so the param is readable here (same pattern as ?error=).
+    if (params.get("verified") === "1") {
+      setNotice("Email verified — you can now sign in.");
+      params.delete("verified");
+      const next = `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ""}`;
+      window.history.replaceState(null, "", next);
+    }
     return () => {
       cancelled = true;
     };
@@ -136,6 +168,9 @@ export function AuthScreen({
     e.preventDefault();
     setError(null);
     setNotice(null);
+    setUnverifiedEmail(null);
+    setResendSent(false);
+    setResendError(null);
     setSigningIn(true);
     try {
       const res = await apiRequest<{
@@ -161,11 +196,36 @@ export function AuthScreen({
         setError(
           "Too many sign-in attempts — this account is temporarily locked. Try again in 15 minutes.",
         );
+      } else if (
+        // OD-06: the password was right but the email is unverified.
+        // This is NOT a wrong password (401) — show the resend panel
+        // for this email instead of the generic failure.
+        err instanceof ApiClientError &&
+        err.statusCode === 403 &&
+        err.code === "EMAIL_NOT_VERIFIED"
+      ) {
+        setUnverifiedEmail(email);
       } else {
         setError(errorMessage(err, "Sign-in failed"));
       }
     } finally {
       setSigningIn(false);
+    }
+  }
+
+  async function handleResendVerification() {
+    if (!unverifiedEmail || resendBusy) return;
+    setResendError(null);
+    setResendBusy(true);
+    try {
+      // The endpoint is generic-200 by design; a 200 means the
+      // request was accepted. Only a transport/server error lands here.
+      await resendVerificationEmail(unverifiedEmail);
+      setResendSent(true);
+    } catch (err) {
+      setResendError(errorMessage(err, "Could not send the verification email"));
+    } finally {
+      setResendBusy(false);
     }
   }
 
@@ -280,13 +340,17 @@ export function AuthScreen({
   return (
     <main className="sm-auth">
       <section className="sm-auth-card" aria-labelledby="auth-heading">
-        <h1 id="auth-heading" className="sm-page-title">
+        <div className="sm-auth-brand">
+          <span className="sm-brand-mark">
+            <Package size={20} strokeWidth={2} />
+          </span>
+          <span className="sm-brand-name">{appName}</span>
+        </div>
+        <h1 id="auth-heading" className="sm-auth-heading">
           {setupStatus === "required" ? "Set up your first admin" : `${appName} Staff Sign In`}
         </h1>
         {generalConfig?.app_description ? (
-          <p className="sm-muted" style={{ margin: "8px 0 0" }}>
-            {generalConfig.app_description}
-          </p>
+          <p className="sm-auth-tagline">{generalConfig.app_description}</p>
         ) : null}
         {notice ? (
           <Alert variant="success" role="status">
@@ -304,8 +368,8 @@ export function AuthScreen({
           <form className="sm-auth-form" onSubmit={handleSetup}>
             <p className="sm-hint" style={{ margin: 0 }}>
               No admin account exists yet. Create the first one — this form
-              appears only once. The setup token is the secret set by the
-              owner in the Cloudflare dashboard (Worker secret SETUP_TOKEN).
+              appears only once. The setup token is the owner-set secret
+              (Worker secret SETUP_TOKEN).
             </p>
             <Field label="Name" required htmlFor="sm-setup-name">
               <Input
@@ -346,7 +410,7 @@ export function AuthScreen({
                 onChange={(e) => setSetupToken(e.target.value)}
               />
             </Field>
-            <Button variant="accent" type="submit" loading={settingUp}>
+            <Button variant="primary" type="submit" loading={settingUp}>
               Create first admin
             </Button>
           </form>
@@ -372,7 +436,7 @@ export function AuthScreen({
                 onChange={(e) => setTotpCode(e.target.value)}
               />
             </Field>
-            <Button variant="accent" type="submit" loading={verifying}>
+            <Button variant="primary" type="submit" loading={verifying}>
               Verify
             </Button>
             <button
@@ -421,7 +485,7 @@ export function AuthScreen({
                     onChange={(e) => setForgotEmail(e.target.value)}
                   />
                 </Field>
-                <Button variant="accent" type="submit" loading={forgotBusy}>
+                <Button variant="primary" type="submit" loading={forgotBusy}>
                   Send reset link
                 </Button>
               </>
@@ -441,17 +505,19 @@ export function AuthScreen({
           <form className="sm-auth-form" onSubmit={handleSignIn}>
             {oauthProviders.length > 0 ? (
               <>
-                {oauthProviders.map((provider) => (
-                  <Button
-                    key={provider}
-                    type="button"
-                    variant="secondary"
-                    loading={oauthBusy === provider}
-                    onClick={() => void handleOAuth(provider)}
-                  >
-                    {PROVIDER_LABELS[provider] ?? `Continue with ${provider}`}
-                  </Button>
-                ))}
+                <div className="sm-auth-social">
+                  {oauthProviders.map((provider) => (
+                    <Button
+                      key={provider}
+                      type="button"
+                      variant="secondary"
+                      loading={oauthBusy === provider}
+                      onClick={() => void handleOAuth(provider)}
+                    >
+                      {PROVIDER_LABELS[provider] ?? `Continue with ${provider}`}
+                    </Button>
+                  ))}
+                </div>
                 <div className="sm-auth-divider" aria-hidden="true">
                   <span>or sign in with email</span>
                 </div>
@@ -467,6 +533,40 @@ export function AuthScreen({
                 onChange={(e) => setEmail(e.target.value)}
               />
             </Field>
+            {/* OD-06: shown only for a 403 EMAIL_NOT_VERIFIED sign-in
+                (never for a 401 wrong password). The password was
+                correct — the email just needs verifying first. */}
+            {unverifiedEmail ? (
+              <Alert variant="warning" role="alert">
+                <p style={{ margin: 0 }}>
+                  <strong>Email not verified.</strong> Your password was
+                  correct, but{" "}
+                  <span className="sm-mono">{unverifiedEmail}</span> has
+                  not been verified yet. Click the link in your
+                  verification email, then sign in again here.
+                </p>
+                {resendSent ? (
+                  <p style={{ margin: "8px 0 0" }}>
+                    Verification email sent to {unverifiedEmail} — check
+                    your inbox (and spam folder) for the link.
+                  </p>
+                ) : (
+                  <div style={{ marginTop: 8 }}>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      loading={resendBusy}
+                      onClick={() => void handleResendVerification()}
+                    >
+                      Resend verification email
+                    </Button>
+                  </div>
+                )}
+                {resendError ? (
+                  <p style={{ margin: "8px 0 0" }}>{resendError}</p>
+                ) : null}
+              </Alert>
+            ) : null}
             <Field label="Password" required htmlFor="sm-password">
               <Input
                 id="sm-password"
@@ -477,7 +577,7 @@ export function AuthScreen({
                 onChange={(e) => setPassword(e.target.value)}
               />
             </Field>
-            <Button variant="accent" type="submit" loading={signingIn}>
+            <Button variant="primary" type="submit" loading={signingIn}>
               Sign In
             </Button>
             <button

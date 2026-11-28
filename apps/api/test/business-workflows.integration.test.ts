@@ -272,6 +272,15 @@ describe.skipIf(!DATABASE_URL)("Business workflows (Postgres)", () => {
         body: { name, email, password, role_keys: roleKeys },
       });
       assert.equal(created.status, 201, JSON.stringify(created.body));
+      // OD-06: admin-created staff start UNVERIFIED and cannot sign in
+      // until they verify. This suite exercises business workflows, not
+      // verification, so the fixture marks the row verified directly
+      // (the test-only equivalent of clicking the link). The Better Auth
+      // sign-in path reads emailVerified from this DB row, so the SQL
+      // flip is enough even if the store's in-memory state is stale.
+      await adminClient.query("UPDATE users SET email_verified = true WHERE id = $1", [
+        created.body.data.user.id,
+      ]);
     }
     readOnlyCookie = await signIn(READONLY_EMAIL, READONLY_PASSWORD);
     financeCookie = await signIn(FINANCE_EMAIL, FINANCE_PASSWORD);

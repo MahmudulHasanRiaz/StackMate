@@ -83,7 +83,7 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { ApiClientError, apiRequest } from "../lib/api-client";
+import { ApiClientError, apiRequest, resendVerificationEmail } from "../lib/api-client";
 import { queryClient } from "../lib/query";
 import { useIdempotencyKey } from "../lib/section-kit";
 import { humanizeType } from "../lib/resolve-names";
@@ -132,6 +132,12 @@ export interface StaffPrincipalDto {
     /** Custom avatar URL (users.avatar_url, audit M-23) — null when
      *  the user has none; Avatar falls back to Gravatar, then initials. */
     avatar_url?: string | null;
+    /** OD-06: true once the user clicked the verification link.
+     *  Optional — the principal does not carry it yet (API gap,
+     *  Worker 1: add `email_verified` to buildPrincipal in
+     *  apps/api/src/modules/identity/service.ts, lines ~530–547).
+     *  Undefined renders as no verification state, never as verified. */
+    email_verified?: boolean;
   };
   roles: string[];
   permissions: string[];
@@ -948,6 +954,13 @@ function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }
   // Avatar (audit M-23): the media picker opens as a sibling dialog.
   const [pickerOpen, setPickerOpen] = useState(false);
   const [avatarSaving, setAvatarSaving] = useState(false);
+  // OD-06: resend-verification state for the signed-in user's own
+  // email. Only shown when the principal explicitly says unverified —
+  // a signed-in user is normally verified (sign-in gates on it), but
+  // a session from before the gate can still be unverified.
+  const [profileResendBusy, setProfileResendBusy] = useState(false);
+  const [profileResendSent, setProfileResendSent] = useState(false);
+  const [profileResendError, setProfileResendError] = useState<string | null>(null);
 
   // Avatar updates PATCH immediately (separate from the Name save):
   // the picker hands back a media asset; its content URL is sent and
@@ -986,8 +999,31 @@ function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }
       setName(principal.user.name);
       setError(null);
       setFieldError(undefined);
+      setProfileResendSent(false);
+      setProfileResendError(null);
     }
   }, [open, principal.user.name]);
+
+  // OD-06: resend a verification email to the signed-in user's own
+  // address (public endpoint — always 200; only a transport/server
+  // failure lands in the catch, and it is reported, never hidden).
+  const resendOwnVerification = async () => {
+    if (profileResendBusy) return;
+    setProfileResendError(null);
+    setProfileResendBusy(true);
+    try {
+      await resendVerificationEmail(principal.user.email);
+      setProfileResendSent(true);
+    } catch (err) {
+      setProfileResendError(
+        err instanceof ApiClientError
+          ? err.message
+          : "Could not send the verification email.",
+      );
+    } finally {
+      setProfileResendBusy(false);
+    }
+  };
 
   const save = async () => {
     const trimmed = name.trim();
@@ -1094,6 +1130,38 @@ function ProfileDialog({ open, onClose }: { open: boolean; onClose: () => void }
         >
           <Input id="profile-email" value={principal.user.email} disabled />
         </Field>
+        {/* OD-06: only when the principal explicitly says unverified.
+            A signed-in user is normally verified (sign-in gates on it);
+            this covers a session from before the gate. */}
+        {principal.user.email_verified === false ? (
+          <Alert variant="warning" role="status">
+            <p style={{ margin: 0 }}>
+              <strong>Your email is not verified.</strong> New sign-ins
+              are blocked until you verify it — use the link in your
+              verification email, or send a new one.
+            </p>
+            {profileResendSent ? (
+              <p style={{ margin: "8px 0 0" }}>
+                Verification email sent to {principal.user.email} — check
+                your inbox (and spam folder) for the link.
+              </p>
+            ) : (
+              <div style={{ marginTop: 8 }}>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  loading={profileResendBusy}
+                  onClick={() => void resendOwnVerification()}
+                >
+                  Resend verification email
+                </Button>
+              </div>
+            )}
+            {profileResendError ? (
+              <p style={{ margin: "8px 0 0" }}>{profileResendError}</p>
+            ) : null}
+          </Alert>
+        ) : null}
         <Field
           label="Roles"
           htmlFor="profile-roles"

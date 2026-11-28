@@ -43,6 +43,7 @@ export const SUPER_ACTOR: StaffPrincipal = {
     email: "super@stackmate.local",
     status: "active",
     avatar_url: null,
+    email_verified: true,
   },
   session_id: "test-session",
   roles: ["super_admin"],
