@@ -72,6 +72,9 @@ const AuditLogsSection = lazy(() =>
 const AuthSettingsSection = lazy(() =>
   import("./sections/auth-settings").then((m) => ({ default: m.AuthSettingsSection })),
 );
+const ApiTokensSection = lazy(() =>
+  import("./sections/api-tokens").then((m) => ({ default: m.ApiTokensSection })),
+);
 const EmailSettingsSection = lazy(() =>
   import("./sections/email-settings").then((m) => ({ default: m.EmailSettingsSection })),
 );
@@ -586,6 +589,7 @@ const settingsIntegrationGuideRoute = makeSettingsListRoute(
   "/integration-guide",
   IntegrationGuideSection,
 );
+const settingsApiTokensRoute = makeSettingsListRoute("/api-tokens", ApiTokensSection);
 
 const settingsIndexRoute = createRoute({
   getParentRoute: () => settingsRoute,
@@ -645,6 +649,7 @@ const routeTree = rootRoute.addChildren([
     settingsGeneralRoute,
     settingsStorageRoute,
     settingsIntegrationGuideRoute,
+    settingsApiTokensRoute,
   ]),
 ]);
 

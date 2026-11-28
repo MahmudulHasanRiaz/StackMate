@@ -14,6 +14,14 @@
  * genuinely useful report panels below (Recent orders, Needs attention),
  * built from the existing list endpoints only. No fake data: every
  * number comes from a real endpoint; empty states stay empty.
+ *
+ * OD-07 (2026-11-28, PRD §18): the dashboard analytics endpoint
+ * (GET /api/v1/admin/analytics/dashboard) adds the full §18 surface —
+ * product / payment-status / subscription-status / source filters
+ * (URL-persisted), a clickable Total customers card, an Upcoming
+ * renewals panel, and Revenue / Orders / Payment-method charts
+ * (components/dashboard-charts.tsx, hand-rolled SVG). Money fields
+ * are null when the caller lacks payments.read — hidden, never 0.
  */
 import { useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
@@ -50,9 +58,17 @@ import {
   ErrorState,
   Field,
   MoneyCell,
+  SearchableSelect,
+  Select,
   Skeleton,
   StatusBadge,
 } from "../components/primitives";
+import {
+  OrdersChart,
+  PaymentMethodChart,
+  RevenueChart,
+  type DashboardAnalyticsDto,
+} from "../components/dashboard-charts";
 
 interface AnalyticsOverviewDto {
   currency_code: string;
@@ -157,6 +173,97 @@ function rangeToSearch(range: DashboardRange): Record<string, unknown> {
   return { range: range.preset };
 }
 
+/* ------------------------------------------------------------------ */
+/* OD-07 filters (PRD §18) — URL-persisted alongside the range.        */
+/* ------------------------------------------------------------------ */
+const PAYMENT_STATUSES = [
+  "unpaid",
+  "pending_verification",
+  "partially_paid",
+  "paid",
+  "partially_refunded",
+  "refunded",
+] as const;
+const SUBSCRIPTION_STATUSES = [
+  "trialing",
+  "pending",
+  "active",
+  "past_due",
+  "paused",
+  "cancelled",
+  "expired",
+] as const;
+const SOURCES = ["admin", "website", "api", "import"] as const;
+const SOURCE_LABELS: Record<string, string> = {
+  admin: "Admin",
+  website: "Website",
+  api: "API",
+  import: "Import",
+};
+
+interface DashboardFilters {
+  productId: string;
+  paymentStatus: string;
+  subscriptionStatus: string;
+  source: string;
+}
+
+const EMPTY_FILTERS: DashboardFilters = {
+  productId: "",
+  paymentStatus: "",
+  subscriptionStatus: "",
+  source: "",
+};
+
+/** "pending_verification" → "Pending verification" (never a raw enum). */
+function sentenceCase(value: string): string {
+  const words = value.replace(/_/g, " ").toLowerCase();
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+function parseFiltersFromSearch(search: Record<string, unknown>): DashboardFilters {
+  const str = (key: string) => (typeof search[key] === "string" ? (search[key] as string) : "");
+  const paymentStatus = str("paymentStatus");
+  const subscriptionStatus = str("subscriptionStatus");
+  const source = str("source");
+  return {
+    productId: str("productId"),
+    paymentStatus: (PAYMENT_STATUSES as readonly string[]).includes(paymentStatus)
+      ? paymentStatus
+      : "",
+    subscriptionStatus: (SUBSCRIPTION_STATUSES as readonly string[]).includes(
+      subscriptionStatus,
+    )
+      ? subscriptionStatus
+      : "",
+    source: (SOURCES as readonly string[]).includes(source) ? source : "",
+  };
+}
+
+function filtersToSearch(filters: DashboardFilters): Record<string, unknown> {
+  return {
+    ...(filters.productId ? { productId: filters.productId } : {}),
+    ...(filters.paymentStatus ? { paymentStatus: filters.paymentStatus } : {}),
+    ...(filters.subscriptionStatus
+      ? { subscriptionStatus: filters.subscriptionStatus }
+      : {}),
+    ...(filters.source ? { source: filters.source } : {}),
+  };
+}
+
+function buildSearch(range: DashboardRange, filters: DashboardFilters): Record<string, unknown> {
+  return { ...rangeToSearch(range), ...filtersToSearch(filters) };
+}
+
+function hasAnyFilter(filters: DashboardFilters): boolean {
+  return (
+    filters.productId !== "" ||
+    filters.paymentStatus !== "" ||
+    filters.subscriptionStatus !== "" ||
+    filters.source !== ""
+  );
+}
+
 function rangeSpanDays(fromIso: string, toIso: string): number {
   const [fy, fm, fd] = fromIso.split("-").map(Number);
   const [ty, tm, td] = toIso.split("-").map(Number);
@@ -188,14 +295,20 @@ function KpiCard({
   icon: Icon,
   tone,
   children,
+  onClick,
+  ariaLabel,
 }: {
   label: string;
   icon: LucideIcon;
   tone: KpiTone;
   children: ReactNode;
+  /** When set the card is a keyboard-accessible button (OD-07). */
+  onClick?: () => void;
+  ariaLabel?: string;
 }) {
-  return (
-    <div className={`sm-kpi-card sm-kpi-tint-${tone}`}>
+  const [focused, setFocused] = useState(false);
+  const inner = (
+    <>
       <div className="sm-kpi-head">
         <div className="sm-label">{label}</div>
         <span className="sm-kpi-icon" aria-hidden="true">
@@ -205,6 +318,34 @@ function KpiCard({
       <div className="sm-kpi-value" style={{ marginTop: 6 }}>
         {children}
       </div>
+    </>
+  );
+  if (!onClick) {
+    return <div className={`sm-kpi-card sm-kpi-tint-${tone}`}>{inner}</div>;
+  }
+  return (
+    <div
+      className={`sm-kpi-card sm-kpi-tint-${tone}`}
+      role="button"
+      tabIndex={0}
+      aria-label={ariaLabel ?? label}
+      onClick={onClick}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onClick();
+        }
+      }}
+      onFocus={() => setFocused(true)}
+      onBlur={() => setFocused(false)}
+      style={{
+        cursor: "pointer",
+        ...(focused
+          ? { borderColor: "var(--sm-accent)", boxShadow: "var(--sm-focus-ring)" }
+          : {}),
+      }}
+    >
+      {inner}
     </div>
   );
 }
@@ -229,13 +370,19 @@ export function DashboardSection() {
   const rawSearch = useSearch({ strict: false }) as Record<string, unknown>;
   const range = parseRangeFromSearch(rawSearch);
   const bounds = rangeToBounds(range);
+  const filters = parseFiltersFromSearch(rawSearch);
+  const anyFilterSet = hasAnyFilter(filters);
   const [customOpen, setCustomOpen] = useState(false);
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
   const [customError, setCustomError] = useState<string | null>(null);
 
   const applyRange = (next: DashboardRange) => {
-    void navigate({ search: rangeToSearch(next) } as never);
+    void navigate({ search: buildSearch(next, filters) } as never);
+  };
+
+  const applyFilters = (next: DashboardFilters) => {
+    void navigate({ search: buildSearch(range, next) } as never);
   };
 
   const query = useQuery({
@@ -250,6 +397,39 @@ export function DashboardSection() {
           bounds ? `?from=${bounds.from}&to=${bounds.to}` : ""
         }`,
       ),
+    placeholderData: keepPreviousData,
+  });
+
+  // OD-07 (PRD §18): dashboard analytics — renewals + charts, scoped
+  // by the same range plus the four filters above. Same bounds logic
+  // as the overview query; the endpoint is Worker A's build, coded
+  // against the agreed DTO shape (see dashboard-charts.tsx).
+  const chartsQuery = useQuery({
+    queryKey: [
+      "admin",
+      "dashboard-charts",
+      range.kind === "custom" ? `custom:${bounds?.from}..${bounds?.to}` : range.preset,
+      filters.productId,
+      filters.paymentStatus,
+      filters.subscriptionStatus,
+      filters.source,
+    ],
+    queryFn: () => {
+      const params = new URLSearchParams();
+      if (bounds) {
+        params.set("from", bounds.from);
+        params.set("to", bounds.to);
+      }
+      if (filters.productId) params.set("productId", filters.productId);
+      if (filters.paymentStatus) params.set("paymentStatus", filters.paymentStatus);
+      if (filters.subscriptionStatus)
+        params.set("subscriptionStatus", filters.subscriptionStatus);
+      if (filters.source) params.set("source", filters.source);
+      const qs = params.toString();
+      return apiRequest<DashboardAnalyticsDto>(
+        `/api/v1/admin/analytics/dashboard${qs ? `?${qs}` : ""}`,
+      );
+    },
     placeholderData: keepPreviousData,
   });
 
@@ -371,7 +551,7 @@ export function DashboardSection() {
       <PageHeader
         breadcrumb={[{ label: "Dashboard" }]}
         title="Operational Overview"
-        help="Revenue, orders and paid orders reflect the selected period; product, subscription, licence and queue counts are current totals. Recent orders follow the selected period; Needs attention shows what is waiting right now."
+        help="Revenue, orders and paid orders reflect the selected period; product, subscription, licence and queue counts are current totals. Recent orders follow the selected period; Needs attention shows what is waiting right now. The product, payment, subscription and source filters scope the renewals and charts below."
       />
       <div className="sm-filter-row" role="group" aria-label="Date range">
         {DASHBOARD_PRESETS.map((p) => (
@@ -398,6 +578,104 @@ export function DashboardSection() {
         <span className="sm-filter-label" aria-live="polite">
           {formatRangeLabel(bounds)}
         </span>
+      </div>
+      {/* OD-07 filters row — persisted in the URL alongside the range,
+          so refresh/share keeps them; any change refetches the
+          dashboard analytics query (keepPreviousData). */}
+      <div className="sm-filter-row" role="group" aria-label="Dashboard filters">
+        <div style={{ flex: "1 1 240px", maxWidth: 300, minWidth: 200 }}>
+          <label className="sm-label" htmlFor="dash-filter-product">
+            Product
+          </label>
+          <div style={{ marginTop: 4 }}>
+            <SearchableSelect
+              id="dash-filter-product"
+              value={filters.productId}
+              onChange={(v) => applyFilters({ ...filters, productId: v })}
+              options={(chartsQuery.data?.filter_options.products ?? []).map((p) => ({
+                value: p.id,
+                label: p.code ? `${p.name} (${p.code})` : p.name,
+              }))}
+              leadingOptions={[{ value: "", label: "All products" }]}
+              placeholder="All products"
+              ariaLabel="Filter by product"
+            />
+          </div>
+        </div>
+        <div style={{ flex: "1 1 170px", maxWidth: 230, minWidth: 160 }}>
+          <label className="sm-label" htmlFor="dash-filter-payment-status">
+            Payment status
+          </label>
+          <div style={{ marginTop: 4 }}>
+            <Select
+              id="dash-filter-payment-status"
+              value={filters.paymentStatus}
+              onChange={(e) =>
+                applyFilters({ ...filters, paymentStatus: e.target.value })
+              }
+              aria-label="Filter by payment status"
+            >
+              <option value="">All payment statuses</option>
+              {PAYMENT_STATUSES.map((s) => (
+                <option key={s} value={s}>
+                  {sentenceCase(s)}
+                </option>
+              ))}
+            </Select>
+          </div>
+        </div>
+        <div style={{ flex: "1 1 170px", maxWidth: 230, minWidth: 160 }}>
+          <label className="sm-label" htmlFor="dash-filter-subscription-status">
+            Subscription status
+          </label>
+          <div style={{ marginTop: 4 }}>
+            <Select
+              id="dash-filter-subscription-status"
+              value={filters.subscriptionStatus}
+              onChange={(e) =>
+                applyFilters({ ...filters, subscriptionStatus: e.target.value })
+              }
+              aria-label="Filter by subscription status"
+            >
+              <option value="">All subscription statuses</option>
+              {SUBSCRIPTION_STATUSES.map((s) => (
+                <option key={s} value={s}>
+                  {sentenceCase(s)}
+                </option>
+              ))}
+            </Select>
+          </div>
+        </div>
+        <div style={{ flex: "1 1 140px", maxWidth: 200, minWidth: 140 }}>
+          <label className="sm-label" htmlFor="dash-filter-source">
+            Source
+          </label>
+          <div style={{ marginTop: 4 }}>
+            <Select
+              id="dash-filter-source"
+              value={filters.source}
+              onChange={(e) => applyFilters({ ...filters, source: e.target.value })}
+              aria-label="Filter by source"
+            >
+              <option value="">All sources</option>
+              {SOURCES.map((s) => (
+                <option key={s} value={s}>
+                  {SOURCE_LABELS[s] ?? sentenceCase(s)}
+                </option>
+              ))}
+            </Select>
+          </div>
+        </div>
+        {anyFilterSet ? (
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => applyFilters(EMPTY_FILTERS)}
+            aria-label="Clear all dashboard filters"
+          >
+            Clear filters
+          </Button>
+        ) : null}
       </div>
       {/* LIVE L8: isFetching covers a range-change refetch, when the
           previous range's numbers would otherwise stay visible. */}
@@ -462,7 +740,13 @@ export function DashboardSection() {
               {query.data.pending_outbox_events}
             </KpiCard>
             {/* E-11: total_customers was fetched but never displayed. */}
-            <KpiCard label="Total customers" icon={Users} tone="plain">
+            <KpiCard
+              label="Total customers"
+              icon={Users}
+              tone="plain"
+              onClick={() => goTo("/customers")}
+              ariaLabel={`Total customers: ${query.data.total_customers}. Open customers`}
+            >
               {query.data.total_customers}
             </KpiCard>
             {query.data.upcoming_renewals !== undefined &&
@@ -479,6 +763,144 @@ export function DashboardSection() {
             )}
         </>
       ) : null}
+
+      {/* OD-07: upcoming renewals + charts from the dashboard analytics
+          endpoint. Full-width rows, so the 2-column panels below are
+          not crowded. The overview query above is untouched. */}
+      <div
+        className="sm-dash-panel"
+        aria-label="Upcoming renewals"
+        style={{ marginBottom: "var(--sm-space-6)" }}
+      >
+        <div className="sm-dash-panel-head">
+          <h2 className="sm-section-title">Upcoming renewals</h2>
+          <Button size="sm" variant="secondary" onClick={() => goTo("/renewals")}>
+            View all
+          </Button>
+        </div>
+        {chartsQuery.isPending || chartsQuery.isFetching ? (
+          <PanelSkeleton />
+        ) : chartsQuery.isError ? (
+          <p className="sm-hint">
+            Could not load renewals.{" "}
+            <button
+              type="button"
+              className="sm-link-btn"
+              onClick={() => void chartsQuery.refetch()}
+            >
+              Retry
+            </button>
+          </p>
+        ) : (chartsQuery.data?.upcoming_renewals_list.length ?? 0) === 0 ? (
+          <p className="sm-hint">
+            {anyFilterSet
+              ? "No renewals match the filters."
+              : "No renewals in the next 30 days."}
+          </p>
+        ) : (
+          chartsQuery.data?.upcoming_renewals_list.map((r) => (
+            <button
+              key={r.subscription_id}
+              type="button"
+              className="sm-dash-row"
+              onClick={() => goTo(`/subscriptions/${r.subscription_id}`)}
+            >
+              <span className="sm-dash-row-main">
+                <span className="sm-tabular">{r.renewal_date_display}</span>
+                <span className="sm-dash-row-sub">
+                  {[r.customer_name, r.product_name].filter(Boolean).join(" · ") || "—"}
+                </span>
+              </span>
+              <span className="sm-dash-row-side">
+                {r.amount_minor !== null ? (
+                  <MoneyCell currency={r.currency_code} minor={r.amount_minor} />
+                ) : (
+                  <span className="sm-dash-row-sub">—</span>
+                )}
+                <StatusBadge status={r.status} />
+              </span>
+            </button>
+          ))
+        )}
+      </div>
+
+      <div
+        className="sm-dash-panel"
+        aria-label="Revenue over time"
+        style={{ marginBottom: "var(--sm-space-6)" }}
+      >
+        <div className="sm-dash-panel-head">
+          <h2 className="sm-section-title">Revenue over time</h2>
+        </div>
+        {chartsQuery.isPending || chartsQuery.isFetching ? (
+          <PanelSkeleton />
+        ) : chartsQuery.isError ? (
+          <p className="sm-hint">
+            Could not load charts.{" "}
+            <button
+              type="button"
+              className="sm-link-btn"
+              onClick={() => void chartsQuery.refetch()}
+            >
+              Retry
+            </button>
+          </p>
+        ) : chartsQuery.data ? (
+          <RevenueChart
+            series={chartsQuery.data.revenue_series}
+            currencyCode={chartsQuery.data.currency_code}
+          />
+        ) : null}
+      </div>
+
+      <div className="sm-grid-2">
+        <div className="sm-dash-panel" aria-label="Orders over time">
+          <div className="sm-dash-panel-head">
+            <h2 className="sm-section-title">Orders over time</h2>
+          </div>
+          {chartsQuery.isPending || chartsQuery.isFetching ? (
+            <PanelSkeleton />
+          ) : chartsQuery.isError ? (
+            <p className="sm-hint">
+              Could not load charts.{" "}
+              <button
+                type="button"
+                className="sm-link-btn"
+                onClick={() => void chartsQuery.refetch()}
+              >
+                Retry
+              </button>
+            </p>
+          ) : chartsQuery.data ? (
+            <OrdersChart series={chartsQuery.data.revenue_series} />
+          ) : null}
+        </div>
+
+        <div className="sm-dash-panel" aria-label="Payment method distribution">
+          <div className="sm-dash-panel-head">
+            <h2 className="sm-section-title">Payment methods</h2>
+          </div>
+          {chartsQuery.isPending || chartsQuery.isFetching ? (
+            <PanelSkeleton />
+          ) : chartsQuery.isError ? (
+            <p className="sm-hint">
+              Could not load charts.{" "}
+              <button
+                type="button"
+                className="sm-link-btn"
+                onClick={() => void chartsQuery.refetch()}
+              >
+                Retry
+              </button>
+            </p>
+          ) : chartsQuery.data ? (
+            <PaymentMethodChart
+              rows={chartsQuery.data.payment_method_distribution}
+              currencyCode={chartsQuery.data.currency_code}
+            />
+          ) : null}
+        </div>
+      </div>
 
       <div className="sm-grid-2">
         <div className="sm-dash-panel" aria-label="Recent orders">

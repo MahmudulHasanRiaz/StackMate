@@ -48,6 +48,11 @@ export const SEED_PERMISSIONS = [
   { id: "00000000-0000-4000-8000-000000000134", key: "expenses.read", description: "View expenses and profit & loss analytics" },
   { id: "00000000-0000-4000-8000-000000000135", key: "expenses.manage", description: "Create, edit, and delete expenses" },
   { id: "00000000-0000-4000-8000-000000000136", key: "expense_categories.manage", description: "Create, edit, and delete expense categories" },
+  // OD-13 (2026-11-28): scoped API tokens. super_admin + admin hold it
+  // via SEED_PERMISSIONS.map below (migration 0028 grants it in SQL);
+  // no other role is granted it. Token scopes can never include this
+  // key (API_TOKEN_SCOPES_EXCLUDED in modules/api-tokens/service.ts).
+  { id: "00000000-0000-4000-8000-000000000137", key: "api_tokens.manage", description: "Create, list, and revoke scoped API tokens" },
 ] as const;
 
 export const SEED_ROLES: ReadonlyArray<{

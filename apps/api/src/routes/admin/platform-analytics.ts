@@ -28,6 +28,7 @@ import {
   parseOverviewRange,
 } from "../../modules/analytics/overview-range.ts";
 import { computeProfitLoss } from "../../modules/analytics/pnl.ts";
+import { computeDashboard } from "../../modules/analytics/dashboard.ts";
 
 // --- HTTP plumbing copied from app.ts handleRequest (closures there) ---
 
@@ -228,6 +229,46 @@ export function registerAdminPlatformAnalyticsRoutes(app: Hono<AppEnv>): void {
       ).length,
       range,
     });
+  });
+
+  // OD-07 dashboard (PRD §18) — full dashboard surface in one call:
+  // totals, revenue series (daily ≤ 92 days, else weekly from Monday),
+  // payment-method distribution, upcoming renewals (top 10), plus
+  // filter options. Pure computation over the already-loaded
+  // store.state (see modules/analytics/dashboard.ts header): this
+  // endpoint adds ZERO additional DB queries. Filters combine with
+  // AND; invalid enum values and unknown productId are 400
+  // VALIDATION_ERROR (thrown by computeDashboard). Permission gating
+  // follows the overview precedent (products.read to call;
+  // payments.read / super_admin for money fields, null when gated).
+  app.get("/api/v1/admin/analytics/dashboard", async (c) => {
+    const store = c.var.store;
+    const env = c.var.env;
+    const principal = requirePrincipal(c);
+    const requestId = c.var.requestId;
+    await assertStaffPermissionAudited(store, principal, "products.read", requestId);
+    const canSeeMoney =
+      principal.roles.includes("super_admin") ||
+      principal.permissions.includes("payments.read");
+    const params = new URL(c.req.url).searchParams;
+    const range = parseOverviewRange(params);
+    // Empty-string query values count as absent, not as a filter.
+    const queryOrNull = (name: string): string | null => {
+      const value = c.req.query(name);
+      return value ? value : null;
+    };
+    const result = computeDashboard(store.state, {
+      range,
+      productId: queryOrNull("productId"),
+      paymentStatus: queryOrNull("paymentStatus"),
+      subscriptionStatus: queryOrNull("subscriptionStatus"),
+      source: queryOrNull("source"),
+      currencyCode: env.DEFAULT_CURRENCY,
+      timeZone: env.DEFAULT_TIMEZONE,
+      todayDay: new Date().toISOString().slice(0, 10),
+      canSeeMoney,
+    });
+    return ok(c, result);
   });
 
   // Profit & Loss — sales are the dashboard verified-revenue

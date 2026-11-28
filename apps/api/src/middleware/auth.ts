@@ -23,9 +23,15 @@ import {
 } from "../modules/auth-config/service.ts";
 import {
   resolveStaffPrincipal,
+  resolveTokenPepper,
   storeSupportsBetterAuth,
   type StaffPrincipal,
 } from "../modules/identity/service.ts";
+import {
+  buildApiTokenPrincipal,
+  isApiTokenValue,
+  verifyApiToken,
+} from "../modules/api-tokens/service.ts";
 import type { AppEnv } from "../types/context.ts";
 import { AppError } from "../shared/errors.ts";
 import {
@@ -119,6 +125,24 @@ export function authContext(
       // null-principal path as before).
       const cookieHeader = c.req.header("Cookie") ?? null;
       const bearerToken = extractBearerToken(c.req.header("Authorization") ?? null);
+      // OD-13: scoped API tokens (`stk_...`) authenticate WITHOUT
+      // Better Auth. A `stk_` Bearer token is never a session token,
+      // so it must never fall through to `resolveStaffPrincipal`
+      // (which would look it up as a Better Auth session). On success
+      // the principal carries exactly the token's scopes (roles: [],
+      // so the `super_admin` bypass in `assertStaffPermission` never
+      // applies); on failure the principal is null and downstream
+      // guards answer 401 — never throw here, never fall through.
+      // Skipping the Better Auth construction is pure-overhead
+      // avoidance for these requests, same reasoning as the B-01 gate
+      // below.
+      if (bearerToken !== null && isApiTokenValue(bearerToken)) {
+        const pepper = resolveTokenPepper(store, env.ENCRYPTION_KEY_V1) ?? null;
+        const token = await verifyApiToken(store, { rawToken: bearerToken, pepper });
+        c.set("principal", token ? buildApiTokenPrincipal(token) : null);
+        await next();
+        return;
+      }
       const auth =
         cookieHeader === null && bearerToken === null
           ? null

@@ -30,6 +30,7 @@ export { registerAdminSubscriptionsRoutes } from "./subscriptions.ts";
 export { registerAdminLicensesRoutes } from "./licenses.ts";
 export { registerAdminSitesRoutes } from "./sites.ts";
 export { registerAdminSiteCredentialsRoutes } from "./sites-credentials.ts";
+export { registerAdminApiTokensRoutes } from "./api-tokens.ts";
 export { registerAdminSiteDomainsRoutes } from "./sites-domains.ts";
 export { registerAdminSiteTrackingRoutes } from "./sites-tracking.ts";
 export { registerAdminWebhooksRoutes } from "./webhooks.ts";

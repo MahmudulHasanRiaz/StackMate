@@ -85,6 +85,17 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
     permission: "integrations.manage",
   },
   {
+    // OD-13: scoped API tokens (stk_) for external API clients —
+    // Settings config, never main-menu. Same Integrations group as
+    // the other integration material; gated on api_tokens.manage.
+    slug: "api-tokens",
+    label: "API Tokens",
+    icon: KeyRound,
+    to: "/settings/api-tokens",
+    group: "Integrations",
+    permission: "api_tokens.manage",
+  },
+  {
     slug: "payment-methods",
     label: "Payment Methods",
     icon: CreditCard,

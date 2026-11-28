@@ -49,6 +49,7 @@ import {
   registerAdminProductsRoutes,
   registerAdminSettingsRoutes,
   registerAdminSiteCredentialsRoutes,
+  registerAdminApiTokensRoutes,
   registerAdminSiteDomainsRoutes,
   registerAdminSiteTrackingRoutes,
   registerAdminSitesRoutes,
@@ -97,6 +98,7 @@ export function registerAllRoutes(app: Hono<AppEnv>): void {
   registerAdminLicensesRoutes(app);
   registerAdminSitesRoutes(app);
   registerAdminSiteCredentialsRoutes(app);
+  registerAdminApiTokensRoutes(app);
   registerAdminSiteDomainsRoutes(app);
   registerAdminSiteTrackingRoutes(app);
   registerAdminWebhooksRoutes(app);
