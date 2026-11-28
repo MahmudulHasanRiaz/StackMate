@@ -3,5 +3,34 @@
   "private": true,
   "version": "0.1.0",
   "description": "Centralized product, licensing, subscription and commerce platform",
-  "scripts": {}
+  "packageManager": "pnpm@10.6.1",
+  "engines": {
+    "node": ">=18.20.0",
+    "pnpm": ">=9.0.0"
+  },
+  "scripts": {
+    "validate:repo": "node scripts/validate-repo.mjs",
+    "db:check": "node scripts/check-migrations.mjs",
+    "db:generate": "pnpm --filter @stackmate/db run generate",
+    "db:migrate": "node scripts/migrate.mjs",
+    "db:migrate:deploy": "node scripts/migrate.mjs --deploy",
+    "db:seed": "node scripts/seed-reference.mjs",
+    "bootstrap:super-admin": "node scripts/bootstrap-super-admin.mjs",
+    "dev:api": "pnpm --filter @stackmate/api run dev",
+    "dev:admin": "pnpm --filter @stackmate/admin run dev",
+    "typecheck": "node scripts/typecheck.mjs",
+    "lint": "node scripts/lint-repo.mjs",
+    "format:check": "node scripts/lint-repo.mjs --format-check",
+    "test": "node scripts/run-tests.mjs",
+    "check": "node scripts/validate-repo.mjs && node scripts/check-migrations.mjs && node scripts/lint-repo.mjs && node scripts/typecheck.mjs && node scripts/run-tests.mjs",
+    "build": "node scripts/build-all.mjs",
+    "deploy:production": "pnpm --filter @stackmate/api run deploy && pnpm --filter @stackmate/admin run deploy",
+    "smoke:check": "node scripts/smoke-check.mjs",
+    "smoke:api": "node scripts/smoke-check.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "22.13.10",
+    "typescript": "5.8.2",
+    "vitest": "3.0.8"
+  }
 }

@@ -1,0 +1,195 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1794731400000,
+      "tag": "0000_stackmate_initial_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1794731460000,
+      "tag": "0001_seed_reference_catalog",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1794731520000,
+      "tag": "0002_sequence_counters",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1794734000000,
+      "tag": "0003_role_permission_grants",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1794734600000,
+      "tag": "0004_signing_keys",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1794751239000,
+      "tag": "0005_staff_invitations",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1794775845494,
+      "tag": "0006_tracking_pixel_groups",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1794820499000,
+      "tag": "0007_auth_email",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "8",
+      "when": 1794820500000,
+      "tag": "0008_general_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "8",
+      "when": 1794900000000,
+      "tag": "0009_customer_order_payments_tickets_leads",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "8",
+      "when": 1794910000000,
+      "tag": "0010_order_payment_status_partially_paid",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "8",
+      "when": 1794912204000,
+      "tag": "0011_customer_website",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "8",
+      "when": 1795002762000,
+      "tag": "0012_media_library_storage",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "8",
+      "when": 1795002763000,
+      "tag": "0013_media_thumbnails",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "8",
+      "when": 1795107735000,
+      "tag": "0014_audit_fix_batch",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "8",
+      "when": 1795110091751,
+      "tag": "0015_simulated_status_f01_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "8",
+      "when": 1795110875254,
+      "tag": "0016_rate_limit_buckets_read_permissions",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "8",
+      "when": 1795322278959,
+      "tag": "0017_outbox_skipped_status",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "8",
+      "when": 1795615324271,
+      "tag": "0018_expense_categories_expenses",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "8",
+      "when": 1795615885883,
+      "tag": "0019_expense_permissions",
+      "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "8",
+      "when": 1795621800000,
+      "tag": "0020_audit_c01_skipped_constraints_reattempt",
+      "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "8",
+      "when": 1795621801000,
+      "tag": "0021_fk_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "8",
+      "when": 1795621802000,
+      "tag": "0022_media_search_trgm",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "8",
+      "when": 1795621803000,
+      "tag": "0023_subscription_invoice_payment_fks",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "8",
+      "when": 1795621804000,
+      "tag": "0024_scheduled_job_runs",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "8",
+      "when": 1795621805000,
+      "tag": "0025_sent_reminders_reference_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "8",
+      "when": 1795621806000,
+      "tag": "0026_expense_category_hierarchy",
+      "breakpoints": true
+    }
+  ]
+}

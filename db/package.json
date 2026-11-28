@@ -1,0 +1,28 @@
+{
+  "name": "@stackmate/db",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./schema/index.ts",
+  "types": "./schema/index.ts",
+  "exports": {
+    ".": "./schema/index.ts",
+    "./schema": "./schema/index.ts",
+    "./schema/*": "./schema/*.ts",
+    "./seeds/*": "./seeds/*.ts"
+  },
+  "scripts": {
+    "generate": "drizzle-kit generate --config=drizzle.config.ts",
+    "migrate": "node ../scripts/migrate.mjs",
+    "check": "node ../scripts/check-migrations.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "drizzle-orm": "0.45.4",
+    "pg": "8.20.0"
+  },
+  "devDependencies": {
+    "@types/pg": "8.11.11",
+    "drizzle-kit": "0.31.4"
+  }
+}

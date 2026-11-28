@@ -17,11 +17,11 @@ Documentation is the product and engineering source of truth.
 
 - [Implementation plan](./implementation/PLAN.md)
 - [AI agent handoff prompt](./implementation/AI-AGENT-START-PROMPT.md)
-- [Implementation plan](./implementation/PLAN.md)
 - [Implementation status](./implementation/STATUS.md)
-- Architecture Decision Records: [ADR template](./decisions/ADR-TEMPLATE.md) and [docs/decisions](./decisions/)
-- External integration guides: [docs/integration](./integration/)
-- Operations runbooks: [docs/operations](./operations/)
+- [Architecture Decision Records](./decisions/)
+- [CI/CD and database migration runbook](./operations/CI-CD-AND-MIGRATIONS.md)
+- [External integration guides](./integration/)
+- [Operations runbooks](./operations/)
 
 ## Authority
 

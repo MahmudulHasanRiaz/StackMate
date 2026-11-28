@@ -1,0 +1,355 @@
+/**
+ * TEMPORARY reproduction for the staging Worker 1101 (2026-11-15).
+ *
+ * Staging: GET /api/v1/admin/me returned Cloudflare error 1101
+ * ("Worker threw exception") on ~10% of sequential requests and ~25%
+ * of 20 concurrent requests, then 12/12 store-dependent calls failed
+ * 22:11–22:15 +06 (including the owner's own sign-in attempts).
+ * Cloudflare Real-time Logs proved the cause: store creation threw
+ * "This promise was created by a request that has since ended, so it
+ * can never settle" (handle_cross_request_promise_resolution flag),
+ * from `DrizzleStore.acquireQueue → DrizzleStore.create →
+ * createRequestStore → fetchHandler`. The Batch 0 perf fix's
+ * per-isolate shared pg Client + per-client promise-chain queue
+ * created promises in one request and awaited them in another; warm
+ * isolates got poisoned, so the failure rate climbed with warmth.
+ *
+ * The fix (ADR-0005 evening amendment — the pre-recorded revert path)
+ * is REQUEST-SCOPED clients: one fresh pg Client per create(), closed
+ * when the request finishes; no module-level promise queue, no
+ * module-scope promise. B-01 REUSE (2026-11-27) keeps the store
+ * request-scoped but lets the underlying TCP connection be reused
+ * across requests through `platform/db/connection-cache.ts`: ONE idle
+ * client per connection string, claimed by a synchronous boolean
+ * lease (busy → fresh client). The cache holds NO promise at module
+ * scope, so the cross-request-promise failure above cannot recur —
+ * that is what this file now pins. This file pins the behavior:
+ *  1. Concurrent /me through the REAL Worker entrypoint stays clean
+ *     against local Postgres.
+ *  2. A first connection rejected with PostgreSQL 53300
+ *     (too_many_connections — "remaining connection slots…") is
+ *     recovered by the connect-phase retry: a fake pg proxy rejects
+ *     the first handshake with a 53300 ErrorResponse and TCP-proxies
+ *     later handshakes to the real database; the request must still
+ *     answer 401 (unauthenticated), never throw.
+ *  3. Structural: two sequential requests through the real entrypoint
+ *     open ONE pg connection (handshake count via a counting proxy)
+ *     — the second request leases the parked client. A cross-request
+ *     promise failure would 500/throw instead of answering 401.
+ *  4. Structural: concurrent requests each hold their own backend
+ *     (pg_stat_activity shows >= 2 distinct backends mid-flight —
+ *     the lease never shares a client between concurrent requests)
+ *     and exactly ONE idle backend lingers after the requests settle
+ *     (the parked lease client, never in a transaction).
+ *
+ * Requires DATABASE_URL (same convention as the other Postgres suites).
+ */
+import { describe, it, beforeAll, afterAll } from "vitest";
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import net from "node:net";
+import path from "node:path";
+import { Client } from "pg";
+import { resolveRuntimeConfig } from "../src/env.ts";
+import { drainConnectionCache } from "../src/platform/db/connection-cache.ts";
+import worker from "../src/index.ts";
+
+const DATABASE_URL = process.env.DATABASE_URL ?? "";
+const REPRO_DB_NAME = "stackmate_1101_repro";
+const MIGRATIONS_DIR = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../../../db/migrations"
+);
+const MAINTENANCE_URL =
+  "postgresql://postgres:postgres@127.0.0.1:5432/postgres";
+
+describe.skipIf(!DATABASE_URL)("worker 1101 repro (Postgres)", () => {
+  let dbUrl = "";
+  let env: ReturnType<typeof resolveRuntimeConfig>;
+
+  beforeAll(async () => {
+    const maintenance = new Client({ connectionString: MAINTENANCE_URL });
+    await maintenance.connect();
+    await maintenance.query(`DROP DATABASE IF EXISTS "${REPRO_DB_NAME}"`);
+    await maintenance.query(`CREATE DATABASE "${REPRO_DB_NAME}"`);
+    await maintenance.end();
+    dbUrl = `postgresql://postgres:postgres@127.0.0.1:5432/${REPRO_DB_NAME}`;
+    const admin = new Client({ connectionString: dbUrl });
+    await admin.connect();
+    const journal = JSON.parse(
+      await readFile(path.join(MIGRATIONS_DIR, "meta", "_journal.json"), "utf8")
+    ) as { entries: Array<{ tag: string }> };
+    for (const entry of journal.entries) {
+      const sql = await readFile(path.join(MIGRATIONS_DIR, `${entry.tag}.sql`), "utf8");
+      await admin.query(sql);
+    }
+    await admin.end();
+    env = resolveRuntimeConfig({
+      APP_ENV: "test",
+      HYPERDRIVE_NO_CACHE: { connectionString: dbUrl },
+      HYPERDRIVE_CACHED: { connectionString: dbUrl },
+    } as never);
+  }, 120_000);
+
+  afterAll(async () => {
+    // Stores are request-scoped and the entrypoint closes each one
+    // after its request; B-01 reuse parks the last client instead of
+    // ending it, so ONE idle backend may linger — terminate the repro
+    // DB's backends first or DROP DATABASE waits forever.
+    const maintenance = new Client({ connectionString: MAINTENANCE_URL });
+    await maintenance.connect();
+    await maintenance
+      .query(
+        `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
+        [REPRO_DB_NAME]
+      )
+      .catch(() => {});
+    await maintenance
+      .query(`DROP DATABASE IF EXISTS "${REPRO_DB_NAME}"`)
+      .catch(() => {});
+    await maintenance.end();
+  }, 120_000);
+
+  it("20 concurrent /me requests: none throws, none 500s", async () => {
+    const runWave = async (wave: number) => {
+      const results = await Promise.all(
+        Array.from({ length: 20 }, async (_, i) => {
+          try {
+            const res = await worker.fetch(
+              new Request("http://localhost:8787/api/v1/admin/me"),
+              env as never,
+              undefined as never
+            );
+            const body = await res.text();
+            return { i, status: res.status, body: body.slice(0, 80) };
+          } catch (e) {
+            return {
+              i,
+              status: "THREW",
+              body: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+            };
+          }
+        })
+      );
+      const bad = results.filter((r) => r.status !== 401);
+      console.log(
+        `[1101-repro] wave ${wave}: ok=${results.length - bad.length}/20 bad=${bad.length}`,
+        JSON.stringify(bad, null, 2)
+      );
+      return bad;
+    };
+
+    const bad1 = await runWave(1);
+    const bad2 = await runWave(2);
+    const bad3 = await runWave(3);
+    assert.deepEqual(
+      [...bad1, ...bad2, ...bad3],
+      [],
+      "concurrent /me requests must all return 401 (unauthenticated), never throw or 500"
+    );
+  }, 120_000);
+
+  it("a 53300 connect rejection recovers via the connect-phase retry", async () => {
+    // Fake pg proxy: the FIRST handshake gets a 53300 ErrorResponse
+    // (too_many_connections); later handshakes are TCP-proxied to the
+    // real database. The entrypoint must answer 401, not throw.
+    const proxy = net.createServer();
+    let handshakes = 0;
+    const liveSockets = new Set<net.Socket>();
+    proxy.on("connection", (socket) => {
+      liveSockets.add(socket);
+      socket.on("close", () => liveSockets.delete(socket));
+      handshakes += 1;
+      if (handshakes === 1) {
+        socket.once("data", () => {
+          const message =
+            "remaining connection slots are reserved for non-replication superuser connections";
+          const fields = Buffer.concat([
+            Buffer.from("SFATAL\0", "utf8"),
+            Buffer.from("C53300\0", "utf8"),
+            Buffer.from(`M${message}\0`, "utf8"),
+            Buffer.from([0]),
+          ]);
+          const length = 4 + fields.length;
+          const header = Buffer.alloc(5);
+          header[0] = 0x45; // 'E' ErrorResponse
+          header.writeInt32BE(length, 1);
+          socket.end(Buffer.concat([header, fields]));
+        });
+        return;
+      }
+      const upstream = net.connect(5432, "127.0.0.1");
+      liveSockets.add(upstream);
+      upstream.on("close", () => liveSockets.delete(upstream));
+      socket.pipe(upstream);
+      upstream.pipe(socket);
+      const destroyBoth = () => {
+        socket.destroy();
+        upstream.destroy();
+      };
+      socket.on("error", destroyBoth);
+      upstream.on("error", destroyBoth);
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+    const address = proxy.address() as net.AddressInfo;
+    try {
+      const proxyUrl = `postgresql://postgres:postgres@127.0.0.1:${address.port}/${REPRO_DB_NAME}`;
+      const proxyEnv = resolveRuntimeConfig({
+        APP_ENV: "test",
+        HYPERDRIVE_NO_CACHE: { connectionString: proxyUrl },
+        HYPERDRIVE_CACHED: { connectionString: proxyUrl },
+      } as never);
+      const res = await worker.fetch(
+        new Request("http://localhost:8787/api/v1/admin/me"),
+        proxyEnv as never,
+        undefined as never
+      );
+      const body = await res.text();
+      console.log(`[1101-repro] 53300 test: fetch returned ${res.status} after ${handshakes} handshake(s)`);
+      assert.equal(res.status, 401, `expected 401 after 53300 recovery, got ${res.status}: ${body.slice(0, 200)}`);
+      assert.ok(handshakes >= 2, `expected a retry handshake, saw ${handshakes}`);
+    } finally {
+      // The request's store is closed after the request, so its proxied
+      // connection should already be gone; destroy the sockets first
+      // anyway or proxy.close() waits forever if anything lingered.
+      for (const s of liveSockets) s.destroy();
+      await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    }
+  }, 120_000);
+
+  it("two sequential requests open ONE pg connection (counting proxy)", async () => {
+    // Structural proof of B-01 connection reuse through the REAL
+    // entrypoint: a plain TCP proxy counts handshakes. Two sequential
+    // /me requests must produce EXACTLY 1 handshake — the second
+    // request leases the parked client instead of connecting fresh.
+    // (The Cloudflare cross-request promise flag cannot be reproduced
+    // under Node, so the observable properties are the handshake count
+    // AND that both requests still answer 401: a cross-request
+    // promise failure would throw/500 instead.)
+    const proxy = net.createServer();
+    let handshakes = 0;
+    const liveSockets = new Set<net.Socket>();
+    proxy.on("connection", (socket) => {
+      liveSockets.add(socket);
+      socket.on("close", () => liveSockets.delete(socket));
+      handshakes += 1;
+      const upstream = net.connect(5432, "127.0.0.1");
+      liveSockets.add(upstream);
+      upstream.on("close", () => liveSockets.delete(upstream));
+      socket.pipe(upstream);
+      upstream.pipe(socket);
+      const destroyBoth = () => {
+        socket.destroy();
+        upstream.destroy();
+      };
+      socket.on("error", destroyBoth);
+      upstream.on("error", destroyBoth);
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+    const address = proxy.address() as net.AddressInfo;
+    try {
+      const proxyUrl = `postgresql://postgres:postgres@127.0.0.1:${address.port}/${REPRO_DB_NAME}`;
+      const proxyEnv = resolveRuntimeConfig({
+        APP_ENV: "test",
+        HYPERDRIVE_NO_CACHE: { connectionString: proxyUrl },
+        HYPERDRIVE_CACHED: { connectionString: proxyUrl },
+      } as never);
+      for (let i = 0; i < 2; i++) {
+        const res = await worker.fetch(
+          new Request("http://localhost:8787/api/v1/admin/me"),
+          proxyEnv as never,
+          undefined as never
+        );
+        const body = await res.text();
+        assert.equal(res.status, 401, `request ${i + 1}: expected 401, got ${res.status}: ${body.slice(0, 200)}`);
+      }
+      console.log(`[1101-repro] sequential-reuse test: ${handshakes} handshake(s) for 2 requests`);
+      assert.equal(
+        handshakes,
+        1,
+        `expected exactly 1 pg handshake for 2 sequential requests (second leases the parked client), saw ${handshakes}`
+      );
+    } finally {
+      for (const s of liveSockets) s.destroy();
+      await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    }
+  }, 120_000);
+
+  it("concurrent requests hold distinct backends; exactly one idle backend lingers (pg_stat_activity)", async () => {
+    // Black-box proof through the real entrypoint: while 20 /me
+    // requests are in flight, pg_stat_activity must show >= 2 distinct
+    // backends for the repro DB (the lease never shares one client
+    // between concurrent requests), and after they settle exactly ONE
+    // backend lingers — the parked lease client, idle (never inside
+    // a transaction). Earlier tests in this file park clients too, so
+    // drain the cache first for a hermetic pre-state.
+    drainConnectionCache();
+    const activity = new Client({ connectionString: MAINTENANCE_URL });
+    await activity.connect();
+    const countBackends = async (): Promise<number> => {
+      const r = await activity.query(
+        `SELECT pid FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
+        [REPRO_DB_NAME]
+      );
+      return r.rowCount ?? 0;
+    };
+    const lingeringStates = async (): Promise<string[]> => {
+      const r = await activity.query(
+        `SELECT state FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
+        [REPRO_DB_NAME]
+      );
+      return r.rows.map((row) => String((row as { state: unknown }).state));
+    };
+    try {
+      assert.equal(await countBackends(), 0, "no Worker backend should exist before the requests");
+      const inFlight = Promise.all(
+        Array.from({ length: 20 }, () =>
+          worker.fetch(
+            new Request("http://localhost:8787/api/v1/admin/me"),
+            env as never,
+            undefined as never
+          )
+        )
+      );
+      let maxDistinct = 0;
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        maxDistinct = Math.max(maxDistinct, await countBackends());
+        if (maxDistinct >= 2) break;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      const results = await inFlight;
+      assert.ok(
+        results.every((r) => r.status === 401),
+        `all 20 concurrent /me requests must return 401, got ${results.map((r) => r.status).join(",")}`
+      );
+      console.log(`[1101-repro] concurrent-backends test: max ${maxDistinct} distinct backends mid-flight`);
+      assert.ok(
+        maxDistinct >= 2,
+        `expected >= 2 distinct backends mid-flight (fresh client per request), saw max ${maxDistinct}`
+      );
+      // Settle: exactly ONE idle backend lingers once the requests
+      // are done — the parked lease client. More than one would mean
+      // closes are leaking clients; a non-idle one would mean a
+      // client was parked mid-transaction.
+      let lingering = await countBackends();
+      for (let i = 0; i < 40 && lingering !== 1; i++) {
+        await new Promise((r) => setTimeout(r, 50));
+        lingering = await countBackends();
+      }
+      assert.equal(
+        lingering,
+        1,
+        `exactly one parked backend must linger after the requests; saw ${lingering}`
+      );
+      assert.deepEqual(
+        await lingeringStates(),
+        ["idle"],
+        "the lingering backend must be idle, never mid-transaction"
+      );
+    } finally {
+      await activity.end().catch(() => {});
+    }
+  }, 120_000);
+});

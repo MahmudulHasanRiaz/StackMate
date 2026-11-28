@@ -794,9 +794,12 @@ Append-only decision log:
 
 A verification log is never edited to rewrite a previous decision. A later correction is a new event.
 
-### 13.8 `payment_refunds` (future/manual operational capability)
+### 13.8 `payment_refunds`
 
-When refunds are introduced:
+Refunds are implemented (endpoints `POST /api/v1/admin/orders/{orderId}/refunds`
++ standalone `/refunds` UI since the 2026-11-22 finish-everything batch;
+corrected from future tense 2026-11-25, audit F-16). The table shape:
+
 - `id uuid` PK.
 - `payment_transaction_id uuid` FK.
 - `amount_minor bigint` positive.
@@ -1481,6 +1484,7 @@ These decisions affect exact constraints and schema types. They should be answer
 | DB-10 | Payment proof retention | Privacy/storage cost | Define a finite retention period before production |
 | DB-11 | Subscription grace and suspension policy | Period transitions and license validity | Product-level policy, not one global assumption |
 | DB-12 | Do complimentary/manual grants exist? | License source and audit rules | Support explicit audited admin grant without fake payment |
+| DB-13 | Dead-schema surface — wire up or drop? (audit 2026-11-25 C-07, owner decision OD-09, PENDING) | `archived_at` columns declared on `products`, `customers`, `product_packages` but never read or written (the store's load query omits them; no sync writes them); 7 tables created and never used by any business service: `subscription_events`, `license_validation_logs`, `product_releases`, `notifications`, `order_adjustments`, `tracking_deliveries`, `product_integration_profiles`. `product_releases` also contradicts §8.4 "only if needed"; `notifications` is the known-blocked notifications item (no design call yet); `order_adjustments` is conditional per §11.5 (orders already carry `discount_minor`/`tax_minor` directly). | PENDING — no table is dropped or wired up until the owner decides per table/column: wire it up (subscription events / validation logs have obvious writers; validation outcomes are currently not recorded at the DB layer) or drop it in a forward migration. |
 
 ---
 

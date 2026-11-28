@@ -1,0 +1,12 @@
+-- 0025 — idx_sent_reminders_reference (audit 2026-11-25, Batch C
+-- follow-up: pre-existing schema/migration drift).
+--
+-- The Drizzle schema declares `idx_sent_reminders_reference` on
+-- `sent_reminders` (db/schema/reminders.ts) but NO migration ever
+-- created it, and it is not in the live DB — a pre-existing drift
+-- (documented in the fix plan, Worker C follow-up). check-migrations
+-- verifies tables only, so the drift was invisible to it.
+--
+-- Idempotent (IF NOT EXISTS) and reversible (DROP INDEX). Creates the
+-- index the schema already declares, so schema and DB agree.
+CREATE INDEX IF NOT EXISTS "idx_sent_reminders_reference" ON "sent_reminders" ("reference_id", "sent_at" DESC);

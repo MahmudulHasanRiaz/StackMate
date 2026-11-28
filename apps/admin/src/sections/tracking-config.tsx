@@ -1,0 +1,688 @@
+/**
+ * Tracking configuration — pixel groups (Settings area).
+ *
+ * Route (registered in router.tsx, under the Settings shell):
+ *   /settings/tracking
+ *
+ * Endpoints used (all `tracking.manage`):
+ *   GET    /api/v1/admin/integrated-sites
+ *   GET    /api/v1/admin/integrated-sites/:siteId/tracking
+ *   POST   /api/v1/admin/integrated-sites/:siteId/tracking
+ *   PATCH  /api/v1/admin/integrated-sites/:siteId/tracking/:configId
+ *   DELETE /api/v1/admin/integrated-sites/:siteId/tracking/:configId
+ *   POST   /api/v1/admin/tracking/test-event { pixel_group_id,
+ *     event_name? } — "Send test event" per pixel group (E-18).
+ *     The event is recorded and then delivered to Meta by the outbox
+ *     drain (E-01, live); the result reports the recorded status.
+ *
+ * A pixel group is one (provider, pixel_id) configuration for one
+ * site (migration 0006). Several groups per provider are allowed —
+ * e.g. two Meta pixels on the same site. The CAPI token is
+ * write-only: it is encrypted at rest and never returned by any
+ * read endpoint, so the edit form leaves the token blank and only
+ * re-encrypts when a new token is supplied.
+ *
+ * Meta CAPI delivery is LIVE (E-01, verified 2026-11-27 against Meta
+ * Events Manager): events are sent to Meta via the outbox drain
+ * (cron + manual dispatch). TikTok has no delivery yet — its groups
+ * only store configuration. This page never claims a delivery reached
+ * its destination without the drain's success.
+ */
+import { useState, type FormEvent } from "react";
+import { useNavigate } from "@tanstack/react-router";
+import { BarChart3, FlaskConical, Pencil, Plus, Trash2 } from "lucide-react";
+import { apiRequest } from "../lib/api-client";
+import { detailKey } from "../lib/query";
+import {
+  PageHeader,
+  loadListOptions,
+  useAdminDetail,
+  useAdminList,
+  useAdminMutation,
+  useIdempotencyKey,
+} from "../lib/section-kit";
+import {
+  Alert,
+  Button,
+  Checkbox,
+  DateCell,
+  DateTimeCell,
+  Dialog,
+  EmptyState,
+  ErrorState,
+  Field,
+  Input,
+  RowMenu,
+  SearchableSelect,
+  Select,
+  StatusBadge,
+  Switch,
+  TableSkeleton,
+  Toolbar,
+  useConfirm,
+  GroupField,
+} from "../components/primitives";
+import type { IntegratedSite, TrackingConfig } from "./integrations";
+
+/* Events the API accepts (packages/contracts — ALLOWED_TRACKING_EVENTS). */
+/* "Purchase" is listed here but can only ever be emitted after        */
+/* server-verified payment approval — never by a browser or external   */
+/* caller (API spec §17.4).                                            */
+const TRACKING_EVENTS = [
+  "PageView",
+  "ViewContent",
+  "Lead",
+  "InitiateCheckout",
+  "AddPaymentInfo",
+  "Purchase",
+] as const;
+
+const PROVIDER_LABELS: Record<TrackingConfig["provider"], string> = {
+  meta: "Meta",
+  tiktok: "TikTok",
+};
+
+/* ------------------------------------------------------------------ */
+/* Section: site picker + groups table                                 */
+/* ------------------------------------------------------------------ */
+export function TrackingConfigSection() {
+  const [siteId, setSiteId] = useState("");
+  const navigate = useNavigate();
+  const sitesQuery = useAdminList<IntegratedSite>(
+    "integrated-sites",
+    "/api/v1/admin/integrated-sites",
+  );
+  const sites = sitesQuery.data ?? [];
+  const site = sites.find((s) => s.id === siteId);
+
+  return (
+    <section aria-labelledby="tracking-config-heading">
+      <PageHeader
+        breadcrumb={[{ label: "Settings" }, { label: "Tracking" }]}
+        title="Tracking"
+        help="Pixel groups — Meta Pixel + Conversions API, TikTok, and more"
+      />
+      {sitesQuery.isPending ? (
+        <TableSkeleton rows={3} />
+      ) : sitesQuery.isError ? (
+        <div className="sm-table-wrap">
+          <ErrorState
+            message={
+              sitesQuery.error instanceof Error
+                ? sitesQuery.error.message
+                : "Could not load integrated sites."
+            }
+            onRetry={() => void sitesQuery.refetch()}
+          />
+        </div>
+      ) : sites.length === 0 ? (
+        <EmptyState
+          icon={BarChart3}
+          title="No integrated sites yet"
+          body="Register a site first — a pixel group belongs to one site."
+          actionLabel="Register a site"
+          onAction={() => navigate({ to: "/settings/websites" })}
+        />
+      ) : (
+        <>
+          <Toolbar>
+            {/* Searchable (PLAN §29): integrated sites are unbounded —
+               the query runs server-side over the full site set. */}
+            <SearchableSelect
+              id="tracking-site-filter"
+              value={siteId}
+              onChange={(v) => setSiteId(v)}
+              loadOptions={(q, signal) =>
+                loadListOptions<IntegratedSite>(
+                  "/api/v1/admin/integrated-sites",
+                  q,
+                  (s) => ({ value: s.id, label: s.name }),
+                  signal,
+                )
+              }
+              placeholder="Choose a site…"
+              ariaLabel="Integrated site"
+            />
+          </Toolbar>
+          {site ? (
+            <TrackingGroups site={site} />
+          ) : (
+            <EmptyState
+              icon={BarChart3}
+              title="Choose a site"
+              body="Pixel groups are per-site. Pick a site above to see and manage its groups."
+            />
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Groups table for one site                                           */
+/* ------------------------------------------------------------------ */
+function TrackingGroups({ site }: { site: IntegratedSite }) {
+  const [dialog, setDialog] = useState<
+    | null
+    | { mode: "create" }
+    | { mode: "edit"; config: TrackingConfig }
+  >(null);
+  const [testTarget, setTestTarget] = useState<TrackingConfig | null>(null);
+  const [testResult, setTestResult] = useState<string | null>(null);
+  const confirm = useConfirm();
+
+  const query = useAdminDetail<{ items: TrackingConfig[] }>(
+    "tracking-configs",
+    site.id,
+    `/api/v1/admin/integrated-sites/${site.id}/tracking`,
+  );
+  const groups = query.data?.items ?? [];
+
+  // A-04: one key per component instance for each consequential POST.
+  const toggleKey = useIdempotencyKey();
+  const testKey = useIdempotencyKey();
+  const toggle = useAdminMutation<TrackingConfig, { id: string; status: string }>({
+    mutationFn: ({ id, status }) =>
+      apiRequest<TrackingConfig>(
+        `/api/v1/admin/integrated-sites/${site.id}/tracking/${id}`,
+        { method: "PATCH", body: JSON.stringify({ status }), idempotencyKey: toggleKey },
+      ),
+    invalidateKeys: [detailKey("tracking-configs", site.id)],
+    successTitle: "Pixel group updated",
+  });
+
+  const remove = useAdminMutation<TrackingConfig, string>({
+    mutationFn: (configId) =>
+      apiRequest<TrackingConfig>(
+        `/api/v1/admin/integrated-sites/${site.id}/tracking/${configId}`,
+        { method: "DELETE" },
+      ),
+    invalidateKeys: [detailKey("tracking-configs", site.id)],
+    successTitle: "Pixel group deleted",
+  });
+
+  // E-18: send a test event for one pixel group. The endpoint is a
+  // pinned route the API worker implements in parallel; the result is
+  // shown verbatim and never claims a real delivery.
+  const sendTest = useAdminMutation<
+    { ok?: boolean; status?: string; message?: string; event_id?: string },
+    { pixel_group_id: string; event_name: string }
+  >({
+    mutationFn: (body) =>
+      apiRequest<{ ok?: boolean; status?: string; message?: string; event_id?: string }>(
+        "/api/v1/admin/tracking/test-event",
+        { method: "POST", body: JSON.stringify(body), idempotencyKey: testKey },
+      ),
+    invalidateKeys: [detailKey("tracking-configs", site.id)],
+    successTitle: "Test event sent",
+    onSuccess: (data) =>
+      setTestResult(
+        data.message ??
+          `Test event recorded (${data.status ?? data.event_id ?? "no status returned"}).`,
+      ),
+  });
+
+  if (query.isPending) return <TableSkeleton rows={4} />;
+  if (query.isError) {
+    return (
+      <div className="sm-table-wrap">
+        <ErrorState
+          message={
+            query.error instanceof Error
+              ? query.error.message
+              : "Could not load pixel groups."
+          }
+          onRetry={() => void query.refetch()}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <Toolbar>
+        <Button
+          variant="accent"
+          icon={Plus}
+          onClick={() => setDialog({ mode: "create" })}
+        >
+          Create pixel group
+        </Button>
+      </Toolbar>
+      {testResult ? (
+        <Alert variant="info" onDismiss={() => setTestResult(null)}>
+          {testResult}
+        </Alert>
+      ) : null}
+      {groups.length === 0 ? (
+        <EmptyState
+          icon={BarChart3}
+          title="No pixel groups yet"
+          body={`No tracking is configured for ${site.name}. Create a group to attach a Meta pixel or a TikTok pixel.`}
+          actionLabel="Create pixel group"
+          onAction={() => setDialog({ mode: "create" })}
+        />
+      ) : (
+        <div className="sm-table-wrap">
+          <table className="sm-table">
+            <thead>
+              <tr>
+                <th>Group</th>
+                <th>Provider</th>
+                <th>Pixel ID</th>
+                <th>Status</th>
+                <th>Enabled</th>
+                <th>Test code</th>
+                <th>Events</th>
+                <th>Updated</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {groups.map((g) => (
+                <tr key={g.id}>
+                  <td>{g.label ?? g.pixel_id}</td>
+                  <td>{PROVIDER_LABELS[g.provider]}</td>
+                  <td>
+                    <span className="sm-mono">{g.pixel_id}</span>
+                  </td>
+                  <td>
+                    <StatusBadge status={g.status} />
+                  </td>
+                  <td>
+                    <Switch
+                      label={g.status === "enabled" ? "On" : "Off"}
+                      checked={g.status === "enabled"}
+                      disabled={toggle.isPending}
+                      onChange={(e) =>
+                        toggle.mutate({
+                          id: g.id,
+                          status: e.target.checked ? "enabled" : "disabled",
+                        })
+                      }
+                    />
+                  </td>
+                  <td>
+                    <span className="sm-mono">{g.test_event_code ?? "—"}</span>
+                  </td>
+                  <td>{g.enabled_events.join(", ")}</td>
+                  <td>
+                    <DateTimeCell value={g.updated_at} />
+                  </td>
+                  <td>
+                    <RowMenu
+                      items={[
+                        {
+                          icon: Pencil,
+                          label: "Edit",
+                          onSelect: () =>
+                            setDialog({ mode: "edit", config: g }),
+                        },
+                        {
+                          // E-18: send a test event for this group.
+                          icon: FlaskConical,
+                          label: "Send test event",
+                          disabled: g.status !== "enabled",
+                          onSelect: () => setTestTarget(g),
+                        },
+                        {
+                          icon: Trash2,
+                          label: "Delete",
+                          danger: true,
+                          onSelect: () =>
+                            void (async () => {
+                              const ok = await confirm({
+                                title: "Delete pixel group?",
+                                body: (
+                                  <div>
+                                    <p>
+                                      {g.label ?? g.pixel_id} (
+                                      {PROVIDER_LABELS[g.provider]}) will be
+                                      permanently deleted and will stop
+                                      receiving events for {site.name}. The
+                                      stored CAPI token is deleted with it.
+                                    </p>
+                                  </div>
+                                ),
+                                confirmLabel: "Delete",
+                                danger: true,
+                                warning: `${g.label ?? g.pixel_id} (${PROVIDER_LABELS[g.provider]}) will be permanently deleted.`,
+                              });
+                              if (ok) remove.mutate(g.id);
+                            })(),
+                        },
+                      ]}
+                    />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {dialog ? (
+        <TrackingGroupDialog
+          site={site}
+          mode={dialog.mode}
+          config={dialog.mode === "edit" ? dialog.config : null}
+          onClose={() => setDialog(null)}
+        />
+      ) : null}
+      {testTarget ? (
+        <SendTestEventDialog
+          group={testTarget}
+          siteName={site.name}
+          sending={sendTest.isPending}
+          onClose={() => setTestTarget(null)}
+          onSend={(eventName) => {
+            sendTest.mutate(
+              { pixel_group_id: testTarget.id, event_name: eventName },
+              {
+                onSuccess: () => setTestTarget(null),
+                onError: () => setTestTarget(null),
+              },
+            );
+          }}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Send test event dialog (E-18)                                       */
+/* ------------------------------------------------------------------ */
+function SendTestEventDialog({
+  group,
+  siteName,
+  sending,
+  onClose,
+  onSend,
+}: {
+  group: TrackingConfig;
+  siteName: string;
+  sending: boolean;
+  onClose: () => void;
+  onSend: (eventName: string) => void;
+}) {
+  const [eventName, setEventName] = useState<(typeof TRACKING_EVENTS)[number]>("PageView");
+  return (
+    <Dialog
+      open
+      onClose={onClose}
+      title="Send test event"
+      size="sm"
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="accent" loading={sending} onClick={() => onSend(eventName)}>
+            Send test event
+          </Button>
+        </>
+      }
+    >
+      <p className="sm-hint" style={{ marginTop: 0 }}>
+        {group.label ?? group.pixel_id} ({PROVIDER_LABELS[group.provider]}) · {siteName}
+      </p>
+      <Field label="Event" htmlFor="test-event-name">
+        <Select
+          id="test-event-name"
+          name="event_name"
+          value={eventName}
+          onChange={(e) =>
+            setEventName(e.target.value as (typeof TRACKING_EVENTS)[number])
+          }
+        >
+          {TRACKING_EVENTS.map((ev) => (
+            <option key={ev} value={ev}>
+              {ev}
+            </option>
+          ))}
+        </Select>
+      </Field>
+      <p className="sm-hint">
+        The event is recorded, then delivered to Meta by the outbox
+        drain — the result reports the recorded status.
+      </p>
+    </Dialog>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Create / edit dialog                                                */
+/* ------------------------------------------------------------------ */
+function TrackingGroupDialog({
+  site,
+  mode,
+  config,
+  onClose,
+}: {
+  site: IntegratedSite;
+  mode: "create" | "edit";
+  config: TrackingConfig | null;
+  onClose: () => void;
+}) {
+  const [provider, setProvider] = useState<TrackingConfig["provider"]>(
+    config?.provider ?? "meta",
+  );
+  const [label, setLabel] = useState(config?.label ?? "");
+  const [pixelId, setPixelId] = useState(config?.pixel_id ?? "");
+  const [token, setToken] = useState("");
+  const [testCode, setTestCode] = useState(config?.test_event_code ?? "");
+  const [events, setEvents] = useState<string[]>(
+    config ? [...config.enabled_events] : [],
+  );
+  const [enabled, setEnabled] = useState(
+    config ? config.status === "enabled" : true,
+  );
+  const [errors, setErrors] = useState<Record<string, string>>({});
+
+  // A-04: one key per dialog instance — a retried create replays.
+  const formKey = useIdempotencyKey();
+  const create = useAdminMutation<TrackingConfig, Record<string, unknown>>({
+    mutationFn: (body) =>
+      apiRequest<TrackingConfig>(
+        `/api/v1/admin/integrated-sites/${site.id}/tracking`,
+        { method: "POST", body: JSON.stringify(body), idempotencyKey: formKey },
+      ),
+    invalidateKeys: [detailKey("tracking-configs", site.id)],
+    successTitle: "Pixel group created",
+    onSuccess: () => onClose(),
+  });
+
+  const update = useAdminMutation<TrackingConfig, Record<string, unknown>>({
+    mutationFn: (body) =>
+      apiRequest<TrackingConfig>(
+        `/api/v1/admin/integrated-sites/${site.id}/tracking/${config!.id}`,
+        { method: "PATCH", body: JSON.stringify(body) },
+      ),
+    invalidateKeys: [detailKey("tracking-configs", site.id)],
+    successTitle: "Pixel group updated",
+    onSuccess: () => onClose(),
+  });
+
+  const toggleEvent = (event: string) =>
+    setEvents((prev) =>
+      prev.includes(event)
+        ? prev.filter((e) => e !== event)
+        : [...prev, event],
+    );
+
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    const next: Record<string, string> = {};
+    if (pixelId.trim().length < 4)
+      next.pixel_id = "Pixel ID must be at least 4 characters.";
+    if (mode === "create" && token.trim().length < 8)
+      next.access_token = "Access token must be at least 8 characters.";
+    if (mode === "create" && token.trim().length === 0)
+      next.access_token = "Access token is required.";
+    if (events.length === 0)
+      next.enabled_events = "Select at least one event.";
+    setErrors(next);
+    if (Object.keys(next).length > 0) return;
+
+    if (mode === "create") {
+      create.mutate({
+        provider,
+        label: label.trim() || undefined,
+        pixel_id: pixelId.trim(),
+        access_token: token.trim(),
+        test_event_code: testCode.trim() || undefined,
+        enabled_events: events,
+        status: enabled ? "enabled" : "disabled",
+      });
+      return;
+    }
+
+    // Edit: send only what changed — the API 422s a no-op body, and
+    // omitting access_token keeps the stored token (rotated_at
+    // untouched). A token is re-encrypted only when one is supplied.
+    const body: Record<string, unknown> = {};
+    if (provider !== config!.provider) body.provider = provider;
+    if (label.trim() !== (config!.label ?? "")) {
+      body.label = label.trim() || null;
+    }
+    if (pixelId.trim() !== config!.pixel_id) body.pixel_id = pixelId.trim();
+    if (token.trim().length > 0) body.access_token = token.trim();
+    if (testCode.trim() !== (config!.test_event_code ?? "")) {
+      body.test_event_code = testCode.trim() || null;
+    }
+    const sorted = (list: string[]) => [...list].sort();
+    if (
+      JSON.stringify(sorted(events)) !==
+      JSON.stringify(sorted(config!.enabled_events))
+    ) {
+      body.enabled_events = events;
+    }
+    if ((enabled ? "enabled" : "disabled") !== config!.status) {
+      body.status = enabled ? "enabled" : "disabled";
+    }
+    if (Object.keys(body).length === 0) {
+      onClose();
+      return;
+    }
+    update.mutate(body);
+  };
+
+  const pending = create.isPending || update.isPending;
+
+  return (
+    <Dialog
+      open
+      onClose={onClose}
+      title={
+        mode === "create"
+          ? `Create pixel group — ${site.name}`
+          : `Edit pixel group — ${config!.label ?? config!.pixel_id}`
+      }
+    >
+      <form onSubmit={submit}>
+        <div className="sm-form-grid">
+          <Field label="Site" htmlFor="pixel-site">
+            <Input id="pixel-site" name="site" value={site.name} disabled />
+          </Field>
+          <Field label="Provider" required htmlFor="pixel-provider">
+            <Select
+              id="pixel-provider"
+              name="provider"
+              value={provider}
+              onChange={(e) =>
+                setProvider(e.target.value as TrackingConfig["provider"])
+              }
+            >
+              <option value="meta">Meta</option>
+              <option value="tiktok">TikTok</option>
+            </Select>
+          </Field>
+          <Field label="Group label" htmlFor="pixel-label" hint="Shown in the list; falls back to the pixel ID.">
+            <Input
+              id="pixel-label"
+              name="label"
+              value={label}
+              onChange={(e) => setLabel(e.target.value)}
+              placeholder="e.g. Main store pixel"
+              maxLength={120}
+            />
+          </Field>
+          <Field label="Pixel ID" required htmlFor="pixel-id" error={errors.pixel_id}>
+            <Input
+              id="pixel-id"
+              name="pixel_id"
+              value={pixelId}
+              onChange={(e) => setPixelId(e.target.value)}
+              placeholder="e.g. 123456789012345"
+            />
+          </Field>
+          <Field
+            label="CAPI access token"
+            required={mode === "create"}
+            htmlFor="pixel-access-token"
+            error={errors.access_token}
+            hint={
+              mode === "edit"
+                ? "Leave empty to keep the current token. A new token is encrypted and replaces it."
+                : "Encrypted at rest. Never shown again after saving."
+            }
+          >
+            <Input
+              id="pixel-access-token"
+              name="access_token"
+              type="password"
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
+              autoComplete="new-password"
+              placeholder={
+                mode === "edit" ? "•••••••• (unchanged)" : "EAAB…"
+              }
+            />
+          </Field>
+          <Field label="Test event code" htmlFor="pixel-test-code" hint="Meta test-events code; leave empty when not testing.">
+            <Input
+              id="pixel-test-code"
+              name="test_event_code"
+              value={testCode}
+              onChange={(e) => setTestCode(e.target.value)}
+              placeholder="e.g. TEST12345"
+            />
+          </Field>
+          <GroupField
+            label="Enabled events"
+            required
+            error={errors.enabled_events}
+            hint="Purchase is emitted only after server-verified payment approval."
+          >
+            <div className="sm-stack">
+              {TRACKING_EVENTS.map((event) => (
+                <Checkbox
+                  key={event}
+                  label={event}
+                  checked={events.includes(event)}
+                  onChange={() => toggleEvent(event)}
+                />
+              ))}
+            </div>
+          </GroupField>
+          <GroupField label="Status">
+            <Switch
+              label={enabled ? "Enabled" : "Disabled"}
+              checked={enabled}
+              onChange={(e) => setEnabled(e.target.checked)}
+            />
+          </GroupField>
+        </div>
+        <div className="sm-dialog-footer sm-dialog-footer-flush">
+          <Button variant="secondary" type="button" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button variant="accent" type="submit" loading={pending}>
+            {mode === "create" ? "Create group" : "Save changes"}
+          </Button>
+        </div>
+      </form>
+    </Dialog>
+  );
+}
